@@ -739,7 +739,7 @@ export class WishlistService {
       giftOrderId: data.id,
       recipientName: data.recipient?.username,
       productName: wishlistItem.products?.name,
-      totalAmount: order.total_amount,
+      totalAmount: wishlistItem.products?.price,
       isSurprise: isSurprise
     };
   }
