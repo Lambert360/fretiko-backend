@@ -68,6 +68,7 @@ export class WishlistController {
     friendId: string;
     shareType?: 'view_only' | 'view_and_add';
     shareMessage?: string;
+    selectedItemIds?: string[];
   }) {
     console.log('💖 Sharing wishlist with friend:', shareData);
     return this.wishlistService.shareWishlistWithFriend(
@@ -75,6 +76,7 @@ export class WishlistController {
       shareData.friendId,
       shareData.shareType,
       shareData.shareMessage,
+      shareData.selectedItemIds,
       req.supabaseToken
     );
   }
@@ -83,6 +85,12 @@ export class WishlistController {
   async getSharedWishlists(@Request() req) {
     console.log('💖 Getting wishlists shared with user:', req.user.sub);
     return this.wishlistService.getSharedWishlists(req.user.sub, req.supabaseToken);
+  }
+
+  @Get('shared/:ownerId')
+  async getSharedWishlistItems(@Request() req, @Param('ownerId') ownerId: string) {
+    console.log('💖 Getting shared wishlist items from owner:', ownerId, 'for user:', req.user.sub);
+    return this.wishlistService.getSharedWishlistItems(req.user.sub, ownerId, req.supabaseToken);
   }
 
   @Get('collaborative')
@@ -128,9 +136,10 @@ export class WishlistController {
   }
 
   @Get('shareable-friends')
-  async getShareableFriends(@Request() req) {
-    console.log('💖 Getting shareable friends for user:', req.user.sub);
-    return this.wishlistService.getShareableFriends(req.user.sub, req.supabaseToken);
+  async getShareableFriends(@Request() req, @Query('search') search?: string, @Query('limit') limit?: string) {
+    console.log('💖 Getting shareable friends for user:', req.user.sub, 'search:', search);
+    const limitNum = limit ? parseInt(limit, 10) : 20;
+    return this.wishlistService.getShareableFriends(req.user.sub, req.supabaseToken, search, limitNum);
   }
 
   // ============================================

@@ -29,6 +29,18 @@ export class CartService {
           product_categories (
             name
           )
+        ),
+        services (
+          name,
+          base_price,
+          images,
+          user_id,
+          user_profiles (
+            username
+          ),
+          service_categories (
+            name
+          )
         )
       `)
       .eq('user_id', userId)
@@ -46,20 +58,46 @@ export class CartService {
     });
 
     // Transform data to match frontend expectations
-    return data?.map(item => ({
-      id: item.id,
-      productId: item.product_id,
-      productName: item.products?.name || 'Unknown Product',
-      productImage: item.products?.images?.[0] || item.products?.primary_image_url || 'https://via.placeholder.com/150',
-      price: item.price_at_add,
-      originalPrice: item.products?.price || null, // Show original price from products table
-      quantity: item.quantity,
-      maxQuantity: item.products?.quantity || 999, // Use 'quantity' not 'max_quantity'
-      sellerId: item.products?.user_id,
-      sellerName: item.products?.user_profiles?.username || 'Unknown Seller',
-      category: item.products?.product_categories?.name || 'Uncategorized',
-      createdAt: item.created_at,
-    })) || [];
+    return data?.map(item => {
+      const isService = !!item.service_id;
+
+      if (isService) {
+        // Service item
+        return {
+          id: item.id,
+          serviceId: item.service_id,
+          productName: item.services?.name || 'Unknown Service',
+          productImage: item.services?.images?.[0] || 'https://via.placeholder.com/150',
+          price: item.price_at_add,
+          originalPrice: item.services?.base_price || null,
+          quantity: item.quantity,
+          maxQuantity: 1, // Services are typically non-stackable
+          sellerId: item.services?.user_id,
+          sellerName: item.services?.user_profiles?.username || 'Unknown Provider',
+          category: item.services?.service_categories?.name || 'Services',
+          serviceDate: item.scheduled_date,
+          serviceTime: item.scheduled_time,
+          serviceNotes: item.service_notes,
+          createdAt: item.created_at,
+        };
+      } else {
+        // Product item
+        return {
+          id: item.id,
+          productId: item.product_id,
+          productName: item.products?.name || 'Unknown Product',
+          productImage: item.products?.images?.[0] || item.products?.primary_image_url || 'https://via.placeholder.com/150',
+          price: item.price_at_add,
+          originalPrice: item.products?.price || null,
+          quantity: item.quantity,
+          maxQuantity: item.products?.quantity || 999,
+          sellerId: item.products?.user_id,
+          sellerName: item.products?.user_profiles?.username || 'Unknown Seller',
+          category: item.products?.product_categories?.name || 'Uncategorized',
+          createdAt: item.created_at,
+        };
+      }
+    }) || [];
   }
 
   async getCartSummary(userId: string, userToken?: string) {
@@ -289,5 +327,57 @@ export class CartService {
       errors,
       unavailableItems,
     };
+  }
+
+  async addServiceToCart(userId: string, serviceData: {
+    serviceId: string;
+    scheduledDate?: string;
+    scheduledTime?: string;
+    notes?: string;
+  }, userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+
+    // Check if service exists and get its info
+    const { data: service, error: serviceError } = await client
+      .from('services')
+      .select('id, name, base_price, status')
+      .eq('id', serviceData.serviceId)
+      .eq('status', 'active')
+      .single();
+
+    if (serviceError || !service) {
+      throw new NotFoundException('Service not found or not available');
+    }
+
+    // Check if service already exists in cart
+    const { data: existingItem } = await client
+      .from('cart_items')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('service_id', serviceData.serviceId)
+      .single();
+
+    if (existingItem) {
+      throw new BadRequestException('This service is already in your cart');
+    }
+
+    // Add service to cart
+    const { error: insertError } = await client
+      .from('cart_items')
+      .insert({
+        user_id: userId,
+        service_id: serviceData.serviceId,
+        quantity: 1, // Services are typically quantity 1
+        price_at_add: service.base_price,
+        scheduled_date: serviceData.scheduledDate || null,
+        scheduled_time: serviceData.scheduledTime || null,
+        service_notes: serviceData.notes || null,
+      });
+
+    if (insertError) {
+      throw new Error(`Failed to add service to cart: ${insertError.message}`);
+    }
+
+    return { message: 'Service added to cart' };
   }
 }

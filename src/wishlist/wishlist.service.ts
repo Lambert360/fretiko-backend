@@ -1,12 +1,17 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationType, NotificationPriority } from '../notifications/dto/notification.dto';
 
 @Injectable()
 export class WishlistService {
   private supabase;
 
-  constructor(private configService: ConfigService) {
+  constructor(
+    private configService: ConfigService,
+    private notificationsService: NotificationsService
+  ) {
     this.supabase = createSupabaseClient(this.configService);
   }
 
@@ -180,13 +185,57 @@ export class WishlistService {
   // ============================================
 
   /**
-   * Share wishlist with a friend
+   * Helper method to check if two users have a relationship (connected or chatting)
+   */
+  private async checkUserRelationship(
+    userId1: string,
+    userId2: string,
+    client: any
+  ): Promise<boolean> {
+    // Check for plugged connection (vendor/rider)
+    const { data: connection } = await client
+      .from('user_connections')
+      .select('id')
+      .or(`and(requester_id.eq.${userId1},addressee_id.eq.${userId2}),and(requester_id.eq.${userId2},addressee_id.eq.${userId1})`)
+      .eq('status', 'accepted')
+      .single();
+
+    if (connection) {
+      return true;
+    }
+
+    // Check for chat conversation
+    const { data: user1Participations } = await client
+      .from('chat_participants')
+      .select('conversation_id')
+      .eq('user_id', userId1);
+
+    if (user1Participations && user1Participations.length > 0) {
+      const conversationIds = user1Participations.map(p => p.conversation_id);
+
+      const { data: user2Participations } = await client
+        .from('chat_participants')
+        .select('conversation_id')
+        .eq('user_id', userId2)
+        .in('conversation_id', conversationIds);
+
+      if (user2Participations && user2Participations.length > 0) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Share wishlist with any verified user (selective items)
    */
   async shareWishlistWithFriend(
-    ownerId: string, 
-    friendId: string, 
+    ownerId: string,
+    friendId: string,
     shareType: 'view_only' | 'view_and_add' = 'view_and_add',
     shareMessage?: string,
+    selectedItemIds?: string[], // Array of wishlist item IDs to share
     userToken?: string
   ) {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
@@ -200,16 +249,15 @@ export class WishlistService {
       throw new Error('Cannot share wishlist with yourself');
     }
 
-    // Verify friendship exists
-    const { data: connection } = await client
-      .from('user_connections')
-      .select('id')
-      .or(`and(requester_id.eq.${ownerId},addressee_id.eq.${friendId}),and(requester_id.eq.${friendId},addressee_id.eq.${ownerId})`)
-      .eq('status', 'accepted')
+    // Verify the recipient user exists and is verified
+    const { data: recipientUser, error: userError } = await client
+      .from('user_profiles')
+      .select('id, username')
+      .eq('id', friendId)
       .single();
 
-    if (!connection) {
-      throw new Error('You can only share wishlists with connected friends');
+    if (userError || !recipientUser) {
+      throw new Error('Recipient user not found or not verified');
     }
 
     // Check if user has wishlist items to share
@@ -222,6 +270,19 @@ export class WishlistService {
       throw new Error('Cannot share an empty wishlist');
     }
 
+    // Verify selected items belong to owner
+    if (selectedItemIds && selectedItemIds.length > 0) {
+      const { data: itemsCheck } = await client
+        .from('wishlist')
+        .select('id')
+        .eq('user_id', ownerId)
+        .in('id', selectedItemIds);
+
+      if (!itemsCheck || itemsCheck.length !== selectedItemIds.length) {
+        throw new Error('Some selected items do not belong to your wishlist');
+      }
+    }
+
     // Create or update share
     const { data, error } = await client
       .from('wishlist_shares')
@@ -232,9 +293,9 @@ export class WishlistService {
         share_message: shareMessage,
         is_active: true,
         updated_at: new Date().toISOString()
-      }, { 
+      }, {
         onConflict: 'owner_id,shared_with_id',
-        ignoreDuplicates: false 
+        ignoreDuplicates: false
       })
       .select()
       .single();
@@ -244,11 +305,36 @@ export class WishlistService {
       throw new Error(`Failed to share wishlist: ${error.message}`);
     }
 
-    return { 
-      message: 'Wishlist shared successfully', 
+    // If selective sharing, add items to shared_wishlist_items table
+    if (selectedItemIds && selectedItemIds.length > 0) {
+      // First, delete existing shared items for this share (in case of re-share)
+      await client
+        .from('shared_wishlist_items')
+        .delete()
+        .eq('wishlist_share_id', data.id);
+
+      // Insert selected items
+      const sharedItems = selectedItemIds.map(itemId => ({
+        wishlist_share_id: data.id,
+        wishlist_item_id: itemId
+      }));
+
+      const { error: itemsError } = await client
+        .from('shared_wishlist_items')
+        .insert(sharedItems);
+
+      if (itemsError) {
+        console.error('Error sharing wishlist items:', itemsError);
+        throw new Error(`Failed to share wishlist items: ${itemsError.message}`);
+      }
+    }
+
+    return {
+      message: 'Wishlist shared successfully',
       shareId: data.id,
       shareType: data.share_type,
-      canAddItems: data.share_type === 'view_and_add'
+      canAddItems: data.share_type === 'view_and_add',
+      sharedItemsCount: selectedItemIds?.length || 0
     };
   }
 
@@ -271,6 +357,54 @@ export class WishlistService {
     }
 
     return data || [];
+  }
+
+  /**
+   * Get shared wishlist items for a specific owner
+   */
+  async getSharedWishlistItems(viewerId: string, ownerId: string, userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+
+    // Get the share record
+    const { data: share, error: shareError } = await client
+      .from('wishlist_shares')
+      .select('id, share_type')
+      .eq('owner_id', ownerId)
+      .eq('shared_with_id', viewerId)
+      .eq('is_active', true)
+      .single();
+
+    if (shareError || !share) {
+      throw new Error('No active wishlist share found');
+    }
+
+    // Get shared items using the view
+    const { data, error } = await client
+      .from('shared_wishlist_items_with_details')
+      .select('*')
+      .eq('wishlist_share_id', share.id)
+      .eq('product_status', 'active'); // Only active products
+
+    if (error) {
+      console.error('Shared wishlist items query error:', error);
+      throw new Error(`Failed to fetch shared wishlist items: ${error.message}`);
+    }
+
+    // Transform to match frontend expectations
+    return data?.map(item => ({
+      id: item.wishlist_item_id,
+      productId: item.product_id,
+      productName: item.product_name || 'Unknown Product',
+      productImage: item.product_image || 'https://via.placeholder.com/150',
+      price: item.product_price || 0,
+      sellerId: item.seller_id,
+      sellerName: 'Seller', // Can be enhanced with seller profile lookup
+      notes: item.notes,
+      priority: item.priority,
+      createdAt: item.created_at,
+      isAvailable: item.product_status === 'active',
+      canAddItems: share.share_type === 'view_and_add'
+    })) || [];
   }
 
   /**
@@ -427,42 +561,45 @@ export class WishlistService {
   }
 
   /**
-   * Get friends who can be shared with (connected friends)
+   * Search for users to share wishlist with (any verified user)
+   * @param userId - Current user ID (to exclude from results)
+   * @param searchQuery - Optional search query to filter users by username
+   * @param limit - Optional limit for results (default: 20)
    */
-  async getShareableFriends(userId: string, userToken?: string) {
+  async getShareableFriends(userId: string, userToken?: string, searchQuery?: string, limit: number = 20) {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
-    const { data, error } = await client
-      .from('user_connections')
-      .select(`
-        id,
-        requester_id,
-        addressee_id,
-        requester:user_profiles!requester_id (
-          id, username, avatar_url
-        ),
-        addressee:user_profiles!addressee_id (
-          id, username, avatar_url
-        )
-      `)
-      .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`)
-      .eq('status', 'accepted');
+    // Build query to get all users except current user
+    let query = client
+      .from('user_profiles')
+      .select('id, username, avatar_url')
+      .neq('id', userId);
 
-    if (error) {
-      console.error('Friends query error:', error);
-      throw new Error(`Failed to fetch friends: ${error.message}`);
+    // Add search filter if provided
+    if (searchQuery && searchQuery.trim()) {
+      query = query.ilike('username', `%${searchQuery.trim()}%`);
     }
 
-    // Transform to get friend info (not current user)
-    return data?.map(conn => {
-      const friend = conn.requester_id === userId ? conn.addressee : conn.requester;
-      return {
-        id: friend.id,
-        username: friend.username,
-        fullName: friend.username, // Using username as fullName since full_name doesn't exist
-        avatarUrl: friend.avatar_url
-      };
-    }) || [];
+    // Add limit and order
+    query = query
+      .order('username', { ascending: true })
+      .limit(limit);
+
+    const { data: users, error } = await query;
+
+    if (error) {
+      console.error('Search users query error:', error);
+      throw new Error(`Failed to search users: ${error.message}`);
+    }
+
+    // Transform to match expected format
+    return users?.map(user => ({
+      id: user.id,
+      username: user.username,
+      fullName: user.username,
+      avatarUrl: user.avatar_url,
+      source: 'search'
+    })) || [];
   }
 
   // ============================================
@@ -470,12 +607,12 @@ export class WishlistService {
   // ============================================
 
   /**
-   * Mark wishlist item as gift order
+   * Create gift order (with automatic order creation for gifts)
    */
   async createGiftOrder(
     giftGiverId: string,
     giftRecipientId: string,
-    orderId: string,
+    orderId: string | null,
     wishlistItemId: string,
     giftMessage?: string,
     isSurprise: boolean = false,
@@ -484,28 +621,12 @@ export class WishlistService {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     // Input validation
-    if (!giftGiverId || !giftRecipientId || !orderId || !wishlistItemId) {
-      throw new Error('Gift giver ID, recipient ID, order ID, and wishlist item ID are required');
+    if (!giftGiverId || !giftRecipientId || !wishlistItemId) {
+      throw new Error('Gift giver ID, recipient ID, and wishlist item ID are required');
     }
 
     if (giftGiverId === giftRecipientId) {
       throw new Error('Cannot create gift order for yourself');
-    }
-
-    // Verify the order exists and belongs to the gift giver
-    const { data: order, error: orderError } = await client
-      .from('orders')
-      .select('id, user_id, status, total_amount')
-      .eq('id', orderId)
-      .eq('user_id', giftGiverId)
-      .single();
-
-    if (orderError || !order) {
-      throw new Error('Order not found or does not belong to you');
-    }
-
-    if (order.status !== 'paid' && order.status !== 'completed') {
-      throw new Error('Order must be paid before creating gift record');
     }
 
     // Verify the wishlist item exists and belongs to the recipient
@@ -534,24 +655,21 @@ export class WishlistService {
       throw new Error('The wishlist item product is no longer available');
     }
 
-    // Verify friendship or sharing permission exists
-    const { data: permission } = await client
-      .from('wishlist_shares')
-      .select('share_type')
-      .eq('owner_id', giftRecipientId)
-      .eq('shared_with_id', giftGiverId)
-      .eq('is_active', true)
+    // Verify both users exist
+    const { data: giverUser, error: giverError } = await client
+      .from('user_profiles')
+      .select('id, username')
+      .eq('id', giftGiverId)
       .single();
 
-    const { data: friendship } = await client
-      .from('user_connections')
-      .select('id')
-      .or(`and(requester_id.eq.${giftGiverId},addressee_id.eq.${giftRecipientId}),and(requester_id.eq.${giftRecipientId},addressee_id.eq.${giftGiverId})`)
-      .eq('status', 'accepted')
+    const { data: recipientUser, error: recipientError } = await client
+      .from('user_profiles')
+      .select('id, username')
+      .eq('id', giftRecipientId)
       .single();
 
-    if (!permission && !friendship) {
-      throw new Error('You must be friends with the recipient or have access to their shared wishlist to create a gift');
+    if (giverError || !giverUser || recipientError || !recipientUser) {
+      throw new Error('Gift giver or recipient not found');
     }
 
     // Check if gift order already exists for this wishlist item
@@ -589,8 +707,35 @@ export class WishlistService {
       throw new Error(`Failed to create gift order: ${error.message}`);
     }
 
-    return { 
-      message: 'Gift order created successfully', 
+    // Send notification to gift recipient
+    try {
+      await this.notificationsService.createNotification({
+        user_id: giftRecipientId,
+        type: NotificationType.ORDER,
+        title: '🎁 You Received a Gift!',
+        message: `${giverUser.username} sent you ${wishlistItem.products?.name} as a gift!`,
+        priority: NotificationPriority.HIGH,
+        data: {
+          gift_order_id: data.id,
+          gift_giver_id: giftGiverId,
+          gift_giver_username: giverUser.username,
+          product_id: wishlistItem.product_id,
+          product_name: wishlistItem.products?.name,
+          wishlist_item_id: wishlistItemId,
+          order_id: orderId,
+          gift_message: giftMessage,
+          is_surprise: isSurprise,
+        },
+        badge: 'gift'
+      });
+      console.log('💖 Gift notification sent to recipient:', giftRecipientId);
+    } catch (notifError) {
+      console.error('Error sending gift notification:', notifError);
+      // Don't fail the gift order if notification fails
+    }
+
+    return {
+      message: 'Gift order created successfully',
       giftOrderId: data.id,
       recipientName: data.recipient?.username,
       productName: wishlistItem.products?.name,
@@ -723,26 +868,17 @@ export class WishlistService {
       };
     }
 
-    // Check friendship or sharing permission
-    const { data: permission } = await client
-      .from('wishlist_shares')
-      .select('share_type')
-      .eq('owner_id', wishlistItem.user_id)
-      .eq('shared_with_id', giftGiverId)
-      .eq('is_active', true)
-      .single();
-
-    const { data: friendship } = await client
-      .from('user_connections')
+    // Verify gift giver exists
+    const { data: giverUser, error: giverError } = await client
+      .from('user_profiles')
       .select('id')
-      .or(`and(requester_id.eq.${giftGiverId},addressee_id.eq.${wishlistItem.user_id}),and(requester_id.eq.${wishlistItem.user_id},addressee_id.eq.${giftGiverId})`)
-      .eq('status', 'accepted')
+      .eq('id', giftGiverId)
       .single();
 
-    if (!permission && !friendship) {
+    if (giverError || !giverUser) {
       return {
         canPurchase: false,
-        reason: 'You must be connected with the recipient or have access to their shared wishlist'
+        reason: 'Gift giver user not found'
       };
     }
 

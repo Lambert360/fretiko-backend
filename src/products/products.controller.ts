@@ -12,7 +12,7 @@ import {
   UseInterceptors,
   UploadedFiles,
 } from '@nestjs/common';
-import { FilesInterceptor } from '@nestjs/platform-express';
+import { FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 // import { Public } from '../auth/public.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ProductsService } from './products.service';
@@ -118,14 +118,21 @@ export class ProductsController {
 
   @Post('upload')
   @UseGuards(JwtAuthGuard)
-  @UseInterceptors(FilesInterceptor('images', 10)) // Allow up to 10 images
+  @UseInterceptors(
+    FileFieldsInterceptor([
+      { name: 'images', maxCount: 10 },
+      { name: 'videos', maxCount: 2 },
+    ]),
+  )
   async uploadProduct(
     @Request() req,
-    @UploadedFiles() files: Express.Multer.File[],
+    @UploadedFiles() files: { images?: Express.Multer.File[]; videos?: Express.Multer.File[] },
     @Body() body: any, // Use any for FormData parsing
   ) {
     console.log('📦 Uploading product with files for user:', req.user.sub);
     console.log('📝 Raw FormData body:', body);
+    console.log('📸 Images count:', files?.images?.length || 0);
+    console.log('🎥 Videos count:', files?.videos?.length || 0);
 
     // Parse FormData fields manually
     const productData: CreateProductDto = {
@@ -137,6 +144,7 @@ export class ProductsController {
       quantity: parseInt(body.quantity),
       location: body.location,
       images: [], // Will be populated by the service
+      videos: [], // Will be populated by the service
       tags: body.tags ? JSON.parse(body.tags) : [],
       shipping_options: body.shipping_options ? JSON.parse(body.shipping_options) : undefined,
     };
@@ -145,7 +153,8 @@ export class ProductsController {
 
     return await this.productsService.uploadProductWithFiles(
       req.user.sub,
-      files,
+      files?.images || [],
+      files?.videos || [],
       productData,
       req.supabaseToken,
     );

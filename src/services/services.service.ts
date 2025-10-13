@@ -140,7 +140,8 @@ export class ServicesService {
         ),
         user_profiles!services_user_id_fkey (
           username,
-          avatar_url
+          avatar_url,
+          is_verified
         )
       `)
       .eq('status', 'active');
@@ -171,7 +172,43 @@ export class ServicesService {
       throw new Error(`Failed to fetch services: ${error.message}`);
     }
 
-    return data;
+    console.log('🔍 Raw services from DB:', data?.length || 0, 'services');
+    if (data && data.length > 0) {
+      console.log('🔍 First raw service:', {
+        id: data[0].id,
+        name: data[0].name,
+        base_price: data[0].base_price,
+        user_profiles: data[0].user_profiles,
+      });
+    }
+
+    // Transform data to match frontend expectations
+    const transformedData = data?.map(service => {
+      const transformed = {
+        ...service,
+        // Add price field (frontend expects 'price', not 'base_price')
+        price: service.base_price,
+        // Flatten user_profiles data to provider fields
+        provider_name: service.user_profiles?.username || 'Unknown Provider',
+        provider_avatar: service.user_profiles?.avatar_url || null,
+        provider_verified: service.user_profiles?.is_verified || false,
+        provider_id: service.user_id,
+        // Add category name
+        category_name: service.service_categories?.name || null,
+      };
+
+      console.log('✅ Transformed service:', {
+        id: transformed.id,
+        name: transformed.name,
+        price: transformed.price,
+        provider_name: transformed.provider_name,
+        provider_avatar: transformed.provider_avatar,
+      });
+
+      return transformed;
+    }) || [];
+
+    return transformedData;
   }
 
   async getVideoFeed(options: { limit?: number; offset?: number }) {
@@ -214,32 +251,44 @@ export class ServicesService {
 
     // Transform services data to video feed format
     const videoFeed = data?.map(service => {
-      console.log('🎥 Transforming service:', service.id, 'user_id:', service.user_id);
+      console.log('🎥 Transforming service:', {
+        id: service.id,
+        name: service.name,
+        base_price: service.base_price,
+        like_count: service.like_count,
+        booking_count: service.booking_count,
+        average_rating: service.average_rating,
+        user_id: service.user_id,
+        username: service.user_profiles?.username,
+      });
+
       return {
         id: service.id,
         title: service.name,
         thumbnail: service.images?.[0] || null,
         videoUri: service.videos?.[0] || null,
-        userId: service.user_id, // Add the missing userId field
+        userId: service.user_id,
         username: service.user_profiles?.username || 'user',
         userAvatar: service.user_profiles?.avatar_url || null,
         description: service.description || '',
-        likes: service.like_count?.toString() || '0',
+        likes: (service.like_count || 0).toString(),
         comments: '0', // Will need comments table
-        shares: '0',   // Will need shares functionality
-        price: service.base_price,
+        shares: (service.share_count || 0).toString(),
+        price: parseFloat(service.base_price) || 0,
         originalPrice: null, // No original price concept for services yet
-        location: service.location || '',
+        location: service.location || 'Location not set',
         serviceProvider: service.user_profiles?.username || 'Unknown Provider',
-        rating: service.average_rating || 0,
-        completedJobs: service.booking_count?.toString() || '0',
+        rating: parseFloat(service.average_rating) || 4.5, // Default to 4.5 if no rating yet
+        completedJobs: (service.booking_count || 0).toString(),
         isLiked: false, // Will need user-specific like status
         isBookmarked: false, // Will need bookmarks functionality
       };
     }) || [];
 
     console.log('🎥 Final video feed items:', videoFeed.length);
-    console.log('🎥 First video feed item userId:', videoFeed[0]?.userId);
+    if (videoFeed.length > 0) {
+      console.log('🎥 First transformed item:', JSON.stringify(videoFeed[0], null, 2));
+    }
 
     return videoFeed;
   }

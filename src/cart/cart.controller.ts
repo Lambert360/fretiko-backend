@@ -64,4 +64,15 @@ export class CartController {
     console.log('🛒 Validating cart for user:', req.user.sub);
     return this.cartService.validateCart(req.user.sub, req.supabaseToken);
   }
+
+  @Post('service')
+  async addServiceToCart(@Request() req, @Body() serviceData: {
+    serviceId: string;
+    scheduledDate: string;
+    scheduledTime: string;
+    notes?: string;
+  }) {
+    console.log('🛒 Adding service to cart for user:', req.user.sub, serviceData);
+    return this.cartService.addServiceToCart(req.user.sub, serviceData, req.supabaseToken);
+  }
 }

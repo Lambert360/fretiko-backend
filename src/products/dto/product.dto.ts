@@ -31,6 +31,19 @@ export class CreateProductDto {
   primary_image_url?: string;
 
   @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  videos?: string[];
+
+  @IsOptional()
+  @IsString()
+  primary_video_url?: string;
+
+  @IsOptional()
+  @IsEnum(['image', 'video'])
+  media_type?: string;
+
+  @IsOptional()
   @IsString()
   location?: string;
 
@@ -134,6 +147,9 @@ export class ProductResponseDto {
   condition: string;
   images: string[];
   primary_image_url?: string;
+  videos: string[];
+  primary_video_url?: string;
+  media_type: string;
   location?: string;
   shipping_options: any;
   tags: string[];
@@ -146,6 +162,9 @@ export class ProductResponseDto {
   review_count?: number;
   created_at: string;
   updated_at: string;
+  vendor_username?: string;
+  vendor_avatar?: string;
+  vendor_verified?: boolean;
 }
 
 export class ProductCategoryDto {

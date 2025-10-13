@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsUUID, IsEnum, IsBoolean, IsArray, IsNumber, IsDateString, ValidateNested } from 'class-validator';
+import { IsString, IsOptional, IsUUID, IsEnum, IsBoolean, IsArray, IsNumber, IsDateString, ValidateNested, IsObject } from 'class-validator';
 import { Type, Transform } from 'class-transformer';
 
 // Enums matching database
@@ -11,6 +11,7 @@ export enum MessageType {
   LIVESTREAM = 'livestream',
   AUCTION = 'auction',
   SYSTEM = 'system',
+  INVOICE = 'invoice', // Keep invoice as it's already in the database
 }
 
 export enum MessageStatus {
@@ -120,6 +121,10 @@ export class SendMessageDto {
   @IsOptional()
   @IsBoolean()
   isAIResponse?: boolean;
+
+  @IsOptional()
+  @IsObject()
+  productData?: any; // Using any to avoid strict validation on nested object
 }
 
 // Update Message Status DTO
@@ -464,6 +469,13 @@ export class MessageResponseDto {
   };
   status?: MessageStatus;
   metadata?: any;
+  productData?: {
+    id: string;
+    name: string;
+    price: number;
+    image: string;
+    vendor_username?: string;
+  };
 }
 
 export class LivestreamResponseDto {

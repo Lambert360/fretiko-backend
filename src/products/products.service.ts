@@ -2,6 +2,10 @@ import { Injectable, NotFoundException, BadRequestException, ForbiddenException 
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto, ProductResponseDto, ProductCategoryDto } from './dto/product.dto';
+import ffmpeg from 'fluent-ffmpeg';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 @Injectable()
 export class ProductsService {
@@ -61,7 +65,10 @@ export class ProductsService {
       quantity: createProductDto.quantity,
       condition: createProductDto.condition,
       images: createProductDto.images || [],
-      primary_image_url: createProductDto.images?.[0] || null,
+      primary_image_url: createProductDto.primary_image_url || createProductDto.images?.[0] || null,
+      videos: createProductDto.videos || [],
+      primary_video_url: createProductDto.primary_video_url || null,
+      media_type: createProductDto.media_type || 'image',
       location: createProductDto.location,
       shipping_options: createProductDto.shipping_options || { pickup: false, delivery: false, shipping: false },
       tags: createProductDto.tags || [],
@@ -85,7 +92,14 @@ export class ProductsService {
   async getProducts(query: ProductQueryDto): Promise<ProductResponseDto[]> {
     let queryBuilder = this.supabase
       .from('products')
-      .select('*')
+      .select(`
+        *,
+        user_profiles!products_user_id_fkey (
+          username,
+          avatar_url,
+          is_verified
+        )
+      `)
       .eq('status', 'active')
       .is('deleted_at', null);
 
@@ -105,7 +119,19 @@ export class ProductsService {
       throw new Error(`Database error: ${error.message}`);
     }
 
-    return (data || []).map(this.mapToProductResponse);
+    console.log('🛍️ Raw products from DB:', data?.length || 0, 'products');
+    if (data && data.length > 0) {
+      console.log('🛍️ First 3 products review stats:');
+      data.slice(0, 3).forEach((p, i) => {
+        console.log(`  Product ${i + 1} (${p.name}):`, {
+          id: p.id,
+          average_rating: p.average_rating,
+          review_count: p.review_count,
+        });
+      });
+    }
+
+    return (data || []).map(product => this.mapToProductResponse(product));
   }
 
   async getMyProducts(userId: string, userToken?: string): Promise<ProductResponseDto[]> {
@@ -129,7 +155,13 @@ export class ProductsService {
     try {
       const { data, error } = await this.supabase
         .from('products')
-        .select('*')
+        .select(`
+          *,
+          user_profiles!products_user_id_fkey (
+            username,
+            avatar_url
+          )
+        `)
         .eq('id', id)
         .eq('status', 'active')
         .is('deleted_at', null)
@@ -247,10 +279,17 @@ export class ProductsService {
     try {
       console.log(`Fetching reviews for product: ${productId}`);
 
-      // First try without the join to isolate the issue
+      // Join with user_profiles to get reviewer information
       const { data, error } = await this.supabase
-        .from('product_reviews')
-        .select('*')
+        .from('product_ratings')
+        .select(`
+          *,
+          user_profiles!product_ratings_user_id_fkey (
+            id,
+            username,
+            avatar_url
+          )
+        `)
         .eq('product_id', productId)
         .order('created_at', { ascending: false });
 
@@ -262,15 +301,14 @@ export class ProductsService {
 
       console.log(`Found ${data?.length || 0} reviews`);
 
-      // For now, return simplified data without user profiles
-      // TODO: Add user profile join back once we fix the relationship
+      // Map database fields to frontend format with user profile data
       return data?.map(review => ({
         id: review.id,
         userId: review.user_id,
-        userName: 'Anonymous', // Temporary fallback
-        userAvatar: null,
+        userName: review.user_profiles?.username || 'Anonymous',
+        userAvatar: review.user_profiles?.avatar_url || null,
         rating: review.rating,
-        comment: review.comment,
+        comment: review.review || '',
         createdAt: review.created_at,
         helpful: review.helpful_count || 0,
       })) || [];
@@ -303,7 +341,7 @@ export class ProductsService {
 
     // Check if user already reviewed this product
     const { data: existingReview } = await client
-      .from('product_reviews')
+      .from('product_ratings')
       .select('id')
       .eq('product_id', productId)
       .eq('user_id', userId)
@@ -313,19 +351,19 @@ export class ProductsService {
       throw new BadRequestException('You have already reviewed this product');
     }
 
-    // Add the review
+    // Add the review - product_ratings table has 'review' column, not 'comment'
     const { data, error } = await client
-      .from('product_reviews')
+      .from('product_ratings')
       .insert({
         product_id: productId,
         user_id: userId,
         rating: reviewData.rating,
-        comment: reviewData.comment,
+        review: reviewData.comment, // Column is named 'review' in the database
         helpful_count: 0,
       })
       .select(`
         *,
-        user_profiles!product_reviews_user_id_fkey (
+        user_profiles!product_ratings_user_id_fkey (
           username,
           avatar_url
         )
@@ -345,7 +383,7 @@ export class ProductsService {
       userName: data.user_profiles?.username || 'Anonymous',
       userAvatar: data.user_profiles?.avatar_url || null,
       rating: data.rating,
-      comment: data.comment,
+      comment: data.review || '', // Map 'review' column to 'comment' for frontend compatibility
       createdAt: data.created_at,
       helpful: data.helpful_count || 0,
     };
@@ -354,18 +392,18 @@ export class ProductsService {
   private async updateProductAverageRating(productId: string) {
     // Calculate new average rating
     const { data: reviews } = await this.supabase
-      .from('product_reviews')
+      .from('product_ratings')
       .select('rating')
       .eq('product_id', productId);
 
     if (reviews && reviews.length > 0) {
       const average = reviews.reduce((sum, review) => sum + review.rating, 0) / reviews.length;
-      
+
       await this.supabase
         .from('products')
-        .update({ 
+        .update({
           average_rating: average,
-          review_count: reviews.length 
+          review_count: reviews.length
         })
         .eq('id', productId);
     }
@@ -376,26 +414,14 @@ export class ProductsService {
    */
   async uploadProductWithFiles(
     userId: string,
-    files: Express.Multer.File[],
+    imageFiles: Express.Multer.File[],
+    videoFiles: Express.Multer.File[],
     productData: CreateProductDto,
     userToken?: string
   ): Promise<any> {
     try {
-      if (!files || files.length === 0) {
-        throw new BadRequestException('At least one image file is required');
-      }
-
-      // Validate files
-      const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
-      const maxSize = 10 * 1024 * 1024; // 10MB per image
-
-      for (const file of files) {
-        if (!allowedTypes.includes(file.mimetype)) {
-          throw new BadRequestException('Invalid file type. Only JPEG, PNG, and WebP images are allowed.');
-        }
-        if (file.size > maxSize) {
-          throw new BadRequestException('Image file too large. Maximum size is 10MB per image.');
-        }
+      if ((!imageFiles || imageFiles.length === 0) && (!videoFiles || videoFiles.length === 0)) {
+        throw new BadRequestException('At least one image or video file is required');
       }
 
       const supabaseClient = userToken
@@ -413,38 +439,119 @@ export class ProductsService {
         throw new ForbiddenException('Only sellers can create products');
       }
 
-      // Upload all images to Supabase Storage
-      const uploadPromises = files.map(async (file, index) => {
-        const fileExtension = file.originalname.split('.').pop() || 'jpg';
-        const timestamp = Date.now();
-        const uniqueFileName = `${userId}/${timestamp}-${index}-product.${fileExtension}`;
+      let imageUrls: string[] = [];
+      let videoUrls: string[] = [];
 
-        const { data: uploadData, error: uploadError } = await supabaseClient.storage
-          .from('media')
-          .upload(uniqueFileName, file.buffer, {
-            contentType: file.mimetype,
-            upsert: false,
-          });
+      // Validate and upload images
+      if (imageFiles && imageFiles.length > 0) {
+        const allowedImageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+        const maxImageSize = 10 * 1024 * 1024; // 10MB per image
 
-        if (uploadError) {
-          throw new BadRequestException(`Image upload failed: ${uploadError.message}`);
+        for (const file of imageFiles) {
+          if (!allowedImageTypes.includes(file.mimetype)) {
+            throw new BadRequestException('Invalid image file type. Only JPEG, PNG, and WebP are allowed.');
+          }
+          if (file.size > maxImageSize) {
+            throw new BadRequestException('Image file too large. Maximum size is 10MB per image.');
+          }
         }
 
-        // Get public URL
-        const { data: urlData } = supabaseClient.storage
-          .from('media')
-          .getPublicUrl(uniqueFileName);
+        // Upload all images to Supabase Storage
+        const imageUploadPromises = imageFiles.map(async (file, index) => {
+          const fileExtension = file.originalname.split('.').pop() || 'jpg';
+          const timestamp = Date.now();
+          const uniqueFileName = `${userId}/${timestamp}-${index}-product-img.${fileExtension}`;
 
-        return urlData.publicUrl;
-      });
+          const { data: uploadData, error: uploadError } = await supabaseClient.storage
+            .from('media')
+            .upload(uniqueFileName, file.buffer, {
+              contentType: file.mimetype,
+              upsert: false,
+            });
 
-      const imageUrls = await Promise.all(uploadPromises);
+          if (uploadError) {
+            throw new BadRequestException(`Image upload failed: ${uploadError.message}`);
+          }
 
-      // Create product with uploaded image URLs
+          // Get public URL
+          const { data: urlData } = supabaseClient.storage
+            .from('media')
+            .getPublicUrl(uniqueFileName);
+
+          return urlData.publicUrl;
+        });
+
+        imageUrls = await Promise.all(imageUploadPromises);
+      }
+
+      // Validate and upload videos
+      if (videoFiles && videoFiles.length > 0) {
+        const allowedVideoTypes = ['video/mp4', 'video/quicktime', 'video/x-msvideo'];
+        const maxVideoSize = 50 * 1024 * 1024; // 50MB per video
+
+        for (const file of videoFiles) {
+          if (!allowedVideoTypes.includes(file.mimetype)) {
+            throw new BadRequestException('Invalid video file type. Only MP4, MOV, and AVI are allowed.');
+          }
+          if (file.size > maxVideoSize) {
+            throw new BadRequestException('Video file too large. Maximum size is 50MB per video.');
+          }
+        }
+
+        // Upload all videos to Supabase Storage
+        const videoUploadPromises = videoFiles.map(async (file, index) => {
+          const fileExtension = file.originalname.split('.').pop() || 'mp4';
+          const timestamp = Date.now();
+          const uniqueFileName = `${userId}/${timestamp}-${index}-product-vid.${fileExtension}`;
+
+          const { data: uploadData, error: uploadError } = await supabaseClient.storage
+            .from('media')
+            .upload(uniqueFileName, file.buffer, {
+              contentType: file.mimetype,
+              upsert: false,
+            });
+
+          if (uploadError) {
+            throw new BadRequestException(`Video upload failed: ${uploadError.message}`);
+          }
+
+          // Get public URL
+          const { data: urlData } = supabaseClient.storage
+            .from('media')
+            .getPublicUrl(uniqueFileName);
+
+          return urlData.publicUrl;
+        });
+
+        videoUrls = await Promise.all(videoUploadPromises);
+
+        // Generate thumbnail for the first video if no images were provided
+        if (imageUrls.length === 0 && videoFiles.length > 0) {
+          console.log('📸 No images provided, generating thumbnail from video...');
+          try {
+            const thumbnailUrl = await this.generateVideoThumbnail(videoFiles[0], userId, supabaseClient);
+            if (thumbnailUrl) {
+              imageUrls = [thumbnailUrl];
+              console.log('✅ Thumbnail generated successfully:', thumbnailUrl);
+            }
+          } catch (error) {
+            console.error('⚠️ Failed to generate video thumbnail:', error);
+            // Continue without thumbnail - product will use placeholder
+          }
+        }
+      }
+
+      // Determine media type (video takes precedence for product display)
+      const media_type = videoUrls.length > 0 ? 'video' : 'image';
+
+      // Create product with uploaded media URLs
       const createProductDto: CreateProductDto = {
         ...productData,
         images: imageUrls,
-        primary_image_url: imageUrls[0], // First image as primary
+        primary_image_url: imageUrls.length > 0 ? imageUrls[0] : undefined,
+        videos: videoUrls,
+        primary_video_url: videoUrls.length > 0 ? videoUrls[0] : undefined,
+        media_type,
       };
 
       // Create product record
@@ -461,18 +568,113 @@ export class ProductsService {
     }
   }
 
+  /**
+   * Generate a thumbnail from a video file using ffmpeg
+   */
+  private async generateVideoThumbnail(
+    videoFile: Express.Multer.File,
+    userId: string,
+    supabaseClient: any
+  ): Promise<string | null> {
+    return new Promise((resolve, reject) => {
+      // Create temporary paths
+      const tempDir = os.tmpdir();
+      const videoPath = path.join(tempDir, `video-${Date.now()}.mp4`);
+      const thumbnailPath = path.join(tempDir, `thumbnail-${Date.now()}.jpg`);
+
+      try {
+        // Write video buffer to temporary file
+        fs.writeFileSync(videoPath, videoFile.buffer);
+
+        // Extract thumbnail at 1 second mark
+        ffmpeg(videoPath)
+          .screenshots({
+            timestamps: ['00:00:01.000'],
+            filename: path.basename(thumbnailPath),
+            folder: path.dirname(thumbnailPath),
+            size: '640x?', // Maintain aspect ratio
+          })
+          .on('end', async () => {
+            try {
+              // Read the generated thumbnail
+              const thumbnailBuffer = fs.readFileSync(thumbnailPath);
+
+              // Upload thumbnail to Supabase Storage
+              const timestamp = Date.now();
+              const uniqueFileName = `${userId}/${timestamp}-video-thumbnail.jpg`;
+
+              const { error: uploadError } = await supabaseClient.storage
+                .from('media')
+                .upload(uniqueFileName, thumbnailBuffer, {
+                  contentType: 'image/jpeg',
+                  upsert: false,
+                });
+
+              if (uploadError) {
+                console.error('Thumbnail upload error:', uploadError);
+                resolve(null);
+              } else {
+                // Get public URL
+                const { data: urlData } = supabaseClient.storage
+                  .from('media')
+                  .getPublicUrl(uniqueFileName);
+
+                resolve(urlData.publicUrl);
+              }
+
+              // Clean up temporary files
+              fs.unlinkSync(videoPath);
+              fs.unlinkSync(thumbnailPath);
+            } catch (error) {
+              console.error('Error processing thumbnail:', error);
+              // Clean up on error
+              if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+              if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+              resolve(null);
+            }
+          })
+          .on('error', (error) => {
+            console.error('FFmpeg error:', error);
+            // Clean up on error
+            if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+            resolve(null);
+          });
+      } catch (error) {
+        console.error('Error writing video file:', error);
+        if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+        resolve(null);
+      }
+    });
+  }
+
   private mapToProductResponse(data: any): ProductResponseDto {
-    return {
+    console.log('🗺️ Mapping product response:', {
+      id: data.id,
+      name: data.name,
+      price: data.price,
+      user_id: data.user_id,
+      average_rating: data.average_rating,
+      review_count: data.review_count,
+      has_user_profiles: !!data.user_profiles,
+      username: data.user_profiles?.username,
+      avatar_url: data.user_profiles?.avatar_url,
+      is_verified: data.user_profiles?.is_verified,
+    });
+
+    const mapped = {
       id: data.id,
       user_id: data.user_id,
       category_id: data.category_id,
       name: data.name,
       description: data.description,
-      price: parseFloat(data.price),
+      price: parseFloat(data.price) || 0,
       quantity: data.quantity,
       condition: data.condition,
       images: data.images || [],
       primary_image_url: data.primary_image_url,
+      videos: data.videos || [],
+      primary_video_url: data.primary_video_url,
+      media_type: data.media_type || 'image',
       location: data.location,
       shipping_options: data.shipping_options,
       tags: data.tags || [],
@@ -485,6 +687,22 @@ export class ProductsService {
       review_count: data.review_count || 0,
       created_at: data.created_at,
       updated_at: data.updated_at,
+      // Vendor info from joined user_profiles table
+      vendor_username: data.user_profiles?.username || 'Unknown Seller',
+      vendor_avatar: data.user_profiles?.avatar_url || null,
+      vendor_verified: data.user_profiles?.is_verified || false,
     };
+
+    console.log('✅ Mapped product:', {
+      id: mapped.id,
+      name: mapped.name,
+      price: mapped.price,
+      average_rating: mapped.average_rating,
+      review_count: mapped.review_count,
+      vendor_username: mapped.vendor_username,
+      vendor_verified: mapped.vendor_verified,
+    });
+
+    return mapped;
   }
 }

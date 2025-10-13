@@ -484,6 +484,7 @@ export class ChatService {
             ...sendMessageDto.metadata || {},
             isAIResponse: sendMessageDto.isAIResponse || false,
             actualSenderId: sendMessageDto.actualSenderId || userId, // Track who actually sent the message
+            productData: sendMessageDto.productData || null, // Include product data for bargain messages
           },
         })
         .select(`
@@ -920,6 +921,11 @@ export class ChatService {
       status,
       metadata: message.metadata,
     };
+
+    // Add product data if this is a product message (bargain)
+    if (message.metadata?.productData) {
+      response.productData = message.metadata.productData;
+    }
 
     // Add invoice data if this is an invoice message
     if (invoiceData) {
