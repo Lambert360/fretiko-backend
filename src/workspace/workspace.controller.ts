@@ -98,6 +98,46 @@ export class WorkspaceController {
     );
   }
 
+  @Post('orders/:id/ready-for-pickup')
+  async markOrderReadyForPickup(
+    @Request() req,
+    @Param('id', ParseUUIDPipe) orderId: string,
+  ) {
+    return await this.workspaceService.markOrderReadyForPickup(
+      req.user.sub,
+      orderId,
+      req.supabaseToken,
+    );
+  }
+
+  @Post('orders/:id/confirm-self-pickup')
+  async confirmSelfPickupWithPin(
+    @Request() req,
+    @Param('id', ParseUUIDPipe) orderId: string,
+    @Body() body: { deliveryPin: string },
+  ) {
+    return await this.workspaceService.confirmSelfPickupWithPin(
+      req.user.sub,
+      orderId,
+      body.deliveryPin,
+      req.supabaseToken,
+    );
+  }
+
+  @Post('orders/:id/confirm-pickup')
+  async confirmPickupWithPin(
+    @Request() req,
+    @Param('id', ParseUUIDPipe) orderId: string,
+    @Body() body: { pickupPin: string },
+  ) {
+    return await this.workspaceService.confirmPickupWithPin(
+      req.user.sub,
+      orderId,
+      body.pickupPin,
+      req.supabaseToken,
+    );
+  }
+
   @Post('orders/:id/pickup')
   async confirmPickup(
     @Request() req,
@@ -114,16 +154,42 @@ export class WorkspaceController {
   async markDelivered(
     @Request() req,
     @Param('id', ParseUUIDPipe) orderId: string,
-    @Body() deliveryProof?: {
-      photo?: string;
-      signature?: string;
-      notes?: string;
-    },
+    @Body() body: { deliveryPin: string },
   ) {
     return await this.workspaceService.markDelivered(
       req.user.sub,
       orderId,
-      deliveryProof,
+      body.deliveryPin,
+      req.supabaseToken,
+    );
+  }
+
+  @Post('orders/:id/complete-service')
+  async completeServiceBooking(
+    @Request() req,
+    @Param('id', ParseUUIDPipe) orderId: string,
+    @Body() body?: {
+      completionNotes?: string;
+    },
+  ) {
+    return await this.workspaceService.completeServiceBooking(
+      req.user.sub,
+      orderId,
+      body?.completionNotes,
+      req.supabaseToken,
+    );
+  }
+
+  @Post('orders/:id/release-escrow')
+  async requestEscrowRelease(
+    @Request() req,
+    @Param('id', ParseUUIDPipe) orderId: string,
+    @Body() body?: { reason?: string },
+  ) {
+    return await this.workspaceService.requestEscrowRelease(
+      req.user.sub,
+      orderId,
+      body?.reason,
       req.supabaseToken,
     );
   }

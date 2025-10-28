@@ -396,17 +396,22 @@ export class ProductsService {
       .select('rating')
       .eq('product_id', productId);
 
-    if (reviews && reviews.length > 0) {
-      const average = reviews.reduce((sum, review) => sum + review.rating, 0) / reviews.length;
+    // Always update, even if there are no reviews (set to 0)
+    const average = reviews && reviews.length > 0
+      ? reviews.reduce((sum, review) => sum + review.rating, 0) / reviews.length
+      : 0;
+    const count = reviews ? reviews.length : 0;
 
-      await this.supabase
-        .from('products')
-        .update({
-          average_rating: average,
-          review_count: reviews.length
-        })
-        .eq('id', productId);
-    }
+    // Update product with new rating stats, handling NULL values by setting to 0
+    await this.supabase
+      .from('products')
+      .update({
+        average_rating: average,
+        review_count: count
+      })
+      .eq('id', productId);
+
+    console.log(`✅ Updated product ${productId} ratings: average=${average.toFixed(2)}, count=${count}`);
   }
 
   /**

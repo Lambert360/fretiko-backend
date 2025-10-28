@@ -25,6 +25,10 @@ export class UpdateProfileDto {
   dateOfBirth?: string;
 
   @IsOptional()
+  @IsString()
+  gender?: string;
+
+  @IsOptional()
   @IsBoolean()
   isSeller?: boolean;
 

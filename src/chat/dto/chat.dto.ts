@@ -12,6 +12,7 @@ export enum MessageType {
   AUCTION = 'auction',
   SYSTEM = 'system',
   INVOICE = 'invoice', // Keep invoice as it's already in the database
+  WISHLIST = 'wishlist', // Wishlist sharing message type
 }
 
 export enum MessageStatus {
@@ -52,6 +53,27 @@ export enum LivestreamStatus {
   LIVE = 'live',
   ENDED = 'ended',
   SCHEDULED = 'scheduled',
+}
+
+// Wishlist Data Interface
+export interface WishlistPreviewItem {
+  id: string;
+  name: string;
+  price: number;
+  image: string;
+}
+
+export interface WishlistData {
+  shareId: string;
+  shareType: 'view_only' | 'view_and_add';
+  itemCount: number;
+  ownerName: string;
+  ownerId: string;
+  recipientName: string;
+  recipientId: string;
+  previewItems: WishlistPreviewItem[];
+  canAddItems: boolean;
+  sharedAt: Date;
 }
 
 // Create Conversation DTO
@@ -125,6 +147,10 @@ export class SendMessageDto {
   @IsOptional()
   @IsObject()
   productData?: any; // Using any to avoid strict validation on nested object
+
+  @IsOptional()
+  @IsBoolean()
+  broadcastToAll?: boolean; // If true, broadcast to all participants including sender
 }
 
 // Update Message Status DTO
@@ -431,6 +457,7 @@ export class ConversationResponseDto {
   isPinned?: boolean;
   verified?: boolean;
   metadata?: any;
+  otherUserId?: string; // For 1:1 chats, the other participant's user ID
 }
 
 export class ParticipantResponseDto {

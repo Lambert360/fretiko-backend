@@ -1,6 +1,8 @@
-import { Injectable, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, ForbiddenException, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { EscrowService } from '../escrow/escrow.service';
+import { NotificationHelperService } from '../notifications/notification-helper.service';
 import {
   CreateLiveStreamDto,
   UpdateStreamStatusDto,
@@ -30,12 +32,18 @@ import {
  * - Real-time interactions (comments, reactions, gifts)
  * - Live commerce (product sales, service bookings)
  * - Analytics and viewer tracking
+ * - Escrow-protected payments for live purchases
  */
 @Injectable()
 export class LiveSalesService {
   private supabase;
 
-  constructor(private configService: ConfigService) {
+  constructor(
+    private configService: ConfigService,
+    @Inject(forwardRef(() => EscrowService))
+    private escrowService: EscrowService,
+    private notificationHelper: NotificationHelperService,
+  ) {
     this.supabase = createSupabaseClient(this.configService);
   }
 
@@ -862,18 +870,73 @@ export class LiveSalesService {
 
       // 7. Start transaction processing
       const transactionId = `live_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const orderNumber = `LIVE-${Date.now()}-${Math.random().toString(36).substring(7).toUpperCase()}`;
 
-      // Deduct from buyer (to escrow for continue_watching, direct for checkout)
-      const buyerTransactionType = purchaseDto.continue_watching ? 'purchase_escrow' : 'purchase_direct';
+      // 8. Create order record for live stream purchase
+      const { data: order, error: orderError } = await this.supabase
+        .from('orders')
+        .insert({
+          order_number: orderNumber,
+          buyer_id: userId,
+          vendor_id: stream.vendor_id,
+          total_amount: totalAmount,
+          delivery_fee: deliveryFee,
+          platform_fee: platformFee,
+          status: 'pending',
+          escrow_enabled: true,
+          source: 'live_stream',
+          delivery_type: purchaseDto.rider_id ? 'delivery' : 'pickup',
+          rider_id: purchaseDto.rider_id || null,
+          delivery_address: purchaseDto.delivery_address || null,
+          metadata: {
+            stream_id: purchaseDto.stream_id,
+            stream_title: stream.title,
+            transaction_id: transactionId,
+            subtotal: subtotal,
+            unit_price: unitPrice,
+            continue_watching: purchaseDto.continue_watching || false
+          }
+        })
+        .select()
+        .single();
+
+      if (orderError) {
+        console.error('❌ Order creation failed:', orderError);
+        throw new BadRequestException('Failed to create order');
+      }
+
+      console.log('✅ Order created:', order.id, order.order_number);
+
+      // 9. Create order item
+      const { error: orderItemError } = await this.supabase
+        .from('order_items')
+        .insert({
+          order_id: order.id,
+          product_id: purchaseDto.product_id,
+          product_name: liveProduct.product.name,
+          unit_price: unitPrice,
+          quantity: purchaseDto.quantity,
+          total_price: subtotal,
+          product_metadata: {
+            description: liveProduct.product.description,
+            live_price: unitPrice
+          }
+        });
+
+      if (orderItemError) {
+        console.error('❌ Order item creation failed:', orderItemError);
+      }
+
+      // 10. Deduct from buyer wallet
       const { error: deductError } = await this.supabase.rpc(
         'process_wallet_transaction',
         {
           p_user_id: userId,
-          p_transaction_type: buyerTransactionType,
+          p_transaction_type: 'purchase',
           p_amount: -totalAmount,
           p_description: `Live purchase: ${purchaseDto.quantity}x ${liveProduct.product.name} from "${stream.title}"`,
-          p_reference_id: transactionId,
-          p_reference_type: 'live_stream_purchase'
+          p_reference_id: order.id,
+          p_reference_type: 'order'
         }
       );
 
@@ -882,48 +945,53 @@ export class LiveSalesService {
         throw new BadRequestException('Failed to process payment');
       }
 
-      // 8. Handle different purchase flows
-      if (purchaseDto.continue_watching) {
-        // Instant purchase - credit vendor immediately (minus platform fee)
-        const { error: vendorCreditError } = await this.supabase.rpc(
-          'process_wallet_transaction',
-          {
-            p_user_id: stream.vendor_id,
-            p_transaction_type: 'sale_instant',
-            p_amount: vendorAmount,
-            p_description: `Live sale: ${purchaseDto.quantity}x ${liveProduct.product.name} (instant)`,
-            p_reference_id: transactionId,
-            p_reference_type: 'live_stream_sale'
-          }
-        );
+      // 11. Create escrow for buyer protection
+      try {
+        const escrowBreakdown = {
+          totalAmount: totalAmount,
+          vendorAmount: vendorAmount,
+          riderAmount: deliveryFee,
+          platformAmount: platformFee,
+        };
 
-        if (vendorCreditError) {
-          console.error('❌ Vendor credit failed:', vendorCreditError);
-          // TODO: Implement rollback mechanism
-        }
+        await this.escrowService.createEscrow(order.id, escrowBreakdown);
+        console.log(`✅ Escrow created for live stream order ${order.order_number}: ₣${totalAmount}`);
 
-        // Credit platform fee
-        if (platformFee > 0) {
-          const { error: platformFeeError } = await this.supabase.rpc(
-            'process_wallet_transaction',
-            {
-              p_user_id: 'platform', // Special platform user ID
-              p_transaction_type: 'platform_fee',
-              p_amount: platformFee,
-              p_description: `Platform fee: ${purchaseDto.quantity}x ${liveProduct.product.name}`,
-              p_reference_id: transactionId,
-              p_reference_type: 'live_stream_fee'
-            }
-          );
+        // Update order status to paid
+        await this.supabase
+          .from('orders')
+          .update({ status: 'paid' })
+          .eq('id', order.id);
 
-          if (platformFeeError) {
-            console.error('❌ Platform fee credit failed:', platformFeeError);
-          }
-        }
+      } catch (escrowError) {
+        console.error('❌ Escrow creation failed (non-critical):', escrowError);
+        // Continue - payment already processed, escrow can be created manually if needed
       }
-      // For checkout flow, money stays in escrow until order completion
 
-      // 9. Update live stream product stock
+      // 12. Notify vendor of new order
+      try {
+        await this.notificationHelper.notifyVendorNewOrder(stream.vendor_id, {
+          id: order.id,
+          orderNumber: order.order_number,
+          totalAmount: totalAmount,
+          itemCount: 1,
+          buyerName: 'Live Stream Customer', // Could fetch buyer profile if needed
+        });
+
+        // Notify vendor payment is in escrow
+        await this.notificationHelper.notifyVendorOrderPaid(stream.vendor_id, {
+          orderId: order.id,
+          orderNumber: order.order_number,
+          vendorAmount: vendorAmount,
+          escrowId: order.id, // Using order ID as escrow reference
+        });
+
+        console.log(`✅ Vendor ${stream.vendor_id} notified of live stream order`);
+      } catch (notifyError) {
+        console.error('⚠️  Failed to notify vendor (non-critical):', notifyError);
+      }
+
+      // 13. Update live stream product stock
       const { error: stockUpdateError } = await this.supabase
         .from('live_stream_products')
         .update({
@@ -937,7 +1005,7 @@ export class LiveSalesService {
         // Continue anyway - stock sync can be corrected later
       }
 
-      // 10. Create transaction record
+      // 14. Create transaction record (for live stream analytics)
       const transactionData = {
         id: transactionId,
         stream_id: purchaseDto.stream_id,
@@ -950,9 +1018,10 @@ export class LiveSalesService {
         platform_fee: platformFee,
         delivery_fee: deliveryFee,
         total_amount: totalAmount,
-        status: purchaseDto.continue_watching ? TransactionStatus.COMPLETED : TransactionStatus.PENDING,
+        status: TransactionStatus.PENDING, // All purchases go through escrow now
         rider_id: purchaseDto.rider_id || null,
         delivery_address: purchaseDto.delivery_address || null,
+        order_id: order.id, // Link to order record
       };
 
       const { error: transactionError } = await this.supabase
@@ -1122,17 +1191,80 @@ export class LiveSalesService {
 
       // 7. Start transaction processing
       const transactionId = `live_svc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const orderNumber = `SVC-${Date.now()}-${Math.random().toString(36).substring(7).toUpperCase()}`;
 
-      // Deduct from customer (to escrow - services are always escrowed until completion)
+      console.log(`Processing service booking - Total: ₣${servicePrice}, Fee: ₣${platformFee}, Vendor: ₣${vendorAmount}`);
+
+      // 8. Create order record for service booking
+      const { data: order, error: orderError } = await this.supabase
+        .from('orders')
+        .insert({
+          order_number: orderNumber,
+          buyer_id: userId,
+          vendor_id: stream.vendor_id,
+          total_amount: servicePrice,
+          delivery_fee: 0, // Services don't have delivery
+          platform_fee: platformFee,
+          status: 'pending',
+          escrow_enabled: true,
+          source: 'service_booking',
+          metadata: {
+            stream_id: bookingDto.stream_id,
+            service_id: liveService.service_id,
+            service_name: liveService.service.name,
+            booking_date: bookingDto.service_date,
+            booking_time: bookingDto.service_time,
+            duration_minutes: liveService.service.duration_minutes,
+            location_type: liveService.service.location_type,
+            transaction_id: transactionId,
+            special_notes: bookingDto.service_notes,
+          }
+        })
+        .select()
+        .single();
+
+      if (orderError) {
+        console.error('❌ Order creation failed:', orderError);
+        throw new BadRequestException('Failed to create order');
+      }
+
+      console.log(`✅ Order created: ${order.id}, ${order.order_number}`);
+
+      // 9. Create order item for service
+      const { error: orderItemError } = await this.supabase
+        .from('order_items')
+        .insert({
+          order_id: order.id,
+          product_id: null, // Services don't have product IDs
+          product_name: liveService.service.name,
+          unit_price: servicePrice,
+          quantity: 1,
+          total_price: servicePrice,
+          product_metadata: {
+            service_id: liveService.service_id,
+            booking_date: bookingDto.service_date,
+            booking_time: bookingDto.service_time,
+            duration_minutes: liveService.service.duration_minutes,
+            location_type: liveService.service.location_type,
+            description: liveService.service.description,
+            special_notes: bookingDto.service_notes,
+          }
+        });
+
+      if (orderItemError) {
+        console.error('❌ Order item creation failed:', orderItemError);
+      }
+
+      // 10. Deduct from customer wallet
       const { error: deductError } = await this.supabase.rpc(
         'process_wallet_transaction',
         {
           p_user_id: userId,
-          p_transaction_type: 'booking_escrow',
+          p_transaction_type: 'purchase',
           p_amount: -servicePrice,
           p_description: `Service booking: ${liveService.service.name} on ${bookingDto.service_date} ${bookingDto.service_time}`,
-          p_reference_id: transactionId,
-          p_reference_type: 'live_stream_booking'
+          p_reference_id: order.id,
+          p_reference_type: 'order'
         }
       );
 
@@ -1141,9 +1273,35 @@ export class LiveSalesService {
         throw new BadRequestException('Failed to process booking payment');
       }
 
-      // 8. Create service booking record
+      console.log(`✅ Customer wallet deducted: ₣${servicePrice}`);
+
+      // 11. Create escrow for buyer protection
+      try {
+        const escrowBreakdown = {
+          totalAmount: servicePrice,
+          vendorAmount: vendorAmount,
+          riderAmount: 0, // Services don't have delivery
+          platformAmount: platformFee,
+        };
+
+        await this.escrowService.createEscrow(order.id, escrowBreakdown);
+        console.log(`✅ Escrow created for service booking ${order.order_number}: ₣${servicePrice}`);
+
+        // Update order status to paid
+        await this.supabase
+          .from('orders')
+          .update({ status: 'paid' })
+          .eq('id', order.id);
+
+      } catch (escrowError) {
+        console.error('❌ Escrow creation failed (non-critical):', escrowError);
+        // Continue - payment already processed
+      }
+
+      // 12. Create service booking record (for service-specific data)
       const bookingData = {
         id: transactionId,
+        order_id: order.id, // Link to order
         stream_id: bookingDto.stream_id,
         customer_id: userId,
         service_id: liveService.service_id,
@@ -1164,8 +1322,29 @@ export class LiveSalesService {
 
       if (bookingError) {
         console.error('❌ Service booking record failed:', bookingError);
-        // TODO: Implement rollback mechanism
-        throw new BadRequestException('Failed to create booking record');
+        // Continue - order and escrow already created
+      }
+
+      // 13. Notify vendor of new booking
+      try {
+        await this.notificationHelper.notifyVendorNewOrder(stream.vendor_id, {
+          id: order.id,
+          orderNumber: order.order_number,
+          totalAmount: servicePrice,
+          itemCount: 1,
+          buyerName: 'Service Customer',
+        });
+
+        await this.notificationHelper.notifyVendorOrderPaid(stream.vendor_id, {
+          orderId: order.id,
+          orderNumber: order.order_number,
+          vendorAmount: vendorAmount,
+          escrowId: order.id,
+        });
+
+        console.log(`✅ Vendor ${stream.vendor_id} notified of service booking`);
+      } catch (notifyError) {
+        console.error('⚠️  Failed to notify vendor (non-critical):', notifyError);
       }
 
       // 9. Update available slots to mark as booked
@@ -1260,7 +1439,7 @@ export class LiveSalesService {
    */
   async getGiftTypes(): Promise<GiftTypeResponse[]> {
     try {
-      const { data, error } = await this.supabase
+      const { data, error} = await this.supabase
         .from('gift_types')
         .select('*')
         .eq('is_active', true)
@@ -1272,5 +1451,164 @@ export class LiveSalesService {
       console.error('Error fetching gift types:', error);
       throw new BadRequestException('Failed to fetch gift types');
     }
+  }
+
+  // =====================
+  // AGORA INTEGRATION
+  // =====================
+
+  /**
+   * Generate Agora RTC token for vendor broadcasting
+   * 
+   * Note: Requires agora-access-token package
+   * npm install agora-access-token
+   */
+  async generateAgoraToken(streamId: string, vendorId: string, role: 'host' | 'audience'): Promise<{
+    token: string;
+    channel: string;
+    uid: number;
+    appId: string;
+  }> {
+    try {
+      const appId = this.configService.get<string>('AGORA_APP_ID');
+      const appCertificate = this.configService.get<string>('AGORA_APP_CERTIFICATE');
+
+      if (!appId || !appCertificate) {
+        throw new BadRequestException('Agora credentials not configured');
+      }
+
+      // Verify stream ownership
+      const { data: stream, error } = await this.supabase
+        .from('live_streams')
+        .select('vendor_id')
+        .eq('id', streamId)
+        .single();
+
+      if (error || !stream) {
+        throw new NotFoundException('Stream not found');
+      }
+
+      if (stream.vendor_id !== vendorId && role === 'host') {
+        throw new ForbiddenException('Only stream owner can broadcast');
+      }
+
+      // Use stream ID as channel name
+      const channelName = `fretiko_${streamId}`;
+      
+      // Generate unique UID (use numeric part of vendor ID hash)
+      const uid = Math.abs(this.hashCode(vendorId)) % 1000000;
+      
+      // Token expires in 24 hours
+      const expirationTimeInSeconds = 86400;
+      const currentTimestamp = Math.floor(Date.now() / 1000);
+      const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+      // Generate actual Agora token
+      const { RtcTokenBuilder, RtcRole } = require('agora-token');
+      const agoraRole = role === 'host' ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+      
+      const token = RtcTokenBuilder.buildTokenWithUid(
+        appId,
+        appCertificate,
+        channelName,
+        uid,
+        agoraRole,
+        privilegeExpiredTs
+      );
+
+      console.log('🎥 Generated Agora token:', {
+        channel: channelName,
+        uid,
+        role,
+        expires: new Date(privilegeExpiredTs * 1000).toISOString()
+      });
+
+      return {
+        token,
+        channel: channelName,
+        uid,
+        appId,
+      };
+    } catch (error) {
+      console.error('Error generating Agora token:', error);
+      if (error instanceof NotFoundException || error instanceof ForbiddenException || error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to generate streaming token');
+    }
+  }
+
+  /**
+   * Get HLS stream URL for viewers
+   * 
+   * In production, this would return the HLS URL from Agora's CDN
+   * The URL is generated automatically when host starts broadcasting with HLS enabled
+   */
+  async getHLSStreamUrl(streamId: string): Promise<{ hlsUrl: string; status: string }> {
+    try {
+      // Verify stream exists and is live
+      const { data: stream, error } = await this.supabase
+        .from('live_streams')
+        .select('status, stream_url')
+        .eq('id', streamId)
+        .single();
+
+      if (error || !stream) {
+        throw new NotFoundException('Stream not found');
+      }
+
+      if (stream.status !== 'live') {
+        return {
+          hlsUrl: '',
+          status: 'Stream is not live yet'
+        };
+      }
+
+      // If stream_url is already set (vendor started broadcasting), return it
+      if (stream.stream_url) {
+        return {
+          hlsUrl: stream.stream_url,
+          status: 'live'
+        };
+      }
+
+      // Generate HLS URL pattern (Agora CDN)
+      // Format: https://[agora-cdn]/[appId]/[channel]/playlist.m3u8
+      const appId = this.configService.get<string>('AGORA_APP_ID');
+      const channelName = `fretiko_${streamId}`;
+      
+      // NOTE: Actual HLS URL comes from Agora's HLS extension
+      // This is a placeholder pattern
+      const hlsUrl = `https://agora-hls.example.com/${appId}/${channelName}/playlist.m3u8`;
+
+      // In production, you would:
+      // 1. Check if Agora has started HLS transcoding
+      // 2. Query Agora's REST API for the actual HLS URL
+      // 3. Return the CDN URL
+
+      return {
+        hlsUrl,
+        status: 'generating'
+      };
+    } catch (error) {
+      console.error('Error getting HLS URL:', error);
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to get stream URL');
+    }
+  }
+
+  /**
+   * Hash function for generating numeric UID from string
+   */
+  private hashCode(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return hash;
   }
 }

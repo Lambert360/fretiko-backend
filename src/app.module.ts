@@ -26,6 +26,9 @@ import { RealtimeModule } from './realtime/realtime.module';
 import { StoriesModule } from './stories/stories.module';
 import { WorkspaceModule } from './workspace/workspace.module';
 import { AnalyticsModule } from './analytics/analytics.module';
+import { EscrowModule } from './escrow/escrow.module';
+import { DisputesModule } from './disputes/disputes.module';
+import { AdminModule } from './admin/admin.module';
 import { ExchangeRateController } from './shared/exchange-rate.controller';
 import { ExchangeRateService } from './shared/exchange-rate.service';
 
@@ -59,6 +62,9 @@ import { ExchangeRateService } from './shared/exchange-rate.service';
     StoriesModule,
     WorkspaceModule,
     AnalyticsModule,
+    EscrowModule,
+    DisputesModule,
+    AdminModule,
   ],
   controllers: [AppController, ExchangeRateController],
   providers: [AppService, ExchangeRateService],

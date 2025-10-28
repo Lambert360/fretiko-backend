@@ -516,6 +516,51 @@ export class RewardsService {
   }
 
   /**
+   * Get user's rewards transaction history
+   */
+  async getRewardsTransactionHistory(
+    userId: string,
+    limit: number = 50,
+    offset: number = 0,
+    type?: string
+  ): Promise<any[]> {
+    try {
+      let query = this.supabase
+        .from('rewards_transactions')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .range(offset, offset + limit - 1);
+
+      if (type) {
+        query = query.eq('transaction_type', type);
+      }
+
+      const { data, error } = await query;
+
+      if (error) throw error;
+
+      return (data || []).map(tx => ({
+        id: tx.id,
+        transactionType: tx.transaction_type,
+        availableDelta: tx.available_delta,
+        pendingDelta: tx.pending_delta,
+        availableBalanceAfter: tx.available_balance_after,
+        pendingBalanceAfter: tx.pending_balance_after,
+        calculationPeriod: tx.calculation_period,
+        referenceType: tx.reference_type,
+        referenceId: tx.reference_id,
+        description: tx.description,
+        metadata: tx.metadata,
+        createdAt: tx.created_at,
+      }));
+    } catch (error) {
+      this.logger.error(`Error fetching rewards history for user ${userId}:`, error);
+      return [];
+    }
+  }
+
+  /**
    * Format rewards amount for display (as stars)
    */
   formatRewards(amount: number): string {

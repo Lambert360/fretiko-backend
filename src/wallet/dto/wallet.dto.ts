@@ -12,6 +12,16 @@ export class WalletResponseDto {
   dailyWithdrawalLimit: number;
   createdAt: string;
   updatedAt: string;
+  
+  // Pending escrow balances (locked until release)
+  pendingVendorEarnings?: number;
+  pendingRiderEarnings?: number;
+  totalPendingEarnings?: number;
+  
+  // Sales tracking (cumulative revenue)
+  totalVendorSales?: number;
+  totalRiderEarnings?: number;
+  lifetimeRevenue?: number;
 }
 
 export class DepositRequestDto {

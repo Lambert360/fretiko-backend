@@ -109,6 +109,7 @@ export class UsersService {
     if (updateData.location !== undefined) dbUpdateData.location = updateData.location;
     if (updateData.phone !== undefined) dbUpdateData.phone = updateData.phone;
     if (updateData.dateOfBirth !== undefined) dbUpdateData.date_of_birth = updateData.dateOfBirth;
+    if (updateData.gender !== undefined) dbUpdateData.gender = updateData.gender;
     if (updateData.isSeller !== undefined) dbUpdateData.is_seller = updateData.isSeller;
     // Include is_rider if it's being updated (can be true or false)
     if (updateData.isRider !== undefined) dbUpdateData.is_rider = updateData.isRider;
@@ -246,6 +247,173 @@ export class UsersService {
       isSeller: user.is_seller,
       createdAt: user.created_at,
     }));
+  }
+
+  async deleteAccount(userId: string, userToken?: string): Promise<{ message: string; deletedData: any }> {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+    
+    console.log('🗑️ Starting account deletion for user:', userId);
+    
+    try {
+      // Get user profile first to log what we're deleting
+      const { data: profile } = await client
+        .from('user_profiles')
+        .select('username, is_seller, is_rider')
+        .eq('id', userId)
+        .single();
+      
+      console.log('📋 Deleting account for:', profile?.username || 'Unknown user');
+      
+      const deletedData = {
+        profile: profile,
+        timestamp: new Date().toISOString(),
+        userId: userId
+      };
+      
+      // Start transaction-like deletion process
+      // Note: Supabase doesn't have explicit transactions, so we'll do this step by step
+      
+      // 1. Delete user's products and related data
+      console.log('🗑️ Deleting user products...');
+      const { error: productsError } = await client
+        .from('products')
+        .delete()
+        .eq('user_id', userId);
+      
+      if (productsError) {
+        console.error('Error deleting products:', productsError);
+        throw new Error(`Failed to delete products: ${productsError.message}`);
+      }
+      
+      // 2. Delete user's wishlist items
+      console.log('🗑️ Deleting wishlist items...');
+      const { error: wishlistError } = await client
+        .from('wishlist')
+        .delete()
+        .eq('user_id', userId);
+      
+      if (wishlistError) {
+        console.error('Error deleting wishlist:', wishlistError);
+        throw new Error(`Failed to delete wishlist: ${wishlistError.message}`);
+      }
+      
+      // 3. Delete user's cart items
+      console.log('🗑️ Deleting cart items...');
+      const { error: cartError } = await client
+        .from('cart')
+        .delete()
+        .eq('user_id', userId);
+      
+      if (cartError) {
+        console.error('Error deleting cart:', cartError);
+        throw new Error(`Failed to delete cart: ${cartError.message}`);
+      }
+      
+      // 4. Delete user's orders
+      console.log('🗑️ Deleting orders...');
+      const { error: ordersError } = await client
+        .from('orders')
+        .delete()
+        .eq('user_id', userId);
+      
+      if (ordersError) {
+        console.error('Error deleting orders:', ordersError);
+        throw new Error(`Failed to delete orders: ${ordersError.message}`);
+      }
+      
+      // 5. Delete user's connections
+      console.log('🗑️ Deleting connections...');
+      const { error: connectionsError } = await client
+        .from('connections')
+        .delete()
+        .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`);
+      
+      if (connectionsError) {
+        console.error('Error deleting connections:', connectionsError);
+        throw new Error(`Failed to delete connections: ${connectionsError.message}`);
+      }
+      
+      // 6. Delete user's chat messages
+      console.log('🗑️ Deleting chat messages...');
+      const { error: messagesError } = await client
+        .from('chat_messages')
+        .delete()
+        .eq('sender_id', userId);
+      
+      if (messagesError) {
+        console.error('Error deleting messages:', messagesError);
+        throw new Error(`Failed to delete messages: ${messagesError.message}`);
+      }
+      
+      // 7. Delete user's notifications
+      console.log('🗑️ Deleting notifications...');
+      const { error: notificationsError } = await client
+        .from('notifications')
+        .delete()
+        .eq('user_id', userId);
+      
+      if (notificationsError) {
+        console.error('Error deleting notifications:', notificationsError);
+        throw new Error(`Failed to delete notifications: ${notificationsError.message}`);
+      }
+      
+      // 8. Delete user's wallet transactions
+      console.log('🗑️ Deleting wallet transactions...');
+      const { error: walletError } = await client
+        .from('wallet_transactions')
+        .delete()
+        .eq('user_id', userId);
+      
+      if (walletError) {
+        console.error('Error deleting wallet transactions:', walletError);
+        throw new Error(`Failed to delete wallet transactions: ${walletError.message}`);
+      }
+      
+      // 9. Delete user's wallet
+      console.log('🗑️ Deleting wallet...');
+      const { error: walletDeleteError } = await client
+        .from('wallet')
+        .delete()
+        .eq('user_id', userId);
+      
+      if (walletDeleteError) {
+        console.error('Error deleting wallet:', walletDeleteError);
+        throw new Error(`Failed to delete wallet: ${walletDeleteError.message}`);
+      }
+      
+      // 10. Delete user's profile (this should be last)
+      console.log('🗑️ Deleting user profile...');
+      const { error: profileError } = await client
+        .from('user_profiles')
+        .delete()
+        .eq('id', userId);
+      
+      if (profileError) {
+        console.error('Error deleting profile:', profileError);
+        throw new Error(`Failed to delete profile: ${profileError.message}`);
+      }
+      
+      // 11. Finally, delete the auth user from Supabase Auth
+      console.log('🗑️ Deleting auth user...');
+      const { error: authError } = await client.auth.admin.deleteUser(userId);
+      
+      if (authError) {
+        console.error('Error deleting auth user:', authError);
+        // Don't throw here as the profile is already deleted
+        console.warn('Auth user deletion failed, but profile data is deleted');
+      }
+      
+      console.log('✅ Account deletion completed successfully');
+      
+      return {
+        message: 'Account and all associated data have been permanently deleted',
+        deletedData: deletedData
+      };
+      
+    } catch (error: any) {
+      console.error('❌ Account deletion failed:', error);
+      throw new Error(`Account deletion failed: ${error.message}`);
+    }
   }
 
   private mapToProfileResponse(data: any): UserProfileResponse {

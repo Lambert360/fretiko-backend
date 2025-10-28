@@ -180,35 +180,180 @@ export class IkoSchedulerService {
       const ongoingPlans = ikoContext.ongoing_plans || [];
 
       for (const plan of ongoingPlans) {
-        // Check if plan has a due date approaching
-        if (plan.due_date && plan.status !== 'completed') {
-          const dueDate = new Date(plan.due_date);
-          const timeUntilDue = dueDate.getTime() - now.getTime();
-          const hoursUntilDue = timeUntilDue / (1000 * 60 * 60);
+        // Skip completed or cancelled plans
+        if (plan.status === 'completed' || plan.status === 'cancelled') {
+          continue;
+        }
 
-          // Send reminder if due within 24 hours
-          if (hoursUntilDue > 0 && hoursUntilDue <= 24) {
+        // Support both old (due_date) and new (scheduledFor) formats
+        const scheduledDate = plan.scheduledFor || plan.due_date;
+        
+        if (scheduledDate) {
+          const dueDate = new Date(scheduledDate);
+          const timeUntilDue = dueDate.getTime() - now.getTime();
+          const minutesUntilDue = timeUntilDue / (1000 * 60);
+          const hoursUntilDue = minutesUntilDue / 60;
+
+          // Get reminder window (default 1440 minutes = 24 hours)
+          const reminderBefore = plan.reminderBefore || 1440; // minutes
+
+          // Check if reminder was already sent
+          const reminderSent = plan.notes?.includes('REMINDER_SENT');
+
+          // Send reminder if within reminder window and not yet sent
+          if (minutesUntilDue > 0 && minutesUntilDue <= reminderBefore && !reminderSent) {
+            const timeMessage = this.formatTimeUntil(minutesUntilDue);
+            const activityEmoji = this.getActivityEmoji(plan.type);
+
             await this.notificationsService.createNotification({
               user_id: user.id,
               type: NotificationType.AI_REMINDER,
               priority: NotificationPriority.HIGH,
-              title: '⏰ Plan reminder from Iko',
-              message: `Your plan "${plan.title}" is due ${hoursUntilDue < 1 ? 'soon' : 'in ' + Math.round(hoursUntilDue) + ' hours'}!`,
+              title: `${activityEmoji} Reminder from IKO`,
+              message: `Your ${plan.type || 'activity'} "${plan.title}" is ${timeMessage}!`,
               data: {
                 action_type: 'open_ai_chat',
                 source: 'iko_scheduler',
                 plan_id: plan.id,
+                plan_type: plan.type,
                 check_type: 'plan_reminder'
               }
             });
 
+            // Mark reminder as sent
+            await this.markReminderAsSent(user.id, plan.id);
+
             this.logger.log(`Sent plan reminder to user ${user.id} for plan ${plan.id}`);
+          }
+
+          // Auto-update status to in_progress if time has arrived
+          if (timeUntilDue <= 0 && timeUntilDue > -60 * 60 * 1000 && plan.status === 'pending') {
+            await this.updatePlanStatus(user.id, plan.id, 'in_progress');
           }
         }
       }
     } catch (error) {
       this.logger.error(`Error processing plan reminders for user ${user.id}:`, error);
     }
+  }
+
+  /**
+   * Mark reminder as sent for a plan
+   */
+  private async markReminderAsSent(userId: string, planId: string) {
+    try {
+      // Get current context
+      const { data: profile } = await this.supabase
+        .from('user_profiles')
+        .select('iko_context')
+        .eq('id', userId)
+        .single();
+
+      if (!profile) return;
+
+      const context = profile.iko_context || {};
+      const ongoingPlans = context.ongoing_plans || [];
+
+      // Update the specific plan
+      const updatedPlans = ongoingPlans.map((plan: any) => {
+        if (plan.id === planId) {
+          return {
+            ...plan,
+            notes: (plan.notes || '') + ' REMINDER_SENT',
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        return plan;
+      });
+
+      // Save updated context
+      await this.supabase
+        .from('user_profiles')
+        .update({
+          iko_context: {
+            ...context,
+            ongoing_plans: updatedPlans,
+          },
+        })
+        .eq('id', userId);
+    } catch (error) {
+      this.logger.error(`Error marking reminder as sent for plan ${planId}:`, error);
+    }
+  }
+
+  /**
+   * Update plan status
+   */
+  private async updatePlanStatus(userId: string, planId: string, newStatus: string) {
+    try {
+      // Get current context
+      const { data: profile } = await this.supabase
+        .from('user_profiles')
+        .select('iko_context')
+        .eq('id', userId)
+        .single();
+
+      if (!profile) return;
+
+      const context = profile.iko_context || {};
+      const ongoingPlans = context.ongoing_plans || [];
+
+      // Update the specific plan
+      const updatedPlans = ongoingPlans.map((plan: any) => {
+        if (plan.id === planId) {
+          return {
+            ...plan,
+            status: newStatus,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        return plan;
+      });
+
+      // Save updated context
+      await this.supabase
+        .from('user_profiles')
+        .update({
+          iko_context: {
+            ...context,
+            ongoing_plans: updatedPlans,
+          },
+        })
+        .eq('id', userId);
+
+      this.logger.log(`Updated plan ${planId} status to ${newStatus} for user ${userId}`);
+    } catch (error) {
+      this.logger.error(`Error updating plan status for plan ${planId}:`, error);
+    }
+  }
+
+  /**
+   * Format time until due in a human-readable way
+   */
+  private formatTimeUntil(minutes: number): string {
+    if (minutes < 60) {
+      return `due in ${Math.round(minutes)} minutes`;
+    } else if (minutes < 1440) {
+      const hours = Math.round(minutes / 60);
+      return `due in ${hours} hour${hours !== 1 ? 's' : ''}`;
+    } else {
+      const days = Math.round(minutes / 1440);
+      return `due in ${days} day${days !== 1 ? 's' : ''}`;
+    }
+  }
+
+  /**
+   * Get emoji for activity type
+   */
+  private getActivityEmoji(type: string): string {
+    const emojiMap: { [key: string]: string } = {
+      'meal_plan': '🍽️',
+      'reminder': '⏰',
+      'purchase': '🛒',
+      'event': '📅',
+      'task': '✅',
+    };
+    return emojiMap[type] || '📌';
   }
 
   /**

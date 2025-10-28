@@ -169,6 +169,24 @@ export class LiveSalesController {
     return { success: true, message: 'Stream ended successfully' };
   }
 
+  /**
+   * GET /live-sales/streams/:id/agora-token
+   * Generate Agora RTC token for broadcasting/viewing
+   */
+  @Get('streams/:id/agora-token')
+  async generateAgoraToken(
+    @Param('id') streamId: string,
+    @Query('role') role: 'host' | 'audience' = 'host',
+    @Request() req: any,
+  ) {
+    const userId = req.user?.sub;
+    if (!userId) {
+      throw new BadRequestException('User not authenticated');
+    }
+
+    return this.liveSalesService.generateAgoraToken(streamId, userId, role);
+  }
+
   // =====================
   // VIEWER ACTIONS
   // =====================

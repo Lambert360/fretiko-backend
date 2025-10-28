@@ -1,8 +1,10 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { LiveSalesController } from './live-sales.controller';
 import { LiveSalesService } from './live-sales.service';
 import { LiveStreamGateway } from './live-stream.gateway';
 import { AnalyticsModule } from '../analytics/analytics.module';
+import { EscrowModule } from '../escrow/escrow.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 
 /**
  * Live Sales Module
@@ -10,11 +12,15 @@ import { AnalyticsModule } from '../analytics/analytics.module';
  * Handles all live streaming functionality including:
  * - Stream management (create, start, end)
  * - Real-time features (comments, reactions, gifts)
- * - Live product sales and service bookings
+ * - Live product sales and service bookings (with escrow protection)
  * - Analytics and viewer tracking
  */
 @Module({
-  imports: [AnalyticsModule],
+  imports: [
+    AnalyticsModule,
+    forwardRef(() => EscrowModule),
+    NotificationsModule,
+  ],
   controllers: [LiveSalesController],
   providers: [LiveSalesService, LiveStreamGateway],
   exports: [LiveSalesService],

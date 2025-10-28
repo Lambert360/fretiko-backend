@@ -30,7 +30,9 @@ async function bootstrap() {
 
   // await app.startAllMicroservices();
   const port = configService.get<number>('PORT') || 3000;
+  // Listen on 0.0.0.0 to accept connections from mobile devices/emulators
   await app.listen(port, '0.0.0.0');
   console.log(`🚀 Server is running on http://0.0.0.0:${port}`);
+  console.log(`📱 Mobile devices can connect via your network IP on port ${port}`);
 }
 bootstrap();

@@ -14,6 +14,8 @@ import {
   HttpCode,
   UseInterceptors,
   UploadedFiles,
+  BadRequestException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { AuctionsService } from './auctions.service';
@@ -172,8 +174,11 @@ export class AuctionsController {
     @Body(ValidationPipe) updateProxyBidDto: UpdateProxyBidDto,
     @Request() req: any,
   ) {
-    // TODO: Implement proxy bid update logic
-    throw new Error('Proxy bid updates not yet implemented');
+    return this.auctionsService.updateProxyBid(
+      req.user.id,
+      updateProxyBidDto.auction_id,
+      updateProxyBidDto.max_bid_amount,
+    );
   }
 
   /**
@@ -215,13 +220,51 @@ export class AuctionsController {
   }
 
   /**
+   * Generate Agora token for live auction streaming
+   * Links auction to live stream infrastructure
+   */
+  @Get(':id/live-stream-token')
+  @UseGuards(JwtAuthGuard)
+  async generateLiveStreamToken(
+    @Param('id') auctionId: string,
+    @Query('role') role: 'host' | 'audience' = 'audience',
+    @Request() req: any,
+  ) {
+    // Verify auction exists and is a live auction
+    const auction = await this.auctionsService.findById(auctionId, req.user.id);
+    
+    if (auction.auction_type !== 'live') {
+      throw new BadRequestException('This auction is not a live auction');
+    }
+    
+    // For hosts, verify they own the auction
+    if (role === 'host' && auction.seller_id !== req.user.id) {
+      throw new UnauthorizedException('Only the auction owner can host the stream');
+    }
+    
+    // Generate channel name for this auction
+    const channelName = `auction_${auctionId}`;
+    
+    return {
+      auctionId,
+      channelName,
+      role,
+      auctionTitle: auction.title,
+      currentBid: auction.current_bid,
+      // Note: Actual Agora token generation would be integrated here
+      // using the liveSalesService.generateAgoraToken() method
+      message: 'Endpoint ready - integrate with Agora token service',
+    };
+  }
+
+  /**
    * Get user's bid history
    * Requires authentication
    */
   @Get('user/my-bids')
   @UseGuards(JwtAuthGuard)
   async getMyBids(@Request() req: any) {
-    // TODO: Implement user bid history
+    return this.auctionsService.getUserBidHistory(req.user.id);
     throw new Error('User bid history not yet implemented');
   }
 
@@ -236,8 +279,7 @@ export class AuctionsController {
     @Body() updateData: Partial<CreateAuctionDto>,
     @Request() req: any,
   ) {
-    // TODO: Implement auction update logic
-    throw new Error('Auction updates not yet implemented');
+    return this.auctionsService.updateAuction(id, req.user.id, updateData);
   }
 
   /**
@@ -248,8 +290,7 @@ export class AuctionsController {
   @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
   @HttpCode(HttpStatus.NO_CONTENT)
   async deleteAuction(@Param('id') id: string, @Request() req: any) {
-    // TODO: Implement auction cancellation logic
-    throw new Error('Auction cancellation not yet implemented');
+    return this.auctionsService.cancelAuction(id, req.user.id);
   }
 
   /**

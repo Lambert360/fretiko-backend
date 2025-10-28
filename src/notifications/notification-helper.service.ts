@@ -98,37 +98,6 @@ export class NotificationHelperService {
     }
   }
 
-  /**
-   * Notify user when order is delivered
-   */
-  async notifyOrderDelivered(userId: string, orderData: any): Promise<void> {
-    try {
-      const notification: CreateNotificationDto = {
-        user_id: userId,
-        type: NotificationType.ORDER,
-        title: 'Order Delivered! ✅',
-        message: `Your order #${orderData.order_number} has been delivered. Hope you love it!`,
-        priority: NotificationPriority.MEDIUM,
-        badge: 'DELIVERED',
-        has_actions: true,
-        action_buttons: [
-          { label: 'Rate Order', type: ActionButtonType.PRIMARY },
-          { label: 'Order Again', type: ActionButtonType.SECONDARY }
-        ],
-        data: {
-          order_id: orderData.id,
-          order_number: orderData.order_number,
-          delivered_at: new Date().toISOString()
-        }
-      };
-
-      await this.createAndSendNotification(notification);
-      this.logger.log(`Created order delivered notification for user ${userId}`);
-    } catch (error) {
-      this.logger.error('Failed to create order delivered notification:', error);
-    }
-  }
-
   // ============================================
   // PAYMENT NOTIFICATIONS  
   // ============================================
@@ -274,7 +243,7 @@ export class NotificationHelperService {
     try {
       const notification: CreateNotificationDto = {
         user_id: userId,
-        type: NotificationType.SOCIAL,
+        type: NotificationType.CONNECTION_REQUEST,
         title: `${requesterData.username} wants to connect! 🤝`,
         message: `${requesterData.username} sent you a connection request. Check out their profile!`,
         priority: NotificationPriority.MEDIUM,
@@ -305,7 +274,7 @@ export class NotificationHelperService {
     try {
       const notification: CreateNotificationDto = {
         user_id: userId,
-        type: NotificationType.SOCIAL,
+        type: NotificationType.CONNECTION_ACCEPTED,
         title: `${acceptorData.username} accepted your request! ✨`,
         message: `Great! You and ${acceptorData.username} are now connected. Start exploring what they have to offer!`,
         priority: NotificationPriority.MEDIUM,
@@ -505,6 +474,628 @@ export class NotificationHelperService {
       this.logger.log(`Created live event notification for user ${userId}`);
     } catch (error) {
       this.logger.error('Failed to create live event notification:', error);
+    }
+  }
+
+  // ============================================
+  // VENDOR/RIDER/ESCROW NOTIFICATIONS
+  // ============================================
+
+  /**
+   * Notify vendor of new order
+   */
+  async notifyVendorNewOrder(vendorId: string, orderData: any): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: vendorId,
+        type: NotificationType.ORDER,
+        title: 'New Order! 🎉',
+        message: `You received a new order #${orderData.orderNumber} for ₣${orderData.totalAmount.toFixed(2)}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'NEW_ORDER',
+        has_actions: true,
+        action_buttons: [
+          { label: 'Accept Order', type: ActionButtonType.PRIMARY },
+          { label: 'View Details', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          total_amount: orderData.totalAmount,
+          item_count: orderData.itemCount,
+          buyer_name: orderData.buyerName
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified vendor ${vendorId} of new order ${orderData.orderNumber}`);
+    } catch (error) {
+      this.logger.error('Failed to notify vendor of new order:', error);
+    }
+  }
+
+  /**
+   * Notify vendor that payment is held in escrow
+   */
+  async notifyVendorOrderPaid(vendorId: string, orderData: any): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: vendorId,
+        type: NotificationType.PAYMENT,
+        title: 'Payment Confirmed ✅',
+        message: `₣${orderData.vendorAmount.toFixed(2)} is held in escrow for order #${orderData.orderNumber}`,
+        priority: NotificationPriority.MEDIUM,
+        badge: 'ESCROW',
+        data: {
+          order_id: orderData.orderId,
+          order_number: orderData.orderNumber,
+          vendor_amount: orderData.vendorAmount,
+          escrow_id: orderData.escrowId
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified vendor ${vendorId} of payment in escrow`);
+    } catch (error) {
+      this.logger.error('Failed to notify vendor of payment:', error);
+    }
+  }
+
+  /**
+   * Notify vendor that escrow funds have been released
+   */
+  async notifyVendorEscrowReleased(vendorId: string, amount: number, orderNumber: string): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: vendorId,
+        type: NotificationType.PAYMENT,
+        title: 'Payment Released! 💰',
+        message: `₣${amount.toFixed(2)} has been added to your wallet for order #${orderNumber}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'PAID',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Wallet', type: ActionButtonType.PRIMARY },
+          { label: 'Withdraw', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          amount: amount,
+          order_number: orderNumber,
+          transaction_type: 'escrow_release'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified vendor ${vendorId} of escrow release`);
+    } catch (error) {
+      this.logger.error('Failed to notify vendor of escrow release:', error);
+    }
+  }
+
+  /**
+   * Notify rider of payment released
+   */
+  async notifyRiderPaymentReleased(riderId: string, amount: number, orderNumber: string): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: riderId,
+        type: NotificationType.PAYMENT,
+        title: 'Delivery Fee Received! 💰',
+        message: `₣${amount.toFixed(2)} delivery fee has been added to your wallet for order #${orderNumber}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'PAID',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Wallet', type: ActionButtonType.PRIMARY },
+          { label: 'Withdraw', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          amount: amount,
+          order_number: orderNumber,
+          transaction_type: 'delivery_payment'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified rider ${riderId} of payment release`);
+    } catch (error) {
+      this.logger.error('Failed to notify rider of payment release:', error);
+    }
+  }
+
+  /**
+   * Notify rider of new delivery assignment
+   */
+  async notifyRiderNewAssignment(riderId: string, orderData: any): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: riderId,
+        type: NotificationType.ORDER,
+        title: 'New Delivery Assignment 🏍️',
+        message: `Pickup at ${orderData.pickupAddress}. Delivery fee: ₣${orderData.deliveryFee.toFixed(2)}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'DELIVERY',
+        has_actions: true,
+        action_buttons: [
+          { label: 'Start Delivery', type: ActionButtonType.PRIMARY },
+          { label: 'View Route', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          delivery_fee: orderData.deliveryFee,
+          pickup_address: orderData.pickupAddress,
+          delivery_address: orderData.deliveryAddress,
+          estimated_earnings: orderData.estimatedEarnings
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified rider ${riderId} of new assignment`);
+    } catch (error) {
+      this.logger.error('Failed to notify rider of assignment:', error);
+    }
+  }
+
+  /**
+   * Notify buyer that order has been refunded
+   */
+  async notifyOrderRefunded(buyerId: string, amount: number, orderNumber: string, reason: string): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.PAYMENT,
+        title: 'Order Refunded 💵',
+        message: `₣${amount.toFixed(2)} has been refunded to your wallet for order #${orderNumber}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'REFUND',
+        data: {
+          amount: amount,
+          order_number: orderNumber,
+          reason: reason,
+          transaction_type: 'refund'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified buyer ${buyerId} of refund`);
+    } catch (error) {
+      this.logger.error('Failed to notify buyer of refund:', error);
+    }
+  }
+
+  /**
+   * Notify buyer that order has been accepted by vendor
+   */
+  async notifyOrderAccepted(buyerId: string, orderData: any): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.ORDER,
+        title: 'Order Accepted! 👍',
+        message: `Your order #${orderData.orderNumber} has been accepted and is being prepared`,
+        priority: NotificationPriority.MEDIUM,
+        badge: 'ACCEPTED',
+        has_actions: true,
+        action_buttons: [
+          { label: 'Track Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: orderData.orderId,
+          order_number: orderData.orderNumber,
+          vendor_id: orderData.vendorId
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified buyer ${buyerId} of order acceptance`);
+    } catch (error) {
+      this.logger.error('Failed to notify buyer of order acceptance:', error);
+    }
+  }
+
+  // ============================================
+  // DISPUTE NOTIFICATIONS
+  // ============================================
+
+  /**
+   * Notify user that a dispute has been filed against them
+   */
+  async notifyDisputeFiled(userId: string, orderNumber: string, disputeType: string, disputeId: string): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: userId,
+        type: NotificationType.SYSTEM,
+        title: 'Dispute Filed ⚠️',
+        message: `A dispute has been filed for order #${orderNumber}. Please review and respond.`,
+        priority: NotificationPriority.HIGH,
+        badge: 'DISPUTE',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Dispute', type: ActionButtonType.PRIMARY },
+          { label: 'Respond', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          order_number: orderNumber,
+          dispute_type: disputeType,
+          dispute_id: disputeId
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified user ${userId} of dispute filing`);
+    } catch (error) {
+      this.logger.error('Failed to notify user of dispute:', error);
+    }
+  }
+
+  /**
+   * Notify user that a dispute has been resolved
+   */
+  async notifyDisputeResolved(userId: string, orderNumber: string, resolution: string, disputeId: string): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: userId,
+        type: NotificationType.SYSTEM,
+        title: 'Dispute Resolved ✅',
+        message: `The dispute for order #${orderNumber} has been resolved: ${resolution.replace('_', ' ')}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'RESOLVED',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Details', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_number: orderNumber,
+          resolution: resolution,
+          dispute_id: disputeId
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified user ${userId} of dispute resolution`);
+    } catch (error) {
+      this.logger.error('Failed to notify user of dispute resolution:', error);
+    }
+  }
+
+  /**
+   * Notify user of new message in dispute thread
+   */
+  async notifyDisputeMessage(userId: string, disputeId: string): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: userId,
+        type: NotificationType.CHAT,
+        title: 'New Dispute Message 💬',
+        message: `You have a new message in your dispute case`,
+        priority: NotificationPriority.MEDIUM,
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Message', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          dispute_id: disputeId
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified user ${userId} of dispute message`);
+    } catch (error) {
+      this.logger.error('Failed to notify user of dispute message:', error);
+    }
+  }
+
+  // ============================================
+  // PIN NOTIFICATIONS
+  // ============================================
+
+  /**
+   * Notify rider with pickup PIN
+   */
+  async notifyRiderPickupPin(riderId: string, orderData: { id: string; orderNumber: string; pickupPin: string; vendorName?: string }): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: riderId,
+        type: NotificationType.DELIVERY,
+        title: '🔐 Pickup PIN for Order',
+        message: `Pickup PIN for order #${orderData.orderNumber}: ${orderData.pickupPin}. Show this to the vendor when collecting the order.`,
+        priority: NotificationPriority.HIGH,
+        badge: 'PICKUP_PIN',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          pickup_pin: orderData.pickupPin,
+          vendor_name: orderData.vendorName
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Sent pickup PIN to rider ${riderId} for order ${orderData.orderNumber}`);
+    } catch (error) {
+      this.logger.error('Failed to send pickup PIN to rider:', error);
+    }
+  }
+
+  /**
+   * Notify buyer with delivery PIN
+   */
+  async notifyBuyerDeliveryPin(buyerId: string, orderData: { id: string; orderNumber: string; deliveryPin: string }): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.DELIVERY,
+        title: '🔐 Delivery PIN for Your Order',
+        message: `Delivery PIN for order #${orderData.orderNumber}: ${orderData.deliveryPin}. Give this to the rider when they deliver your order.`,
+        priority: NotificationPriority.HIGH,
+        badge: 'DELIVERY_PIN',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          delivery_pin: orderData.deliveryPin
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Sent delivery PIN to buyer ${buyerId} for order ${orderData.orderNumber}`);
+    } catch (error) {
+      this.logger.error('Failed to send delivery PIN to buyer:', error);
+    }
+  }
+
+  /**
+   * Notify vendor with self-pickup PIN (for verification when buyer arrives)
+   */
+  async notifyVendorSelfPickupPin(vendorId: string, orderData: { id: string; orderNumber: string; deliveryPin: string; buyerName?: string }): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: vendorId,
+        type: NotificationType.ORDER,
+        title: '🔐 Self-Pickup PIN for Order',
+        message: `Pickup PIN for order #${orderData.orderNumber}: ${orderData.deliveryPin}. Ask the buyer to provide this PIN when they arrive to collect the order.`,
+        priority: NotificationPriority.HIGH,
+        badge: 'PICKUP_PIN',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY },
+          { label: 'Mark Ready', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          delivery_pin: orderData.deliveryPin,
+          buyer_name: orderData.buyerName,
+          delivery_type: 'pickup'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Sent self-pickup PIN to vendor ${vendorId} for order ${orderData.orderNumber}`);
+    } catch (error) {
+      this.logger.error('Failed to send self-pickup PIN to vendor:', error);
+    }
+  }
+
+  /**
+   * Notify buyer with self-pickup PIN (to provide to vendor)
+   */
+  async notifyBuyerSelfPickupPin(buyerId: string, orderData: { id: string; orderNumber: string; deliveryPin: string; vendorName?: string }): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.ORDER,
+        title: '🔐 Your Pickup PIN',
+        message: `Your pickup PIN for order #${orderData.orderNumber}: ${orderData.deliveryPin}. Provide this PIN to ${orderData.vendorName || 'the vendor'} when collecting your order.`,
+        priority: NotificationPriority.HIGH,
+        badge: 'PICKUP_PIN',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY },
+          { label: 'Get Directions', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          delivery_pin: orderData.deliveryPin,
+          vendor_name: orderData.vendorName,
+          delivery_type: 'pickup'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Sent self-pickup PIN to buyer ${buyerId} for order ${orderData.orderNumber}`);
+    } catch (error) {
+      this.logger.error('Failed to send self-pickup PIN to buyer:', error);
+    }
+  }
+
+  /**
+   * Notify buyer that self-pickup order is ready
+   */
+  async notifyBuyerOrderReadyForPickup(buyerId: string, orderData: { id: string; orderNumber: string; vendorName?: string; deliveryPin?: string }): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.ORDER,
+        title: '✅ Order Ready for Pickup!',
+        message: `Your order #${orderData.orderNumber} is ready! Visit ${orderData.vendorName || 'the vendor'} to collect it. Your PIN: ${orderData.deliveryPin}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'READY',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY },
+          { label: 'Get Directions', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          vendor_name: orderData.vendorName,
+          delivery_pin: orderData.deliveryPin,
+          delivery_type: 'pickup'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified buyer ${buyerId} that order is ready for pickup`);
+    } catch (error) {
+      this.logger.error('Failed to notify buyer of ready order:', error);
+    }
+  }
+
+  /**
+   * Notify rider and buyer that order is ready for pickup
+   */
+  async notifyOrderReadyForPickup(riderId: string, buyerId: string, orderData: { id: string; orderNumber: string; vendorName?: string }): Promise<void> {
+    try {
+      // Notify rider
+      const riderNotification: CreateNotificationDto = {
+        user_id: riderId,
+        type: NotificationType.DELIVERY,
+        title: '📦 Order Ready for Pickup!',
+        message: `Order #${orderData.orderNumber} is ready for pickup${orderData.vendorName ? ` from ${orderData.vendorName}` : ''}. Head to the pickup location.`,
+        priority: NotificationPriority.HIGH,
+        badge: 'READY_FOR_PICKUP',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Details', type: ActionButtonType.PRIMARY },
+          { label: 'Navigate', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber
+        }
+      };
+
+      await this.createAndSendNotification(riderNotification);
+
+      // Notify buyer
+      const buyerNotification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.ORDER,
+        title: '✅ Order Ready!',
+        message: `Your order #${orderData.orderNumber} is ready and awaiting pickup by the rider.`,
+        priority: NotificationPriority.MEDIUM,
+        badge: 'READY',
+        has_actions: true,
+        action_buttons: [
+          { label: 'Track Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber
+        }
+      };
+
+      await this.createAndSendNotification(buyerNotification);
+      this.logger.log(`Notified rider ${riderId} and buyer ${buyerId} that order ${orderData.orderNumber} is ready`);
+    } catch (error) {
+      this.logger.error('Failed to notify order ready for pickup:', error);
+    }
+  }
+
+  /**
+   * Notify buyer and vendor that order has been delivered
+   */
+  async notifyOrderDelivered(buyerId: string, vendorId: string, orderData: { id: string; orderNumber: string; totalAmount: number }): Promise<void> {
+    try {
+      // Notify buyer
+      const buyerNotification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.DELIVERY,
+        title: '🎉 Order Delivered!',
+        message: `Your order #${orderData.orderNumber} has been delivered! You have 24 hours to report any issues, or funds will be released automatically.`,
+        priority: NotificationPriority.HIGH,
+        badge: 'DELIVERED',
+        has_actions: true,
+        action_buttons: [
+          { label: 'Confirm & Release Funds', type: ActionButtonType.PRIMARY },
+          { label: 'Report Issue', type: ActionButtonType.SECONDARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          total_amount: orderData.totalAmount
+        }
+      };
+
+      await this.createAndSendNotification(buyerNotification);
+
+      // Notify vendor
+      const vendorNotification: CreateNotificationDto = {
+        user_id: vendorId,
+        type: NotificationType.ORDER,
+        title: '📬 Order Delivered',
+        message: `Order #${orderData.orderNumber} has been delivered to the customer. Funds will be released in 24 hours.`,
+        priority: NotificationPriority.MEDIUM,
+        badge: 'DELIVERED',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber
+        }
+      };
+
+      await this.createAndSendNotification(vendorNotification);
+      this.logger.log(`Notified buyer ${buyerId} and vendor ${vendorId} that order ${orderData.orderNumber} was delivered`);
+    } catch (error) {
+      this.logger.error('Failed to notify order delivered:', error);
+    }
+  }
+
+  /**
+   * Notify all parties that order pickup was confirmed
+   */
+  async notifyOrderPickedUp(buyerId: string, vendorId: string, orderData: { id: string; orderNumber: string; riderName?: string }): Promise<void> {
+    try {
+      // Notify buyer
+      const buyerNotification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.DELIVERY,
+        title: '🚴 Order Picked Up!',
+        message: `Your order #${orderData.orderNumber} has been picked up${orderData.riderName ? ` by ${orderData.riderName}` : ''} and is on the way!`,
+        priority: NotificationPriority.HIGH,
+        badge: 'OUT_FOR_DELIVERY',
+        has_actions: true,
+        action_buttons: [
+          { label: 'Track Live', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber
+        }
+      };
+
+      await this.createAndSendNotification(buyerNotification);
+
+      // Notify vendor
+      const vendorNotification: CreateNotificationDto = {
+        user_id: vendorId,
+        type: NotificationType.ORDER,
+        title: '✅ Order Picked Up',
+        message: `Order #${orderData.orderNumber} has been picked up by the rider and is now out for delivery.`,
+        priority: NotificationPriority.MEDIUM,
+        badge: 'OUT_FOR_DELIVERY',
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber
+        }
+      };
+
+      await this.createAndSendNotification(vendorNotification);
+      this.logger.log(`Notified buyer ${buyerId} and vendor ${vendorId} that order ${orderData.orderNumber} was picked up`);
+    } catch (error) {
+      this.logger.error('Failed to notify order picked up:', error);
     }
   }
 

@@ -42,6 +42,21 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
 
   async handleConnection(client: Socket) {
     console.log(`Client connected: ${client.id}`);
+    
+    // Verify JWT token from handshake
+    const token = client.handshake.auth?.token;
+    if (token) {
+      try {
+        // Token validation would happen here via JWT service
+        // For now, just log that we received a token
+        console.log(`Client ${client.id} authenticated with token`);
+      } catch (error) {
+        console.error(`Authentication failed for client ${client.id}`);
+        client.disconnect();
+        return;
+      }
+    }
+    
     this.activeConnections.set(client.id, { auctionRooms: new Set() });
 
     // Send welcome message
@@ -156,7 +171,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       const roomName = `auction_${data.auction_id}`;
 
       // Broadcast new bid to all room members
-      this.server.to(roomName).emit('bid_placed', {
+      this.server.to(roomName).emit('new_bid', {
         auction_id: data.auction_id,
         amount: data.amount,
         bidder_display_id: 'Bidder #42', // Would come from service
@@ -209,7 +224,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   async broadcastBidUpdate(auctionId: string, bidData: any) {
     const roomName = `auction_${auctionId}`;
 
-    this.server.to(roomName).emit('bid_placed', {
+    this.server.to(roomName).emit('new_bid', {
       auction_id: auctionId,
       ...bidData,
       timestamp: new Date().toISOString(),

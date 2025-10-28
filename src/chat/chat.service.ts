@@ -37,6 +37,22 @@ export class ChatService {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     try {
+      // First, get conversation IDs where the user is a participant
+      const { data: userParticipations } = await client
+        .from('chat_participants')
+        .select('conversation_id')
+        .eq('user_id', userId);
+
+      const userConversationIds = userParticipations?.map(p => p.conversation_id) || [];
+
+      this.logger.debug(`📊 User has ${userConversationIds.length} conversations`);
+
+      if (userConversationIds.length === 0) {
+        this.logger.log('User has no conversations');
+        return [];
+      }
+
+      // Then get full conversation data with ALL participants
       let conversationsQuery = client
         .from('chat_conversations')
         .select(`
@@ -62,7 +78,7 @@ export class ChatService {
           )
         `)
         .eq('is_active', true)
-        .eq('chat_participants.user_id', userId)
+        .in('id', userConversationIds)
         .order('last_message_at', { ascending: false });
 
       // Apply filters
@@ -91,6 +107,11 @@ export class ChatService {
       if (error) {
         this.logger.error('Failed to fetch conversations:', error);
         throw new Error(`Database error: ${error.message}`);
+      }
+
+      this.logger.debug(`📊 Fetched ${conversations?.length || 0} conversations from database`);
+      if (conversations && conversations.length > 0) {
+        this.logger.debug(`📊 First conversation participants: ${JSON.stringify(conversations[0].chat_participants)}`);
       }
 
       // Fetch last message for each conversation
@@ -123,19 +144,46 @@ export class ChatService {
         conv.chat_participants?.map(p => p.user_id) || []
       );
       const senderIds = lastMessages?.map(msg => msg.sender_id) || [];
-      const userIds = [...new Set([...participantIds, ...senderIds])];
+      const allUserIds = [...new Set([...participantIds, ...senderIds])];
+
+      // 🔥 FIX: Filter out invalid UUIDs before querying (prevents PostgreSQL errors)
+      const validUserIds = allUserIds.filter(id => {
+        // Check if ID exists and is not a string "null" or "undefined"
+        if (!id || id === 'null' || id === 'undefined' || id.trim() === '') {
+          return false;
+        }
+
+        // Validate UUID format (8-4-4-4-12 hex digits)
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        return uuidRegex.test(id);
+      });
+
+      // Log invalid IDs for debugging
+      const invalidIds = allUserIds.filter(id => !validUserIds.includes(id));
+      if (invalidIds.length > 0) {
+        this.logger.warn(`⚠️ Found ${invalidIds.length} invalid user IDs that will be skipped:`, invalidIds);
+      }
+
+      this.logger.debug(`📊 Fetching profiles for ${validUserIds.length} valid users (${invalidIds.length} invalid filtered out)`);
 
       let userProfiles = [];
-      if (userIds.length > 0) {
-        const { data: profiles } = await client
+      if (validUserIds.length > 0) {
+        const { data: profiles, error: profilesError } = await client
           .from('user_profiles')
           .select('id, username, avatar_url')
-          .in('id', userIds);
+          .in('id', validUserIds);
+
+        if (profilesError) {
+          this.logger.error('❌ Error fetching user profiles:', profilesError);
+        } else {
+          this.logger.debug(`📊 Fetched ${profiles?.length || 0} user profiles: ${JSON.stringify(profiles)}`);
+        }
+
         userProfiles = profiles || [];
       }
 
       // Transform and return data
-      return conversations.map(conv => this.mapConversationResponse(conv, lastMessages, unreadCounts, userProfiles));
+      return conversations.map(conv => this.mapConversationResponse(conv, lastMessages, unreadCounts, userProfiles, userId));
     } catch (error) {
       this.logger.error('Error fetching conversations:', error);
       throw error;
@@ -165,7 +213,10 @@ export class ChatService {
       this.logger.log(`Generated participant hash: ${participantHash}`);
 
       // Look for existing conversation with this exact participant hash
-      this.logger.log(`Looking for conversation with hash: ${participantHash}, chatType: ${chatType}`);
+      // NOTE: We search by participant_hash ONLY, not by chat_type
+      // This ensures the same participants always use the same conversation room
+      // regardless of who initiates the conversation
+      this.logger.log(`Looking for conversation with hash: ${participantHash}`);
 
       const { data: existingConversations, error: queryError } = await client
         .from('chat_conversations')
@@ -183,7 +234,6 @@ export class ChatService {
           participant_hash
         `)
         .eq('participant_hash', participantHash)
-        .eq('chat_type', chatType)
         .eq('is_active', true)
         .order('created_at', { ascending: false }); // Get most recent first
 
@@ -213,6 +263,7 @@ export class ChatService {
         .from('chat_conversations')
         .insert({
           chat_type: chatType,
+          name: null, // 🔥 FIX: Explicitly set to null for 1:1 chats (enables username derivation)
           created_by: userId,
           is_group: allParticipants.length > 2,
           participant_hash: participantHash,
@@ -540,15 +591,23 @@ export class ChatService {
       await this.notifyParticipants(sendMessageDto.conversationId, message, userToken);
 
       // 🔥 CRITICAL FIX: Broadcast message via WebSocket for real-time chat
-      // Exclude the sender so they don't receive their own message (they already have it optimistically)
+      // For system-generated messages (wishlist, invoice), broadcast to ALL including sender
+      // For user messages, exclude the sender (they already have it optimistically)
       try {
         const messageForBroadcast = this.mapMessageResponse(message, MessageStatus.SENT, userProfiles);
+        const excludeUserId = sendMessageDto.broadcastToAll ? undefined : userId; // undefined means don't exclude anyone
+
         await this.realtimeGateway.notifyNewMessage(
           sendMessageDto.conversationId,
           messageForBroadcast,
-          userId // Exclude sender from broadcast
+          excludeUserId
         );
-        this.logger.log(`📡 Real-time message broadcast sent for conversation: ${sendMessageDto.conversationId} (excluded sender: ${userId})`);
+
+        if (sendMessageDto.broadcastToAll) {
+          this.logger.log(`📡 Real-time message broadcast sent to ALL participants in conversation: ${sendMessageDto.conversationId}`);
+        } else {
+          this.logger.log(`📡 Real-time message broadcast sent for conversation: ${sendMessageDto.conversationId} (excluded sender: ${userId})`);
+        }
       } catch (broadcastError) {
         this.logger.error('❌ Failed to broadcast message via WebSocket:', broadcastError);
         // Don't throw - message was saved successfully, broadcast failure shouldn't fail the request
@@ -839,22 +898,69 @@ export class ChatService {
       userProfiles = profiles || [];
     }
 
-    return this.mapConversationResponse(conversation, [], [], userProfiles);
+    return this.mapConversationResponse(conversation, [], [], userProfiles, userId);
   }
 
-  private mapConversationResponse(conversation: any, lastMessages: any[] = [], unreadCounts: any[] = [], userProfiles: any[] = []): ConversationResponseDto {
+  private mapConversationResponse(conversation: any, lastMessages: any[] = [], unreadCounts: any[] = [], userProfiles: any[] = [], currentUserId?: string): ConversationResponseDto {
     const lastMessage = lastMessages?.find(msg => msg.conversation_id === conversation.id);
     const unreadCount = unreadCounts?.filter(msg => msg.conversation_id === conversation.id).length || 0;
 
     // Determine if this is an AI conversation
     const isAI = conversation.chat_type === 'ai';
 
+    // 🔍 DEBUG: Log input data
+    this.logger.debug(`🔍 mapConversationResponse INPUT - conversationId: ${conversation.id}`);
+    this.logger.debug(`🔍 currentUserId: ${currentUserId}`);
+    this.logger.debug(`🔍 conversation.chat_participants: ${JSON.stringify(conversation.chat_participants)}`);
+    this.logger.debug(`🔍 userProfiles count: ${userProfiles?.length || 0}`);
+    this.logger.debug(`🔍 userProfiles: ${JSON.stringify(userProfiles)}`);
+
+    // Derive conversation name for 1:1 chats
+    let conversationName = conversation.name;
+    let conversationAvatar = conversation.avatar_url;
+    let otherUserId: string | undefined;
+
+    // 🔥 FIX: Check for null, undefined, empty string, OR whitespace-only strings
+    // This ensures the username derivation logic always runs for 1:1 chats without explicit names
+    const hasNoName = !conversationName || conversationName.trim() === '';
+
+    if (hasNoName && !conversation.is_group && conversation.chat_participants) {
+      // For 1:1 chats, use the other participant's username
+      const otherParticipant = conversation.chat_participants.find(p => p.user_id !== currentUserId);
+      this.logger.debug(`🔍 otherParticipant: ${JSON.stringify(otherParticipant)}`);
+
+      if (otherParticipant) {
+        const otherUserProfile = userProfiles.find(profile => profile.id === otherParticipant.user_id);
+        this.logger.debug(`🔍 otherUserProfile: ${JSON.stringify(otherUserProfile)}`);
+
+        conversationName = otherUserProfile?.username || 'Unknown User';
+        conversationAvatar = conversationAvatar || otherUserProfile?.avatar_url;
+        otherUserId = otherParticipant.user_id; // Store for frontend use
+      } else {
+        // No other participant found - this shouldn't happen but handle gracefully
+        this.logger.warn(`⚠️ No other participant found for 1:1 conversation ${conversation.id}`);
+        conversationName = 'Unknown User';
+      }
+    }
+
+    // AI conversation defaults
+    // 🔥 FIX: Use logical OR to catch empty strings too
+    if (isAI) {
+      conversationName = conversationName?.trim() || 'Iko';
+    }
+
+    // 🔥 FIX: Final safety check - ensure we never return null/undefined/empty
+    conversationName = conversationName?.trim() || 'Unknown User';
+
+    // Debug logging
+    this.logger.debug(`💬 Mapped conversation: id=${conversation.id}, name=${conversationName}, otherUserId=${otherUserId}, isGroup=${conversation.is_group}`);
+
     return {
       id: conversation.id,
       chatType: conversation.chat_type,
-      name: conversation.name || (isAI ? 'Iko' : undefined),
+      name: conversationName,
       description: conversation.description,
-      avatarUrl: conversation.avatar_url,
+      avatarUrl: conversationAvatar,
       isGroup: conversation.is_group,
       createdAt: conversation.created_at,
       updatedAt: conversation.updated_at,
@@ -887,6 +993,7 @@ export class ChatService {
       isPinned: conversation.chat_participants?.some(p => p.is_pinned) || false,
       verified: isAI ? true : undefined, // AI is always verified
       metadata: conversation.metadata,
+      otherUserId: otherUserId, // For 1:1 chats, the other participant's ID
     };
   }
 

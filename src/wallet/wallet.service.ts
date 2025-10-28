@@ -60,7 +60,18 @@ export class WalletService {
       throw new Error(`Database error: ${error.message}`);
     }
 
-    return this.mapWalletToDto(data);
+    // ✅ QUERY PENDING ESCROW BALANCES (vendor/rider earnings)
+    const pendingEscrows = await this.getPendingEscrowBalances(userId);
+
+    const walletDto = this.mapWalletToDto(data);
+    
+    // Add pending escrow data to response
+    return {
+      ...walletDto,
+      pendingVendorEarnings: pendingEscrows.vendorAmount,
+      pendingRiderEarnings: pendingEscrows.riderAmount,
+      totalPendingEarnings: pendingEscrows.totalPending,
+    };
   }
 
   private async createWalletForUser(userId: string): Promise<WalletResponseDto> {
@@ -222,9 +233,52 @@ export class WalletService {
     }
 
     // TODO: Integrate with payment provider (Stripe, Paystack, etc.)
-    // For now, return the pending deposit
+    // Payment integration placeholder - graceful handling
+    console.log('⚠️  Payment Integration Pending:', {
+      depositId: data.id,
+      fretiAmount: data.freti_amount,
+      localAmount: data.local_amount,
+      localCurrency: data.local_currency,
+      message: 'This deposit is pending payment provider integration. Status will remain "pending" until payment gateway is configured.'
+    });
+
+    // NOTE: When payment provider is integrated, the flow will be:
+    // 1. Create payment session with provider (Stripe, Paystack, etc.)
+    // 2. Return payment URL/redirect to frontend
+    // 3. Handle webhook callbacks to update deposit status to 'completed'
+    // 4. Update wallet balance via ledger entry on successful payment
     
     return this.mapDepositToDto(data);
+  }
+
+  async getDepositHistory(userId: string, params?: {
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<DepositResponseDto[]> {
+    let query = this.supabase
+      .from('deposits')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    // Apply filters
+    if (params?.status) {
+      query = query.eq('status', params.status);
+    }
+
+    // Apply pagination
+    const limit = params?.limit || 20;
+    const offset = params?.offset || 0;
+    query = query.range(offset, offset + limit - 1);
+
+    const { data, error } = await query;
+
+    if (error) {
+      throw new Error(`Failed to fetch deposit history: ${error.message}`);
+    }
+
+    return (data || []).map(d => this.mapDepositToDto(d));
   }
 
   // ================================
@@ -282,54 +336,58 @@ export class WalletService {
     }
 
     // TODO: Integrate with payment provider for payout
-    // For now, return the requested payout
+    // Payout integration placeholder - graceful handling
+    console.log('⚠️  Payout Integration Pending:', {
+      payoutId: data.id,
+      fretiAmount: data.freti_amount,
+      estimatedLocalAmount: estimatedLocalAmount,
+      localCurrency: localCurrency,
+      message: 'This withdrawal is pending payment provider integration. Funds are held in pending_withdrawal. Payout will be processed once payment gateway is configured.'
+    });
+
+    // NOTE: When payment provider is integrated, the flow will be:
+    // 1. Create payout request with provider (Stripe, Paystack, etc.)
+    // 2. Provider processes payout to user's bank account
+    // 3. Handle webhook callbacks to update payout status to 'paid'
+    // 4. Move funds from pending_withdrawal via ledger entry on successful payout
+    // 5. For failures, refund from pending_withdrawal to available_balance
 
     return this.mapPayoutToDto(data);
   }
 
-  // ================================
-  // TRANSACTION HISTORY
-  // ================================
-
-  async getTransactionHistory(userId: string, query: TransactionHistoryQueryDto): Promise<WalletLedger[]> {
-    let dbQuery = this.supabase
-      .from('wallet_ledger')
+  async getPayoutHistory(userId: string, params?: {
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PayoutRequestResponseDto[]> {
+    let query = this.supabase
+      .from('payout_requests')
       .select('*')
       .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .range(query.offset || 0, (query.offset || 0) + (query.limit || 20) - 1);
+      .order('requested_at', { ascending: false });
 
     // Apply filters
-    if (query.type) {
-      const typeMap = {
-        'deposit': ['deposit_mint'],
-        'withdrawal': ['withdrawal_burn'],
-        'purchase': ['purchase_hold'],
-        'escrow': ['escrow_release', 'escrow_refund'],
-        'adjustment': ['admin_adjustment', 'fee_deduction', 'reward_credit']
-      };
-      
-      if (typeMap[query.type]) {
-        dbQuery = dbQuery.in('transaction_type', typeMap[query.type]);
-      }
+    if (params?.status) {
+      query = query.eq('status', params.status);
     }
 
-    if (query.startDate) {
-      dbQuery = dbQuery.gte('created_at', query.startDate);
-    }
+    // Apply pagination
+    const limit = params?.limit || 20;
+    const offset = params?.offset || 0;
+    query = query.range(offset, offset + limit - 1);
 
-    if (query.endDate) {
-      dbQuery = dbQuery.lte('created_at', query.endDate);
-    }
-
-    const { data, error } = await dbQuery;
+    const { data, error } = await query;
 
     if (error) {
-      throw new Error(`Failed to fetch transaction history: ${error.message}`);
+      throw new Error(`Failed to fetch payout history: ${error.message}`);
     }
 
-    return data || [];
+    return (data || []).map(p => this.mapPayoutToDto(p));
   }
+
+  // ================================
+  // TRANSACTION HISTORY (removed - see new implementation below in sales section)
+  // ================================
 
   // ================================
   // ESCROW OPERATIONS
@@ -368,6 +426,58 @@ export class WalletService {
       riderTrusted,
       buyerEligible,
       riskFlags: riskFlags.map(flag => flag.flagType)
+    };
+  }
+
+  async getRemainingDailyLimits(userId: string): Promise<{
+    dailyDepositLimit: number;
+    dailyWithdrawalLimit: number;
+    remainingDepositLimit: number;
+    remainingWithdrawalLimit: number;
+    kycStatus: string;
+  }> {
+    const wallet = await this.getWallet(userId);
+    const today = new Date().toISOString().split('T')[0];
+
+    // Calculate deposits made today
+    const { data: depositsToday } = await this.supabase
+      .from('deposits')
+      .select('freti_amount')
+      .eq('user_id', userId)
+      .gte('created_at', `${today}T00:00:00Z`)
+      .lt('created_at', `${today}T23:59:59Z`);
+
+    const dailyDepositUsed = depositsToday?.reduce((sum, d) => sum + parseFloat(d.freti_amount), 0) || 0;
+
+    // Calculate withdrawals made today
+    const { data: withdrawalsToday } = await this.supabase
+      .from('payout_requests')
+      .select('freti_amount')
+      .eq('user_id', userId)
+      .gte('requested_at', `${today}T00:00:00Z`)
+      .lt('requested_at', `${today}T23:59:59Z`);
+
+    const dailyWithdrawalUsed = withdrawalsToday?.reduce((sum, w) => sum + parseFloat(w.freti_amount), 0) || 0;
+
+    const remainingDepositLimit = Math.max(0, wallet.dailyDepositLimit - dailyDepositUsed);
+    const remainingWithdrawalLimit = Math.max(0, wallet.dailyWithdrawalLimit - dailyWithdrawalUsed);
+
+    console.log('📊 Daily limits calculated:', {
+      userId,
+      depositLimit: wallet.dailyDepositLimit,
+      depositUsed: dailyDepositUsed,
+      depositRemaining: remainingDepositLimit,
+      withdrawalLimit: wallet.dailyWithdrawalLimit,
+      withdrawalUsed: dailyWithdrawalUsed,
+      withdrawalRemaining: remainingWithdrawalLimit,
+    });
+
+    return {
+      dailyDepositLimit: wallet.dailyDepositLimit,
+      dailyWithdrawalLimit: wallet.dailyWithdrawalLimit,
+      remainingDepositLimit,
+      remainingWithdrawalLimit,
+      kycStatus: wallet.kycStatus,
     };
   }
 
@@ -491,7 +601,66 @@ export class WalletService {
     return data || [];
   }
 
-  // Mapping functions
+  // ================================
+  // ESCROW BALANCE QUERY
+  // ================================
+
+  /**
+   * Get pending escrow balances for a user (as vendor or rider)
+   * These amounts are "locked" until escrow is released
+   */
+  async getPendingEscrowBalances(userId: string): Promise<{
+    vendorAmount: number;
+    riderAmount: number;
+    totalPending: number;
+  }> {
+    try {
+      // Use JOIN to get vendor earnings from escrows
+      const { data: vendorEscrows, error: vendorError } = await this.supabase
+        .from('escrows')
+        .select('vendor_amount, orders!inner(vendor_id)')
+        .eq('status', 'held')
+        .eq('orders.vendor_id', userId);
+
+      if (vendorError) {
+        console.error('Error fetching vendor escrows:', vendorError);
+      }
+
+      // Use JOIN to get rider earnings from escrows
+      const { data: riderEscrows, error: riderError } = await this.supabase
+        .from('escrows')
+        .select('rider_amount, orders!inner(rider_id)')
+        .eq('status', 'held')
+        .eq('orders.rider_id', userId);
+
+      if (riderError) {
+        console.error('Error fetching rider escrows:', riderError);
+      }
+
+      const vendorAmount = vendorEscrows?.reduce((sum, e) => sum + parseFloat(e.vendor_amount || '0'), 0) || 0;
+      const riderAmount = riderEscrows?.reduce((sum, e) => sum + parseFloat(e.rider_amount || '0'), 0) || 0;
+
+      console.log(`💰 Pending escrows for user ${userId}: Vendor ₣${vendorAmount}, Rider ₣${riderAmount}`);
+
+      return {
+        vendorAmount,
+        riderAmount,
+        totalPending: vendorAmount + riderAmount,
+      };
+    } catch (error) {
+      console.error('Failed to query pending escrows (non-critical):', error);
+      return {
+        vendorAmount: 0,
+        riderAmount: 0,
+        totalPending: 0,
+      };
+    }
+  }
+
+  // ================================
+  // MAPPING FUNCTIONS
+  // ================================
+
   private mapWalletToDto(data: any): WalletResponseDto {
     return {
       id: data.id,
@@ -505,6 +674,10 @@ export class WalletService {
       dailyWithdrawalLimit: parseFloat(data.daily_withdrawal_limit),
       createdAt: data.created_at,
       updatedAt: data.updated_at,
+      // Sales tracking
+      totalVendorSales: data.total_vendor_sales ? parseFloat(data.total_vendor_sales) : 0,
+      totalRiderEarnings: data.total_rider_earnings ? parseFloat(data.total_rider_earnings) : 0,
+      lifetimeRevenue: data.lifetime_revenue ? parseFloat(data.lifetime_revenue) : 0,
     };
   }
 
@@ -543,5 +716,290 @@ export class WalletService {
       createdAt: data.created_at,
       updatedAt: data.updated_at,
     };
+  }
+
+  // ================================
+  // SALES TRACKING & ANALYTICS
+  // ================================
+
+  /**
+   * Get sales history for a user
+   * Returns individual sales/earnings transactions
+   */
+  async getSalesHistory(
+    userId: string,
+    type?: 'vendor_sale' | 'rider_delivery',
+    limit: number = 50,
+    offset: number = 0,
+    startDate?: string,
+    endDate?: string,
+  ) {
+    try {
+      let query = this.supabase
+        .from('sales_ledger')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      // Filter by transaction type if specified
+      if (type) {
+        query = query.eq('transaction_type', type);
+      }
+
+      // Filter by date range if specified
+      if (startDate) {
+        query = query.gte('created_at', startDate);
+      }
+      if (endDate) {
+        query = query.lte('created_at', endDate);
+      }
+
+      // Pagination
+      query = query.range(offset, offset + limit - 1);
+
+      const { data, error, count } = await query;
+
+      if (error) {
+        console.error('Error fetching sales history:', error);
+        throw error;
+      }
+
+      // Get order details for each sale
+      const salesWithDetails = await Promise.all(
+        (data || []).map(async (sale) => {
+          let orderDetails: any = null;
+          if (sale.order_id) {
+            const { data: order } = await this.supabase
+              .from('orders')
+              .select('order_number, buyer_id, created_at')
+              .eq('id', sale.order_id)
+              .single();
+            orderDetails = order;
+          }
+
+          return {
+            id: sale.id,
+            transactionType: sale.transaction_type,
+            amount: parseFloat(sale.amount),
+            orderId: sale.order_id,
+            orderNumber: orderDetails?.order_number || null,
+            vendorSalesAfter: sale.vendor_sales_after ? parseFloat(sale.vendor_sales_after) : 0,
+            riderEarningsAfter: sale.rider_earnings_after ? parseFloat(sale.rider_earnings_after) : 0,
+            lifetimeRevenueAfter: sale.lifetime_revenue_after ? parseFloat(sale.lifetime_revenue_after) : 0,
+            description: sale.description,
+            createdAt: sale.created_at,
+          };
+        })
+      );
+
+      return {
+        sales: salesWithDetails,
+        total: count || salesWithDetails.length,
+        limit,
+        offset,
+      };
+    } catch (error) {
+      console.error('Error in getSalesHistory:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get sales analytics (aggregated data for charts/dashboards)
+   */
+  /**
+   * Get wallet transaction history (ledger entries)
+   */
+  async getTransactionHistory(
+    userId: string,
+    type?: string,
+    limit: number = 50,
+    offset: number = 0,
+    startDate?: string,
+    endDate?: string,
+  ) {
+    try {
+      console.log('🔍 [DEBUG] getTransactionHistory called:', { userId, type, limit, offset });
+      
+      // Query by user_id instead of wallet_id to catch all transactions
+      // (some old transactions may have wallet_id = null due to a previous bug)
+      let query = this.supabase
+        .from('wallet_ledger')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      // Filter by transaction type if specified
+      if (type) {
+        console.log(`🔍 [DEBUG] Filtering by transaction type: ${type}`);
+        query = query.eq('transaction_type', type);
+      }
+
+      // Filter by date range if specified
+      if (startDate) {
+        query = query.gte('created_at', startDate);
+      }
+      if (endDate) {
+        query = query.lte('created_at', endDate);
+      }
+
+      // Pagination
+      query = query.range(offset, offset + limit - 1);
+
+      const { data, error } = await query;
+
+      if (error) {
+        console.error('❌ [DEBUG] Error fetching transaction history:', error);
+        throw error;
+      }
+
+      console.log(`✅ [DEBUG] Found ${data?.length || 0} transactions for user ${userId}${type ? ` (type: ${type})` : ''}`);
+      if (data && data.length > 0) {
+        console.log('📋 [DEBUG] Sample transaction:', {
+          id: data[0].id,
+          transaction_type: data[0].transaction_type,
+          wallet_id: data[0].wallet_id,
+          user_id: data[0].user_id,
+          created_at: data[0].created_at
+        });
+      }
+
+      // Map to frontend format
+      return (data || []).map((entry) => ({
+        id: entry.id,
+        walletId: entry.wallet_id,
+        userId: entry.user_id,
+        transactionType: entry.transaction_type,
+        availableDelta: parseFloat(entry.available_delta),
+        escrowDelta: parseFloat(entry.escrow_delta),
+        pendingWithdrawalDelta: parseFloat(entry.pending_withdrawal_delta),
+        availableBalanceAfter: parseFloat(entry.available_balance_after),
+        escrowBalanceAfter: parseFloat(entry.escrow_balance_after),
+        pendingWithdrawalAfter: parseFloat(entry.pending_withdrawal_after),
+        referenceType: entry.reference_type,
+        referenceId: entry.reference_id,
+        description: entry.description,
+        metadata: entry.metadata,
+        createdAt: entry.created_at,
+      }));
+    } catch (error) {
+      console.error('Error in getTransactionHistory:', error);
+      throw error;
+    }
+  }
+
+  async getSalesAnalytics(
+    userId: string,
+    period: 'daily' | 'weekly' | 'monthly' | 'yearly' = 'daily',
+    startDate?: string,
+    endDate?: string,
+  ) {
+    try {
+      // Set default date range if not provided
+      const end = endDate ? new Date(endDate) : new Date();
+      let start: Date;
+      
+      switch (period) {
+        case 'daily':
+          start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // Last 30 days
+          break;
+        case 'weekly':
+          start = startDate ? new Date(startDate) : new Date(Date.now() - 12 * 7 * 24 * 60 * 60 * 1000); // Last 12 weeks
+          break;
+        case 'monthly':
+          start = startDate ? new Date(startDate) : new Date(Date.now() - 12 * 30 * 24 * 60 * 60 * 1000); // Last 12 months
+          break;
+        case 'yearly':
+          start = startDate ? new Date(startDate) : new Date(Date.now() - 5 * 365 * 24 * 60 * 60 * 1000); // Last 5 years
+          break;
+      }
+
+      // Fetch all sales in the date range
+      const { data: sales, error } = await this.supabase
+        .from('sales_ledger')
+        .select('*')
+        .eq('user_id', userId)
+        .gte('created_at', start.toISOString())
+        .lte('created_at', end.toISOString())
+        .order('created_at', { ascending: true });
+
+      if (error) {
+        console.error('Error fetching sales for analytics:', error);
+        throw error;
+      }
+
+      // Aggregate data by period
+      const grouped = new Map<string, { vendorSales: number; riderEarnings: number; total: number; count: number }>();
+
+      (sales || []).forEach((sale) => {
+        const date = new Date(sale.created_at);
+        let key: string;
+
+        switch (period) {
+          case 'daily':
+            key = date.toISOString().split('T')[0]; // YYYY-MM-DD
+            break;
+          case 'weekly':
+            const weekStart = new Date(date);
+            weekStart.setDate(date.getDate() - date.getDay());
+            key = weekStart.toISOString().split('T')[0];
+            break;
+          case 'monthly':
+            key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`; // YYYY-MM
+            break;
+          case 'yearly':
+            key = String(date.getFullYear()); // YYYY
+            break;
+        }
+
+        if (!grouped.has(key)) {
+          grouped.set(key, { vendorSales: 0, riderEarnings: 0, total: 0, count: 0 });
+        }
+
+        const group = grouped.get(key)!;
+        const amount = parseFloat(sale.amount);
+        
+        if (sale.transaction_type === 'vendor_sale') {
+          group.vendorSales += amount;
+        } else if (sale.transaction_type === 'rider_delivery') {
+          group.riderEarnings += amount;
+        }
+        
+        group.total += amount;
+        group.count += 1;
+      });
+
+      // Convert to array and sort
+      const chartData = Array.from(grouped.entries()).map(([period, data]) => ({
+        period,
+        vendorSales: data.vendorSales,
+        riderEarnings: data.riderEarnings,
+        totalRevenue: data.total,
+        transactionCount: data.count,
+      }));
+
+      // Calculate summary statistics
+      const totalVendorSales = chartData.reduce((sum, d) => sum + d.vendorSales, 0);
+      const totalRiderEarnings = chartData.reduce((sum, d) => sum + d.riderEarnings, 0);
+      const totalRevenue = totalVendorSales + totalRiderEarnings;
+      const totalTransactions = chartData.reduce((sum, d) => sum + d.transactionCount, 0);
+
+      return {
+        summary: {
+          totalVendorSales,
+          totalRiderEarnings,
+          totalRevenue,
+          totalTransactions,
+          averagePerTransaction: totalTransactions > 0 ? totalRevenue / totalTransactions : 0,
+          period,
+          startDate: start.toISOString(),
+          endDate: end.toISOString(),
+        },
+        chartData,
+      };
+    } catch (error) {
+      console.error('Error in getSalesAnalytics:', error);
+      throw error;
+    }
   }
 }

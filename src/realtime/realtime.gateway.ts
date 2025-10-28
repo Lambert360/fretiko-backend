@@ -830,6 +830,134 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
   }
 
+  // ================================
+  // WALLET BALANCE UPDATES
+  // ================================
+
+  async notifyWalletBalanceUpdate(userId: string, walletData: {
+    availableBalance: number;
+    escrowBalance: number;
+    pendingWithdrawal: number;
+    totalBalance: number;
+    transactionType?: string;
+  }) {
+    try {
+      if (!this.server) {
+        this.logger.error(`💥 WALLET UPDATE ERROR: Server not available for user ${userId}`);
+        return;
+      }
+
+      const roomName = `user_${userId}`;
+      
+      this.server.to(roomName).emit('wallet_balance_update', {
+        userId,
+        ...walletData,
+        timestamp: new Date().toISOString(),
+      });
+      
+      this.logger.log(`💰 WALLET UPDATE: Sent balance update to user ${userId} - Available: ₣${walletData.availableBalance}`);
+    } catch (error) {
+      this.logger.error(`💥 WALLET UPDATE ERROR for user ${userId}:`, error.stack || error.message);
+    }
+  }
+
+  // ============================================
+  // ORDER & ESCROW REAL-TIME NOTIFICATIONS
+  // ============================================
+
+  /**
+   * Notify participants of order status change
+   */
+  async notifyOrderStatusUpdate(orderId: string, status: string, participants: {
+    buyerId: string;
+    vendorId: string;
+    riderId?: string;
+  }) {
+    try {
+      if (!this.server) {
+        this.logger.error(`💥 ORDER UPDATE ERROR: Server not available for order ${orderId}`);
+        return;
+      }
+
+      const payload = {
+        orderId,
+        status,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Notify buyer
+      this.server.to(`user_${participants.buyerId}`).emit('order_status_update', payload);
+      
+      // Notify vendor
+      this.server.to(`user_${participants.vendorId}`).emit('order_status_update', payload);
+      
+      // Notify rider if assigned
+      if (participants.riderId) {
+        this.server.to(`user_${participants.riderId}`).emit('order_status_update', payload);
+      }
+
+      this.logger.log(`📦 ORDER UPDATE: Broadcasted status '${status}' for order ${orderId}`);
+    } catch (error) {
+      this.logger.error(`💥 ORDER UPDATE ERROR for order ${orderId}:`, error.stack || error.message);
+    }
+  }
+
+  /**
+   * Notify user that escrow has been released and wallet credited
+   */
+  async notifyEscrowReleased(userId: string, amount: number, orderNumber: string) {
+    try {
+      if (!this.server) {
+        this.logger.error(`💥 ESCROW RELEASE ERROR: Server not available for user ${userId}`);
+        return;
+      }
+
+      const roomName = `user_${userId}`;
+      
+      this.server.to(roomName).emit('escrow_released', {
+        userId,
+        amount,
+        orderNumber,
+        timestamp: new Date().toISOString(),
+      });
+      
+      this.logger.log(`💸 ESCROW RELEASED: Notified user ${userId} of ₣${amount} release for order ${orderNumber}`);
+    } catch (error) {
+      this.logger.error(`💥 ESCROW RELEASE ERROR for user ${userId}:`, error.stack || error.message);
+    }
+  }
+
+  /**
+   * Broadcast rider location update for live tracking
+   */
+  async notifyRiderLocationUpdate(orderId: string, location: {
+    riderId: string;
+    latitude: number;
+    longitude: number;
+    accuracy: number;
+    heading?: number;
+    speed?: number;
+  }) {
+    try {
+      if (!this.server) {
+        this.logger.error(`💥 RIDER LOCATION ERROR: Server not available for order ${orderId}`);
+        return;
+      }
+
+      const roomName = `order_${orderId}`;
+      
+      this.server.to(roomName).emit('rider_location_update', {
+        orderId,
+        ...location,
+        timestamp: new Date().toISOString(),
+      });
+      
+      this.logger.debug(`🏍️ RIDER LOCATION: Broadcasted location for rider ${location.riderId} on order ${orderId}`);
+    } catch (error) {
+      this.logger.error(`💥 RIDER LOCATION ERROR for order ${orderId}:`, error.stack || error.message);
+    }
+  }
+
   async notifyReactionUpdate(conversationId: string, messageId: string, reactions: any) {
     try {
       this.logger.log(`🎭 BROADCASTING REACTION UPDATE to conversation ${conversationId} for message ${messageId}`);

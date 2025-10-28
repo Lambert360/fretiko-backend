@@ -115,18 +115,17 @@ export class CartService {
     const itemsCount = data?.length || 0;
     const subtotal = data?.reduce((sum, item) => sum + (item.price_at_add * item.quantity), 0) || 0;
     
-    // Calculate shipping, tax, and discounts
-    const shipping = subtotal > 50000 ? 0 : 2500; // Free shipping over ₦50,000
-    const tax = subtotal * 0.075; // 7.5% VAT
+    // Cart summary only shows items and subtotal
+    // Shipping, tax, and final calculations happen at checkout
     const discount = 0; // Add discount logic as needed
-    const total = subtotal + shipping + tax - discount;
+    const total = subtotal - discount; // Cart total = subtotal - discount (no shipping/tax yet)
 
     return {
       itemsCount,
       subtotal,
       discount,
-      shipping,
-      tax,
+      shipping: 0, // Not calculated in cart - calculated at checkout
+      tax: 0,      // Not calculated in cart - calculated at checkout
       total,
     };
   }
@@ -257,6 +256,19 @@ export class CartService {
   async removeItem(userId: string, itemId: string, userToken?: string) {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
+    // Log cart state before deletion
+    const { data: beforeItems } = await client
+      .from('cart_items')
+      .select('id, product_id, service_id')
+      .eq('user_id', userId);
+    
+    console.log(`🗑️ Backend removeItem - Cart before deletion:`, {
+      userId,
+      itemToRemove: itemId,
+      totalItems: beforeItems?.length || 0,
+      items: beforeItems?.map(i => ({ id: i.id, product_id: i.product_id, service_id: i.service_id }))
+    });
+
     const { error } = await client
       .from('cart_items')
       .delete()
@@ -264,8 +276,22 @@ export class CartService {
       .eq('user_id', userId);
 
     if (error) {
+      console.error(`❌ Backend removeItem - Error:`, error);
       throw new Error(`Failed to remove cart item: ${error.message}`);
     }
+
+    // Log cart state after deletion
+    const { data: afterItems } = await client
+      .from('cart_items')
+      .select('id, product_id, service_id')
+      .eq('user_id', userId);
+    
+    console.log(`✅ Backend removeItem - Cart after deletion:`, {
+      userId,
+      removedItem: itemId,
+      remainingItems: afterItems?.length || 0,
+      items: afterItems?.map(i => ({ id: i.id, product_id: i.product_id, service_id: i.service_id }))
+    });
 
     return { message: 'Cart item removed' };
   }

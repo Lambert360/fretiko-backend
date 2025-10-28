@@ -12,6 +12,8 @@ import { Type, Transform } from 'class-transformer';
 export enum NotificationType {
   ORDER = 'order',
   SOCIAL = 'social',
+  CONNECTION_REQUEST = 'connection_request',
+  CONNECTION_ACCEPTED = 'connection_accepted',
   PROMOTION = 'promotion',
   SYSTEM = 'system',
   DELIVERY = 'delivery',

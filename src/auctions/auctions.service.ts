@@ -450,6 +450,142 @@ export class AuctionsService {
   /**
    * Complete auction sale and process payment
    */
+  /**
+   * Get user's bid history across all auctions
+   */
+  async getUserBidHistory(userId: string): Promise<any[]> {
+    const { data, error } = await this.supabase
+      .from('auction_bids')
+      .select(`
+        *,
+        auctions:auction_id (
+          id,
+          title,
+          thumbnail_url,
+          current_bid,
+          status,
+          time_status,
+          end_time
+        )
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+    return data || [];
+  }
+
+  /**
+   * Update proxy bid maximum amount
+   */
+  async updateProxyBid(userId: string, auctionId: string, maxBidAmount: number): Promise<any> {
+    // Find user's proxy bid for this auction
+    const { data: existingBid, error: findError } = await this.supabase
+      .from('auction_bids')
+      .select('*')
+      .eq('auction_id', auctionId)
+      .eq('user_id', userId)
+      .eq('bid_type', 'proxy')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (findError && findError.code !== 'PGRST116') throw findError;
+
+    if (existingBid) {
+      // Update existing proxy bid
+      const { data, error } = await this.supabase
+        .from('auction_bids')
+        .update({ max_bid_amount: maxBidAmount, updated_at: new Date().toISOString() })
+        .eq('id', existingBid.id)
+        .select()
+        .single();
+
+      if (error) throw error;
+      return { message: 'Proxy bid updated successfully', bid: data };
+    } else {
+      throw new Error('No proxy bid found for this auction. Place a proxy bid first.');
+    }
+  }
+
+  /**
+   * Update auction details (before it starts or while scheduled)
+   */
+  async updateAuction(auctionId: string, sellerId: string, updateData: any): Promise<any> {
+    // Get current auction
+    const auction = await this.findById(auctionId);
+
+    if (auction.seller_id !== sellerId) {
+      throw new Error('Unauthorized: You can only update your own auctions');
+    }
+
+    if (auction.status === 'active' || auction.status === 'sold') {
+      throw new Error('Cannot update active or sold auctions');
+    }
+
+    // Only allow certain fields to be updated
+    const allowedFields = ['title', 'description', 'reserve_price', 'start_time', 'end_time', 'images', 'thumbnail_url'];
+    const filteredData: any = {};
+    
+    for (const field of allowedFields) {
+      if (updateData[field] !== undefined) {
+        filteredData[field] = updateData[field];
+      }
+    }
+
+    filteredData.updated_at = new Date().toISOString();
+
+    const { data, error } = await this.supabase
+      .from('auctions')
+      .update(filteredData)
+      .eq('id', auctionId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    return { message: 'Auction updated successfully', auction: data };
+  }
+
+  /**
+   * Cancel auction (only if not started or no bids placed)
+   */
+  async cancelAuction(auctionId: string, sellerId: string): Promise<any> {
+    const auction = await this.findById(auctionId);
+
+    if (auction.seller_id !== sellerId) {
+      throw new Error('Unauthorized: You can only cancel your own auctions');
+    }
+
+    if (auction.status === 'active') {
+      throw new Error('Cannot cancel active auctions. Contact support if needed.');
+    }
+
+    if (auction.status === 'sold') {
+      throw new Error('Cannot cancel sold auctions');
+    }
+
+    // Check for bids
+    const { count } = await this.supabase
+      .from('auction_bids')
+      .select('id', { count: 'exact', head: true })
+      .eq('auction_id', auctionId);
+
+    if (count && count > 0) {
+      throw new Error('Cannot cancel auction with existing bids. Contact support.');
+    }
+
+    // Mark as cancelled
+    const { error } = await this.supabase
+      .from('auctions')
+      .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+      .eq('id', auctionId);
+
+    if (error) throw error;
+
+    return { message: 'Auction cancelled successfully' };
+  }
+
   async completeAuctionSale(auctionId: string, sellerId: string): Promise<{ success: boolean; transactionId?: string }> {
     // Get auction details
     const auction = await this.findById(auctionId);

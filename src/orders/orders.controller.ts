@@ -102,6 +102,22 @@ export class OrdersController {
     return this.ordersService.confirmOrderReceipt(userId, orderId);
   }
 
+  @Post(':id/release-funds')
+  async confirmAndReleaseFunds(@Req() req, @Param('id') orderId: string) {
+    const userId = req.user.sub;
+    return this.ordersService.confirmAndReleaseFunds(userId, orderId);
+  }
+
+  @Post(':id/report-issue')
+  async reportIssue(
+    @Req() req, 
+    @Param('id') orderId: string,
+    @Body() body: { reason: string; description?: string }
+  ) {
+    const userId = req.user.sub;
+    return this.ordersService.reportIssue(userId, orderId, body.reason, body.description);
+  }
+
   @Post(':id/auto-release-escrow')
   async autoReleaseEscrow(@Req() req, @Param('id') orderId: string) {
     const userId = req.user.sub;
@@ -127,5 +143,33 @@ export class OrdersController {
   async getRealTimeUpdates(@Req() req, @Param('id') orderId: string) {
     const userId = req.user.sub;
     return this.ordersService.getRealTimeUpdates(userId, orderId);
+  }
+
+  // ========== MULTI-VENDOR ORDER GROUP ENDPOINTS ==========
+
+  // Get order group details
+  @Get('group/:groupId')
+  async getOrderGroup(@Req() req, @Param('groupId') groupId: string) {
+    try {
+      const userId = req.user.sub;
+      const group = await this.ordersService.getOrderGroup(groupId, userId, req.supabaseToken);
+      return group;
+    } catch (error) {
+      console.error('Error fetching order group:', error);
+      throw error;
+    }
+  }
+
+  // Confirm multiple orders (bulk)
+  @Post('confirm-multiple')
+  async confirmMultipleOrders(@Req() req, @Body() body: { orderIds: string[] }) {
+    try {
+      const userId = req.user.sub;
+      const result = await this.ordersService.confirmMultipleOrders(body.orderIds, userId, req.supabaseToken);
+      return result;
+    } catch (error) {
+      console.error('Error confirming multiple orders:', error);
+      throw error;
+    }
   }
 }

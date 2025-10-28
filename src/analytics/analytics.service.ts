@@ -136,12 +136,14 @@ export class AnalyticsService {
         },
       ];
 
-      // Calculate trends (mock data)
-      const trends = {
-        ordersChange: 12.5,
-        revenueChange: 8.3,
-        customersChange: 5.7,
-      };
+      // Calculate real trends by comparing with previous period
+      const trends = await this.calculateTrends(
+        userId,
+        period,
+        date,
+        { ordersProcessed, revenue, activeCustomers },
+        supabaseClient
+      );
 
       return {
         period,
@@ -153,7 +155,7 @@ export class AnalyticsService {
         activeCustomers,
         averageOrderValue,
         completionRate: ordersProcessed > 0 ? (transactionCount / ordersProcessed) * 100 : 0,
-        customerSatisfaction: 4.7, // Mock data
+        customerSatisfaction: await this.calculateCustomerSatisfaction(userId, supabaseClient),
         chartData,
         reports,
         trends,
@@ -730,43 +732,35 @@ export class AnalyticsService {
    * Generate chart data for live streaming analytics
    */
   private generateLiveStreamingChartData(streams: any[], analytics: any[], period: string): any {
-    // Group data by time period
-    const chartData = {
-      labels: [] as string[],
-      viewers: [] as number[],
-      revenue: [] as number[],
-      engagement: [] as number[],
+    // Prepare data arrays from real streams
+    const viewerData: Array<{ date: string; value: number }> = [];
+    const revenueData: Array<{ date: string; value: number }> = [];
+    const engagementData: Array<{ date: string; value: number }> = [];
+
+    // Extract real data from streams
+    (streams || []).forEach(stream => {
+      const date = stream.created_at || stream.started_at;
+      if (date) {
+        viewerData.push({ date, value: stream.viewer_count || stream.max_viewers || 0 });
+        revenueData.push({ date, value: stream.total_sales || 0 });
+        
+        // Calculate engagement from comments and reactions
+        const engagement = (stream.comment_count || 0) + (stream.reaction_count || 0);
+        engagementData.push({ date, value: engagement });
+      }
+    });
+
+    // Group by period using the same helper function
+    const groupedViewers = this.groupByPeriod(viewerData, period as any);
+    const groupedRevenue = this.groupByPeriod(revenueData, period as any);
+    const groupedEngagement = this.groupByPeriod(engagementData, period as any);
+
+    return {
+      labels: groupedViewers.map(g => g.label),
+      viewers: groupedViewers.map(g => g.value),
+      revenue: groupedRevenue.map(g => g.value),
+      engagement: groupedEngagement.map(g => g.value),
     };
-
-    // Generate time-based chart data based on period
-    if (period === 'daily') {
-      // Hourly breakdown for daily view
-      for (let hour = 0; hour < 24; hour++) {
-        chartData.labels.push(`${hour}:00`);
-        chartData.viewers.push(Math.floor(Math.random() * 50)); // Mock data
-        chartData.revenue.push(Math.floor(Math.random() * 1000));
-        chartData.engagement.push(Math.floor(Math.random() * 20));
-      }
-    } else if (period === 'weekly') {
-      // Daily breakdown for weekly view
-      const daysOfWeek = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-      daysOfWeek.forEach(day => {
-        chartData.labels.push(day);
-        chartData.viewers.push(Math.floor(Math.random() * 200));
-        chartData.revenue.push(Math.floor(Math.random() * 5000));
-        chartData.engagement.push(Math.floor(Math.random() * 100));
-      });
-    } else {
-      // Weekly breakdown for monthly view
-      for (let week = 1; week <= 4; week++) {
-        chartData.labels.push(`Week ${week}`);
-        chartData.viewers.push(Math.floor(Math.random() * 800));
-        chartData.revenue.push(Math.floor(Math.random() * 20000));
-        chartData.engagement.push(Math.floor(Math.random() * 400));
-      }
-    }
-
-    return chartData;
   }
 
   async getRealTimeAnalytics(userId: string, userToken?: string) {
@@ -973,31 +967,260 @@ export class AnalyticsService {
   }
 
   private generateChartData(allData: any, period: string) {
-    // Simplified chart data generation using combined data
-    const days = period === 'weekly' ? 7 : period === 'monthly' ? 30 : 1;
-    const labels = Array.from({ length: days }, (_, i) => `Day ${i + 1}`);
-    const values = Array.from({ length: days }, () => Math.floor(Math.random() * 1000) + 500);
+    const { orders, liveTransactions, auctionSales, serviceBookings } = allData;
+    
+    // Combine all data sources into unified format
+    const allTransactions: Array<{ date: string; value: number }> = [
+      ...(orders || []).map(o => ({ date: o.created_at, value: o.total || 0 })),
+      ...(liveTransactions || []).map(t => ({ date: t.created_at, value: t.total_amount || 0 })),
+      ...(auctionSales || []).map(a => ({ date: a.created_at, value: a.total_amount || 0 })),
+      ...(serviceBookings || []).map(b => ({ date: b.created_at, value: b.total_price || 0 })),
+    ];
+    
+    // Group by time period
+    const grouped = this.groupByPeriod(allTransactions, period as any);
+    
+    return {
+      labels: grouped.map(g => g.label),
+      values: grouped.map(g => g.value),
+    };
+  }
 
-    return { labels, values };
+  private groupByPeriod(
+    transactions: Array<{ date: string; value: number }>,
+    period: 'daily' | 'weekly' | 'monthly'
+  ): Array<{ label: string; value: number }> {
+    if (!transactions || transactions.length === 0) {
+      return this.getEmptyPeriodData(period);
+    }
+
+    const grouped = new Map<string, number>();
+
+    transactions.forEach(tx => {
+      const date = new Date(tx.date);
+      let key: string;
+
+      if (period === 'daily') {
+        // Group by hour (0-23)
+        const hour = date.getHours();
+        key = `${hour}`;
+      } else if (period === 'weekly') {
+        // Group by day of week
+        const dayIndex = date.getDay();
+        key = `${dayIndex}`;
+      } else {
+        // Group by week of month
+        const weekOfMonth = Math.ceil(date.getDate() / 7);
+        key = `${weekOfMonth}`;
+      }
+
+      grouped.set(key, (grouped.get(key) || 0) + tx.value);
+    });
+
+    // Convert to array and sort
+    const result: Array<{ label: string; value: number; sortKey: number }> = [];
+    
+    if (period === 'daily') {
+      // Ensure all 24 hours are present
+      for (let hour = 0; hour < 24; hour++) {
+        result.push({
+          label: `${hour}:00`,
+          value: grouped.get(`${hour}`) || 0,
+          sortKey: hour
+        });
+      }
+    } else if (period === 'weekly') {
+      // Ensure all 7 days are present
+      const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      for (let dayIndex = 0; dayIndex < 7; dayIndex++) {
+        result.push({
+          label: days[dayIndex],
+          value: grouped.get(`${dayIndex}`) || 0,
+          sortKey: dayIndex
+        });
+      }
+    } else {
+      // Ensure all 4 weeks are present
+      for (let week = 1; week <= 4; week++) {
+        result.push({
+          label: `Week ${week}`,
+          value: grouped.get(`${week}`) || 0,
+          sortKey: week
+        });
+      }
+    }
+
+    return result.sort((a, b) => a.sortKey - b.sortKey).map(({ label, value }) => ({ label, value }));
+  }
+
+  private getEmptyPeriodData(period: 'daily' | 'weekly' | 'monthly'): Array<{ label: string; value: number }> {
+    if (period === 'daily') {
+      return Array.from({ length: 24 }, (_, i) => ({ label: `${i}:00`, value: 0 }));
+    } else if (period === 'weekly') {
+      const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      return days.map(day => ({ label: day, value: 0 }));
+    } else {
+      return Array.from({ length: 4 }, (_, i) => ({ label: `Week ${i + 1}`, value: 0 }));
+    }
+  }
+
+  private calculatePercentageChange(oldValue: number, newValue: number): number {
+    if (oldValue === 0) {
+      return newValue > 0 ? 100 : 0;
+    }
+    return ((newValue - oldValue) / oldValue) * 100;
+  }
+
+  private async calculateTrends(
+    userId: string,
+    period: string,
+    date: string | undefined,
+    currentMetrics: { ordersProcessed: number; revenue: number; activeCustomers: number },
+    supabaseClient: any
+  ) {
+    try {
+      // Get previous period date range
+      const previousDateRange = this.getPreviousDateRange(period, date);
+
+      // Fetch previous period data in parallel
+      const [prevOrders, prevLiveTransactions, prevAuctionSales, prevServiceBookings, prevGifts] = 
+        await Promise.all([
+          supabaseClient.from('orders').select('*')
+            .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+            .gte('created_at', previousDateRange.start)
+            .lte('created_at', previousDateRange.end),
+          supabaseClient.from('live_stream_transactions').select('*')
+            .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+            .gte('created_at', previousDateRange.start)
+            .lte('created_at', previousDateRange.end),
+          supabaseClient.from('auction_sales').select('*')
+            .eq('seller_id', userId)
+            .gte('created_at', previousDateRange.start)
+            .lte('created_at', previousDateRange.end),
+          supabaseClient.from('service_bookings').select(`*, service:services!inner(vendor_id)`)
+            .eq('service.vendor_id', userId)
+            .gte('created_at', previousDateRange.start)
+            .lte('created_at', previousDateRange.end),
+          supabaseClient.from('live_stream_gifts').select(`*, stream:live_streams!inner(vendor_id)`)
+            .eq('stream.vendor_id', userId)
+            .gte('created_at', previousDateRange.start)
+            .lte('created_at', previousDateRange.end),
+        ]);
+
+      // Calculate previous period metrics
+      const prevOrdersCount = (prevOrders.data || []).length + 
+                              (prevLiveTransactions.data || []).length + 
+                              (prevAuctionSales.data || []).length + 
+                              (prevServiceBookings.data || []).length;
+
+      const prevRevenue = (prevOrders.data || []).reduce((sum, o) => sum + (o.total || 0), 0) +
+                          (prevLiveTransactions.data || []).reduce((sum, t) => sum + (t.total_amount || 0), 0) +
+                          (prevAuctionSales.data || []).reduce((sum, a) => sum + (a.total_amount || 0), 0) +
+                          (prevServiceBookings.data || []).reduce((sum, b) => sum + (b.total_price || 0), 0) +
+                          (prevGifts.data || []).reduce((sum, g) => sum + (g.total_amount || 0), 0);
+
+      const prevCustomers = new Set([
+        ...(prevOrders.data || []).map(o => o.customer_id),
+        ...(prevLiveTransactions.data || []).map(t => t.buyer_id),
+        ...(prevAuctionSales.data || []).map(a => a.buyer_id),
+        ...(prevServiceBookings.data || []).map(b => b.customer_id),
+        ...(prevGifts.data || []).map(g => g.sender_id),
+      ].filter(Boolean)).size;
+
+      // Calculate percentage changes
+      return {
+        ordersChange: this.calculatePercentageChange(prevOrdersCount, currentMetrics.ordersProcessed),
+        revenueChange: this.calculatePercentageChange(prevRevenue, currentMetrics.revenue),
+        customersChange: this.calculatePercentageChange(prevCustomers, currentMetrics.activeCustomers),
+      };
+    } catch (error) {
+      console.error('Error calculating trends:', error);
+      // Return zero changes if calculation fails
+      return {
+        ordersChange: 0,
+        revenueChange: 0,
+        customersChange: 0,
+      };
+    }
+  }
+
+  private async calculateCustomerSatisfaction(userId: string, supabaseClient: any): Promise<number> {
+    try {
+      // Get post-purchase ratings from order_item_ratings for vendor's orders
+      const { data: orderRatings } = await supabaseClient
+        .from('order_item_ratings')
+        .select(`
+          rating,
+          orders!inner(vendor_id)
+        `)
+        .eq('orders.vendor_id', userId);
+
+      if (!orderRatings || orderRatings.length === 0) {
+        return 0; // No ratings yet
+      }
+
+      const totalRating = orderRatings.reduce((sum, rating) => sum + (rating.rating || 0), 0);
+      const avgRating = totalRating / orderRatings.length;
+
+      return parseFloat(avgRating.toFixed(1));
+    } catch (error) {
+      console.error('Error calculating customer satisfaction:', error);
+      return 0;
+    }
   }
 
   private async getTopSellingItems(userId: string, supabaseClient: any) {
-    // This is a simplified implementation - in practice, you'd want to aggregate
-    // sales data across all order sources to get actual top selling items
-    return [
-      {
-        id: '1',
-        name: 'Premium Product A',
-        quantitySold: 45,
-        revenue: 67500,
-      },
-      {
-        id: '2',
-        name: 'Popular Service B',
-        quantitySold: 32,
-        revenue: 48000,
-      },
-    ];
+    try {
+      // Get order items from the last 30 days
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      
+      const { data: orderItems } = await supabaseClient
+        .from('order_items')
+        .select(`
+          *,
+          orders!inner(vendor_id, created_at),
+          products(id, name)
+        `)
+        .eq('orders.vendor_id', userId)
+        .gte('orders.created_at', thirtyDaysAgo);
+
+      // Aggregate by product
+      const productSales = new Map<string, { name: string; quantity: number; revenue: number }>();
+
+      (orderItems || []).forEach(item => {
+        const productId = item.product_id;
+        if (!productId) return; // Skip service items
+        
+        const productName = item.products?.name || item.name || 'Unknown Product';
+        const quantity = item.quantity || 0;
+        const revenue = item.price * quantity;
+
+        if (productSales.has(productId)) {
+          const existing = productSales.get(productId)!;
+          existing.quantity += quantity;
+          existing.revenue += revenue;
+        } else {
+          productSales.set(productId, { name: productName, quantity, revenue });
+        }
+      });
+
+      // Sort by revenue and get top 5
+      const topItems = Array.from(productSales.entries())
+        .map(([id, data]) => ({ id, ...data }))
+        .sort((a, b) => b.revenue - a.revenue)
+        .slice(0, 5)
+        .map(item => ({
+          id: item.id,
+          name: item.name,
+          quantitySold: item.quantity,
+          revenue: item.revenue,
+        }));
+
+      return topItems.length > 0 ? topItems : [];
+    } catch (error) {
+      console.error('Error fetching top selling items:', error);
+      return [];
+    }
   }
 
   private groupRevenueByDay(orders: any[]) {
@@ -1009,11 +1232,6 @@ export class AnalyticsService {
     });
 
     return Object.entries(grouped).map(([date, revenue]) => ({ date, revenue }));
-  }
-
-  private calculatePercentageChange(oldValue: number, newValue: number) {
-    if (oldValue === 0) return newValue > 0 ? 100 : 0;
-    return ((newValue - oldValue) / oldValue) * 100;
   }
 
   /**

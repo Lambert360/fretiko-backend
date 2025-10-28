@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Body, Param, UseGuards, Request } from '@nestjs/common';
+import { Controller, Post, Get, Put, Body, Param, UseGuards, Request } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RidersService } from './riders.service';
 
@@ -142,5 +142,90 @@ export class RidersController {
     });
 
     return this.ridersService.assignRiderToOrder(body.riderId, body.orderId, req.user.id);
+  }
+
+  // ===== LOCATION TRACKING ENDPOINTS =====
+
+  @Post('location')
+  async updateRiderLocation(
+    @Body() body: {
+      latitude: number;
+      longitude: number;
+      accuracy?: number;
+      isOnline?: boolean;
+      isAvailable?: boolean;
+      batteryLevel?: number;
+    },
+    @Request() req: any,
+  ): Promise<{ success: boolean; message?: string }> {
+    console.log('📍 Updating rider location:', {
+      userId: req.user.id,
+      lat: body.latitude,
+      lon: body.longitude,
+    });
+
+    return this.ridersService.updateRiderLocation(
+      req.user.id,
+      body.latitude,
+      body.longitude,
+      body.accuracy,
+      body.isOnline ?? true,
+      body.isAvailable ?? true,
+      body.batteryLevel,
+    );
+  }
+
+  @Get(':riderId/location')
+  async getRiderLocation(
+    @Param('riderId') riderId: string,
+    @Request() req: any,
+  ): Promise<{
+    latitude: number;
+    longitude: number;
+    accuracy?: number;
+    isOnline: boolean;
+    isAvailable: boolean;
+    lastPing: string;
+    batteryLevel?: number;
+    currentOrderId?: string;
+  } | null> {
+    console.log('📍 Getting rider location:', {
+      riderId,
+      requestedBy: req.user.id,
+    });
+
+    return this.ridersService.getRiderLocation(riderId);
+  }
+
+  @Put('status')
+  async toggleRiderStatus(
+    @Body() body: { isOnline?: boolean; isAvailable?: boolean },
+    @Request() req: any,
+  ): Promise<{ success: boolean }> {
+    console.log('🔄 Toggling rider status:', {
+      userId: req.user.id,
+      ...body,
+    });
+
+    return this.ridersService.toggleRiderStatus(
+      req.user.id,
+      body.isOnline,
+      body.isAvailable,
+    );
+  }
+
+  @Put(':riderId/active-order')
+  async setRiderActiveOrder(
+    @Param('riderId') riderId: string,
+    @Body() body: { orderId: string | null },
+    @Request() req: any,
+  ): Promise<{ success: boolean }> {
+    console.log('📦 Setting rider active order:', {
+      riderId,
+      orderId: body.orderId,
+      requestedBy: req.user.id,
+    });
+
+    return this.ridersService.setRiderActiveOrder(riderId, body.orderId);
   }
 }

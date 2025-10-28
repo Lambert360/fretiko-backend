@@ -16,14 +16,16 @@ export class AuthService {
   }
 
   async signUp(signUpDto: SignUpDto): Promise<AuthResponse> {
-    const { email, password, firstName, lastName } = signUpDto;
+    const { email, password, firstName, lastName, dateOfBirth, gender } = signUpDto;
 
     console.log('🔍 SignUp attempt:', {
       email,
       hasPassword: !!password,
       passwordLength: password?.length,
       firstName,
-      lastName
+      lastName,
+      dateOfBirth,
+      gender,
     });
 
     // Create user in Supabase Auth
@@ -34,6 +36,8 @@ export class AuthService {
         data: {
           first_name: firstName,
           last_name: lastName,
+          date_of_birth: dateOfBirth,
+          gender,
         },
       },
     });

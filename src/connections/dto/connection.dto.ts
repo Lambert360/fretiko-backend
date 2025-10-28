@@ -18,18 +18,24 @@ export class ConnectionResponseDto {
   status: ConnectionStatus;
   createdAt: Date;
   updatedAt: Date;
-  
+
   // Include user details for easy frontend consumption
   requester?: {
     id: string;
     username: string;
+    bio?: string;
     avatarUrl?: string;
+    isSeller?: boolean;
+    isRider?: boolean;
   };
 
   addressee?: {
     id: string;
     username: string;
+    bio?: string;
     avatarUrl?: string;
+    isSeller?: boolean;
+    isRider?: boolean;
   };
 }
 

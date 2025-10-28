@@ -211,8 +211,8 @@ export class ServicesService {
     return transformedData;
   }
 
-  async getVideoFeed(options: { limit?: number; offset?: number }) {
-    console.log('🎥 getVideoFeed called with options:', options);
+  async getVideoFeed(userId: string | null, options: { limit?: number; offset?: number }) {
+    console.log('🎥 getVideoFeed called with userId:', userId, 'options:', options);
 
     // Get services that have videos for the TikTok-style video feed
     const query = this.supabase
@@ -249,8 +249,60 @@ export class ServicesService {
       throw new Error(`Failed to fetch video feed: ${error.message}`);
     }
 
+    // Get user's liked services and bookmarks if userId is provided
+    let likedServiceIds: Set<string> = new Set();
+    let bookmarkedServiceIds: Set<string> = new Set();
+
+    if (userId) {
+      // Fetch likes
+      const { data: likes, error: likesError } = await this.supabase
+        .from('service_likes')
+        .select('service_id')
+        .eq('user_id', userId);
+
+      if (!likesError && likes) {
+        likedServiceIds = new Set(likes.map(like => like.service_id));
+        console.log('🎥 User has liked', likedServiceIds.size, 'services');
+      }
+
+      // Fetch bookmarks
+      const { data: bookmarks, error: bookmarksError } = await this.supabase
+        .from('service_bookmarks')
+        .select('service_id')
+        .eq('user_id', userId);
+
+      if (!bookmarksError && bookmarks) {
+        bookmarkedServiceIds = new Set(bookmarks.map(bm => bm.service_id));
+        console.log('🎥 User has bookmarked', bookmarkedServiceIds.size, 'services');
+      }
+    }
+
+    // Get comment counts for all services
+    const serviceIds = data?.map(s => s.id) || [];
+    const commentCountsMap = new Map<string, number>();
+
+    if (serviceIds.length > 0) {
+      const { data: commentCounts, error: commentsError } = await this.supabase
+        .from('service_comments')
+        .select('service_id')
+        .in('service_id', serviceIds);
+
+      if (!commentsError && commentCounts) {
+        // Count comments per service
+        commentCounts.forEach(comment => {
+          const count = commentCountsMap.get(comment.service_id) || 0;
+          commentCountsMap.set(comment.service_id, count + 1);
+        });
+        console.log('🎥 Fetched comment counts for', commentCountsMap.size, 'services');
+      }
+    }
+
     // Transform services data to video feed format
     const videoFeed = data?.map(service => {
+      const isLiked = likedServiceIds.has(service.id);
+      const isBookmarked = bookmarkedServiceIds.has(service.id);
+      const commentCount = commentCountsMap.get(service.id) || 0;
+
       console.log('🎥 Transforming service:', {
         id: service.id,
         name: service.name,
@@ -260,6 +312,9 @@ export class ServicesService {
         average_rating: service.average_rating,
         user_id: service.user_id,
         username: service.user_profiles?.username,
+        isLiked,
+        isBookmarked,
+        commentCount,
       });
 
       return {
@@ -272,7 +327,7 @@ export class ServicesService {
         userAvatar: service.user_profiles?.avatar_url || null,
         description: service.description || '',
         likes: (service.like_count || 0).toString(),
-        comments: '0', // Will need comments table
+        comments: commentCount.toString(),
         shares: (service.share_count || 0).toString(),
         price: parseFloat(service.base_price) || 0,
         originalPrice: null, // No original price concept for services yet
@@ -280,8 +335,8 @@ export class ServicesService {
         serviceProvider: service.user_profiles?.username || 'Unknown Provider',
         rating: parseFloat(service.average_rating) || 4.5, // Default to 4.5 if no rating yet
         completedJobs: (service.booking_count || 0).toString(),
-        isLiked: false, // Will need user-specific like status
-        isBookmarked: false, // Will need bookmarks functionality
+        isLiked: isLiked, // User-specific like status from service_likes table
+        isBookmarked: isBookmarked, // User-specific bookmark status from service_bookmarks table
       };
     }) || [];
 
@@ -415,51 +470,160 @@ export class ServicesService {
   }
 
   async toggleLike(userId: string, serviceId: string, userToken?: string) {
-    const supabaseClient = userToken 
+    const supabaseClient = userToken
       ? createUserSupabaseClient(this.configService, userToken)
       : this.supabase;
 
     // Check if user has already liked this service
-    // For now, we'll just increment/decrement the counter
-    // In a full implementation, you'd have a likes table to track user-service relationships
-    
-    // Get current service
-    const { data: service } = await supabaseClient
-      .from('services')
-      .select('like_count')
-      .eq('id', serviceId)
-      .single();
+    const { data: existingLike, error: checkError } = await supabaseClient
+      .from('service_likes')
+      .select('id')
+      .eq('service_id', serviceId)
+      .eq('user_id', userId)
+      .maybeSingle(); // Use maybeSingle() instead of single() to allow null results
 
-    if (!service) {
-      throw new NotFoundException('Service not found');
+    console.log('🔍 Checking existing like:', { existingLike, userId, serviceId });
+
+    let liked: boolean;
+    let newLikeCount: number;
+
+    if (existingLike) {
+      // User has already liked - remove like
+      console.log('❌ Removing like from service_likes table');
+      const { error: deleteError } = await supabaseClient
+        .from('service_likes')
+        .delete()
+        .eq('id', existingLike.id);
+
+      if (deleteError) {
+        console.error('❌ Failed to delete like:', deleteError);
+        throw new Error(`Failed to remove like: ${deleteError.message}`);
+      }
+
+      console.log('✅ Like removed from service_likes table');
+
+      // Database trigger automatically decrements like_count, so just fetch the updated value
+      const { data: service } = await supabaseClient
+        .from('services')
+        .select('like_count')
+        .eq('id', serviceId)
+        .single();
+
+      newLikeCount = service?.like_count || 0;
+      console.log('✅ Like count after trigger (decremented):', newLikeCount);
+
+      liked = false;
+    } else {
+      // User hasn't liked - add like
+      console.log('➕ Adding like to service_likes table');
+      const { error: insertError } = await supabaseClient
+        .from('service_likes')
+        .insert({ service_id: serviceId, user_id: userId });
+
+      if (insertError) {
+        console.error('❌ Failed to insert like:', insertError);
+        throw new Error(`Failed to add like: ${insertError.message}`);
+      }
+
+      console.log('✅ Like added to service_likes table');
+
+      // Database trigger automatically increments like_count, so just fetch the updated value
+      const { data: service } = await supabaseClient
+        .from('services')
+        .select('like_count')
+        .eq('id', serviceId)
+        .single();
+
+      newLikeCount = service?.like_count || 0;
+      console.log('✅ Like count after trigger (incremented):', newLikeCount);
+
+      liked = true;
     }
 
-    // For simplicity, toggle the like count (in production, you'd check user's like status)
-    const newLikeCount = service.like_count + 1;
-    
-    const { data, error } = await supabaseClient
-      .from('services')
-      .update({ like_count: newLikeCount })
-      .eq('id', serviceId)
-      .select()
-      .single();
-
-    if (error) {
-      throw new Error(`Failed to toggle like: ${error.message}`);
-    }
-
-    return { liked: true, likeCount: newLikeCount };
+    return { liked, likeCount: newLikeCount };
   }
 
   async toggleBookmark(userId: string, serviceId: string, userToken?: string) {
-    const supabaseClient = userToken 
+    const supabaseClient = userToken
+      ? createUserSupabaseClient(this.configService, userToken)
+      : this.supabase;
+
+    // Check if user has already bookmarked this service
+    const { data: existingBookmark } = await supabaseClient
+      .from('service_bookmarks')
+      .select('id')
+      .eq('service_id', serviceId)
+      .eq('user_id', userId)
+      .single();
+
+    let bookmarked: boolean;
+    let newSaveCount: number;
+
+    if (existingBookmark) {
+      // User has already bookmarked - remove bookmark
+      const { error: deleteError } = await supabaseClient
+        .from('service_bookmarks')
+        .delete()
+        .eq('id', existingBookmark.id);
+
+      if (deleteError) {
+        throw new Error(`Failed to remove bookmark: ${deleteError.message}`);
+      }
+
+      // Decrement save count
+      const { data: service } = await supabaseClient
+        .from('services')
+        .select('save_count')
+        .eq('id', serviceId)
+        .single();
+
+      newSaveCount = Math.max(0, (service?.save_count || 0) - 1);
+
+      await supabaseClient
+        .from('services')
+        .update({ save_count: newSaveCount })
+        .eq('id', serviceId);
+
+      bookmarked = false;
+    } else {
+      // User hasn't bookmarked - add bookmark
+      const { error: insertError } = await supabaseClient
+        .from('service_bookmarks')
+        .insert({ service_id: serviceId, user_id: userId });
+
+      if (insertError) {
+        throw new Error(`Failed to add bookmark: ${insertError.message}`);
+      }
+
+      // Increment save count
+      const { data: service } = await supabaseClient
+        .from('services')
+        .select('save_count')
+        .eq('id', serviceId)
+        .single();
+
+      newSaveCount = (service?.save_count || 0) + 1;
+
+      await supabaseClient
+        .from('services')
+        .update({ save_count: newSaveCount })
+        .eq('id', serviceId);
+
+      bookmarked = true;
+    }
+
+    return { bookmarked, saveCount: newSaveCount };
+  }
+
+  async incrementShareCount(serviceId: string, userToken?: string) {
+    const supabaseClient = userToken
       ? createUserSupabaseClient(this.configService, userToken)
       : this.supabase;
 
     // Get current service
     const { data: service } = await supabaseClient
       .from('services')
-      .select('save_count')
+      .select('share_count')
       .eq('id', serviceId)
       .single();
 
@@ -467,25 +631,106 @@ export class ServicesService {
       throw new NotFoundException('Service not found');
     }
 
-    // For simplicity, increment save count (in production, you'd check user's bookmark status)
-    const newSaveCount = service.save_count + 1;
-    
-    const { data, error } = await supabaseClient
+    const newShareCount = (service.share_count || 0) + 1;
+
+    const { error } = await supabaseClient
       .from('services')
-      .update({ save_count: newSaveCount })
-      .eq('id', serviceId)
-      .select()
+      .update({ share_count: newShareCount })
+      .eq('id', serviceId);
+
+    if (error) {
+      throw new Error(`Failed to increment share count: ${error.message}`);
+    }
+
+    return { shareCount: newShareCount };
+  }
+
+  async getServiceComments(serviceId: string, userToken?: string) {
+    const supabaseClient = userToken
+      ? createUserSupabaseClient(this.configService, userToken)
+      : this.supabase;
+
+    const { data: comments, error } = await supabaseClient
+      .from('service_comments')
+      .select(`
+        id,
+        content,
+        like_count,
+        reply_count,
+        created_at,
+        user_profiles!service_comments_user_id_fkey (
+          id,
+          username,
+          avatar_url
+        )
+      `)
+      .eq('service_id', serviceId)
+      .is('parent_comment_id', null) // Only get top-level comments
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      throw new Error(`Failed to fetch comments: ${error.message}`);
+    }
+
+    // Transform to match frontend format
+    return comments?.map(comment => ({
+      id: comment.id,
+      userId: comment.user_profiles?.id || '',
+      userName: comment.user_profiles?.username || 'Unknown User',
+      userAvatar: comment.user_profiles?.avatar_url || null,
+      comment: comment.content,
+      createdAt: comment.created_at,
+      likes: comment.like_count || 0,
+      replies: comment.reply_count || 0,
+    })) || [];
+  }
+
+  async addComment(userId: string, serviceId: string, content: string, userToken?: string) {
+    const supabaseClient = userToken
+      ? createUserSupabaseClient(this.configService, userToken)
+      : this.supabase;
+
+    // Insert comment
+    const { data: comment, error } = await supabaseClient
+      .from('service_comments')
+      .insert({
+        service_id: serviceId,
+        user_id: userId,
+        content: content,
+      })
+      .select(`
+        id,
+        content,
+        like_count,
+        reply_count,
+        created_at,
+        user_profiles!service_comments_user_id_fkey (
+          id,
+          username,
+          avatar_url
+        )
+      `)
       .single();
 
     if (error) {
-      throw new Error(`Failed to toggle bookmark: ${error.message}`);
+      throw new Error(`Failed to add comment: ${error.message}`);
     }
 
-    return { bookmarked: true, saveCount: newSaveCount };
+    // Return transformed comment
+    return {
+      id: comment.id,
+      userId: comment.user_profiles?.id || '',
+      userName: comment.user_profiles?.username || 'Unknown User',
+      userAvatar: comment.user_profiles?.avatar_url || null,
+      comment: comment.content,
+      createdAt: comment.created_at,
+      likes: comment.like_count || 0,
+      replies: comment.reply_count || 0,
+    };
   }
 
   async addRating(userId: string, serviceId: string, rating: number, userToken?: string) {
-    const supabaseClient = userToken 
+    const supabaseClient = userToken
       ? createUserSupabaseClient(this.configService, userToken)
       : this.supabase;
 
@@ -512,7 +757,7 @@ export class ServicesService {
 
     const { data, error } = await supabaseClient
       .from('services')
-      .update({ 
+      .update({
         average_rating: newAverage,
         rating_count: newCount
       })

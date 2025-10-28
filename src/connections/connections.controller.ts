@@ -38,12 +38,12 @@ export class ConnectionsController {
 
   @Get()
   async getMyConnections(@Request() req): Promise<ConnectionResponseDto[]> {
-    return this.connectionsService.getMyConnections(req.user.sub);
+    return this.connectionsService.getMyConnections(req.user.sub, req.supabaseToken);
   }
 
   @Get('requests')
   async getPendingRequests(@Request() req): Promise<ConnectionResponseDto[]> {
-    return this.connectionsService.getPendingRequests(req.user.sub);
+    return this.connectionsService.getPendingRequests(req.user.sub, req.supabaseToken);
   }
 
   @Post()
@@ -73,7 +73,7 @@ export class ConnectionsController {
 
   @Get('clients')
   async getClientRelationships(@Request() req): Promise<any[]> {
-    return this.connectionsService.getClientRelationships(req.user.sub);
+    return this.connectionsService.getClientRelationships(req.user.sub, req.supabaseToken);
   }
 
   @Post('clients')
@@ -90,5 +90,30 @@ export class ConnectionsController {
     @Param('userId') targetUserId: string,
   ): Promise<{ status: string; connectionId?: string }> {
     return this.connectionsService.getConnectionStatus(req.user.sub, targetUserId, req.supabaseToken);
+  }
+
+  @Post('requests/accept-all')
+  async acceptAllRequests(@Request() req): Promise<{ accepted: number; failed: number; message: string }> {
+    const result = await this.connectionsService.acceptAllConnectionRequests(req.user.sub, req.supabaseToken);
+    return {
+      ...result,
+      message: `Accepted ${result.accepted} connection request(s)`,
+    };
+  }
+
+  @Get('relationship/:userId')
+  async getRelationshipDetails(
+    @Request() req,
+    @Param('userId') targetUserId: string,
+  ): Promise<any> {
+    return this.connectionsService.getRelationshipDetails(req.user.sub, targetUserId, req.supabaseToken);
+  }
+
+  @Get('categorized/:type')
+  async getCategorizedConnections(
+    @Request() req,
+    @Param('type') type: 'plugs' | 'clients',
+  ): Promise<any> {
+    return this.connectionsService.getCategorizedConnections(req.user.sub, type, req.supabaseToken);
   }
 }

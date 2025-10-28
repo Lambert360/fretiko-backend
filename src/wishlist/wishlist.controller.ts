@@ -70,14 +70,20 @@ export class WishlistController {
     shareMessage?: string;
     selectedItemIds?: string[];
   }) {
-    console.log('💖 Sharing wishlist with friend:', shareData);
+    console.log('💖 Sharing wishlist with friend:', {
+      ownerId: req.user.sub,
+      friendId: shareData.friendId,
+      shareType: shareData.shareType,
+      selectedItemsCount: shareData.selectedItemIds?.length
+    });
+
     return this.wishlistService.shareWishlistWithFriend(
-      req.user.sub,
-      shareData.friendId,
-      shareData.shareType,
-      shareData.shareMessage,
-      shareData.selectedItemIds,
-      req.supabaseToken
+      req.user.sub,  // ownerId
+      shareData.friendId,  // friendId
+      shareData.shareType || 'view_and_add',  // shareType with default
+      shareData.shareMessage,  // shareMessage
+      shareData.selectedItemIds,  // selectedItemIds
+      req.supabaseToken  // userToken
     );
   }
 
@@ -91,6 +97,32 @@ export class WishlistController {
   async getSharedWishlistItems(@Request() req, @Param('ownerId') ownerId: string) {
     console.log('💖 Getting shared wishlist items from owner:', ownerId, 'for user:', req.user.sub);
     return this.wishlistService.getSharedWishlistItems(req.user.sub, ownerId, req.supabaseToken);
+  }
+
+  @Post('shared/:ownerId/add')
+  async addToSharedWishlist(
+    @Request() req, 
+    @Param('ownerId') ownerId: string,
+    @Body() itemData: {
+      productId: string;
+      productName: string;
+      productImage: string;
+      price: number;
+      collaborationNote?: string;
+    }
+  ) {
+    console.log('💖 Adding item to shared wishlist:', {
+      collaboratorId: req.user.sub,
+      ownerId,
+      productId: itemData.productId
+    });
+    
+    return this.wishlistService.addToSharedWishlist(
+      req.user.sub,
+      ownerId,
+      itemData,
+      req.supabaseToken
+    );
   }
 
   @Get('collaborative')
@@ -182,5 +214,16 @@ export class WishlistController {
   async canPurchaseAsGift(@Request() req, @Param('wishlistItemId') wishlistItemId: string) {
     console.log('💖 Checking if item can be purchased as gift:', wishlistItemId);
     return this.wishlistService.canPurchaseAsGift(req.user.sub, wishlistItemId, req.supabaseToken);
+  }
+
+  @Post('validate-gift-purchase')
+  async validateGiftPurchase(
+    @Request() req,
+    @Body() body: {
+      items: Array<{ wishlistItemId: string; quantity?: number }>;
+    }
+  ) {
+    console.log('🎁 Validating gift purchase for user:', req.user.sub, 'items:', body.items.length);
+    return this.wishlistService.validateGiftPurchase(req.user.sub, body.items, req.supabaseToken);
   }
 }

@@ -18,6 +18,14 @@ export class SignUpDto {
   @IsString()
   @IsOptional()
   lastName?: string;
+
+  @IsString()
+  @IsOptional()
+  dateOfBirth?: string;
+
+  @IsString()
+  @IsOptional()
+  gender?: string;
 }
 
 export class SignInDto {

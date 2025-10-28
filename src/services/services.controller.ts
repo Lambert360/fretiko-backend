@@ -14,6 +14,7 @@ import {
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { OptionalJwtAuthGuard } from '../auth/optional-jwt-auth.guard';
 import { ServicesService } from './services.service';
 import { CreateServiceDto, UpdateServiceDto } from './dto/service.dto';
 
@@ -41,17 +42,22 @@ export class ServicesController {
   }
 
   @Get('video-feed')
+  @UseGuards(OptionalJwtAuthGuard)
   async getVideoFeed(
+    @Request() req,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
   ) {
-    console.log('🎥 Controller getVideoFeed called with limit:', limit, 'offset:', offset);
+    // Try to get userId from request if user is authenticated (optional)
+    const userId = req.user?.sub || null;
+
+    console.log('🎥 Controller getVideoFeed called with userId:', userId, 'limit:', limit, 'offset:', offset);
     const queryOptions = {
       limit: limit ? parseInt(limit, 10) : 10,
       offset: offset ? parseInt(offset, 10) : 0,
     };
     console.log('🎥 Controller calling service with options:', queryOptions);
-    const result = await this.servicesService.getVideoFeed(queryOptions);
+    const result = await this.servicesService.getVideoFeed(userId, queryOptions);
     console.log('🎥 Controller returning result with', result.length, 'items');
     return result;
   }
@@ -109,6 +115,23 @@ export class ServicesController {
   @UseGuards(JwtAuthGuard)
   async toggleBookmark(@Request() req, @Param('id') id: string) {
     return this.servicesService.toggleBookmark(req.user.sub, id, req.supabaseToken);
+  }
+
+  @Post(':id/share')
+  @UseGuards(JwtAuthGuard)
+  async shareService(@Request() req, @Param('id') id: string) {
+    return this.servicesService.incrementShareCount(id, req.supabaseToken);
+  }
+
+  @Get(':id/comments')
+  async getComments(@Request() req, @Param('id') id: string) {
+    return this.servicesService.getServiceComments(id, req.supabaseToken);
+  }
+
+  @Post(':id/comments')
+  @UseGuards(JwtAuthGuard)
+  async addComment(@Request() req, @Param('id') id: string, @Body() body: { content: string }) {
+    return this.servicesService.addComment(req.user.sub, id, body.content, req.supabaseToken);
   }
 
   @Post(':id/rating')

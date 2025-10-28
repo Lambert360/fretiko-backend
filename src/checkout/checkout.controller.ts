@@ -2,26 +2,35 @@ import {
   Controller,
   Get,
   Post,
+  Put,
+  Delete,
   Body,
   Query,
+  Param,
   UseGuards,
   Request,
   HttpException,
   HttpStatus,
 } from '@nestjs/common';
 import { CheckoutService } from './checkout.service';
+import { RiderOptimizationService } from '../riders/rider-optimization.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 
 @Controller('checkout')
 @UseGuards(JwtAuthGuard)
 export class CheckoutController {
-  constructor(private readonly checkoutService: CheckoutService) {}
+  constructor(
+    private readonly checkoutService: CheckoutService,
+    private readonly riderOptimizationService: RiderOptimizationService,
+  ) {}
 
   // Get checkout summary from cart
   @Get('summary')
-  async getCheckoutSummary(@Request() req) {
+  async getCheckoutSummary(@Request() req, @Query('selectedItemIds') selectedItemIds?: string) {
     try {
-      return await this.checkoutService.getCheckoutSummary(req.user.sub, req.supabaseToken);
+      // Parse selectedItemIds if provided (comma-separated string)
+      const itemIds = selectedItemIds ? selectedItemIds.split(',') : undefined;
+      return await this.checkoutService.getCheckoutSummary(req.user.sub, req.supabaseToken, itemIds);
     } catch (error) {
       console.error('Error getting checkout summary:', error);
       throw new HttpException(
@@ -87,6 +96,20 @@ export class CheckoutController {
     }
   }
 
+  // Get all delivery addresses
+  @Get('addresses')
+  async getAllAddresses(@Request() req) {
+    try {
+      return await this.checkoutService.getAllAddresses(req.user.sub, req.supabaseToken);
+    } catch (error) {
+      console.error('Error getting addresses:', error);
+      throw new HttpException(
+        'Failed to get addresses',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
   // Save delivery address
   @Post('address')
   async saveAddress(@Body() addressData: any, @Request() req) {
@@ -96,6 +119,65 @@ export class CheckoutController {
       console.error('Error saving address:', error);
       throw new HttpException(
         'Failed to save address',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // Update delivery address
+  @Put('address/:id')
+  async updateAddress(
+    @Param('id') addressId: string,
+    @Body() addressData: any,
+    @Request() req,
+  ) {
+    try {
+      return await this.checkoutService.updateAddress(
+        req.user.sub,
+        addressId,
+        addressData,
+        req.supabaseToken,
+      );
+    } catch (error) {
+      console.error('Error updating address:', error);
+      throw new HttpException(
+        'Failed to update address',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // Delete delivery address
+  @Delete('address/:id')
+  async deleteAddress(@Param('id') addressId: string, @Request() req) {
+    try {
+      return await this.checkoutService.deleteAddress(
+        req.user.sub,
+        addressId,
+        req.supabaseToken,
+      );
+    } catch (error) {
+      console.error('Error deleting address:', error);
+      throw new HttpException(
+        'Failed to delete address',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // Set default address
+  @Post('address/:id/set-default')
+  async setDefaultAddress(@Param('id') addressId: string, @Request() req) {
+    try {
+      return await this.checkoutService.setDefaultAddress(
+        req.user.sub,
+        addressId,
+        req.supabaseToken,
+      );
+    } catch (error) {
+      console.error('Error setting default address:', error);
+      throw new HttpException(
+        'Failed to set default address',
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
@@ -190,6 +272,59 @@ export class CheckoutController {
       throw new HttpException(
         error.message || 'Failed to get auction checkout summary',
         error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // Preview rider assignments for multi-vendor checkout
+  @Post('preview-riders')
+  async previewRiderAssignments(@Body() previewData: any, @Request() req) {
+    try {
+      // Get cart summary
+      const summary = await this.checkoutService.getCheckoutSummary(req.user.sub, req.supabaseToken);
+      
+      // Group by vendor
+      const vendorGroups = this.checkoutService.groupItemsByVendor(summary.items);
+      
+      // Optimize rider assignment
+      const assignments = await this.riderOptimizationService.optimizeRiderAssignment(
+        vendorGroups,
+        previewData.buyerLocation,
+        previewData.orderDetails
+      );
+      
+      return {
+        vendorCount: vendorGroups.length,
+        riderAssignments: assignments,
+        totalRiderFee: assignments.reduce((sum, a) => sum + a.pricing.total, 0),
+        summary: assignments.map(a => ({
+          vendorCount: a.vendorIds.length,
+          vehicleType: a.vehicleType,
+          pricing: a.pricing,
+          route: a.route,
+        })),
+      };
+    } catch (error) {
+      console.error('Error previewing rider assignments:', error);
+      throw new HttpException('Failed to preview riders', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+  }
+
+  // Create grouped order
+  @Post('grouped-order')
+  async createGroupedOrder(@Body() orderData: any, @Request() req) {
+    try {
+      const result = await this.checkoutService.createGroupedOrder(
+        req.user.sub,
+        orderData,
+        req.supabaseToken
+      );
+      return result;
+    } catch (error) {
+      console.error('Error creating grouped order:', error);
+      throw new HttpException(
+        error.message || 'Failed to create grouped order',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR
       );
     }
   }

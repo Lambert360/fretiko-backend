@@ -2,6 +2,12 @@ import { Injectable, NotFoundException, ForbiddenException, BadRequestException 
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { CreateStoryDto, UpdateStoryDto, CreateStoryCommentDto, StoryQueryDto } from './dto/story.dto';
+import ffmpeg from 'fluent-ffmpeg';
+import * as fs from 'fs';
+import * as path from 'path';
+import { promisify } from 'util';
+
+const unlinkAsync = promisify(fs.unlink);
 
 @Injectable()
 export class StoriesService {
@@ -693,6 +699,74 @@ export class StoriesService {
   }
 
   /**
+   * Generate video thumbnail using FFmpeg
+   */
+  private async generateVideoThumbnail(
+    videoBuffer: Buffer,
+    userId: string,
+    timestamp: number,
+    supabaseClient: any
+  ): Promise<string | null> {
+    const tempVideoPath = path.join('/tmp', `${timestamp}-temp-video.mp4`);
+    const tempThumbnailPath = path.join('/tmp', `${timestamp}-thumbnail.jpg`);
+
+    try {
+      // Write video buffer to temp file
+      fs.writeFileSync(tempVideoPath, videoBuffer);
+
+      // Generate thumbnail
+      await new Promise((resolve, reject) => {
+        ffmpeg(tempVideoPath)
+          .screenshots({
+            timestamps: ['00:00:01'], // 1 second into video
+            filename: `${timestamp}-thumbnail.jpg`,
+            folder: '/tmp',
+            size: '720x1280'
+          })
+          .on('end', resolve)
+          .on('error', reject);
+      });
+
+      // Read thumbnail
+      const thumbnailBuffer = fs.readFileSync(tempThumbnailPath);
+
+      // Upload thumbnail to Supabase
+      const thumbnailFileName = `${userId}/${timestamp}-thumbnail.jpg`;
+      const { data: thumbnailData, error: thumbnailError } = await supabaseClient.storage
+        .from('stories')
+        .upload(thumbnailFileName, thumbnailBuffer, {
+          contentType: 'image/jpeg',
+          upsert: false,
+        });
+
+      if (thumbnailError) {
+        console.warn('⚠️ Thumbnail upload failed:', thumbnailError.message);
+        return null;
+      }
+
+      // Get public URL
+      const { data: thumbnailUrlData } = supabaseClient.storage
+        .from('stories')
+        .getPublicUrl(thumbnailFileName);
+
+      console.log('✅ Thumbnail generated successfully:', thumbnailUrlData.publicUrl);
+      return thumbnailUrlData.publicUrl;
+
+    } catch (error) {
+      console.error('❌ Thumbnail generation failed:', error);
+      return null;
+    } finally {
+      // Cleanup temp files
+      try {
+        if (fs.existsSync(tempVideoPath)) await unlinkAsync(tempVideoPath);
+        if (fs.existsSync(tempThumbnailPath)) await unlinkAsync(tempThumbnailPath);
+      } catch (cleanupError) {
+        console.warn('⚠️ Temp file cleanup warning:', cleanupError);
+      }
+    }
+  }
+
+  /**
    * Upload story with file handling (using multer)
    */
   async uploadStoryWithFile(
@@ -755,11 +829,21 @@ export class StoriesService {
 
       const publicUrl = urlData.publicUrl;
 
+      // Generate thumbnail for videos
+      let thumbnailUrl: string | null = null;
+      const isVideo = file.mimetype.startsWith('video/');
+      
+      if (isVideo) {
+        console.log('🎬 Generating thumbnail for video...');
+        thumbnailUrl = await this.generateVideoThumbnail(file.buffer, userId, timestamp, supabaseClient);
+      }
+
       // Create story record
       const storyData = {
         user_id: userId,
         media_url: publicUrl,
-        media_type: file.mimetype.startsWith('image/') ? 'image' : 'video',
+        media_type: isVideo ? 'video' : 'image',
+        thumbnail_url: thumbnailUrl,
         caption: caption || null,
         duration: duration || null,
         expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours from now

@@ -3,6 +3,7 @@ import {
   Get,
   Put,
   Post,
+  Delete,
   Body,
   Param,
   UseGuards,
@@ -128,5 +129,13 @@ export class UsersController {
     }
 
     return this.usersService.searchUsers(query.trim(), parseInt(limit));
+  }
+
+  @Delete('account')
+  @UseGuards(JwtAuthGuard)
+  async deleteAccount(@Request() req) {
+    console.log('🗑️ Account deletion requested by user:', req.user.sub);
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    return this.usersService.deleteAccount(req.user.sub, token);
   }
 }

@@ -3,6 +3,9 @@ import { ConfigService } from '@nestjs/config';
 import { createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { InvoiceService } from '../chat/invoice.service';
+import { ConnectionsService } from '../connections/connections.service';
+import { EscrowService } from '../escrow/escrow.service';
+import { RewardsService } from '../rewards/rewards.service';
 
 @Injectable()
 export class OrdersService {
@@ -10,7 +13,13 @@ export class OrdersService {
     private configService: ConfigService,
     private notificationHelper: NotificationHelperService,
     @Inject(forwardRef(() => InvoiceService))
-    private invoiceService: InvoiceService
+    private invoiceService: InvoiceService,
+    @Inject(forwardRef(() => ConnectionsService))
+    private connectionsService: ConnectionsService,
+    @Inject(forwardRef(() => EscrowService))
+    private escrowService: EscrowService,
+    @Inject(forwardRef(() => RewardsService))
+    private rewardsService: RewardsService
   ) {}
 
   async getMyOrders(userId: string, filters?: any) {
@@ -22,49 +31,48 @@ export class OrdersService {
         id,
         order_number,
         status,
-        total,
-        subtotal,
+        total_amount,
         delivery_fee,
-        tax,
-        item_count,
-        order_date,
+        platform_fee,
         estimated_delivery,
         delivery_address,
+        metadata,
+        created_at,
+        buyer_id,
+        vendor_id,
+        rider_id,
+        escrow_enabled,
+        delivery_type,
+        rider_info,
+        source,
         order_items (
           id,
           product_id,
-          service_id,
-          name,
-          image,
-          price,
-          original_price,
+          product_name,
+          unit_price,
           quantity,
-          seller_id,
-          seller_name,
-          category,
-          is_service,
-          service_date,
-          service_time
+          total_price,
+          product_metadata
         )
       `)
-      .eq('user_id', userId)
-      .order('order_date', { ascending: false });
+      .eq('buyer_id', userId)
+      .order('created_at', { ascending: false });
 
     // Apply filters
     if (filters?.status?.length) {
       query = query.in('status', filters.status.split(','));
     }
     if (filters?.startDate) {
-      query = query.gte('order_date', filters.startDate);
+      query = query.gte('created_at', filters.startDate);
     }
     if (filters?.endDate) {
-      query = query.lte('order_date', filters.endDate);
+      query = query.lte('created_at', filters.endDate);
     }
     if (filters?.minAmount) {
-      query = query.gte('total', parseInt(filters.minAmount));
+      query = query.gte('total_amount', parseInt(filters.minAmount));
     }
     if (filters?.maxAmount) {
-      query = query.lte('total', parseInt(filters.maxAmount));
+      query = query.lte('total_amount', parseInt(filters.maxAmount));
     }
 
     const { data, error } = await query;
@@ -78,29 +86,31 @@ export class OrdersService {
       id: order.id,
       orderNumber: order.order_number,
       status: order.status,
-      total: order.total,
-      subtotal: order.subtotal,
+      total: order.total_amount,
+      subtotal: order.metadata?.subtotal || order.total_amount - order.delivery_fee,
       deliveryFee: order.delivery_fee,
-      tax: order.tax,
-      itemCount: order.item_count,
-      orderDate: order.order_date,
+      tax: order.metadata?.tax_amount || 0,
+      platformFee: order.platform_fee,
+      escrowFee: order.metadata?.escrow_fee || 0,
+      itemCount: order.order_items?.length || 0,
+      orderDate: order.created_at,
       estimatedDelivery: order.estimated_delivery,
       deliveryAddress: order.delivery_address,
+      escrowEnabled: order.escrow_enabled,
+      deliveryType: order.delivery_type,
+      riderInfo: order.rider_info,
+      source: order.source,
+      buyerId: order.buyer_id,
+      vendorId: order.vendor_id,
+      riderId: order.rider_id,
       items: order.order_items.map(item => ({
         id: item.id,
         productId: item.product_id,
-        serviceId: item.service_id,
-        name: item.name,
-        image: item.image,
-        price: item.price,
-        originalPrice: item.original_price,
+        name: item.product_name,
+        price: item.unit_price,
         quantity: item.quantity,
-        sellerId: item.seller_id,
-        sellerName: item.seller_name,
-        category: item.category,
-        isService: item.is_service,
-        serviceDate: item.service_date,
-        serviceTime: item.service_time
+        totalPrice: item.total_price,
+        metadata: item.product_metadata,
       }))
     }));
   }
@@ -111,40 +121,19 @@ export class OrdersService {
     const { data, error } = await supabase
       .from('orders')
       .select(`
-        id,
-        order_number,
-        status,
-        total,
-        subtotal,
-        delivery_fee,
-        tax,
-        item_count,
-        order_date,
-        estimated_delivery,
-        delivery_address,
-        payment_method,
-        payment_status,
-        tracking_number,
-        notes,
+        *,
         order_items (
           id,
           product_id,
-          service_id,
-          name,
-          image,
-          price,
-          original_price,
+          product_name,
+          unit_price,
           quantity,
-          seller_id,
-          seller_name,
-          category,
-          is_service,
-          service_date,
-          service_time
+          total_price,
+          product_metadata
         )
       `)
       .eq('id', orderId)
-      .eq('user_id', userId)
+      .eq('buyer_id', userId)
       .single();
 
     if (error) {
@@ -156,33 +145,33 @@ export class OrdersService {
       id: data.id,
       orderNumber: data.order_number,
       status: data.status,
-      total: data.total,
-      subtotal: data.subtotal,
+      total: data.total_amount,
+      subtotal: data.metadata?.subtotal || data.total_amount - data.delivery_fee,
       deliveryFee: data.delivery_fee,
-      tax: data.tax,
-      itemCount: data.item_count,
-      orderDate: data.order_date,
+      platformFee: data.platform_fee,
+      tax: data.metadata?.tax_amount || 0,
+      escrowFee: data.metadata?.escrow_fee || 0,
+      itemCount: data.order_items?.length || 0,
+      orderDate: data.created_at,
       estimatedDelivery: data.estimated_delivery,
       deliveryAddress: data.delivery_address,
-      paymentMethod: data.payment_method,
-      paymentStatus: data.payment_status,
-      trackingNumber: data.tracking_number,
-      notes: data.notes,
+      deliveryInstructions: data.delivery_instructions,
+      deliveryType: data.delivery_type,
+      riderInfo: data.rider_info,
+      escrowEnabled: data.escrow_enabled,
+      source: data.source,
+      buyerId: data.buyer_id,
+      vendorId: data.vendor_id,
+      riderId: data.rider_id,
+      metadata: data.metadata,
       items: data.order_items.map(item => ({
         id: item.id,
         productId: item.product_id,
-        serviceId: item.service_id,
-        name: item.name,
-        image: item.image,
-        price: item.price,
-        originalPrice: item.original_price,
+        name: item.product_name,
+        price: item.unit_price,
         quantity: item.quantity,
-        sellerId: item.seller_id,
-        sellerName: item.seller_name,
-        category: item.category,
-        isService: item.is_service,
-        serviceDate: item.service_date,
-        serviceTime: item.service_time
+        totalPrice: item.total_price,
+        metadata: item.product_metadata,
       }))
     };
   }
@@ -195,7 +184,7 @@ export class OrdersService {
       .from('orders')
       .select('id')
       .eq('id', orderId)
-      .eq('user_id', userId)
+      .eq('buyer_id', userId)
       .single();
 
     if (!order) {
@@ -320,18 +309,48 @@ export class OrdersService {
 
   async cancelOrder(userId: string, orderId: string, reason?: string) {
     const supabase = createServiceSupabaseClient(this.configService);
-    
-    const { error } = await supabase
+
+    // 1) Verify buyer owns order and status is cancellable
+    const { data: order, error: fetchError } = await supabase
+      .from('orders')
+      .select('id, buyer_id, status')
+      .eq('id', orderId)
+      .eq('buyer_id', userId)
+      .single();
+
+    if (fetchError || !order) {
+      throw new Error('Failed to cancel order: Order not found or access denied');
+    }
+
+    // Only allow cancel before vendor accepts/processing/delivered
+    const nonCancellable = ['accepted', 'processing', 'ready_for_pickup', 'picked_up', 'delivered', 'completed'];
+    if (nonCancellable.includes(order.status)) {
+      throw new Error('Failed to cancel order: Order is already in progress or completed');
+    }
+
+    // 2) Refund escrow if exists and held
+    const { data: escrow } = await supabase
+      .from('escrows')
+      .select('id, status')
+      .eq('order_id', orderId)
+      .single();
+
+    if (escrow && escrow.status === 'held') {
+      await this.escrowService.refundEscrow(escrow.id, reason || 'Buyer cancelled order');
+    }
+
+    // 3) Mark order cancelled
+    const { error: updateError } = await supabase
       .from('orders')
       .update({ 
         status: 'cancelled',
-        notes: reason || 'Cancelled by user'
+        updated_at: new Date().toISOString(),
       })
       .eq('id', orderId)
-      .eq('user_id', userId);
+      .eq('buyer_id', userId);
 
-    if (error) {
-      throw new Error(`Failed to cancel order: ${error.message}`);
+    if (updateError) {
+      throw new Error(`Failed to cancel order: ${updateError.message}`);
     }
   }
 
@@ -450,88 +469,145 @@ export class OrdersService {
   async getOrderTrackingData(userId: string, orderId: string) {
     const supabase = createServiceSupabaseClient(this.configService);
     
-    // Get order with rider info
-    const { data: order, error } = await supabase
+    try {
+      // Get order data first (faster, simpler query)
+      const { data: order, error: orderError } = await supabase
       .from('orders')
-      .select(`
-        *,
-        rider_locations!orders_rider_id_fkey (
-          latitude,
-          longitude,
-          last_ping,
-          accuracy
-        ),
-        user_profiles!orders_seller_id_fkey (
-          username,
-          location
-        )
-      `)
+        .select('*')
       .eq('id', orderId)
-      .or(`buyer_id.eq.${userId},seller_id.eq.${userId},rider_id.eq.${userId}`)
+        .or(`buyer_id.eq.${userId},vendor_id.eq.${userId},rider_id.eq.${userId}`)
       .single();
 
-    if (error) {
-      throw new Error(`Failed to get tracking data: ${error.message}`);
+      if (orderError) {
+        console.error('Order fetch error:', orderError);
+        throw new Error(`Failed to get tracking data: ${orderError.message}`);
     }
 
     if (!order) {
       throw new Error('Order not found or access denied');
     }
 
+      // Fetch profiles in parallel for better performance
+      const [vendorProfile, buyerProfile, riderProfile, riderLocationData] = await Promise.all([
+        // Vendor profile
+        order.vendor_id
+          ? (async () => {
+              try {
+                const { data } = await supabase
+                  .from('user_profiles')
+                  .select('id, username, avatar_url, location, phone')
+                  .eq('id', order.vendor_id)
+                  .single();
+                return data;
+              } catch {
+                return null;
+              }
+            })()
+          : Promise.resolve(null),
+        
+        // Buyer profile
+        order.buyer_id
+          ? (async () => {
+              try {
+                const { data } = await supabase
+                  .from('user_profiles')
+                  .select('id, username, avatar_url, location, phone')
+                  .eq('id', order.buyer_id)
+                  .single();
+                return data;
+              } catch {
+                return null;
+              }
+            })()
+          : Promise.resolve(null),
+        
+        // Rider profile
+        order.rider_id
+          ? (async () => {
+              try {
+                const { data } = await supabase
+                  .from('user_profiles')
+                  .select('id, username, avatar_url, phone, preferences')
+                  .eq('id', order.rider_id)
+                  .single();
+                return data;
+              } catch {
+                return null;
+              }
+            })()
+          : Promise.resolve(null),
+        
+        // Rider location
+        order.rider_id
+          ? (async () => {
+              try {
+                const { data } = await supabase
+                  .from('rider_locations')
+                  .select('latitude, longitude, last_ping, accuracy, is_online')
+                  .eq('user_id', order.rider_id)
+                  .single();
+                return data;
+              } catch {
+                return null;
+              }
+            })()
+          : Promise.resolve(null),
+      ]);
+
+      // Attach profiles to order object
+      order.vendor_profile = vendorProfile;
+      order.buyer_profile = buyerProfile;
+      order.rider_profile = riderProfile;
+
     // Determine current phase and calculate timers
     const currentPhase = this.calculateCurrentPhase(order);
     const timerInfo = this.calculateTimerInfo(order, currentPhase);
     const escrowInfo = this.calculateEscrowInfo(order);
 
-    // Mock locations for now - in production these would come from database
+      // Get vendor location from profile or use mock
     const vendorLocation = {
-      latitude: 6.5200,
-      longitude: 3.3750,
-      address: order.pickup_address || "Vendor Location, Lagos"
-    };
+        latitude: vendorProfile?.location?.latitude || 6.5200,
+        longitude: vendorProfile?.location?.longitude || 3.3750,
+        address: vendorProfile?.location?.address || "Vendor Location, Lagos"
+      };
 
+      // Get buyer location from delivery address or profile
     const buyerLocation = {
-      latitude: 6.5300,
-      longitude: 3.3850,
+        latitude: order.delivery_address?.latitude || buyerProfile?.location?.latitude || 6.5300,
+        longitude: order.delivery_address?.longitude || buyerProfile?.location?.longitude || 3.3850,
       address: order.delivery_address?.address || "Delivery Address"
     };
 
+      // Use fetched rider location data
     let riderLocation: any = null;
-    if (order.rider_locations && order.rider_locations.length > 0) {
-      const location = order.rider_locations[0];
+      if (riderLocationData) {
       riderLocation = {
-        latitude: location.latitude,
-        longitude: location.longitude,
-        timestamp: location.last_ping,
-        accuracy: location.accuracy
-      };
-    } else if (currentPhase.phase === 'rider') {
-      // Mock rider location if not found
+          latitude: riderLocationData.latitude,
+          longitude: riderLocationData.longitude,
+          timestamp: riderLocationData.last_ping,
+          accuracy: riderLocationData.accuracy,
+          isOnline: riderLocationData.is_online
+        };
+      } else if (currentPhase.phase === 'rider' && order.rider_id) {
+        // Mock rider location if not found but rider assigned
       riderLocation = {
         latitude: 6.5244,
         longitude: 3.3792,
-        timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          isOnline: false
       };
     }
 
-    // Get rider info
+      // Build rider info from fetched profile
     let riderInfo: any = null;
-    if (order.rider_id) {
-      const { data: rider } = await supabase
-        .from('user_profiles')
-        .select('username, avatar_url, preferences')
-        .eq('id', order.rider_id)
-        .single();
-
-      if (rider) {
+      if (order.rider_id && riderProfile) {
         riderInfo = {
           riderId: order.rider_id,
-          riderName: rider.username || 'Delivery Rider',
-          vehicleType: rider.preferences?.vehicleType || 'bike',
-          phone: '+234 XXX XXX XXXX', // Would be from rider profile
-          avatar: rider.avatar_url
+          riderName: riderProfile.username || 'Delivery Rider',
+          vehicleType: riderProfile.preferences?.vehicleType || 'bike',
+          phone: riderProfile.phone || 'Not available',
+          avatar: riderProfile.avatar_url
         };
-      }
     }
 
     return {
@@ -543,6 +619,10 @@ export class OrdersService {
       riderInfo,
       escrowInfo
     };
+    } catch (error) {
+      console.error('Error in getOrderTrackingData:', error);
+      throw error;
+    }
   }
 
   async updateOrderStatus(userId: string, orderId: string, status: string) {
@@ -599,13 +679,87 @@ export class OrdersService {
     return { success: true };
   }
 
+  /**
+   * Calculate category-based escrow countdown
+   * Returns countdown in milliseconds based on order categories
+   */
+  private getCategoryBasedCountdown(categories: string[]): { 
+    countdownMs: number; 
+    countdownHours: number; 
+    primaryCategory: string 
+  } {
+    // Category-based countdown rules (in hours)
+    const categoryTimers: { [key: string]: number } = {
+      // Perishables - shortest countdown (3 hours)
+      'Food & Beverages': 3,
+      'Fresh Produce': 3,
+      'Bakery': 3,
+      'Fast Food': 3,
+      'Restaurant': 3,
+      'Catering': 3,
+      
+      // Semi-perishables (6 hours)
+      'Flowers': 6,
+      'Plants': 6,
+      'Perishables': 6,
+      
+      // Regular products (24 hours - default)
+      'Health & Personal Care': 24,
+      'Clothing & Apparel': 24,
+      'Home & Garden': 24,
+      'Books & Media': 24,
+      'Toys & Games': 24,
+      'Sports & Outdoors': 24,
+      'Beauty & Cosmetics': 24,
+      'General': 24,
+      
+      // Services (48 hours - more time to verify quality)
+      'Services': 48,
+      'Professional Services': 48,
+      'Home Services': 48,
+      'Beauty Services': 48,
+      'Repair Services': 48,
+      
+      // High-value items (72 hours - inspection/authentication time)
+      'Electronics': 72,
+      'Computers & Accessories': 72,
+      'Jewelry & Watches': 72,
+      'Luxury Goods': 72,
+      'Vehicles & Parts': 72,
+      'Furniture': 72,
+      'Appliances': 72,
+    };
+
+    // Find shortest countdown (most restrictive) - protects buyer for perishables
+    let shortestHours = 24; // Default 24 hours
+    let primaryCategory = 'General';
+
+    for (const category of categories) {
+      const hours = categoryTimers[category];
+      if (hours && hours < shortestHours) {
+        shortestHours = hours;
+        primaryCategory = category;
+      }
+    }
+
+    const countdownMs = shortestHours * 60 * 60 * 1000;
+    
+    console.log(`📊 Category-based countdown: ${shortestHours}h (Primary: ${primaryCategory})`);
+    
+    return {
+      countdownMs,
+      countdownHours: shortestHours,
+      primaryCategory,
+    };
+  }
+
   async confirmOrderReceipt(userId: string, orderId: string) {
     const supabase = createServiceSupabaseClient(this.configService);
 
     // Verify this is the buyer
     const { data: order, error: fetchError } = await supabase
       .from('orders')
-      .select('buyer_id, total, seller_id, escrow_fee, source, metadata')
+      .select('id, buyer_id, vendor_id, total_amount, source, metadata, status')
       .eq('id', orderId)
       .eq('buyer_id', userId)
       .single();
@@ -614,16 +768,71 @@ export class OrdersService {
       throw new Error('Order not found or access denied');
     }
 
-    // Release escrow funds
-    await this.releaseEscrowFunds(orderId, order.seller_id, order.total);
+    // Check if order can be confirmed
+    if (order.status !== 'delivered') {
+      throw new Error('Order must be delivered before confirmation');
+    }
 
-    // Update order status
+    // ✅ FETCH ORDER ITEMS WITH CATEGORIES
+    const { data: orderItems } = await supabase
+      .from('order_items')
+      .select('category')
+      .eq('order_id', orderId);
+
+    const categories = orderItems?.map(item => item.category).filter(Boolean) || ['General'];
+
+    // ✅ CALCULATE CATEGORY-BASED COUNTDOWN
+    const { countdownMs, countdownHours, primaryCategory } = this.getCategoryBasedCountdown(categories);
+
+    // ✅ IMMEDIATELY RELEASE ESCROW (buyer confirmed = instant release)
+    console.log(`💰 Releasing escrow for order ${orderId} to vendor ${order.vendor_id}`);
+    
+    // Find the escrow record for this order
+    const { data: escrow, error: escrowFetchError } = await supabase
+      .from('escrows')
+      .select('id, status, total_amount, vendor_amount, rider_amount')
+      .eq('order_id', orderId)
+      .single();
+
+    if (escrowFetchError || !escrow) {
+      console.error(`❌ CRITICAL: No escrow found for order ${orderId}`);
+      console.error(`   This order has ₣${order.total_amount} that should be in escrow!`);
+      console.error(`   Error:`, escrowFetchError);
+      throw new Error('Escrow not found for this order');
+    }
+
+    console.log(`🔍 Found escrow for order:`, {
+      escrowId: escrow.id,
+      status: escrow.status,
+      totalAmount: escrow.total_amount,
+      vendorAmount: escrow.vendor_amount,
+      riderAmount: escrow.rider_amount
+    });
+
+    // Check if already released
+    if (escrow.status === 'released') {
+      console.log(`ℹ️ Escrow already released - order was previously confirmed`);
+    } else if (escrow.status === 'held') {
+      // ✅ USE ESCROW SERVICE TO PROPERLY RELEASE FUNDS
+      try {
+        await this.escrowService.releaseEscrow(escrow.id, 'Buyer confirmed order receipt');
+        console.log(`✅ Escrow ${escrow.id} released successfully via EscrowService`);
+      } catch (releaseError) {
+        console.error('❌ Failed to release escrow:', releaseError);
+        throw new Error('Failed to release escrow funds');
+      }
+    } else {
+      console.warn(`⚠️ Escrow has unexpected status: ${escrow.status}`);
+    }
+
+    // ✅ UPDATE ORDER STATUS TO COMPLETED
     const { error } = await supabase
       .from('orders')
       .update({
         status: 'completed',
         order_confirmed_at: new Date().toISOString(),
-        escrow_released_at: new Date().toISOString()
+        escrow_released_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       })
       .eq('id', orderId);
 
@@ -631,8 +840,40 @@ export class OrdersService {
       throw new Error(`Failed to confirm order receipt: ${error.message}`);
     }
 
+    console.log(`✅ Order ${orderId} marked as completed with immediate escrow release`);
+
+    // Update service_bookings status if this is a service booking
+    if (order.source === 'service_booking') {
+      try {
+        await supabase
+          .from('service_bookings')
+          .update({
+            status: 'completed',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('order_id', orderId);
+        console.log(`✅ Service booking updated to completed`);
+      } catch (bookingError) {
+        console.error('Failed to update service_bookings (non-critical):', bookingError);
+      }
+    }
+
     // Create tracking event
-    await this.createTrackingEvent(orderId, 'completed', 'Order confirmed by buyer, funds released');
+    await this.createTrackingEvent(orderId, 'completed', 'Order confirmed by buyer. Funds will be released in 24 hours.');
+
+    // Update client relationship - buyer is now a client of the vendor
+    try {
+      await this.connectionsService.createClientRelationship(order.vendor_id, {
+        clientId: userId,
+        relationshipType: 'customer',
+        totalOrders: 1,
+        totalSpent: order.total_amount,
+      });
+      console.log(`✅ Updated client relationship for vendor ${order.vendor_id} and buyer ${userId}`);
+    } catch (error) {
+      console.error('⚠️ Failed to update client relationship:', error);
+      // Don't throw - client relationship update is not critical
+    }
 
     // Mark invoice as paid if this order came from an invoice
     if (order.source === 'invoice' && order.metadata?.invoiceId) {
@@ -644,7 +885,268 @@ export class OrdersService {
       }
     }
 
-    return { success: true, message: 'Order confirmed and funds released' };
+    return { 
+      success: true, 
+      message: 'Order confirmed! Payment will be released to the vendor in 24 hours (7-day dispute window).' 
+    };
+  }
+
+  /**
+   * Buyer manually releases escrow funds immediately (no 24-hour wait)
+   */
+  async confirmAndReleaseFunds(userId: string, orderId: string) {
+    const supabase = createServiceSupabaseClient(this.configService);
+
+    try {
+      // Verify this is the buyer
+      const { data: order, error: fetchError } = await supabase
+        .from('orders')
+        .select('id, order_number, buyer_id, vendor_id, rider_id, total_amount, status')
+        .eq('id', orderId)
+        .eq('buyer_id', userId)
+        .single();
+
+      if (fetchError || !order) {
+        throw new Error('Order not found or access denied');
+      }
+
+      // Check if order is delivered
+      if (order.status !== 'delivered') {
+        throw new Error('Order must be delivered before releasing funds');
+      }
+
+      // Get escrow details
+      const { data: escrow, error: escrowFetchError } = await supabase
+        .from('escrows')
+        .select('id, status')
+        .eq('order_id', orderId)
+        .eq('status', 'held')
+        .single();
+
+      if (escrowFetchError || !escrow) {
+        throw new Error('Escrow not found or already released');
+      }
+
+      // Release escrow immediately
+      await this.escrowService.releaseEscrow(
+        escrow.id,
+        'Buyer manually confirmed and released funds'
+      );
+
+      console.log(`✅ Buyer ${userId} manually released escrow for order ${orderId}`);
+
+      // Create tracking event
+      await this.createTrackingEvent(
+        orderId,
+        'completed',
+        'Buyer confirmed receipt and released funds immediately'
+      );
+
+      return {
+        success: true,
+        message: 'Funds released successfully! Vendor and rider have been paid.',
+      };
+    } catch (error) {
+      console.error('Error releasing funds:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Buyer reports an issue with the order (stops escrow release, initiates refund)
+   */
+  async reportIssue(userId: string, orderId: string, reason: string, description?: string) {
+    const supabase = createServiceSupabaseClient(this.configService);
+
+    try {
+      // Verify this is the buyer
+      const { data: order, error: fetchError } = await supabase
+        .from('orders')
+        .select('id, order_number, buyer_id, vendor_id, rider_id, total_amount, delivery_fee, status')
+        .eq('id', orderId)
+        .eq('buyer_id', userId)
+        .single();
+
+      if (fetchError || !order) {
+        throw new Error('Order not found or access denied');
+      }
+
+      // Check if order is delivered
+      if (order.status !== 'delivered') {
+        throw new Error('Can only report issues for delivered orders');
+      }
+
+      // Get escrow details
+      const { data: escrow, error: escrowFetchError } = await supabase
+        .from('escrows')
+        .select('id, status, auto_release_at, vendor_amount, rider_amount')
+        .eq('order_id', orderId)
+        .eq('status', 'held')
+        .single();
+
+      if (escrowFetchError || !escrow) {
+        throw new Error('Escrow not found or already released');
+      }
+
+      // Check if auto-release timer has expired
+      if (escrow.auto_release_at) {
+        const autoReleaseTime = new Date(escrow.auto_release_at);
+        const now = new Date();
+        if (now > autoReleaseTime) {
+          throw new Error('Dispute window has expired. Funds have been released.');
+        }
+      }
+
+      // Stop escrow auto-release
+      const { error: escrowUpdateError } = await supabase
+        .from('escrows')
+        .update({
+          status: 'dispute',
+          auto_release_at: null, // Stop auto-release
+          dispute_reason: reason,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', escrow.id);
+
+      if (escrowUpdateError) {
+        throw new Error('Failed to update escrow status');
+      }
+
+      // Update order status
+      const { error: orderUpdateError } = await supabase
+        .from('orders')
+        .update({
+          status: 'cancelled',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', orderId);
+
+      if (orderUpdateError) {
+        console.error('Failed to update order status (non-critical):', orderUpdateError);
+      }
+
+      // Create dispute record (if disputes table exists)
+      try {
+        await supabase
+          .from('disputes')
+          .insert({
+            order_id: orderId,
+            complainant_id: userId,
+            respondent_id: order.vendor_id,
+            reason: reason,
+            description: description || '',
+            status: 'open',
+            created_at: new Date().toISOString(),
+          });
+      } catch (disputeError) {
+        console.error('Failed to create dispute record (non-critical):', disputeError);
+      }
+
+      // Calculate refund amount (total - rider fee, rider keeps their fee)
+      const refundAmount = parseFloat(order.total_amount) - parseFloat(order.delivery_fee || '0');
+
+      // Process refund to buyer (buyer gets total - rider fee)
+      try {
+        const { error: refundError } = await supabase.rpc('process_wallet_transaction', {
+          p_user_id: userId,
+          p_transaction_type: 'refund',
+          p_amount: refundAmount,
+          p_description: `Refund for order ${order.order_number} (issue reported)`,
+          p_reference_id: orderId,
+          p_reference_type: 'order',
+        });
+
+        if (refundError) {
+          console.error('Failed to process refund:', refundError);
+          throw new Error('Failed to process refund');
+        }
+
+        console.log(`✅ Refunded ₣${refundAmount} to buyer ${userId}`);
+      } catch (refundError) {
+        console.error('Refund processing error:', refundError);
+        throw refundError;
+      }
+
+      // Pay rider their delivery fee (they did their job)
+      if (order.rider_id && order.delivery_fee && parseFloat(order.delivery_fee) > 0) {
+        try {
+          const { error: riderPaymentError } = await supabase.rpc('process_wallet_transaction', {
+            p_user_id: order.rider_id,
+            p_transaction_type: 'delivery_payment',
+            p_amount: parseFloat(order.delivery_fee),
+            p_description: `Delivery fee for order ${order.order_number}`,
+            p_reference_id: orderId,
+            p_reference_type: 'order',
+          });
+
+          if (riderPaymentError) {
+            console.error('Failed to pay rider (non-critical):', riderPaymentError);
+          } else {
+            console.log(`✅ Paid rider ${order.rider_id} delivery fee: ₣${order.delivery_fee}`);
+          }
+        } catch (riderPaymentError) {
+          console.error('Rider payment error (non-critical):', riderPaymentError);
+        }
+      }
+
+      // ✅ REVERSE REWARDS IF USED
+      const { data: orderWithRewards } = await supabase
+        .from('orders')
+        .select('rewards_used')
+        .eq('id', orderId)
+        .single();
+
+      if (orderWithRewards && orderWithRewards.rewards_used > 0) {
+        console.log(`🔄 Reversing ${orderWithRewards.rewards_used} rewards for cancelled order ${orderId}`);
+        try {
+          await this.rewardsService.reverseRewardsRedemption(
+            userId,
+            orderWithRewards.rewards_used,
+            orderId
+          );
+          console.log(`✅ Reversed ${orderWithRewards.rewards_used} rewards for user ${userId}`);
+        } catch (rewardsError) {
+          console.error('Failed to reverse rewards (non-critical):', rewardsError);
+        }
+      }
+
+      // Notify vendor of issue
+      try {
+        const notification = {
+          user_id: order.vendor_id,
+          type: 'order',
+          title: '⚠️ Order Issue Reported',
+          message: `Buyer reported an issue with order #${order.order_number}: ${reason}`,
+          priority: 'high',
+          data: {
+            order_id: orderId,
+            order_number: order.order_number,
+            reason: reason,
+          },
+        };
+
+        await supabase.from('notifications').insert(notification);
+        console.log(`✅ Notified vendor ${order.vendor_id} of issue`);
+      } catch (notifyError) {
+        console.error('Failed to notify vendor (non-critical):', notifyError);
+      }
+
+      // Create tracking event
+      await this.createTrackingEvent(
+        orderId,
+        'cancelled',
+        `Buyer reported issue: ${reason}. Refund processed (minus rider fee).`
+      );
+
+      return {
+        success: true,
+        message: `Issue reported successfully. You have been refunded ₣${refundAmount.toFixed(2)} (order total minus delivery fee). The rider has been paid for their service.`,
+        refundAmount: refundAmount,
+      };
+    } catch (error) {
+      console.error('Error reporting issue:', error);
+      throw error;
+    }
   }
 
   async autoReleaseEscrow(userId: string, orderId: string) {
@@ -685,6 +1187,20 @@ export class OrdersService {
     }
 
     await this.createTrackingEvent(orderId, 'auto_completed', 'Funds automatically released after timeout');
+
+    // Update client relationship - buyer is now a client of the seller
+    try {
+      await this.connectionsService.createClientRelationship(order.seller_id, {
+        clientId: order.buyer_id,
+        relationshipType: 'customer',
+        totalOrders: 1,
+        totalSpent: order.total,
+      });
+      console.log(`✅ Updated client relationship for seller ${order.seller_id} and buyer ${order.buyer_id}`);
+    } catch (error) {
+      console.error('⚠️ Failed to update client relationship:', error);
+      // Don't throw - client relationship update is not critical
+    }
 
     // Mark invoice as paid if this order came from an invoice
     if (order.source === 'invoice' && order.metadata?.invoiceId) {
@@ -979,9 +1495,17 @@ export class OrdersService {
           break;
 
         case 'delivered':
-          // Notify buyer that order has been delivered
-          if (fullOrder.buyer_id) {
-            await this.notificationHelper.notifyOrderDelivered(fullOrder.buyer_id, orderForNotification);
+          // Notify buyer and vendor that order has been delivered
+          if (fullOrder.buyer_id && fullOrder.seller_id) {
+            await this.notificationHelper.notifyOrderDelivered(
+              fullOrder.buyer_id,
+              fullOrder.seller_id,
+              {
+                id: fullOrder.id,
+                orderNumber: fullOrder.order_number,
+                totalAmount: parseFloat(fullOrder.total)
+              }
+            );
           }
           break;
 
@@ -998,5 +1522,75 @@ export class OrdersService {
       console.error('Error sending order status notifications:', error);
       // Don't throw - notifications shouldn't break the main order flow
     }
+  }
+
+  // ========== MULTI-VENDOR ORDER GROUP METHODS ==========
+
+  // Get order group details
+  async getOrderGroup(groupId: string, userId: string, userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : createServiceSupabaseClient(this.configService);
+    
+    // Fetch order group
+    const { data: group, error: groupError } = await client
+      .from('order_groups')
+      .select('*')
+      .eq('id', groupId)
+      .eq('buyer_id', userId)
+      .single();
+      
+    if (groupError || !group) {
+      throw new Error('Order group not found');
+    }
+    
+    // Fetch all orders in group
+    const { data: orders, error: ordersError } = await client
+      .from('orders')
+      .select(`
+        *,
+        order_items(*),
+        user_profiles!orders_vendor_id_fkey(username, avatar_url)
+      `)
+      .eq('order_group_id', groupId)
+      .order('group_sequence', { ascending: true });
+      
+    if (ordersError) {
+      throw new Error('Failed to fetch orders in group');
+    }
+    
+    // Format orders with vendor info
+    const formattedOrders = orders.map(order => ({
+      ...order,
+      vendor_name: order.user_profiles?.username || 'Unknown Vendor',
+      items: order.order_items,
+    }));
+    
+    return {
+      group: group,
+      orders: formattedOrders,
+    };
+  }
+
+  // Confirm multiple orders (bulk confirmation)
+  async confirmMultipleOrders(orderIds: string[], userId: string, userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : createServiceSupabaseClient(this.configService);
+    
+    // Verify all orders belong to user and are in 'delivered' status
+    const { data: orders, error } = await client
+      .from('orders')
+      .select('id, vendor_id, rider_id, total_amount, escrow_enabled')
+      .in('id', orderIds)
+      .eq('buyer_id', userId)
+      .eq('status', 'delivered');
+      
+    if (error || !orders || orders.length !== orderIds.length) {
+      throw new Error('Some orders cannot be confirmed or do not belong to you');
+    }
+    
+    // Confirm each order (reuse existing confirmOrderReceipt logic)
+    for (const order of orders) {
+      await this.confirmOrderReceipt(userId, order.id);
+    }
+
+    return { success: true, confirmed: orders.length };
   }
 }

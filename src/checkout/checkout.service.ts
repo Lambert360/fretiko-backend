@@ -1,25 +1,43 @@
-import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, HttpException, HttpStatus, forwardRef, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { EscrowService } from '../escrow/escrow.service';
+import { NotificationHelperService } from '../notifications/notification-helper.service';
+import { RewardsService } from '../rewards/rewards.service';
 
 @Injectable()
 export class CheckoutService {
   private supabase;
 
-  constructor(private configService: ConfigService) {
+  constructor(
+    private configService: ConfigService,
+    @Inject(forwardRef(() => EscrowService))
+    private escrowService: EscrowService,
+    private notificationHelper: NotificationHelperService,
+    @Inject(forwardRef(() => RewardsService))
+    private rewardsService: RewardsService,
+  ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
 
+  /**
+   * Generate a 3-digit PIN for order handoff verification
+   */
+  private generatePIN(): string {
+    return Math.floor(100 + Math.random() * 900).toString();
+  }
+
   // Get checkout summary from user's cart
-  async getCheckoutSummary(userId: string, userToken?: string) {
+  async getCheckoutSummary(userId: string, userToken?: string, selectedItemIds?: string[]) {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
-    // Get cart items with product details
+    console.log('🛒 Backend getCheckoutSummary - selectedItemIds:', selectedItemIds);
+
+    // Get cart items with BOTH product AND service details
     const { data: cartItems, error: cartError } = await client
       .from('cart_items')
       .select(`
-        id,
-        quantity,
+        *,
         products!cart_items_product_id_fkey (
           id,
           name,
@@ -27,6 +45,15 @@ export class CheckoutService {
           user_id,
           category_id,
           quantity
+        ),
+        services!cart_items_service_id_fkey (
+          id,
+          name,
+          base_price,
+          user_id,
+          service_categories (
+            name
+          )
         )
       `)
       .eq('user_id', userId);
@@ -40,15 +67,52 @@ export class CheckoutService {
       throw new HttpException('Cart is empty', HttpStatus.BAD_REQUEST);
     }
 
-    // Calculate summary
-    const items = cartItems.map(item => ({
-      id: item.products.id,
-      name: item.products.name,
-      price: item.products.price,
-      quantity: item.quantity,
-      sellerId: item.products.user_id,
-      requiresEscrow: false,
-    }));
+    console.log(`📋 Backend found ${cartItems.length} cart items`);
+
+    // Calculate summary - handle BOTH products AND services
+    let items = cartItems.map(item => {
+      const isService = !!item.service_id;
+      
+      if (isService) {
+        // Service item
+        return {
+          id: item.services.id,
+          name: item.services.name,
+          price: item.price_at_add,
+          quantity: item.quantity,
+          sellerId: item.services.user_id,
+          requiresEscrow: false,
+          itemType: 'service',
+          serviceDate: item.scheduled_date,
+          serviceTime: item.scheduled_time,
+          serviceNotes: item.service_notes,
+          category: item.services?.service_categories?.name || 'Services',
+        };
+      } else {
+        // Product item
+        return {
+          id: item.products.id,
+          name: item.products.name,
+          price: item.products.price,
+          quantity: item.quantity,
+          sellerId: item.products.user_id,
+          requiresEscrow: false,
+          itemType: 'product',
+        };
+      }
+    });
+
+    // Filter items if selectedItemIds is provided (selective checkout)
+    if (selectedItemIds && selectedItemIds.length > 0) {
+      console.log('🔍 Backend filtering to selected items:', selectedItemIds);
+      const beforeCount = items.length;
+      items = items.filter(item => selectedItemIds.includes(item.id));
+      console.log(`✅ Backend filtered: ${items.length} of ${beforeCount} items selected`);
+      
+      if (items.length === 0) {
+        throw new HttpException('No selected items found in cart', HttpStatus.BAD_REQUEST);
+      }
+    }
 
     const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
     const shipping = this.calculateShipping(subtotal, items);
@@ -310,6 +374,166 @@ export class CheckoutService {
     };
   }
 
+  // Get all delivery addresses
+  async getAllAddresses(userId: string, userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+
+    const { data, error } = await client
+      .from('delivery_addresses')
+      .select('*')
+      .eq('user_id', userId)
+      .order('is_default', { ascending: false })
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching addresses:', error);
+      throw new HttpException('Failed to fetch addresses', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    return data.map(addr => ({
+      id: addr.id,
+      fullName: addr.full_name,
+      phone: addr.phone,
+      address: addr.address,
+      city: addr.city,
+      state: addr.state,
+      postalCode: addr.postal_code,
+      isDefault: addr.is_default,
+      createdAt: addr.created_at,
+      updatedAt: addr.updated_at,
+    }));
+  }
+
+  // Update delivery address
+  async updateAddress(userId: string, addressId: string, addressData: any, userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+
+    // If this is being set as default, unset other defaults first
+    if (addressData.isDefault) {
+      await client
+        .from('delivery_addresses')
+        .update({ is_default: false })
+        .eq('user_id', userId);
+    }
+
+    const { data, error } = await client
+      .from('delivery_addresses')
+      .update({
+        full_name: addressData.fullName,
+        phone: addressData.phone,
+        address: addressData.address,
+        city: addressData.city,
+        state: addressData.state,
+        postal_code: addressData.postalCode,
+        is_default: addressData.isDefault || false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', addressId)
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error updating address:', error);
+      throw new HttpException('Failed to update address', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    return {
+      id: data.id,
+      fullName: data.full_name,
+      phone: data.phone,
+      address: data.address,
+      city: data.city,
+      state: data.state,
+      postalCode: data.postal_code,
+      isDefault: data.is_default,
+    };
+  }
+
+  // Delete delivery address
+  async deleteAddress(userId: string, addressId: string, userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+
+    // Check if this is the default address
+    const { data: address } = await client
+      .from('delivery_addresses')
+      .select('is_default')
+      .eq('id', addressId)
+      .eq('user_id', userId)
+      .single();
+
+    if (!address) {
+      throw new HttpException('Address not found', HttpStatus.NOT_FOUND);
+    }
+
+    // Delete the address
+    const { error } = await client
+      .from('delivery_addresses')
+      .delete()
+      .eq('id', addressId)
+      .eq('user_id', userId);
+
+    if (error) {
+      console.error('Error deleting address:', error);
+      throw new HttpException('Failed to delete address', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    // If this was the default address, set another one as default
+    if (address.is_default) {
+      const { data: remainingAddresses } = await client
+        .from('delivery_addresses')
+        .select('id')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (remainingAddresses && remainingAddresses.length > 0) {
+        await client
+          .from('delivery_addresses')
+          .update({ is_default: true })
+          .eq('id', remainingAddresses[0].id);
+      }
+    }
+
+    return { success: true, message: 'Address deleted successfully' };
+  }
+
+  // Set default address
+  async setDefaultAddress(userId: string, addressId: string, userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+
+    // Unset all other defaults
+    await client
+      .from('delivery_addresses')
+      .update({ is_default: false })
+      .eq('user_id', userId);
+
+    // Set this one as default
+    const { data, error } = await client
+      .from('delivery_addresses')
+      .update({ is_default: true, updated_at: new Date().toISOString() })
+      .eq('id', addressId)
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error setting default address:', error);
+      throw new HttpException('Failed to set default address', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    return {
+      id: data.id,
+      fullName: data.full_name,
+      phone: data.phone,
+      address: data.address,
+      city: data.city,
+      state: data.state,
+      postalCode: data.postal_code,
+      isDefault: data.is_default,
+    };
+  }
+
   // Create order
   async createOrder(userId: string, orderData: any, userToken?: string) {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
@@ -335,8 +559,9 @@ export class CheckoutService {
         userToken,
       );
     } else {
-      // Cart checkout
-      summary = await this.getCheckoutSummary(userId, userToken);
+      // Cart checkout (with optional selective item filtering)
+      console.log('🛒 Backend createOrder - Cart checkout with selectedItemIds:', orderData.selectedItemIds);
+      summary = await this.getCheckoutSummary(userId, userToken, orderData.selectedItemIds);
     }
 
     // Validate payment method and balance if wallet
@@ -386,18 +611,36 @@ export class CheckoutService {
     const actualTotal = summary.subtotal + actualDeliveryFee + summary.tax + 
                        (orderData.useEscrow ? summary.escrowFee : 0);
 
-    // Create order
+    // Extract vendor_id from items (all items should be from same vendor for now)
+    const vendorId = summary.sellerId || summary.items[0]?.sellerId;
+    if (!vendorId) {
+      throw new HttpException('Vendor ID not found in order items', HttpStatus.BAD_REQUEST);
+    }
+
+    // Determine order source
+    const orderSource = isAuctionOrder ? 'auction' : 
+                       orderData.directCheckout ? 'regular' : 'regular';
+
+    // Log delivery type detection
+    console.log('🚚 [DEBUG] Delivery type detection:', {
+      hasSelectedRider: !!orderData.selectedRider,
+      selectedRider: orderData.selectedRider,
+      selectedRiderRiderId: orderData.selectedRider?.riderId,
+      isPickup: orderData.selectedRider?.riderId === 'pickup',
+      calculatedRiderId: riderId,
+      deliveryType: orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery'
+    });
+
+    // Create order with correct schema
     const orderToInsert = {
-      user_id: userId,
+      buyer_id: userId,              // ✅ Correct column name
+      vendor_id: vendorId,           // ✅ Required field
       order_number: orderNumber,
-      status: 'pending',
-      payment_method: orderData.paymentMethodId,
-      use_escrow: orderData.useEscrow || false,
-      subtotal: summary.subtotal,
-      shipping_cost: actualDeliveryFee,
-      tax_amount: summary.tax,
-      escrow_fee: orderData.useEscrow ? summary.escrowFee : 0,
+      status: 'pending',             // ✅ Start as pending so vendor can accept
+      escrow_enabled: orderData.useEscrow || false,  // ✅ Correct column name
       total_amount: actualTotal,
+      delivery_fee: actualDeliveryFee,  // ✅ Correct column name
+      platform_fee: actualTotal * 0.05, // 5% platform fee
       rider_id: riderId,
       delivery_type: orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery',
       delivery_address: {
@@ -419,6 +662,15 @@ export class CheckoutService {
         deliveryPrice: orderData.selectedRider.deliveryPrice,
         estimatedArrival: orderData.selectedRider.estimatedArrival,
       } : null,
+      source: orderSource,  // ✅ Track order source
+      metadata: {
+        // Store additional details in metadata JSONB
+        subtotal: summary.subtotal,
+        tax_amount: summary.tax,
+        escrow_fee: orderData.useEscrow ? summary.escrowFee : 0,
+        payment_method: orderData.paymentMethodId,
+        original_shipping: summary.shipping,
+      },
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
@@ -434,16 +686,25 @@ export class CheckoutService {
       throw new HttpException('Failed to create order', HttpStatus.INTERNAL_SERVER_ERROR);
     }
 
-    // Create order items
-    const orderItems = summary.items.map(item => ({
-      order_id: order.id,
-      product_id: item.id,
-      product_name: item.name,
-      quantity: item.quantity,
-      unit_price: item.price,
-      total_price: item.price * item.quantity,
-      created_at: new Date().toISOString(),
-    }));
+    // Create order items - handle BOTH products AND services
+    const orderItems = summary.items.map(item => {
+      const isService = item.itemType === 'service';
+      
+      return {
+        order_id: order.id,
+        product_id: isService ? null : item.id,
+        service_id: isService ? item.id : null,
+        product_name: item.name,
+        category: item.category || 'General',  // ✅ Store category for countdown calculation
+        quantity: item.quantity,
+        unit_price: item.price,
+        total_price: item.price * item.quantity,
+        scheduled_date: isService ? item.serviceDate : null,
+        scheduled_time: isService ? item.serviceTime : null,
+        service_notes: isService ? item.serviceNotes : null,
+        created_at: new Date().toISOString(),
+      };
+    });
 
     const { error: itemsError } = await client
       .from('order_items')
@@ -456,29 +717,112 @@ export class CheckoutService {
       throw new HttpException('Failed to create order items', HttpStatus.INTERNAL_SERVER_ERROR);
     }
 
-    // Process payment if wallet
+    // ✅ HANDLE REWARDS REDEMPTION
+    let rewardsUsed = 0;
+    let finalPaymentAmount = actualTotal;
+
+    if (orderData.useRewards && orderData.rewardsAmount > 0) {
+      console.log(`🎁 User wants to use ${orderData.rewardsAmount} rewards for order ${order.id}`);
+      
+      try {
+        // Verify user has sufficient rewards
+        const rewardsBalance = await this.rewardsService.getUserRewardsBalance(userId);
+        if (!rewardsBalance || rewardsBalance.available_rewards < orderData.rewardsAmount) {
+          throw new HttpException(
+            `Insufficient rewards balance. Available: ${rewardsBalance?.available_rewards || 0}, Requested: ${orderData.rewardsAmount}`,
+            HttpStatus.BAD_REQUEST
+          );
+        }
+        
+        // Redeem rewards
+        const redemptionResult = await this.rewardsService.redeemRewards(
+          userId,
+          orderData.rewardsAmount,
+          order.id
+        );
+        
+        if (!redemptionResult.success) {
+          throw new HttpException('Failed to redeem rewards', HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+        
+        rewardsUsed = orderData.rewardsAmount;
+        finalPaymentAmount = Math.max(0, actualTotal - rewardsUsed);
+        
+        console.log(`✅ Redeemed ${rewardsUsed} rewards for order ${order.id}`);
+        console.log(`💰 Final payment amount: ${finalPaymentAmount} (original: ${actualTotal})`);
+      } catch (rewardsError) {
+        console.error('Rewards redemption error:', rewardsError);
+        // Rollback order creation
+        await client.from('orders').delete().eq('id', order.id);
+        throw rewardsError;
+      }
+    }
+
+    // Update order with rewards used
+    if (rewardsUsed > 0) {
+      const { error: updateError } = await client
+        .from('orders')
+        .update({ 
+          rewards_used: rewardsUsed,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', order.id);
+      
+      if (updateError) {
+        console.error('Failed to update order with rewards_used:', updateError);
+        // Non-critical, continue with order
+      }
+    }
+
+    // Process payment if wallet (use final amount after rewards discount)
     if (orderData.paymentMethodId === 'wallet') {
-      await this.processWalletPayment(userId, order.id, actualTotal, client);
+      await this.processWalletPayment(userId, order.id, finalPaymentAmount, vendorId, riderId, client);
     }
 
     // Clear cart if not direct checkout
-    if (!orderData.directCheckout) {
-      await client
-        .from('cart_items')
-        .delete()
-        .eq('user_id', userId);
+    // For selective checkout, DON'T clear the cart here - let the frontend handle it
+    // For full cart checkout (no selectedItemIds), clear the entire cart
+    if (!orderData.directCheckout && !orderData.auctionCheckout) {
+      if (!orderData.selectedItemIds || orderData.selectedItemIds.length === 0) {
+        // Full cart checkout - clear everything
+        console.log('🗑️ Backend: Clearing entire cart (full cart checkout)');
+        await client
+          .from('cart_items')
+          .delete()
+          .eq('user_id', userId);
+      } else {
+        // Selective checkout - DON'T clear cart (frontend will remove only selected items)
+        console.log(`🔒 Backend: Skipping cart clear (selective checkout - ${orderData.selectedItemIds.length} items selected)`);
+        console.log('   Frontend will handle removing only selected items');
+      }
     }
 
-    // Update product stock (only for non-auction orders)
+    // Update product stock (only for products, not services, and not auctions)
     if (!isAuctionOrder) {
       for (const item of summary.items) {
-        await client
+        // Skip services - they don't have stock
+        if (item.itemType === 'service') {
+          continue;
+        }
+        
+        // Fetch current quantity for products
+        const { data: product } = await client
           .from('products')
-          .update({
-            quantity: client.raw(`quantity - ${item.quantity}`),
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', item.id);
+          .select('quantity')
+          .eq('id', item.id)
+          .single();
+
+        if (product) {
+          const newQuantity = Math.max(0, product.quantity - item.quantity);
+          
+          await client
+            .from('products')
+            .update({
+              quantity: newQuantity,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', item.id);
+        }
       }
     }
 
@@ -506,6 +850,43 @@ export class CheckoutService {
           updated_at: new Date().toISOString(),
         })
         .eq('id', orderData.auctionCheckout.auctionId);
+    }
+
+    // ✅ NOTIFY VENDOR OF NEW ORDER
+    try {
+      // Get buyer name for notification
+      const { data: buyerProfile } = await client
+        .from('user_profiles')
+        .select('username')
+        .eq('id', userId)
+        .single();
+
+      await this.notificationHelper.notifyVendorNewOrder(vendorId, {
+        id: order.id,
+        orderNumber: order.order_number,
+        totalAmount: actualTotal,
+        itemCount: summary.items.length,
+        buyerName: buyerProfile?.username || 'Customer',
+      });
+      console.log(`✅ Vendor ${vendorId} notified of new order ${order.order_number}`);
+    } catch (notifyError) {
+      console.error('Failed to notify vendor (non-critical):', notifyError);
+    }
+
+    // ✅ NOTIFY VENDOR OF PAYMENT IN ESCROW (if wallet payment)
+    if (orderData.paymentMethodId === 'wallet') {
+      try {
+        const escrowBreakdown = this.calculateEscrowBreakdown(actualTotal, riderId);
+        await this.notificationHelper.notifyVendorOrderPaid(vendorId, {
+          orderId: order.id,
+          orderNumber: order.order_number,
+          vendorAmount: escrowBreakdown.vendorAmount,
+          escrowId: order.id, // Escrow uses order_id as reference
+        });
+        console.log(`✅ Vendor ${vendorId} notified of payment in escrow`);
+      } catch (notifyError) {
+        console.error('Failed to notify vendor of payment (non-critical):', notifyError);
+      }
     }
 
     return {
@@ -569,25 +950,43 @@ export class CheckoutService {
     };
   }
 
-  // Calculate escrow fee (2.5% with minimum of ₦50)
+  // Calculate escrow fee (Currently FREE - set to 0%)
+  // TODO: To enable escrow fees in the future, change rate from 0 to desired percentage (e.g., 0.025 for 2.5%)
+  // and set minimum fee (e.g., 50 for ₦50 minimum)
   calculateEscrowFee(amount: number): number {
-    return Math.max(50, Math.round(amount * 0.025));
+    const escrowRate = 0; // 0% = FREE (change to 0.025 for 2.5%)
+    const minimumFee = 0; // ₦0 minimum (change to 50 for ₦50 minimum)
+    return Math.max(minimumFee, Math.round(amount * escrowRate));
   }
 
   // Calculate shipping cost
   private calculateShipping(subtotal: number, items: any[]): number {
-    // Free shipping for orders over ₦10,000
-    if (subtotal >= 10000) {
+    // Services don't require shipping
+    const hasPhysicalProducts = items.some(item => item.itemType === 'product');
+    
+    if (!hasPhysicalProducts) {
+      return 0; // No shipping for service-only orders
+    }
+    
+    // Calculate subtotal for physical products only
+    const productSubtotal = items
+      .filter(item => item.itemType === 'product')
+      .reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    
+    // Free shipping for product orders over ₦10,000
+    if (productSubtotal >= 10000) {
       return 0;
     }
 
-    // Base shipping rate of ₦500
-    return 500;
+    // Base shipping rate of ₦500 for physical products
+    // Note: Actual shipping will be determined by rider selection
+    return 0; // Set to 0 - calculated at rider selection
   }
 
   // Calculate tax (7.5% VAT)
+  // NOTE: Tax calculation disabled - users don't pay tax yet
   private calculateTax(subtotal: number): number {
-    return Math.round(subtotal * 0.075);
+    return 0; // Disabled for now
   }
 
   // Get delivery options based on address
@@ -613,47 +1012,479 @@ export class CheckoutService {
   }
 
   // Process wallet payment
-  private async processWalletPayment(userId: string, orderId: string, amount: number, client: any) {
-    // Deduct from wallet
-    const { error: deductError } = await client
-      .from('wallets')
-      .update({
-        available_balance: client.raw(`available_balance - ${amount}`),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('user_id', userId);
+  private async processWalletPayment(
+    userId: string,
+    orderId: string,
+    amount: number,
+    vendorId: string,
+    riderId: string | null,
+    client: any,
+  ) {
+    // ✅ Use the process_wallet_transaction RPC function for proper escrow handling
+    // This function automatically handles:
+    // - Moving money from available_balance to escrow_balance
+    // - Creating proper wallet_ledger entries
+    // - Atomic transaction safety
+    const { data: result, error: rpcError } = await this.supabase.rpc(
+      'process_wallet_transaction',
+      {
+        p_user_id: userId,
+        p_transaction_type: 'purchase_hold',
+        p_amount: amount,
+        p_description: `Payment for order ${orderId}`,
+        p_reference_id: orderId, // orderId is already a UUID string
+        p_reference_type: 'order',
+      }
+    );
 
-    if (deductError) {
-      console.error('Wallet deduction error:', deductError);
+    if (rpcError) {
+      console.error('❌ Wallet transaction RPC error:', rpcError);
       throw new HttpException('Payment processing failed', HttpStatus.INTERNAL_SERVER_ERROR);
     }
 
-    // Create transaction record
-    const { error: transactionError } = await client
-      .from('wallet_transactions')
-      .insert({
-        user_id: userId,
-        type: 'debit',
-        amount: amount,
-        description: `Payment for order ${orderId}`,
-        reference: orderId,
-        status: 'completed',
-        created_at: new Date().toISOString(),
-      });
-
-    if (transactionError) {
-      console.error('Transaction record error:', transactionError);
-      // Note: We don't throw here as the payment already went through
+    if (!result.success) {
+      console.error('❌ Wallet transaction failed:', result.error);
+      throw new HttpException(result.error || 'Payment processing failed', HttpStatus.INTERNAL_SERVER_ERROR);
     }
 
-    // Update order status
+    console.log(`✅ Wallet payment processed successfully:`, {
+      transactionId: result.transaction_id,
+      availableDelta: result.available_delta,
+      escrowDelta: result.escrow_delta,
+      newAvailable: result.new_available,
+      newEscrow: result.new_escrow,
+    });
+
+    // ✅ Payment processed - money now in escrow
+    // Status stays 'pending' so vendor can accept the order
+    // (Don't change status to 'paid' - vendor needs to accept first)
+
+    // ✅ GENERATE HANDOFF PINS (3-digit)
+    // For self-pickup: only delivery PIN needed (buyer shows to vendor)
+    // For regular delivery: both PINs needed (pickup PIN for rider→vendor, delivery PIN for rider→buyer)
+    const pickupPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
+    const deliveryPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
+    
     await client
       .from('orders')
       .update({
-        status: 'confirmed',
-        payment_status: 'paid',
+        pickup_pin: pickupPin,
+        delivery_pin: deliveryPin,
         updated_at: new Date().toISOString(),
       })
       .eq('id', orderId);
+    
+    console.log(`✅ Generated handoff PINs for order ${orderId}`);
+    
+    // ✅ SEND PINs VIA NOTIFICATIONS
+    try {
+      // Get order details for notifications
+      const { data: orderDetails } = await client
+        .from('orders')
+        .select('order_number, buyer_id, vendor_id, rider_id, delivery_type')
+        .eq('id', orderId)
+        .single();
+
+      if (orderDetails) {
+        // Get vendor name for notifications
+        const { data: vendorProfile } = await client
+          .from('user_profiles')
+          .select('username')
+          .eq('id', orderDetails.vendor_id)
+          .single();
+
+        // ✅ Handle PIN notifications based on delivery type
+        if (orderDetails.delivery_type === 'pickup') {
+          // Self-pickup: Send deliveryPin to BOTH vendor and buyer
+          // Buyer provides deliveryPin to vendor for handoff verification
+          
+          // Send deliveryPin to vendor (for verification)
+          await this.notificationHelper.notifyVendorSelfPickupPin(orderDetails.vendor_id, {
+            id: orderId,
+            orderNumber: orderDetails.order_number,
+            deliveryPin: deliveryPin,
+            buyerName: 'Buyer', // Could fetch buyer username if needed
+          });
+          console.log(`✅ Sent self-pickup PIN to vendor ${orderDetails.vendor_id}`);
+
+          // Send deliveryPin to buyer (to provide to vendor)
+          await this.notificationHelper.notifyBuyerSelfPickupPin(orderDetails.buyer_id, {
+            id: orderId,
+            orderNumber: orderDetails.order_number,
+            deliveryPin: deliveryPin,
+            vendorName: vendorProfile?.username,
+          });
+          console.log(`✅ Sent self-pickup PIN to buyer ${orderDetails.buyer_id}`);
+        } else {
+          // Regular delivery: Send pickupPin to rider, deliveryPin to buyer
+          
+          // Send pickup PIN to rider
+          if (orderDetails.rider_id) {
+            await this.notificationHelper.notifyRiderPickupPin(orderDetails.rider_id, {
+              id: orderId,
+              orderNumber: orderDetails.order_number,
+              pickupPin: pickupPin,
+              vendorName: vendorProfile?.username,
+            });
+            console.log(`✅ Sent pickup PIN to rider ${orderDetails.rider_id}`);
+          }
+
+          // Send delivery PIN to buyer
+          await this.notificationHelper.notifyBuyerDeliveryPin(orderDetails.buyer_id, {
+            id: orderId,
+            orderNumber: orderDetails.order_number,
+            deliveryPin: deliveryPin,
+          });
+          console.log(`✅ Sent delivery PIN to buyer ${orderDetails.buyer_id}`);
+        }
+      }
+    } catch (notifyError) {
+      console.error('Failed to send PIN notifications (non-critical):', notifyError);
+    }
+
+    // ✅ CREATE ESCROW RECORD
+    try {
+      const escrowBreakdown = this.calculateEscrowBreakdown(amount, riderId);
+      const escrow = await this.escrowService.createEscrow(orderId, escrowBreakdown);
+      console.log(`✅ Escrow created for order ${orderId}: ₣${amount}`);
+      return escrow;
+    } catch (escrowError) {
+      console.error('Failed to create escrow (non-critical):', escrowError);
+      // Don't throw - payment already processed, escrow can be created manually if needed
+    }
+  }
+
+  // Calculate escrow breakdown (platform fee: 2%, delivery fee: 10% if rider)
+  private calculateEscrowBreakdown(
+    totalAmount: number,
+    riderId: string | null,
+  ): { totalAmount: number; vendorAmount: number; riderAmount: number; platformAmount: number } {
+    const platformFee = totalAmount * 0.02; // 2% platform fee
+    const deliveryFee = riderId ? totalAmount * 0.10 : 0; // 10% delivery fee if rider assigned
+    const vendorAmount = totalAmount - platformFee - deliveryFee;
+
+    return {
+      totalAmount,
+      vendorAmount,
+      riderAmount: deliveryFee,
+      platformAmount: platformFee,
+    };
+  }
+
+  // ========== MULTI-VENDOR CHECKOUT METHODS ==========
+
+  // Group items by vendor
+  public groupItemsByVendor(items: any[]): any[] {
+    const groups = {};
+    
+    items.forEach(item => {
+      if (!groups[item.sellerId]) {
+        groups[item.sellerId] = {
+          vendorId: item.sellerId,
+          items: [],
+          subtotal: 0,
+        };
+      }
+      
+      groups[item.sellerId].items.push(item);
+      groups[item.sellerId].subtotal += item.price * item.quantity;
+    });
+    
+    return Object.values(groups);
+  }
+
+  // Create single order within a group
+  private async createSingleOrderInGroup(
+    userId: string,
+    orderGroupId: string,
+    vendorGroup: any,
+    riderAssignment: any,
+    orderData: any,
+    sequence: number,
+    userToken?: string
+  ) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+    
+    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+    
+    const orderToInsert = {
+      buyer_id: userId,
+      vendor_id: vendorGroup.vendorId,
+      order_number: orderNumber,
+      status: 'pending',
+      escrow_enabled: orderData.useEscrow || false,
+      total_amount: vendorGroup.subtotal,
+      delivery_fee: riderAssignment.pricing.total / riderAssignment.vendorIds.length, // Split delivery fee
+      platform_fee: vendorGroup.subtotal * 0.05,
+      rider_id: riderAssignment.rider.id,
+      delivery_type: 'delivery',
+      delivery_address: orderData.deliveryAddress,
+      delivery_instructions: orderData.deliveryInstructions,
+      estimated_delivery: new Date(Date.now() + riderAssignment.route.estimatedTime * 60 * 1000).toISOString(),
+      rider_info: {
+        riderId: riderAssignment.rider.id,
+        riderName: riderAssignment.rider.name,
+        vehicleType: riderAssignment.vehicleType,
+        deliveryPrice: riderAssignment.pricing.total / riderAssignment.vendorIds.length,
+        estimatedArrival: riderAssignment.route.estimatedTime,
+        multiStop: riderAssignment.vendorIds.length > 1,
+        stopSequence: riderAssignment.vendorIds.indexOf(vendorGroup.vendorId) + 1,
+      },
+      order_source: 'regular',
+      pickup_pin: this.generatePIN(),
+      delivery_pin: this.generatePIN(),
+      order_group_id: orderGroupId,
+      is_grouped: true,
+      group_sequence: sequence,
+    };
+    
+    const { data: order, error } = await client
+      .from('orders')
+      .insert(orderToInsert)
+      .select()
+      .single();
+      
+    if (error) throw new HttpException('Failed to create order in group', HttpStatus.INTERNAL_SERVER_ERROR);
+    
+    // Create order items - handle BOTH products AND services
+    const orderItems = vendorGroup.items.map(item => {
+      const isService = item.itemType === 'service';
+      
+      return {
+        order_id: order.id,
+        product_id: isService ? null : item.id,
+        service_id: isService ? item.id : null,
+        product_name: item.name,
+        category: item.category || 'General',  // ✅ Store category for countdown calculation
+        quantity: item.quantity,
+        unit_price: item.price,
+        total_price: item.price * item.quantity,
+        scheduled_date: isService ? item.serviceDate : null,
+        scheduled_time: isService ? item.serviceTime : null,
+        service_notes: isService ? item.serviceNotes : null,
+      };
+    });
+    
+    await client.from('order_items').insert(orderItems);
+    
+    // Update stock - only for products, not services
+    for (const item of vendorGroup.items) {
+      // Skip services
+      if (item.itemType === 'service') {
+        continue;
+      }
+      
+      await client.rpc('decrement_product_stock', {
+        p_product_id: item.id,
+        p_quantity: item.quantity,
+      });
+    }
+    
+    return order;
+  }
+
+  // Deduct wallet balance for entire group
+  private async deductWalletForGroup(
+    userId: string,
+    totalAmount: number,
+    orderGroupId: string,
+    userToken?: string
+  ) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+    
+    // Get wallet ID first
+    const { data: walletData } = await client
+      .from('wallets')
+      .select('id, available_balance')
+      .eq('user_id', userId)
+      .single();
+
+    if (!walletData) {
+      throw new HttpException('Wallet not found', HttpStatus.NOT_FOUND);
+    }
+
+    // Deduct from wallet
+    const { error: walletError } = await client
+      .from('wallets')
+      .update({
+        available_balance: walletData.available_balance - totalAmount,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('user_id', userId);
+      
+    if (walletError) throw new HttpException('Failed to deduct wallet balance', HttpStatus.INTERNAL_SERVER_ERROR);
+    
+    // Log transaction in wallet_ledger
+    await client.from('wallet_ledger').insert({
+      wallet_id: walletData.id,
+      transaction_type: 'purchase_hold',
+      amount: totalAmount,
+      balance_after: walletData.available_balance - totalAmount,
+      description: `Multi-vendor order group payment`,
+      reference_id: orderGroupId,
+      reference_type: 'order_group',
+    });
+  }
+
+  // Create grouped order (main method)
+  async createGroupedOrder(userId: string, orderData: any, userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+    
+    let orderGroupId = null;
+    let createdOrderIds: string[] = [];
+    let walletDeducted = false;
+    let totalAmount = 0; // Define outside try block for rollback access
+    
+    try {
+      // Get cart summary
+      const summary = await this.getCheckoutSummary(userId, userToken);
+      
+      // Group items by vendor (sellerId)
+      const vendorGroups = this.groupItemsByVendor(summary.items);
+      
+      if (vendorGroups.length === 1) {
+        // Single vendor - use existing flow
+        return this.createOrder(userId, orderData, userToken);
+      }
+      
+      // Multi-vendor flow
+      // 1. Generate group number
+      const groupNumber = `GRP-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+      
+      // 2. Calculate total across all vendors
+      totalAmount = summary.subtotal + summary.tax + orderData.totalRiderFee + 
+                   (orderData.useEscrow ? summary.escrowFee : 0);
+      
+      // 3. Validate wallet balance (single deduction for entire group)
+      const { data: wallet } = await client
+        .from('wallets')
+        .select('available_balance')
+        .eq('user_id', userId)
+        .single();
+        
+      if (!wallet || wallet.available_balance < totalAmount) {
+        throw new HttpException('Insufficient wallet balance', HttpStatus.BAD_REQUEST);
+      }
+      
+      // 4. Create order group record
+      const { data: orderGroup, error: groupError } = await client
+        .from('order_groups')
+        .insert({
+          group_number: groupNumber,
+          buyer_id: userId,
+          total_amount: totalAmount,
+          total_orders: vendorGroups.length,
+          delivery_address: orderData.deliveryAddress,
+        })
+        .select()
+        .single();
+        
+      if (groupError) throw new HttpException('Failed to create order group', HttpStatus.INTERNAL_SERVER_ERROR);
+      
+      orderGroupId = orderGroup.id;
+      
+      // 5. Create individual orders for each vendor
+      const orders: any[] = [];
+      for (let i = 0; i < vendorGroups.length; i++) {
+        const group = vendorGroups[i];
+        const riderAssignment = orderData.riderAssignments[i]; // From rider optimization
+        
+        const order = await this.createSingleOrderInGroup(
+          userId,
+          orderGroup.id,
+          group,
+          riderAssignment,
+          orderData,
+          i + 1, // sequence
+          userToken
+        );
+        
+        orders.push(order);
+        createdOrderIds.push(order.id);
+      }
+      
+      // 6. Deduct wallet balance ONCE for entire group
+      await this.deductWalletForGroup(userId, totalAmount, orderGroup.id, userToken);
+      walletDeducted = true;
+      
+      // 7. Create escrows per vendor if enabled
+      if (orderData.useEscrow) {
+        for (const order of orders) {
+          const breakdown = {
+            totalAmount: order.total_amount,
+            vendorAmount: order.total_amount - order.delivery_fee - order.platform_fee,
+            riderAmount: order.delivery_fee,
+            platformAmount: order.platform_fee,
+          };
+          await this.escrowService.createEscrow(order.id, breakdown);
+        }
+      }
+      
+      // 8. Send notifications to all vendors and riders
+      try {
+        for (const order of orders) {
+          await this.notificationHelper.notifyVendorNewOrder(order.vendor_id, {
+            id: order.id,
+            orderNumber: order.order_number,
+            totalAmount: order.total_amount,
+          });
+          if (order.rider_id) {
+            await this.notificationHelper.notifyRiderNewAssignment(order.rider_id, {
+              id: order.id,
+              orderNumber: order.order_number,
+              deliveryFee: order.delivery_fee,
+            });
+          }
+        }
+      } catch (notifError) {
+        console.warn('⚠️ Notification sending failed (non-critical):', notifError);
+      }
+      
+      return {
+        orderGroup: orderGroup,
+        orders: orders,
+      };
+      
+    } catch (error) {
+      console.error('❌ Grouped order creation failed, rolling back:', error);
+      
+      // Rollback: Delete created orders
+      if (createdOrderIds.length > 0) {
+        await client.from('orders').delete().in('id', createdOrderIds);
+        await client.from('order_items').delete().in('order_id', createdOrderIds);
+      }
+      
+      // Rollback: Delete order group
+      if (orderGroupId) {
+        await client.from('order_groups').delete().eq('id', orderGroupId);
+      }
+      
+      // Rollback: Refund wallet if deducted using RPC function
+      if (walletDeducted) {
+        try {
+          const { data: refundResult, error: refundError } = await this.supabase.rpc(
+            'process_wallet_transaction',
+            {
+              p_user_id: userId,
+              p_transaction_type: 'escrow_refund',
+              p_amount: totalAmount,
+              p_description: `Refund for failed order group creation`,
+              p_reference_id: orderGroupId || null,
+              p_reference_type: 'order_group',
+            }
+          );
+
+          if (refundError || !refundResult?.success) {
+            console.error('❌ Failed to refund wallet during rollback:', refundError || refundResult?.error);
+          } else {
+            console.log('✅ Wallet refunded during rollback:', refundResult.transaction_id);
+          }
+        } catch (refundError) {
+          console.error('❌ Error during wallet refund rollback:', refundError);
+        }
+      }
+      
+      throw error;
+    }
   }
 }

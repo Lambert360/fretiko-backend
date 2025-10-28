@@ -1,22 +1,27 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { RiderAvailabilityRequest, OrderDetails, RiderProfile } from './riders.controller';
 
 @Injectable()
 export class RidersService {
   private supabase;
 
-  constructor(private configService: ConfigService) {
+  constructor(
+    private configService: ConfigService,
+    private notificationHelper: NotificationHelperService,
+  ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   async findNearbyRiders(
     request: RiderAvailabilityRequest,
-    userId: string,
+    userId?: string | null,
   ): Promise<RiderProfile[]> {
     try {
       // Query riders from user_profiles where is_rider = true
+      // Join with rider_profiles to get actual pricing and vehicle info
       const { data: riderProfiles, error } = await this.supabase
         .from('user_profiles')
         .select(`
@@ -39,8 +44,15 @@ export class RidersService {
         return this.getMockRiders(request);
       }
 
-      // Get trust scores for riders
+      // Get rider_profiles for pricing and vehicle info
       const riderIds = riderProfiles.map(r => r.id);
+      const { data: riderProfilesData } = await this.supabase
+        .from('rider_profiles')
+        .select('*')
+        .in('user_id', riderIds)
+        .eq('profile_status', 'active');
+
+      // Get trust scores for riders
       const { data: trustScores } = await this.supabase
         .from('trust_scores')
         .select('user_id, rider_trust_score, completed_orders')
@@ -50,13 +62,46 @@ export class RidersService {
       const riders: RiderProfile[] = await Promise.all(
         riderProfiles.map(async (profile) => {
           const trustData = trustScores?.find(ts => ts.user_id === profile.id);
+          const riderProfileData = riderProfilesData?.find(rp => rp.user_id === profile.id);
           const preferences = profile.preferences || {};
           
           // Mock distance calculation (in real app, use geolocation)
           const distance = Math.random() * 5; // 0-5km
-          const vehicleType = preferences.vehicleType || 'bike';
-          const basePrice = this.getBasePriceByVehicle(vehicleType);
-          const price = basePrice + (distance * 1.5); // Distance-based pricing
+          
+          // Use rider_profiles data if available, otherwise fallback to preferences
+          const vehicleType = riderProfileData?.vehicle_type || preferences.vehicleType || 'bike';
+          const isOnline = riderProfileData?.is_online ?? (Math.random() > 0.3);
+          
+          // Calculate price based on rider's service_pricing if available
+          let price: number;
+          let deliveryPromise: string | undefined;
+          
+          if (riderProfileData?.service_pricing) {
+            // Determine service category (default to intracity for now)
+            const serviceCategory = distance <= 10 ? 'intracity' : distance <= 50 ? 'intercity' : 'interstate';
+            const servicePricing = riderProfileData.service_pricing[serviceCategory];
+            
+            if (servicePricing?.enabled) {
+              if (servicePricing.custom_price) {
+                price = servicePricing.custom_price;
+              } else {
+                price = (servicePricing.base_price || 2) + (distance * (servicePricing.per_km_rate || 0.5));
+              }
+            } else {
+              // Fallback to default pricing
+              const basePrice = this.getBasePriceByVehicle(vehicleType);
+              price = basePrice + (distance * 1.5);
+            }
+            
+            // Get delivery promise message
+            if (riderProfileData.delivery_promise_message) {
+              deliveryPromise = riderProfileData.delivery_promise_message;
+            }
+          } else {
+            // Fallback to mock pricing
+            const basePrice = this.getBasePriceByVehicle(vehicleType);
+            price = basePrice + (distance * 1.5);
+          }
           
           return {
             id: profile.id,
@@ -64,16 +109,17 @@ export class RidersService {
             avatar: profile.avatar_url || `https://picsum.photos/100/100?random=${profile.id}`,
             rating: this.calculateRating(trustData?.completed_orders || 0),
             totalDeliveries: trustData?.completed_orders || 0,
-            vehicleType: ['wheelbarrow', 'bike', 'car'].includes(vehicleType) ? vehicleType as 'wheelbarrow' | 'bike' | 'car' : 'bike',
+            vehicleType: ['wheelbarrow', 'bike', 'car', 'van', 'truck'].includes(vehicleType) ? vehicleType as any : 'bike',
             price: Math.round(price * 100) / 100,
             distanceFromPickup: Math.round(distance * 10) / 10,
             estimatedArrival: Math.max(3, Math.round(distance * 3)), // 3 min per km minimum
             isAvailable: this.checkAvailability(vehicleType, request.orderDetails),
             unavailableReason: this.getUnavailableReason(vehicleType, request.orderDetails),
             specialties: this.getSpecialtiesByVehicle(vehicleType),
-            isOnline: Math.random() > 0.3, // 70% online rate
+            isOnline: isOnline,
             trustScore: trustData?.rider_trust_score || 750,
             completionRate: Math.min(99, 85 + (trustData?.completed_orders || 0) / 10),
+            deliveryPromise: deliveryPromise, // Add delivery promise
           };
         })
       );
@@ -239,6 +285,19 @@ export class RidersService {
     userId: string,
   ): Promise<{ success: boolean; estimatedPickup?: string; estimatedDelivery?: string }> {
     try {
+      // Fetch order details for notification
+      const { data: order } = await this.supabase
+        .from('orders')
+        .select('order_number, delivery_fee, delivery_address, vendor_id, total_amount')
+        .eq('id', orderId)
+        .eq('buyer_id', userId)
+        .single();
+
+      if (!order) {
+        console.error('❌ Order not found or unauthorized');
+        return { success: false };
+      }
+
       // Update order with rider assignment
       const { error } = await this.supabase
         .from('orders')
@@ -259,6 +318,34 @@ export class RidersService {
       const now = new Date();
       const estimatedPickup = new Date(now.getTime() + 15 * 60000).toISOString(); // 15 min
       const estimatedDelivery = new Date(now.getTime() + 45 * 60000).toISOString(); // 45 min
+
+      // ✅ NOTIFY RIDER OF NEW ASSIGNMENT
+      try {
+        // Get vendor location/address for pickup
+        const { data: vendor } = await this.supabase
+          .from('user_profiles')
+          .select('location')
+          .eq('id', order.vendor_id)
+          .single();
+
+        const pickupAddress = vendor?.location?.address || 'Vendor Location';
+        const deliveryAddress = order.delivery_address?.address || 'Delivery Location';
+        
+        // Calculate estimated earnings (10% of total for rider)
+        const estimatedEarnings = order.total_amount * 0.10;
+
+        await this.notificationHelper.notifyRiderNewAssignment(riderId, {
+          id: orderId,
+          orderNumber: order.order_number,
+          deliveryFee: order.delivery_fee || estimatedEarnings,
+          pickupAddress,
+          deliveryAddress,
+          estimatedEarnings,
+        });
+        console.log(`✅ Rider ${riderId} notified of new assignment ${order.order_number}`);
+      } catch (notifyError) {
+        console.error('Failed to notify rider (non-critical):', notifyError);
+      }
 
       return {
         success: true,
@@ -359,6 +446,132 @@ export class RidersService {
     if (rider.estimatedArrival <= 5) reasons.push('Quick pickup');
     
     return reasons;
+  }
+
+  // ===== LOCATION TRACKING METHODS =====
+
+  async updateRiderLocation(
+    riderId: string,
+    latitude: number,
+    longitude: number,
+    accuracy?: number,
+    isOnline: boolean = true,
+    isAvailable: boolean = true,
+    batteryLevel?: number,
+  ): Promise<{ success: boolean; message?: string }> {
+    try {
+      // Use the database function to update/insert rider location
+      const { data, error } = await this.supabase.rpc('update_rider_location', {
+        rider_id: riderId,
+        new_lat: latitude,
+        new_lon: longitude,
+        new_accuracy: accuracy,
+        online_status: isOnline,
+        available_status: isAvailable,
+      });
+
+      if (error) {
+        console.error('❌ Error updating rider location:', error);
+        return { success: false, message: error.message };
+      }
+
+      // Optionally update battery level separately if provided
+      if (batteryLevel !== undefined) {
+        await this.supabase
+          .from('rider_locations')
+          .update({ battery_level: batteryLevel })
+          .eq('user_id', riderId);
+      }
+
+      return { success: true, message: 'Location updated successfully' };
+    } catch (error) {
+      console.error('❌ Error in updateRiderLocation:', error);
+      return { success: false, message: 'System error' };
+    }
+  }
+
+  async getRiderLocation(riderId: string): Promise<{
+    latitude: number;
+    longitude: number;
+    accuracy?: number;
+    isOnline: boolean;
+    isAvailable: boolean;
+    lastPing: string;
+    batteryLevel?: number;
+    currentOrderId?: string;
+  } | null> {
+    try {
+      const { data, error } = await this.supabase
+        .from('rider_locations')
+        .select('*')
+        .eq('user_id', riderId)
+        .single();
+
+      if (error || !data) {
+        console.log(`📍 No location data found for rider ${riderId}`);
+        return null;
+      }
+
+      return {
+        latitude: parseFloat(data.latitude),
+        longitude: parseFloat(data.longitude),
+        accuracy: data.accuracy ? parseFloat(data.accuracy) : undefined,
+        isOnline: data.is_online,
+        isAvailable: data.is_available,
+        lastPing: data.last_ping,
+        batteryLevel: data.battery_level,
+        currentOrderId: data.current_order_id,
+      };
+    } catch (error) {
+      console.error('❌ Error getting rider location:', error);
+      return null;
+    }
+  }
+
+  async toggleRiderStatus(
+    riderId: string,
+    isOnline?: boolean,
+    isAvailable?: boolean,
+  ): Promise<{ success: boolean }> {
+    try {
+      const updates: any = {};
+      if (isOnline !== undefined) updates.is_online = isOnline;
+      if (isAvailable !== undefined) updates.is_available = isAvailable;
+
+      const { error } = await this.supabase
+        .from('rider_locations')
+        .update(updates)
+        .eq('user_id', riderId);
+
+      if (error) {
+        console.error('❌ Error toggling rider status:', error);
+        return { success: false };
+      }
+
+      return { success: true };
+    } catch (error) {
+      console.error('❌ Error in toggleRiderStatus:', error);
+      return { success: false };
+    }
+  }
+
+  async setRiderActiveOrder(riderId: string, orderId: string | null): Promise<{ success: boolean }> {
+    try {
+      const { error } = await this.supabase
+        .from('rider_locations')
+        .update({ current_order_id: orderId })
+        .eq('user_id', riderId);
+
+      if (error) {
+        console.error('❌ Error setting rider active order:', error);
+        return { success: false };
+      }
+
+      return { success: true };
+    } catch (error) {
+      console.error('❌ Error in setRiderActiveOrder:', error);
+      return { success: false };
+    }
   }
 
   // Mock data fallback when no riders in database
