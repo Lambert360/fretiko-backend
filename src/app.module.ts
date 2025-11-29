@@ -31,6 +31,12 @@ import { DisputesModule } from './disputes/disputes.module';
 import { AdminModule } from './admin/admin.module';
 import { ExchangeRateController } from './shared/exchange-rate.controller';
 import { ExchangeRateService } from './shared/exchange-rate.service';
+// Internal Tool Modules
+import { StaffModule } from './staff/staff.module';
+import { DepartmentsModule } from './departments/departments.module';
+import { MemosModule } from './memos/memos.module';
+import { ReportsModule } from './reports/reports.module';
+import { AuditModule } from './audit/audit.module';
 
 @Module({
   imports: [
@@ -65,6 +71,12 @@ import { ExchangeRateService } from './shared/exchange-rate.service';
     EscrowModule,
     DisputesModule,
     AdminModule,
+    // Internal Tool Modules
+    StaffModule,
+    DepartmentsModule,
+    MemosModule,
+    ReportsModule,
+    AuditModule,
   ],
   controllers: [AppController, ExchangeRateController],
   providers: [AppService, ExchangeRateService],

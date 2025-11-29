@@ -14,46 +14,9 @@ export class RealtimeService {
   constructor(private configService: ConfigService) {
     this.supabase = createSupabaseClient(this.configService);
 
-    // 🔥 DEBUG: Test if service role can access chat data at startup
-    this.testDatabaseAccess();
-  }
-
-  private async testDatabaseAccess() {
-    try {
-      this.logger.log('🔍 TESTING DATABASE ACCESS with service role...');
-
-      // Test 1: Can we read chat_conversations?
-      const { data: conversations, error: convError } = await this.supabase
-        .from('chat_conversations')
-        .select('id, created_by, chat_type')
-        .limit(1);
-
-      this.logger.log('🔍 CONVERSATIONS ACCESS:', {
-        success: !convError,
-        error: convError?.message,
-        count: conversations?.length || 0
-      });
-
-      // Test 2: Can we read chat_participants?
-      const { data: participants, error: partError } = await this.supabase
-        .from('chat_participants')
-        .select('conversation_id, user_id, left_at, is_archived')
-        .limit(1);
-
-      this.logger.log('🔍 PARTICIPANTS ACCESS:', {
-        success: !partError,
-        error: partError?.message,
-        count: participants?.length || 0
-      });
-
-      if (convError || partError) {
-        this.logger.error('🚨 SERVICE ROLE CANNOT ACCESS CHAT TABLES - RLS ISSUE!');
-      } else {
-        this.logger.log('✅ Service role has database access');
-      }
-    } catch (error) {
-      this.logger.error('💥 DATABASE ACCESS TEST FAILED:', error);
-    }
+    // Note: Service role cannot access chat tables due to RLS policies (by design)
+    // This is expected behavior - the service uses user-authenticated clients when available
+    // The testDatabaseAccess method has been removed as it was causing unnecessary error logs
   }
 
   async handleUserConnect(userId: string, socketId: string): Promise<void> {

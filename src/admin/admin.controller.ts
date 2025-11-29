@@ -35,14 +35,8 @@ export class AdminController {
     return this.adminService.getEscrowHealth(req.user.sub);
   }
 
-  /**
-   * Get active disputes for resolution
-   * GET /admin/disputes
-   */
-  @Get('disputes')
-  async getActiveDisputes(@Request() req) {
-    return this.adminService.getActiveDisputes(req.user.sub);
-  }
+  // NOTE: Disputes routes are handled by DisputesController at /admin/disputes/*
+  // This prevents route conflicts between AdminController (JwtAuthGuard) and DisputesController (StaffJwtAuthGuard)
 
   /**
    * Get platform-wide statistics

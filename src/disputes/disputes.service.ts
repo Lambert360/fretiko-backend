@@ -10,6 +10,7 @@ export interface CreateDisputeDto {
   disputeType: 'item_not_received' | 'item_not_as_described' | 'damaged_item' | 'wrong_item' | 'refund_request' | 'quality_issue' | 'delivery_issue' | 'other';
   reason: string;
   description?: string;
+  priority?: 'urgent' | 'high' | 'medium' | 'low';
   evidence?: Array<{ type: 'image' | 'document'; url: string; description: string }>;
 }
 
@@ -141,6 +142,7 @@ export class DisputesService {
           status: 'open',
           reason: createDisputeDto.reason,
           description: createDisputeDto.description,
+          priority: createDisputeDto.priority || 'medium',
           evidence: createDisputeDto.evidence || [],
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
@@ -216,7 +218,8 @@ export class DisputesService {
             id,
             message,
             sender_id,
-            is_admin_message,
+            staff_id,
+            is_admin,
             attachments,
             created_at
           )
@@ -232,6 +235,70 @@ export class DisputesService {
       if (![dispute.disputant_id, dispute.respondent_id].includes(userId)) {
         throw new HttpException('You are not authorized to view this dispute', HttpStatus.FORBIDDEN);
       }
+
+      // Map messages with sender information
+      const messageSenderIds = (dispute.dispute_messages || [])
+        .filter((msg: any) => msg.sender_id)
+        .map((msg: any) => msg.sender_id);
+      
+      const userProfilesMap: Record<string, any> = {};
+      if (messageSenderIds.length > 0) {
+        const { data: profiles } = await this.supabase
+          .from('user_profiles')
+          .select('id, username, preferences')
+          .in('id', messageSenderIds);
+        
+        profiles?.forEach((profile) => {
+          userProfilesMap[profile.id] = profile;
+        });
+      }
+
+      // Fetch staff information for staff messages
+      const staffIds = (dispute.dispute_messages || [])
+        .filter((msg: any) => msg.staff_id)
+        .map((msg: any) => msg.staff_id);
+      
+      const staffMap: Record<string, any> = {};
+      if (staffIds.length > 0) {
+        const { data: staffMembers } = await this.supabase
+          .from('staff_accounts')
+          .select('id, full_name, email')
+          .in('id', staffIds);
+        
+        staffMembers?.forEach((staff) => {
+          staffMap[staff.id] = staff;
+        });
+      }
+
+      const mappedMessages = (dispute.dispute_messages || []).map((msg: any) => {
+        if (msg.staff_id) {
+          // Staff message
+          const staff = staffMap[msg.staff_id];
+          return {
+            id: msg.id,
+            message: msg.message,
+            senderId: msg.staff_id,
+            senderName: staff?.full_name || 'Customer Care',
+            isAdminMessage: true,
+            isStaffMessage: true,
+            attachments: msg.attachments || [],
+            createdAt: msg.created_at,
+          };
+        } else {
+          // User message
+          const senderProfile = userProfilesMap[msg.sender_id];
+          return {
+            id: msg.id,
+            message: msg.message,
+            senderId: msg.sender_id,
+            senderName: senderProfile?.preferences?.fullName || senderProfile?.username || 'Unknown',
+            isAdminMessage: msg.is_admin || false,
+            isStaffMessage: false,
+            attachments: msg.attachments || [],
+            createdAt: msg.created_at,
+          };
+        }
+      });
 
       return {
         id: dispute.id,
@@ -252,7 +319,7 @@ export class DisputesService {
         createdAt: dispute.created_at,
         updatedAt: dispute.updated_at,
         order: dispute.orders,
-        messages: dispute.dispute_messages || [],
+        messages: mappedMessages,
       };
     } catch (error) {
       this.logger.error('Error fetching dispute:', error);

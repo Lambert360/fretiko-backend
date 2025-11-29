@@ -1,0 +1,105 @@
+import { Controller, Get, Query, Request, UseGuards, Post, Delete, Param, Body } from '@nestjs/common';
+import { AdminService } from './admin.service';
+import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
+import { PermissionsGuard } from '../staff/guards/permissions.guard';
+import { Permissions } from '../staff/decorators/permissions.decorator';
+
+/**
+ * Staff Admin Controller
+ * Admin panel endpoints for staff members to manage platform users
+ * Uses StaffJwtAuthGuard and permission-based access control
+ */
+@Controller('admin')
+@UseGuards(StaffJwtAuthGuard)
+export class StaffAdminController {
+  constructor(private readonly adminService: AdminService) {}
+
+  /**
+   * Get all users with filters
+   * GET /admin/users
+   * Requires: view_users permission
+   */
+  @Get('users')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_users')
+  async getAllUsers(
+    @Request() req,
+    @Query('role') role?: 'citizen' | 'vendor' | 'rider' | 'all',
+    @Query('status') status?: 'active' | 'suspended' | 'all',
+    @Query('search') search?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.adminService.getAllUsersForStaff(
+      req.user.sub,
+      {
+        role: role === 'all' ? undefined : role,
+        status: status === 'all' ? undefined : status,
+        search,
+        page: page ? parseInt(page) : 1,
+        limit: limit ? parseInt(limit) : 20,
+      }
+    );
+  }
+
+  /**
+   * Get user statistics
+   * GET /admin/users/stats
+   * Requires: view_users permission
+   */
+  @Get('users/stats')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_users')
+  async getUserStats(@Request() req) {
+    return this.adminService.getUserStatsForStaff(req.user.sub);
+  }
+
+  /**
+   * Get user by ID
+   * GET /admin/users/:id
+   * Requires: view_users permission
+   */
+  @Get('users/:id')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_users')
+  async getUserById(@Request() req, @Param('id') id: string) {
+    return this.adminService.getUserByIdForStaff(req.user.sub, id);
+  }
+
+  /**
+   * Suspend user account
+   * POST /admin/users/:id/suspend
+   * Requires: suspend_users permission
+   */
+  @Post('users/:id/suspend')
+  @UseGuards(PermissionsGuard)
+  @Permissions('suspend_users')
+  async suspendUser(@Request() req, @Param('id') id: string, @Body() body: { reason?: string }) {
+    return this.adminService.suspendUser(req.user.sub, id, body.reason);
+  }
+
+  /**
+   * Activate user account
+   * POST /admin/users/:id/activate
+   * Requires: suspend_users permission
+   */
+  @Post('users/:id/activate')
+  @UseGuards(PermissionsGuard)
+  @Permissions('suspend_users')
+  async activateUser(@Request() req, @Param('id') id: string) {
+    return this.adminService.activateUser(req.user.sub, id);
+  }
+
+  /**
+   * Delete user account
+   * DELETE /admin/users/:id
+   * Requires: delete_users permission
+   */
+  @Delete('users/:id')
+  @UseGuards(PermissionsGuard)
+  @Permissions('delete_users')
+  async deleteUser(@Request() req, @Param('id') id: string) {
+    return this.adminService.deleteUserForStaff(req.user.sub, id);
+  }
+}
+
