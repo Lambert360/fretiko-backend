@@ -6,8 +6,21 @@ import { NotificationHelperService } from '../notifications/notification-helper.
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 
 export interface CreateDisputeDto {
-  orderId: string;
-  disputeType: 'item_not_received' | 'item_not_as_described' | 'damaged_item' | 'wrong_item' | 'refund_request' | 'quality_issue' | 'delivery_issue' | 'other';
+  // Dispute category (customer care only)
+  disputeCategory: 'order_dispute' | 'bug_report' | 'general';
+  
+  // Order dispute fields (optional)
+  orderId?: string;
+  
+  // Dispute type (varies by category)
+  disputeType: 
+    // Order dispute types
+    | 'item_not_received' | 'item_not_as_described' | 'damaged_item' | 'wrong_item' | 'refund_request' | 'quality_issue' | 'delivery_issue'
+    // Bug report types
+    | 'app_crash' | 'payment_issue' | 'login_issue' | 'feature_not_working' | 'performance_issue'
+    // General
+    | 'other';
+  
   reason: string;
   description?: string;
   priority?: 'urgent' | 'high' | 'medium' | 'low';
@@ -22,10 +35,11 @@ export interface ResolveDisputeDto {
 
 export interface Dispute {
   id: string;
-  orderId: string;
-  escrowId: string;
+  disputeCategory: 'order_dispute' | 'bug_report' | 'general';
+  orderId?: string;
+  escrowId?: string;
   disputantId: string;
-  respondentId: string;
+  respondentId?: string;
   disputeType: string;
   status: string;
   reason: string;
@@ -57,96 +71,118 @@ export class DisputesService {
   }
 
   /**
-   * Create a new dispute for an order
+   * Create a new dispute (customer care: orders, bugs, general support)
    */
   async createDispute(userId: string, createDisputeDto: CreateDisputeDto): Promise<Dispute> {
     try {
-      this.logger.log(`Creating dispute for order ${createDisputeDto.orderId} by user ${userId}`);
+      this.logger.log(`Creating ${createDisputeDto.disputeCategory} dispute by user ${userId}`);
 
-      // 1. Fetch order details
-      const { data: order, error: orderError } = await this.supabase
-        .from('orders')
-        .select('id, order_number, status, buyer_id, vendor_id, rider_id, created_at, updated_at')
-        .eq('id', createDisputeDto.orderId)
-        .single();
+      let order: any = null;
+      let escrow: any = null;
+      let respondentId: string | null = null;
+      let orderNumber: string | null = null;
 
-      if (orderError || !order) {
-        throw new HttpException('Order not found', HttpStatus.NOT_FOUND);
+      // Handle order disputes (existing logic)
+      if (createDisputeDto.disputeCategory === 'order_dispute') {
+        if (!createDisputeDto.orderId) {
+          throw new HttpException('Order ID is required for order disputes', HttpStatus.BAD_REQUEST);
+        }
+
+        // 1. Fetch order details
+        const { data: orderData, error: orderError } = await this.supabase
+          .from('orders')
+          .select('id, order_number, status, buyer_id, vendor_id, rider_id, created_at, updated_at')
+          .eq('id', createDisputeDto.orderId)
+          .single();
+
+        if (orderError || !orderData) {
+          throw new HttpException('Order not found', HttpStatus.NOT_FOUND);
+        }
+
+        order = orderData;
+        orderNumber = order.order_number;
+
+        // 2. Verify user is involved in the order
+        if (![order.buyer_id, order.vendor_id, order.rider_id].includes(userId)) {
+          throw new HttpException('You are not authorized to dispute this order', HttpStatus.FORBIDDEN);
+        }
+
+        // 3. Check if dispute window is still open (7 days from delivery/completion)
+        const orderCompletedAt = new Date(order.updated_at);
+        const daysSinceCompletion = (Date.now() - orderCompletedAt.getTime()) / (1000 * 60 * 60 * 24);
+        
+        if (daysSinceCompletion > 7) {
+          throw new HttpException(
+            'Dispute window has closed. Disputes can only be filed within 7 days of order completion.',
+            HttpStatus.BAD_REQUEST,
+          );
+        }
+
+        // 4. Check if dispute already exists for this order
+        const { data: existingDispute } = await this.supabase
+          .from('disputes')
+          .select('id, status')
+          .eq('order_id', createDisputeDto.orderId)
+          .in('status', ['open', 'under_review', 'awaiting_info'])
+          .single();
+
+        if (existingDispute) {
+          throw new HttpException('A dispute is already open for this order', HttpStatus.CONFLICT);
+        }
+
+        // 5. Find escrow for this order
+        const { data: escrowData, error: escrowError } = await this.supabase
+          .from('escrows')
+          .select('id, status, total_amount')
+          .eq('order_id', createDisputeDto.orderId)
+          .single();
+
+        if (escrowError || !escrowData) {
+          throw new HttpException('No escrow found for this order', HttpStatus.NOT_FOUND);
+        }
+
+        escrow = escrowData;
+
+        if (escrow.status !== 'held') {
+          throw new HttpException(
+            `Escrow has already been ${escrow.status}. Disputes can only be filed for held escrows.`,
+            HttpStatus.BAD_REQUEST,
+          );
+        }
+
+        // 6. Determine respondent (the other party)
+        if (userId === order.buyer_id) {
+          respondentId = order.vendor_id;
+        } else if (userId === order.vendor_id) {
+          respondentId = order.buyer_id;
+        } else {
+          respondentId = order.vendor_id; // Rider disputes vendor
+        }
       }
-
-      // 2. Verify user is involved in the order
-      if (![order.buyer_id, order.vendor_id, order.rider_id].includes(userId)) {
-        throw new HttpException('You are not authorized to dispute this order', HttpStatus.FORBIDDEN);
-      }
-
-      // 3. Check if dispute window is still open (7 days from delivery/completion)
-      const orderCompletedAt = new Date(order.updated_at);
-      const daysSinceCompletion = (Date.now() - orderCompletedAt.getTime()) / (1000 * 60 * 60 * 24);
-      
-      if (daysSinceCompletion > 7) {
-        throw new HttpException(
-          'Dispute window has closed. Disputes can only be filed within 7 days of order completion.',
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-
-      // 4. Check if dispute already exists for this order
-      const { data: existingDispute } = await this.supabase
-        .from('disputes')
-        .select('id, status')
-        .eq('order_id', createDisputeDto.orderId)
-        .in('status', ['open', 'under_review', 'awaiting_info'])
-        .single();
-
-      if (existingDispute) {
-        throw new HttpException('A dispute is already open for this order', HttpStatus.CONFLICT);
-      }
-
-      // 5. Find escrow for this order
-      const { data: escrow, error: escrowError } = await this.supabase
-        .from('escrows')
-        .select('id, status, total_amount')
-        .eq('order_id', createDisputeDto.orderId)
-        .single();
-
-      if (escrowError || !escrow) {
-        throw new HttpException('No escrow found for this order', HttpStatus.NOT_FOUND);
-      }
-
-      if (escrow.status !== 'held') {
-        throw new HttpException(
-          `Escrow has already been ${escrow.status}. Disputes can only be filed for held escrows.`,
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-
-      // 6. Determine respondent (the other party)
-      let respondentId: string;
-      if (userId === order.buyer_id) {
-        respondentId = order.vendor_id;
-      } else if (userId === order.vendor_id) {
-        respondentId = order.buyer_id;
-      } else {
-        respondentId = order.vendor_id; // Rider disputes vendor
-      }
+      // Bug reports and general - no respondent needed
 
       // 7. Create dispute record
+      const disputeData: any = {
+        dispute_category: createDisputeDto.disputeCategory,
+        disputant_id: userId,
+        dispute_type: createDisputeDto.disputeType,
+        status: 'open',
+        reason: createDisputeDto.reason,
+        description: createDisputeDto.description,
+        priority: createDisputeDto.priority || 'medium',
+        evidence: createDisputeDto.evidence || [],
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+
+      // Add optional fields based on category
+      if (createDisputeDto.orderId) disputeData.order_id = createDisputeDto.orderId;
+      if (escrow?.id) disputeData.escrow_id = escrow.id;
+      if (respondentId) disputeData.respondent_id = respondentId;
+
       const { data: dispute, error: disputeError } = await this.supabase
         .from('disputes')
-        .insert({
-          order_id: createDisputeDto.orderId,
-          escrow_id: escrow.id,
-          disputant_id: userId,
-          respondent_id: respondentId,
-          dispute_type: createDisputeDto.disputeType,
-          status: 'open',
-          reason: createDisputeDto.reason,
-          description: createDisputeDto.description,
-          priority: createDisputeDto.priority || 'medium',
-          evidence: createDisputeDto.evidence || [],
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
+        .insert(disputeData)
         .select()
         .single();
 
@@ -155,33 +191,37 @@ export class DisputesService {
         throw new HttpException('Failed to create dispute', HttpStatus.INTERNAL_SERVER_ERROR);
       }
 
-      // 8. Update escrow status to 'dispute'
-      await this.escrowService.disputeEscrow(escrow.id, createDisputeDto.reason, userId);
+      // 8. Update escrow status if order dispute
+      if (createDisputeDto.disputeCategory === 'order_dispute' && escrow?.id) {
+        await this.escrowService.disputeEscrow(escrow.id, createDisputeDto.reason, userId);
+      }
 
-      // 9. Send notifications to all parties
+      // 9. Send notifications
       try {
-        // Notify respondent
-        await this.notificationHelper.notifyDisputeFiled(
-          respondentId,
-          order.order_number,
-          createDisputeDto.disputeType,
-          dispute.id,
-        );
+        if (respondentId) {
+          await this.notificationHelper.notifyDisputeFiled(
+            respondentId,
+            orderNumber || 'Support Request',
+            createDisputeDto.disputeType,
+            dispute.id,
+          );
+        }
 
-        // Notify admin (TODO: implement admin notification)
+        // Notify admin for all disputes
         this.logger.log(`Admin notification needed for dispute ${dispute.id}`);
       } catch (notifyError) {
         this.logger.warn('Failed to send dispute notifications (non-critical):', notifyError);
       }
 
-      this.logger.log(`✅ Dispute ${dispute.id} created for order ${order.order_number}`);
+      this.logger.log(`✅ Dispute ${dispute.id} created (category: ${createDisputeDto.disputeCategory})`);
 
       return {
         id: dispute.id,
-        orderId: dispute.order_id,
-        escrowId: dispute.escrow_id,
+        disputeCategory: dispute.dispute_category,
+        orderId: dispute.order_id || undefined,
+        escrowId: dispute.escrow_id || undefined,
         disputantId: dispute.disputant_id,
-        respondentId: dispute.respondent_id,
+        respondentId: dispute.respondent_id || undefined,
         disputeType: dispute.dispute_type,
         status: dispute.status,
         reason: dispute.reason,
@@ -199,45 +239,78 @@ export class DisputesService {
   /**
    * Get dispute details
    */
-  async getDispute(userId: string, disputeId: string): Promise<Dispute & { order: any; messages: any[] }> {
+  async getDispute(userId: string, disputeId: string): Promise<Dispute & { order?: any; messages: any[] }> {
     try {
-      const { data: dispute, error } = await this.supabase
+      this.logger.log(`Fetching dispute ${disputeId} for user ${userId}`);
+      
+      // First, get the dispute without nested relations to avoid issues with optional foreign keys
+      const { data: dispute, error: disputeError } = await this.supabase
         .from('disputes')
-        .select(`
-          *,
-          orders!inner(
-            id,
-            order_number,
-            status,
-            total_amount,
-            buyer_id,
-            vendor_id,
-            rider_id
-          ),
-          dispute_messages(
-            id,
-            message,
-            sender_id,
-            staff_id,
-            is_admin,
-            attachments,
-            created_at
-          )
-        `)
+        .select('*')
         .eq('id', disputeId)
         .single();
 
-      if (error || !dispute) {
+      if (disputeError || !dispute) {
+        this.logger.error(`Dispute not found: ${disputeError?.message || 'No data returned'}`);
         throw new HttpException('Dispute not found', HttpStatus.NOT_FOUND);
       }
 
-      // Verify user is involved
-      if (![dispute.disputant_id, dispute.respondent_id].includes(userId)) {
-        throw new HttpException('You are not authorized to view this dispute', HttpStatus.FORBIDDEN);
+      this.logger.log(`Dispute found: ${dispute.id}, category: ${dispute.dispute_category}, order_id: ${dispute.order_id}`);
+
+      // Fetch order separately if order_id exists
+      let order = null;
+      if (dispute.order_id) {
+        const { data: orderData, error: orderError } = await this.supabase
+          .from('orders')
+          .select('id, order_number, status, total_amount, buyer_id, vendor_id, rider_id')
+          .eq('id', dispute.order_id)
+          .single();
+        
+        if (!orderError && orderData) {
+          order = orderData;
+        }
+      }
+
+      // Fetch messages separately
+      const { data: disputeMessages, error: messagesError } = await this.supabase
+        .from('dispute_messages')
+        .select('id, message, sender_id, staff_id, is_admin, attachments, created_at')
+        .eq('dispute_id', disputeId)
+        .order('created_at', { ascending: true });
+
+      if (messagesError) {
+        this.logger.warn(`Error fetching messages: ${messagesError.message}`);
+      }
+
+      // Combine the data
+      const disputeWithRelations = {
+        ...dispute,
+        orders: order ? [order] : [],
+        dispute_messages: disputeMessages || [],
+      };
+
+      // Verify user is involved (or is admin)
+      const isInvolved = disputeWithRelations.disputant_id === userId || 
+                        (disputeWithRelations.respondent_id && disputeWithRelations.respondent_id === userId);
+      
+      if (!isInvolved) {
+        // Check if user is admin
+        const { data: profile } = await this.supabase
+          .from('user_profiles')
+          .select('role, preferences')
+          .eq('id', userId)
+          .single();
+        
+        const isAdmin = profile?.role === 'admin' || profile?.preferences?.isAdmin === true;
+        
+        if (!isAdmin) {
+          throw new HttpException('You are not authorized to view this dispute', HttpStatus.FORBIDDEN);
+        }
       }
 
       // Map messages with sender information
-      const messageSenderIds = (dispute.dispute_messages || [])
+      const messages = disputeWithRelations.dispute_messages || [];
+      const messageSenderIds = messages
         .filter((msg: any) => msg.sender_id)
         .map((msg: any) => msg.sender_id);
       
@@ -254,7 +327,7 @@ export class DisputesService {
       }
 
       // Fetch staff information for staff messages
-      const staffIds = (dispute.dispute_messages || [])
+      const staffIds = messages
         .filter((msg: any) => msg.staff_id)
         .map((msg: any) => msg.staff_id);
       
@@ -270,7 +343,7 @@ export class DisputesService {
         });
       }
 
-      const mappedMessages = (dispute.dispute_messages || []).map((msg: any) => {
+      const mappedMessages = messages.map((msg: any) => {
         if (msg.staff_id) {
           // Staff message
           const staff = staffMap[msg.staff_id];
@@ -301,24 +374,25 @@ export class DisputesService {
       });
 
       return {
-        id: dispute.id,
-        orderId: dispute.order_id,
-        escrowId: dispute.escrow_id,
-        disputantId: dispute.disputant_id,
-        respondentId: dispute.respondent_id,
-        disputeType: dispute.dispute_type,
-        status: dispute.status,
-        reason: dispute.reason,
-        description: dispute.description,
-        evidence: dispute.evidence,
-        resolution: dispute.resolution,
-        resolutionReason: dispute.resolution_reason,
-        resolutionAmount: dispute.resolution_amount ? parseFloat(dispute.resolution_amount) : undefined,
-        resolvedBy: dispute.resolved_by,
-        resolvedAt: dispute.resolved_at,
-        createdAt: dispute.created_at,
-        updatedAt: dispute.updated_at,
-        order: dispute.orders,
+        id: disputeWithRelations.id,
+        disputeCategory: disputeWithRelations.dispute_category,
+        orderId: disputeWithRelations.order_id || undefined,
+        escrowId: disputeWithRelations.escrow_id || undefined,
+        disputantId: disputeWithRelations.disputant_id,
+        respondentId: disputeWithRelations.respondent_id || undefined,
+        disputeType: disputeWithRelations.dispute_type,
+        status: disputeWithRelations.status,
+        reason: disputeWithRelations.reason,
+        description: disputeWithRelations.description,
+        evidence: disputeWithRelations.evidence,
+        resolution: disputeWithRelations.resolution,
+        resolutionReason: disputeWithRelations.resolution_reason,
+        resolutionAmount: disputeWithRelations.resolution_amount ? parseFloat(disputeWithRelations.resolution_amount) : undefined,
+        resolvedBy: disputeWithRelations.resolved_by,
+        resolvedAt: disputeWithRelations.resolved_at,
+        createdAt: disputeWithRelations.created_at,
+        updatedAt: disputeWithRelations.updated_at,
+        order: order,
         messages: mappedMessages,
       };
     } catch (error) {
@@ -336,7 +410,7 @@ export class DisputesService {
         .from('disputes')
         .select(`
           *,
-          orders!inner(order_number)
+          orders(order_number)
         `)
         .or(`disputant_id.eq.${userId},respondent_id.eq.${userId}`)
         .order('created_at', { ascending: false });
@@ -348,10 +422,11 @@ export class DisputesService {
 
       return disputes?.map((d) => ({
         id: d.id,
-        orderId: d.order_id,
-        escrowId: d.escrow_id,
+        disputeCategory: d.dispute_category,
+        orderId: d.order_id || undefined,
+        escrowId: d.escrow_id || undefined,
         disputantId: d.disputant_id,
-        respondentId: d.respondent_id,
+        respondentId: d.respondent_id || undefined,
         disputeType: d.dispute_type,
         status: d.status,
         reason: d.reason,
@@ -428,8 +503,11 @@ export class DisputesService {
           if (!resolveDisputeDto.resolutionAmount) {
             throw new HttpException('Resolution amount required for partial refund', HttpStatus.BAD_REQUEST);
           }
-          // TODO: Implement partial refund logic
-          this.logger.warn('Partial refund not yet fully implemented');
+          await this.escrowService.partialRefundEscrow(
+            escrow.id,
+            resolveDisputeDto.resolutionAmount,
+            resolveDisputeDto.resolutionReason,
+          );
           break;
 
         case 'release_to_vendor':
@@ -438,12 +516,15 @@ export class DisputesService {
           break;
 
         case 'split_amount':
-          // Split escrow between parties
+          // Split escrow between parties (buyer gets resolutionAmount, vendor gets rest)
           if (!resolveDisputeDto.resolutionAmount) {
             throw new HttpException('Resolution amount required for split amount', HttpStatus.BAD_REQUEST);
           }
-          // TODO: Implement split amount logic
-          this.logger.warn('Split amount not yet fully implemented');
+          await this.escrowService.splitEscrowAmount(
+            escrow.id,
+            resolveDisputeDto.resolutionAmount,
+            resolveDisputeDto.resolutionReason,
+          );
           break;
 
         case 'no_action':
@@ -518,8 +599,26 @@ export class DisputesService {
         .eq('id', disputeId)
         .single();
 
-      if (!dispute || ![dispute.disputant_id, dispute.respondent_id].includes(userId)) {
-        throw new HttpException('You are not authorized to message this dispute', HttpStatus.FORBIDDEN);
+      if (!dispute) {
+        throw new HttpException('Dispute not found', HttpStatus.NOT_FOUND);
+      }
+
+      const isInvolved = dispute.disputant_id === userId || 
+                        (dispute.respondent_id && dispute.respondent_id === userId);
+      
+      if (!isInvolved) {
+        // Check if user is admin
+        const { data: profile } = await this.supabase
+          .from('user_profiles')
+          .select('role, preferences')
+          .eq('id', userId)
+          .single();
+        
+        const isAdmin = profile?.role === 'admin' || profile?.preferences?.isAdmin === true;
+        
+        if (!isAdmin) {
+          throw new HttpException('You are not authorized to message this dispute', HttpStatus.FORBIDDEN);
+        }
       }
 
       // Create message
@@ -539,12 +638,29 @@ export class DisputesService {
         throw new HttpException('Failed to send message', HttpStatus.INTERNAL_SERVER_ERROR);
       }
 
-      // Notify the other party
-      const recipientId = userId === dispute.disputant_id ? dispute.respondent_id : dispute.disputant_id;
+      // Notify the other party (if respondent exists)
+      if (dispute.respondent_id) {
+        const recipientId = userId === dispute.disputant_id ? dispute.respondent_id : dispute.disputant_id;
+        try {
+          await this.notificationHelper.notifyDisputeMessage(recipientId, disputeId);
+        } catch (notifyError) {
+          this.logger.warn('Failed to send message notification (non-critical):', notifyError);
+        }
+      }
+
+      // Broadcast real-time message update
       try {
-        await this.notificationHelper.notifyDisputeMessage(recipientId, disputeId);
-      } catch (notifyError) {
-        this.logger.warn('Failed to send message notification (non-critical):', notifyError);
+        const messagePayload = {
+          id: messageData.id,
+          disputeId: disputeId,
+          senderId: userId,
+          message: message,
+          attachments: attachments || [],
+          createdAt: messageData.created_at,
+        };
+        await this.realtimeGateway.notifyDisputeMessage(disputeId, messagePayload, userId);
+      } catch (realtimeError) {
+        this.logger.warn('Failed to broadcast real-time message update (non-critical):', realtimeError);
       }
 
       return {
@@ -566,7 +682,7 @@ export class DisputesService {
         .from('disputes')
         .select(`
           *,
-          orders!inner(order_number, status, total_amount)
+          orders(order_number, status, total_amount)
         `)
         .in('status', ['open', 'under_review', 'awaiting_info'])
         .order('created_at', { ascending: false });
@@ -578,10 +694,11 @@ export class DisputesService {
 
       return disputes?.map((d) => ({
         id: d.id,
-        orderId: d.order_id,
-        escrowId: d.escrow_id,
+        disputeCategory: d.dispute_category,
+        orderId: d.order_id || undefined,
+        escrowId: d.escrow_id || undefined,
         disputantId: d.disputant_id,
-        respondentId: d.respondent_id,
+        respondentId: d.respondent_id || undefined,
         disputeType: d.dispute_type,
         status: d.status,
         reason: d.reason,

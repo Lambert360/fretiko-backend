@@ -344,6 +344,338 @@ export class EscrowService {
   }
 
   /**
+   * Partial refund - refund buyer partial amount, release rest to vendor
+   */
+  async partialRefundEscrow(
+    escrowId: string,
+    refundAmount: number,
+    reason: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Processing partial refund for escrow ${escrowId}: ₣${refundAmount}`);
+
+      // Fetch escrow with order details
+      const { data: escrow, error: fetchError } = await this.supabase
+        .from('escrows')
+        .select(`
+          *,
+          orders!inner(
+            id,
+            order_number,
+            buyer_id,
+            vendor_id,
+            rider_id
+          )
+        `)
+        .eq('id', escrowId)
+        .in('status', ['held', 'dispute'])
+        .single();
+
+      if (fetchError || !escrow) {
+        throw new HttpException('Escrow not found or already processed', HttpStatus.NOT_FOUND);
+      }
+
+      const totalAmount = parseFloat(escrow.total_amount);
+      if (refundAmount > totalAmount || refundAmount <= 0) {
+        throw new HttpException('Invalid refund amount', HttpStatus.BAD_REQUEST);
+      }
+
+      const order = escrow.orders;
+      const remainingAmount = totalAmount - refundAmount;
+
+      // 1. Refund buyer partial amount
+      this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${refundAmount}`);
+      const { error: refundError } = await this.supabase.rpc('process_wallet_transaction', {
+        p_user_id: order.buyer_id,
+        p_transaction_type: 'refund',
+        p_amount: refundAmount,
+        p_description: `Partial refund for order ${order.order_number}: ${reason}`,
+        p_reference_id: order.id,
+        p_reference_type: 'order',
+      });
+
+      if (refundError) {
+        this.logger.error('Failed to refund buyer wallet:', refundError);
+        throw new HttpException('Failed to process partial refund', HttpStatus.INTERNAL_SERVER_ERROR);
+      }
+
+      // 2. Calculate vendor and rider amounts proportionally
+      const vendorProportion = parseFloat(escrow.vendor_amount) / totalAmount;
+      const riderProportion = parseFloat(escrow.rider_amount) / totalAmount;
+      const platformProportion = parseFloat(escrow.platform_amount) / totalAmount;
+
+      const vendorAmount = remainingAmount * vendorProportion;
+      const riderAmount = remainingAmount * riderProportion;
+      const platformAmount = remainingAmount * platformProportion;
+
+      // 3. Release remaining amount to vendor
+      this.logger.log(`Releasing remaining ₣${vendorAmount} to vendor ${order.vendor_id}`);
+      const { error: vendorError } = await this.supabase.rpc('process_wallet_transaction', {
+        p_user_id: order.vendor_id,
+        p_transaction_type: 'escrow_release',
+        p_amount: vendorAmount,
+        p_description: `Partial escrow release for order ${order.order_number} (after partial refund)`,
+        p_reference_id: escrowId,
+        p_reference_type: 'escrow',
+      });
+
+      if (vendorError) {
+        this.logger.error('Failed to credit vendor wallet:', vendorError);
+        // Don't throw - buyer already refunded, log and continue
+      }
+
+      // 4. Release rider amount if applicable
+      if (order.rider_id && riderAmount > 0) {
+        this.logger.log(`Releasing ₣${riderAmount} to rider ${order.rider_id}`);
+        const { error: riderError } = await this.supabase.rpc('process_wallet_transaction', {
+          p_user_id: order.rider_id,
+          p_transaction_type: 'delivery_payment',
+          p_amount: riderAmount,
+          p_description: `Delivery fee for order ${order.order_number} (partial)`,
+          p_reference_id: order.id,
+          p_reference_type: 'order',
+        });
+
+        if (riderError) {
+          this.logger.error('Failed to credit rider wallet:', riderError);
+          // Don't throw - log and continue
+        }
+      }
+
+      // 5. Update escrow status to released (partial refund completed)
+      const { error: updateError } = await this.supabase
+        .from('escrows')
+        .update({
+          status: 'released',
+          released_at: new Date().toISOString(),
+          release_reason: `Partial refund: ${reason}. Refunded ₣${refundAmount}, released ₣${remainingAmount}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', escrowId);
+
+      if (updateError) {
+        this.logger.error('Failed to update escrow status:', updateError);
+      }
+
+      // 6. Update order status
+      await this.supabase
+        .from('orders')
+        .update({
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', order.id);
+
+      // 7. Send notifications
+      await this.notificationHelper.notifyOrderRefunded(
+        order.buyer_id,
+        refundAmount,
+        order.order_number,
+        `Partial refund: ${reason}`,
+      );
+
+      await this.notificationHelper.notifyVendorEscrowReleased(
+        order.vendor_id,
+        vendorAmount,
+        order.order_number,
+      );
+
+      // 8. Broadcast real-time updates
+      await this.realtimeGateway.notifyWalletBalanceUpdate(order.buyer_id, {
+        availableBalance: 0,
+        escrowBalance: 0,
+        pendingWithdrawal: 0,
+        totalBalance: 0,
+        transactionType: 'refund',
+      });
+
+      await this.realtimeGateway.notifyWalletBalanceUpdate(order.vendor_id, {
+        availableBalance: 0,
+        escrowBalance: 0,
+        pendingWithdrawal: 0,
+        totalBalance: 0,
+        transactionType: 'escrow_release',
+      });
+
+      this.logger.log(`✅ Partial refund completed for escrow ${escrowId}`);
+    } catch (error) {
+      this.logger.error('Error processing partial refund:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Split escrow amount between buyer and vendor
+   */
+  async splitEscrowAmount(
+    escrowId: string,
+    buyerAmount: number,
+    reason: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Splitting escrow ${escrowId}: Buyer gets ₣${buyerAmount}`);
+
+      // Fetch escrow with order details
+      const { data: escrow, error: fetchError } = await this.supabase
+        .from('escrows')
+        .select(`
+          *,
+          orders!inner(
+            id,
+            order_number,
+            buyer_id,
+            vendor_id,
+            rider_id
+          )
+        `)
+        .eq('id', escrowId)
+        .in('status', ['held', 'dispute'])
+        .single();
+
+      if (fetchError || !escrow) {
+        throw new HttpException('Escrow not found or already processed', HttpStatus.NOT_FOUND);
+      }
+
+      const totalAmount = parseFloat(escrow.total_amount);
+      if (buyerAmount > totalAmount || buyerAmount < 0) {
+        throw new HttpException('Invalid split amount', HttpStatus.BAD_REQUEST);
+      }
+
+      const order = escrow.orders;
+      const vendorAmount = totalAmount - buyerAmount;
+
+      // 1. Refund buyer their portion
+      if (buyerAmount > 0) {
+        this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${buyerAmount}`);
+        const { error: refundError } = await this.supabase.rpc('process_wallet_transaction', {
+          p_user_id: order.buyer_id,
+          p_transaction_type: 'refund',
+          p_amount: buyerAmount,
+          p_description: `Split resolution for order ${order.order_number}: ${reason}`,
+          p_reference_id: order.id,
+          p_reference_type: 'order',
+        });
+
+        if (refundError) {
+          this.logger.error('Failed to refund buyer wallet:', refundError);
+          throw new HttpException('Failed to process buyer refund', HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+      }
+
+      // 2. Calculate vendor and rider amounts proportionally from vendor portion
+      const vendorProportion = parseFloat(escrow.vendor_amount) / totalAmount;
+      const riderProportion = parseFloat(escrow.rider_amount) / totalAmount;
+
+      const vendorFinalAmount = vendorAmount * vendorProportion;
+      const riderFinalAmount = vendorAmount * riderProportion;
+
+      // 3. Release vendor portion
+      if (vendorFinalAmount > 0) {
+        this.logger.log(`Releasing ₣${vendorFinalAmount} to vendor ${order.vendor_id}`);
+        const { error: vendorError } = await this.supabase.rpc('process_wallet_transaction', {
+          p_user_id: order.vendor_id,
+          p_transaction_type: 'escrow_release',
+          p_amount: vendorFinalAmount,
+          p_description: `Split escrow release for order ${order.order_number}: ${reason}`,
+          p_reference_id: escrowId,
+          p_reference_type: 'escrow',
+        });
+
+        if (vendorError) {
+          this.logger.error('Failed to credit vendor wallet:', vendorError);
+          // Don't throw - buyer already refunded
+        }
+      }
+
+      // 4. Release rider amount if applicable
+      if (order.rider_id && riderFinalAmount > 0) {
+        this.logger.log(`Releasing ₣${riderFinalAmount} to rider ${order.rider_id}`);
+        const { error: riderError } = await this.supabase.rpc('process_wallet_transaction', {
+          p_user_id: order.rider_id,
+          p_transaction_type: 'delivery_payment',
+          p_amount: riderFinalAmount,
+          p_description: `Delivery fee for order ${order.order_number} (split resolution)`,
+          p_reference_id: order.id,
+          p_reference_type: 'order',
+        });
+
+        if (riderError) {
+          this.logger.error('Failed to credit rider wallet:', riderError);
+          // Don't throw - log and continue
+        }
+      }
+
+      // 5. Update escrow status
+      const { error: updateError } = await this.supabase
+        .from('escrows')
+        .update({
+          status: 'released',
+          released_at: new Date().toISOString(),
+          release_reason: `Split resolution: ${reason}. Buyer: ₣${buyerAmount}, Vendor: ₣${vendorFinalAmount}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', escrowId);
+
+      if (updateError) {
+        this.logger.error('Failed to update escrow status:', updateError);
+      }
+
+      // 6. Update order status
+      await this.supabase
+        .from('orders')
+        .update({
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', order.id);
+
+      // 7. Send notifications
+      if (buyerAmount > 0) {
+        await this.notificationHelper.notifyOrderRefunded(
+          order.buyer_id,
+          buyerAmount,
+          order.order_number,
+          `Split resolution: ${reason}`,
+        );
+      }
+
+      if (vendorFinalAmount > 0) {
+        await this.notificationHelper.notifyVendorEscrowReleased(
+          order.vendor_id,
+          vendorFinalAmount,
+          order.order_number,
+        );
+      }
+
+      // 8. Broadcast real-time updates
+      if (buyerAmount > 0) {
+        await this.realtimeGateway.notifyWalletBalanceUpdate(order.buyer_id, {
+          availableBalance: 0,
+          escrowBalance: 0,
+          pendingWithdrawal: 0,
+          totalBalance: 0,
+          transactionType: 'refund',
+        });
+      }
+
+      if (vendorFinalAmount > 0) {
+        await this.realtimeGateway.notifyWalletBalanceUpdate(order.vendor_id, {
+          availableBalance: 0,
+          escrowBalance: 0,
+          pendingWithdrawal: 0,
+          totalBalance: 0,
+          transactionType: 'escrow_release',
+        });
+      }
+
+      this.logger.log(`✅ Split resolution completed for escrow ${escrowId}`);
+    } catch (error) {
+      this.logger.error('Error processing split resolution:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Mark escrow as disputed
    */
   async disputeEscrow(escrowId: string, reason: string, disputantId: string): Promise<void> {

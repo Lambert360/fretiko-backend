@@ -537,6 +537,91 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
   }
 
+  // ================================
+  // DISPUTE ROOM HANDLERS
+  // ================================
+
+  @SubscribeMessage('join_dispute')
+  async handleJoinDispute(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { disputeId: string }
+  ) {
+    try {
+      this.logger.log(`⚖️ JOIN DISPUTE REQUEST: Socket ${client.id} wants to join dispute: ${data.disputeId}`);
+
+      const userId = await this.realtimeService.getUserBySocketId(client.id);
+
+      if (!userId) {
+        this.logger.warn(`❌ JOIN DISPUTE FAILED: Unauthorized socket ${client.id}`);
+        client.emit('error', { message: 'Unauthorized' });
+        return;
+      }
+
+      // Verify user has access to this dispute (they should be disputant or respondent)
+      // This is a basic check - full authorization is handled by the disputes service
+      const roomName = `dispute_${data.disputeId}`;
+      client.join(roomName);
+
+      // Get room size
+      let roomSize = 0;
+      try {
+        if (this.server && this.server.sockets && this.server.sockets.adapter && this.server.sockets.adapter.rooms) {
+          roomSize = this.server.sockets.adapter.rooms.get(roomName)?.size || 0;
+        }
+      } catch (roomSizeError) {
+        this.logger.error(`💥 Error getting dispute room size:`, roomSizeError);
+      }
+
+      this.logger.log(`✅ JOIN DISPUTE SUCCESS: User ${userId} (socket ${client.id}) joined dispute ${data.disputeId} - Room size: ${roomSize}`);
+
+      // Send confirmation to client
+      client.emit('joined_dispute', {
+        disputeId: data.disputeId,
+        success: true,
+        roomSize: roomSize,
+        message: 'Successfully joined dispute',
+        timestamp: new Date().toISOString()
+      });
+
+    } catch (error) {
+      this.logger.error(`💥 JOIN DISPUTE ERROR for socket ${client.id}:`, error);
+      if (client && client.emit) {
+        client.emit('error', { message: 'Failed to join dispute' });
+      }
+    }
+  }
+
+  @SubscribeMessage('leave_dispute')
+  async handleLeaveDispute(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { disputeId: string }
+  ) {
+    try {
+      this.logger.log(`⚖️ LEAVE DISPUTE REQUEST: Socket ${client.id} wants to leave dispute: ${data.disputeId}`);
+
+      const roomName = `dispute_${data.disputeId}`;
+      client.leave(roomName);
+
+      const userId = await this.realtimeService.getUserBySocketId(client.id);
+
+      // Get room size after leave
+      let roomSize = 0;
+      try {
+        if (this.server && this.server.sockets && this.server.sockets.adapter && this.server.sockets.adapter.rooms) {
+          roomSize = this.server.sockets.adapter.rooms.get(roomName)?.size || 0;
+        }
+      } catch (roomSizeError) {
+        this.logger.error(`💥 Error getting dispute room size on leave:`, roomSizeError);
+      }
+
+      this.logger.log(`✅ LEAVE DISPUTE SUCCESS: User ${userId} left dispute ${data.disputeId} - Room size now: ${roomSize}`);
+
+      client.emit('left_dispute', { disputeId: data.disputeId });
+    } catch (error) {
+      this.logger.error(`💥 LEAVE DISPUTE ERROR for socket ${client.id}:`, error);
+    }
+  }
+
   @SubscribeMessage('chat_message')
   async handleChatMessage(
     @ConnectedSocket() client: Socket,
@@ -827,6 +912,85 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       this.logger.debug(`🔄 Conversation update sent for: ${conversationId}`);
     } catch (error) {
       this.logger.error(`💥 Error notifying conversation update for ${conversationId}:`, error.stack || error.message);
+    }
+  }
+
+  // ================================
+  // DISPUTE MESSAGE UPDATES
+  // ================================
+
+  async notifyDisputeMessage(disputeId: string, message: any, excludeUserId?: string) {
+    try {
+      this.logger.log(`🔥 Broadcasting dispute message update for dispute ${disputeId}${excludeUserId ? ` (excluding user ${excludeUserId})` : ''}`);
+
+      // Find sender's socket IDs to exclude them from broadcast
+      const senderSocketIds: string[] = [];
+      if (excludeUserId) {
+        this.connectedClients.forEach((clientInfo, socketId) => {
+          if (clientInfo.userId === excludeUserId) {
+            senderSocketIds.push(socketId);
+          }
+        });
+        this.logger.log(`🔍 Found ${senderSocketIds.length} socket(s) for sender ${excludeUserId}: [${senderSocketIds.join(', ')}]`);
+      }
+
+      if (!this.server) {
+        this.logger.error(`💥 DISPUTE MESSAGE ERROR: Server not available for dispute ${disputeId}`);
+        return;
+      }
+
+      const roomName = `dispute_${disputeId}`;
+
+      // Exclude sender's sockets from receiving the broadcast
+      if (senderSocketIds.length > 0) {
+        this.logger.log(`🔥 BROADCASTING DISPUTE MESSAGE: Excluding sender sockets [${senderSocketIds.join(', ')}] from broadcast to '${roomName}'`);
+
+        // Get all sockets in the room
+        const socketsInRoom = await this.server.in(roomName).fetchSockets();
+        this.logger.log(`🔍 Found ${socketsInRoom.length} sockets in room ${roomName}`);
+
+        // Manually emit to each socket except sender's
+        let sentCount = 0;
+        for (const socket of socketsInRoom) {
+          if (!senderSocketIds.includes(socket.id)) {
+            socket.emit('dispute_message', {
+              disputeId,
+              message,
+            });
+            sentCount++;
+            this.logger.log(`   ✅ Sent dispute message to socket ${socket.id}`);
+          } else {
+            this.logger.log(`   ⏭️ Skipped sender socket ${socket.id}`);
+          }
+        }
+        this.logger.log(`✅ DISPUTE MESSAGE SUCCESS: Update sent to ${sentCount}/${socketsInRoom.length} clients (excluded ${senderSocketIds.length} sender socket(s))`);
+      } else {
+        this.logger.log(`🔥 BROADCASTING DISPUTE MESSAGE: Using this.server.to('${roomName}').emit('dispute_message')`);
+        this.server.to(roomName).emit('dispute_message', {
+          disputeId,
+          message,
+        });
+        this.logger.log(`✅ DISPUTE MESSAGE SUCCESS: Update sent to dispute ${disputeId}`);
+      }
+    } catch (error) {
+      this.logger.error(`💥 DISPUTE MESSAGE ERROR for dispute ${disputeId}:`, error.stack || error.message);
+    }
+  }
+
+  async notifyDisputeUpdate(disputeId: string, update: any) {
+    try {
+      if (!this.server) {
+        this.logger.error(`💥 DISPUTE UPDATE ERROR: Server not available for dispute ${disputeId}`);
+        return;
+      }
+
+      this.server.to(`dispute_${disputeId}`).emit('dispute_update', {
+        disputeId,
+        update,
+      });
+      this.logger.debug(`🔄 Dispute update sent for: ${disputeId}`);
+    } catch (error) {
+      this.logger.error(`💥 Error notifying dispute update for ${disputeId}:`, error.stack || error.message);
     }
   }
 

@@ -28,6 +28,7 @@ import { WorkspaceModule } from './workspace/workspace.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { EscrowModule } from './escrow/escrow.module';
 import { DisputesModule } from './disputes/disputes.module';
+import { ContentReportsModule } from './content-reports/content-reports.module';
 import { AdminModule } from './admin/admin.module';
 import { ExchangeRateController } from './shared/exchange-rate.controller';
 import { ExchangeRateService } from './shared/exchange-rate.service';
@@ -70,6 +71,7 @@ import { AuditModule } from './audit/audit.module';
     AnalyticsModule,
     EscrowModule,
     DisputesModule,
+    ContentReportsModule,
     AdminModule,
     // Internal Tool Modules
     StaffModule,

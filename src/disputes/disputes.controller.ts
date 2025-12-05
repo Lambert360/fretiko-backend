@@ -2,6 +2,7 @@ import { Controller, Post, Get, Body, Param, Req, UseGuards, HttpCode, HttpStatu
 import { DisputesService } from './disputes.service';
 import type { CreateDisputeDto, ResolveDisputeDto } from './disputes.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { AdminGuard } from '../auth/admin.guard';
 
 @Controller('disputes')
 @UseGuards(JwtAuthGuard)
@@ -47,18 +48,18 @@ export class DisputesController {
 
   /**
    * Resolve a dispute (admin only)
-   * TODO: Add admin role guard
    */
   @Post(':id/resolve')
+  @UseGuards(AdminGuard)
   async resolveDispute(@Req() req, @Param('id') disputeId: string, @Body() resolveDisputeDto: ResolveDisputeDto) {
     return this.disputesService.resolveDispute(req.user.sub, disputeId, resolveDisputeDto);
   }
 
   /**
    * Get all open disputes (admin only)
-   * TODO: Add admin role guard
    */
   @Get('admin/open')
+  @UseGuards(AdminGuard)
   async getAllOpenDisputes(@Req() req) {
     return this.disputesService.getAllOpenDisputes();
   }
