@@ -28,14 +28,7 @@ export class ExchangeRateService {
   // In-memory cache for exchange rates
   private rateCache = new Map<string, { rate: ExchangeRate; expiry: number }>();
   
-  // Fallback rates (updated manually as backup)
-  private fallbackRates: Record<string, number> = {
-    'NGN': 1600.00,  // 1 USD = 1600 NGN (approximate)
-    'EUR': 0.85,     // 1 USD = 0.85 EUR
-    'GBP': 0.73,     // 1 USD = 0.73 GBP
-    'CAD': 1.25,     // 1 USD = 1.25 CAD
-    'AUD': 1.35,     // 1 USD = 1.35 AUD
-  };
+  // No fallback rates - all rates must be fetched from APIs
 
   constructor(private configService: ConfigService) {}
 
@@ -73,9 +66,9 @@ export class ExchangeRateService {
       });
       
       return liveRate;
-    } catch (error) {
-      this.logger.warn(`Failed to fetch live rate for ${targetCurrency}, using fallback`);
-      return this.getFallbackRate(targetCurrency);
+    } catch (error: any) {
+      this.logger.error(`Failed to fetch live rate for ${targetCurrency}:`, error.message);
+      throw new Error(`Exchange rate service is temporarily unavailable. Unable to fetch rate for ${targetCurrency}. Please try again later.`);
     }
   }
 
@@ -159,17 +152,18 @@ export class ExchangeRateService {
 
   /**
    * Get multiple exchange rates at once
+   * Returns only successfully fetched rates (doesn't throw if some fail)
    */
   async getMultipleRates(targetCurrencies: string[]): Promise<Record<string, ExchangeRate>> {
     const rates: Record<string, ExchangeRate> = {};
     
-    await Promise.all(
+    await Promise.allSettled(
       targetCurrencies.map(async (currency) => {
         try {
           rates[currency] = await this.getExchangeRate(currency);
-        } catch (error) {
-          this.logger.error(`Failed to get rate for ${currency}:`, error);
-          rates[currency] = this.getFallbackRate(currency);
+        } catch (error: any) {
+          this.logger.error(`Failed to get rate for ${currency}:`, error.message);
+          // Skip this currency - don't include it in results
         }
       })
     );
@@ -179,96 +173,78 @@ export class ExchangeRateService {
 
   /**
    * Get supported currencies
+   * Note: This returns common currencies, but actual support depends on API availability
    */
   getSupportedCurrencies(): string[] {
-    return ['USD', ...Object.keys(this.fallbackRates)];
+    return ['USD', 'NGN', 'EUR', 'GBP', 'CAD', 'AUD', 'GHS', 'KES', 'ZAR', 'UGX', 'TZS', 'RWF', 'XAF', 'XOF'];
   }
 
   /**
    * Fetch live exchange rate from API
    */
   private async fetchLiveRate(targetCurrency: string): Promise<ExchangeRate> {
-    // Using exchangerate-api.com (free tier: 1500 requests/month)
+    // Try exchangerate-api.com first (free tier: 1500 requests/month)
     const apiKey = this.configService.get('EXCHANGE_RATE_API_KEY');
     const baseUrl = 'https://v6.exchangerate-api.com/v6';
     
-    if (!apiKey) {
-      this.logger.warn('No exchange rate API key configured, using fallback rates');
-      return this.getFallbackRate(targetCurrency);
-    }
+    if (apiKey) {
+      try {
+        const response = await axios.get(
+          `${baseUrl}/${apiKey}/pair/USD/${targetCurrency}`,
+          { timeout: 5000 }
+        );
 
-    try {
-      const response = await axios.get(
-        `${baseUrl}/${apiKey}/pair/USD/${targetCurrency}`,
-        { timeout: 5000 }
-      );
-
-      if (response.data.result === 'success') {
-        return {
-          baseCurrency: 'USD',
-          targetCurrency,
-          rate: response.data.conversion_rate,
-          lastUpdated: new Date().toISOString(),
-          source: 'exchangerate-api.com'
-        };
-      } else {
-        throw new Error(`API returned error: ${response.data.error_type}`);
+        if (response.data.result === 'success') {
+          return {
+            baseCurrency: 'USD',
+            targetCurrency,
+            rate: response.data.conversion_rate,
+            lastUpdated: new Date().toISOString(),
+            source: 'exchangerate-api.com'
+          };
+        } else {
+          throw new Error(`API returned error: ${response.data.error_type}`);
+        }
+      } catch (error: any) {
+        this.logger.warn(`exchangerate-api.com failed for ${targetCurrency}, trying alternative:`, error.message);
+        // Continue to alternative API
       }
-    } catch (error) {
-      // Try alternative free API
-      return this.fetchFromAlternativeAPI(targetCurrency);
+    } else {
+      this.logger.warn('No EXCHANGE_RATE_API_KEY configured, trying alternative API');
     }
+
+    // Try alternative free API (exchangerate-api.com v4 - no API key required)
+    return this.fetchFromAlternativeAPI(targetCurrency);
   }
 
   /**
-   * Fallback to alternative free API
+   * Fallback to alternative free API (exchangerate-api.com v4 - no API key required)
    */
   private async fetchFromAlternativeAPI(targetCurrency: string): Promise<ExchangeRate> {
     try {
-      // Using fixer.io free tier as fallback
+      // Using exchangerate-api.com v4 (free, no API key required)
       const response = await axios.get(
-        `https://api.fixer.io/latest?access_key=${this.configService.get('FIXER_API_KEY')}&base=USD&symbols=${targetCurrency}`,
-        { timeout: 5000 }
+        `https://api.exchangerate-api.com/v4/latest/USD`,
+        { timeout: 10000 }
       );
 
-      if (response.data.success && response.data.rates[targetCurrency]) {
+      if (response.data && response.data.rates && response.data.rates[targetCurrency]) {
         return {
           baseCurrency: 'USD',
           targetCurrency,
           rate: response.data.rates[targetCurrency],
           lastUpdated: new Date().toISOString(),
-          source: 'fixer.io'
+          source: 'exchangerate-api.com-v4'
         };
+      } else {
+        throw new Error(`Currency ${targetCurrency} not found in API response`);
       }
-    } catch (error) {
-      this.logger.warn(`Alternative API also failed for ${targetCurrency}`);
+    } catch (error: any) {
+      this.logger.error(`Alternative API also failed for ${targetCurrency}:`, error.message);
+      throw new Error(`Exchange rate service is temporarily unavailable. Unable to fetch rate for ${targetCurrency}. Please try again later.`);
     }
-
-    // Final fallback to static rates
-    return this.getFallbackRate(targetCurrency);
   }
 
-  /**
-   * Get fallback rate when APIs fail
-   */
-  private getFallbackRate(targetCurrency: string): ExchangeRate {
-    const rate = this.fallbackRates[targetCurrency];
-    
-    if (!rate) {
-      this.logger.error(`No fallback rate configured for ${targetCurrency}`);
-      throw new Error(`Unsupported currency: ${targetCurrency}`);
-    }
-
-    this.logger.warn(`Using fallback rate for ${targetCurrency}: ${rate}`);
-    
-    return {
-      baseCurrency: 'USD',
-      targetCurrency,
-      rate,
-      lastUpdated: new Date().toISOString(),
-      source: 'fallback'
-    };
-  }
 
   /**
    * Clear rate cache (useful for testing or manual refresh)

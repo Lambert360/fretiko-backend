@@ -7,6 +7,7 @@ import { ConfigService } from '@nestjs/config';
 import { ValidationPipe } from '@nestjs/common';
 import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { SocketIoAdapter } from './realtime/socket-io.adapter';
+import * as express from 'express';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -26,6 +27,10 @@ async function bootstrap() {
   await socketAdapter.connectToRedis(); // Initialize adapter (currently no-op)
   app.useWebSocketAdapter(socketAdapter);
   console.log('✅ Socket.IO adapter configured');
+
+  // Configure raw body for Flutterwave webhook signature verification
+  // This must be before other body parsers
+  app.use('/wallet/webhooks/flutterwave', express.raw({ type: 'application/json' }));
 
   // Global validation for inputs
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));

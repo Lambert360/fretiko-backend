@@ -13,12 +13,15 @@ import { AdminService } from './admin.service';
 import { StaffModule } from '../staff/staff.module';
 import { AuditModule } from '../audit/audit.module';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { WalletModule } from '../wallet/wallet.module';
 
 @Module({
-  imports: [ConfigModule, StaffModule, AuditModule, NotificationsModule],
+  imports: [ConfigModule, StaffModule, AuditModule, NotificationsModule, WalletModule],
   controllers: [AdminController, StaffAdminController, ContentModerationController, FinanceController, StaffAnalyticsController, LogisticsController, DashboardController, OrdersController, DisputesController],
   providers: [AdminService],
   exports: [AdminService],
 })
-export class AdminModule {}
+export class AdminModule {
+  // WalletReconciliationService is imported via WalletModule and auto-injected into FinanceController
+}
 

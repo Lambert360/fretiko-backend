@@ -1,8 +1,9 @@
-import { Controller, Get, Post, Param, Query, UseGuards, Req } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, UseGuards, Req, Body } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
 import { PermissionsGuard } from '../staff/guards/permissions.guard';
 import { Permissions } from '../staff/decorators/permissions.decorator';
+import { WalletReconciliationService } from '../wallet/wallet-reconciliation.service';
 
 /**
  * Finance Controller (Staff)
@@ -12,7 +13,10 @@ import { Permissions } from '../staff/decorators/permissions.decorator';
 @Controller('admin/finance')
 @UseGuards(StaffJwtAuthGuard)
 export class FinanceController {
-  constructor(private readonly adminService: AdminService) {}
+  constructor(
+    private readonly adminService: AdminService,
+    private readonly walletReconciliationService: WalletReconciliationService,
+  ) {}
 
   /**
    * Get platform revenue analytics
@@ -132,6 +136,102 @@ export class FinanceController {
       page: page ? parseInt(page) : 1,
       limit: limit ? parseInt(limit) : 20,
     });
+  }
+
+  /**
+   * Get reconciliation alerts (exchange rate fallback usage)
+   * GET /admin/finance/reconciliation-alerts
+   * Requires: view_revenue permission
+   */
+  @Get('reconciliation-alerts')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async getReconciliationAlerts(
+    @Req() req,
+    @Query('status') status?: 'pending' | 'reviewed' | 'resolved' | 'dismissed',
+    @Query('severity') severity?: 'low' | 'medium' | 'high' | 'critical',
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+  ) {
+    return this.adminService.getReconciliationAlertsForStaff(req.user.sub, {
+      status,
+      severity,
+      page: page ? parseInt(page) : 1,
+      limit: limit ? parseInt(limit) : 20,
+      startDate,
+      endDate,
+    });
+  }
+
+  /**
+   * Update reconciliation alert status
+   * PATCH /admin/finance/reconciliation-alerts/:id/status
+   * Requires: view_revenue permission
+   */
+  @Post('reconciliation-alerts/:id/status')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async updateReconciliationAlertStatus(
+    @Req() req,
+    @Param('id') id: string,
+    @Query('status') status: 'reviewed' | 'resolved' | 'dismissed',
+    @Query('notes') notes?: string,
+  ) {
+    return this.adminService.updateReconciliationAlertStatus(
+      req.user.sub,
+      id,
+      status,
+      notes,
+    );
+  }
+
+  /**
+   * Manually refund a failed withdrawal
+   * POST /admin/finance/withdrawals/:payoutId/refund
+   * Requires: process_payouts permission (Finance staff only)
+   */
+  @Post('withdrawals/:payoutId/refund')
+  @UseGuards(PermissionsGuard)
+  @Permissions('process_payouts')
+  async refundWithdrawal(
+    @Req() req,
+    @Param('payoutId') payoutId: string,
+    @Body() body: { reason: string },
+  ) {
+    if (!body.reason || body.reason.trim().length === 0) {
+      throw new Error('Refund reason is required');
+    }
+    return this.adminService.refundWithdrawalManually(
+      req.user.sub,
+      payoutId,
+      body.reason,
+    );
+  }
+
+  /**
+   * Trigger wallet balance reconciliation manually
+   * POST /admin/finance/reconcile-wallets
+   * Requires: view_revenue permission (Finance staff only)
+   */
+  @Post('reconcile-wallets')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async triggerReconciliation(@Req() req) {
+    return this.walletReconciliationService.triggerReconciliation();
+  }
+
+  /**
+   * Reconcile specific user's wallet
+   * POST /admin/finance/reconcile-wallets/:userId
+   * Requires: view_revenue permission (Finance staff only)
+   */
+  @Post('reconcile-wallets/:userId')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async reconcileUserWallet(@Req() req, @Param('userId') userId: string) {
+    return this.walletReconciliationService.reconcileUserWallet(userId);
   }
 }
 

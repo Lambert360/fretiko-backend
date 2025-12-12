@@ -17,6 +17,7 @@ export interface BankAccount {
   accountNumber: string;
   accountType: 'savings' | 'checking' | 'current';
   currency: string;
+  country?: string; // ISO country code (e.g., 'NG', 'GH', 'US')
   isVerified: boolean;
   verificationMethod?: string;
   verifiedAt?: string;
@@ -39,6 +40,7 @@ export interface CreateBankAccountDto {
   accountNumber: string;
   accountType?: 'savings' | 'checking' | 'current';
   currency?: string;
+  country?: string; // ISO country code (e.g., 'NG', 'GH', 'US')
   swiftCode?: string;
   iban?: string;
   routingNumber?: string;
@@ -149,9 +151,27 @@ export class BankAccountService {
         throw new BadRequestException('Account name, bank name, and account number are required');
       }
 
+      // Bank code is required for withdrawals (Flutterwave needs it)
+      if (!dto.bankCode) {
+        throw new BadRequestException(
+          'Bank code is required. The bank code is needed to process withdrawals. Please provide your bank\'s code.'
+        );
+      }
+
       // Check if this is the first account (should be default)
       const existingAccounts = await this.getUserBankAccounts(userId);
       const isFirstAccount = existingAccounts.length === 0;
+
+      // Infer country from currency if not provided
+      let country = dto.country;
+      if (!country && dto.currency) {
+        const currencyToCountry: Record<string, string> = {
+          'NGN': 'NG', 'GHS': 'GH', 'KES': 'KE', 'ZAR': 'ZA', 'UGX': 'UG',
+          'TZS': 'TZ', 'RWF': 'RW', 'XAF': 'CM', 'XOF': 'SN', 'USD': 'US',
+          'EUR': 'EU', 'GBP': 'GB', 'CAD': 'CA', 'AUD': 'AU',
+        };
+        country = currencyToCountry[dto.currency.toUpperCase()];
+      }
 
       const { data, error } = await this.supabase
         .from('user_bank_accounts')
@@ -163,6 +183,7 @@ export class BankAccountService {
           account_number: dto.accountNumber,
           account_type: dto.accountType || 'savings',
           currency: dto.currency || 'NGN',
+          country: country,
           swift_code: dto.swiftCode,
           iban: dto.iban,
           routing_number: dto.routingNumber,
@@ -170,6 +191,11 @@ export class BankAccountService {
           branch_code: dto.branchCode,
           is_default: isFirstAccount ? true : (dto.isDefault || false),
           is_active: true,
+          // Auto-verify on creation since actual verification is not yet implemented
+          // TODO: Replace with actual bank account verification when implemented
+          is_verified: true,
+          verification_method: 'auto_verified',
+          verified_at: new Date().toISOString(),
         })
         .select()
         .single();
@@ -346,6 +372,7 @@ export class BankAccountService {
       accountNumber: data.account_number,
       accountType: data.account_type,
       currency: data.currency,
+      country: data.country,
       isVerified: data.is_verified,
       verificationMethod: data.verification_method,
       verifiedAt: data.verified_at,

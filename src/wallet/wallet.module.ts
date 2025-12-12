@@ -3,12 +3,36 @@ import { WalletController } from './wallet.controller';
 import { WalletService } from './wallet.service';
 import { PinService } from './pin.service';
 import { BankAccountService } from './bank-account.service';
+import { FlutterwaveService } from './flutterwave.service';
+import { ReconciliationService } from './reconciliation.service';
+import { WalletReconciliationService } from './wallet-reconciliation.service';
+import { ExchangeRateService } from '../shared/exchange-rate.service';
+import { ProcessingTimeService } from './processing-time.service';
+import { WithdrawalValidationService } from './withdrawal-validation.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 
 @Module({
   imports: [NotificationsModule],
   controllers: [WalletController],
-  providers: [WalletService, PinService, BankAccountService],
-  exports: [WalletService, PinService, BankAccountService], // Export for use in other modules
+  providers: [
+    WalletService, 
+    PinService, 
+    BankAccountService, 
+    FlutterwaveService, 
+    ReconciliationService, 
+    WalletReconciliationService,
+    ExchangeRateService, 
+    ProcessingTimeService,
+    WithdrawalValidationService
+  ],
+  exports: [
+    WalletService, 
+    PinService, 
+    BankAccountService, 
+    FlutterwaveService, 
+    ReconciliationService, 
+    WalletReconciliationService,
+    ProcessingTimeService
+  ], // Export for use in other modules
 })
 export class WalletModule {}

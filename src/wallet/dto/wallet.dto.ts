@@ -25,18 +25,19 @@ export class WalletResponseDto {
 }
 
 export class DepositRequestDto {
+  @IsOptional()
   @IsNumber()
   @Min(0.000001)
-  fretiAmount: number;
+  fretiAmount?: number; // Estimated FRETI amount (optional if localAmount provided)
 
   @IsOptional()
   @IsNumber()
   @Min(0.01)
-  localAmount?: number;
+  localAmount?: number; // Amount in user's local currency (required if fretiAmount not provided)
 
   @IsOptional()
   @IsString()
-  localCurrency?: string;
+  localCurrency?: string; // Currency code (e.g., NGN, GHS, USD)
 
   @IsOptional()
   @IsString()
@@ -47,6 +48,9 @@ export class WithdrawRequestDto {
   @IsNumber()
   @Min(0.000001)
   fretiAmount: number;
+
+  @IsUUID()
+  bankAccountId: string;
 
   @IsOptional()
   @IsString()
@@ -146,6 +150,7 @@ export class DepositResponseDto {
   exchangeRate?: number;
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
   externalPaymentId?: string;
+  paymentLink?: string; // Flutterwave payment link
   initiatedAt: string;
   completedAt?: string;
   failureReason?: string;

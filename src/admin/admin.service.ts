@@ -1,9 +1,10 @@
-import { Injectable, Logger, UnauthorizedException, NotFoundException, Inject, forwardRef } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException, NotFoundException, Inject, forwardRef, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction, AuditEntityType } from '../audit/dto/audit.dto';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
+import { WalletService } from '../wallet/wallet.service';
 
 /**
  * Admin Service
@@ -19,6 +20,8 @@ export class AdminService {
     @Inject(forwardRef(() => AuditService))
     private auditService: AuditService,
     private notificationHelper: NotificationHelperService,
+    @Inject(forwardRef(() => WalletService))
+    private walletService: WalletService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -185,8 +188,8 @@ export class AdminService {
    * Get platform revenue for staff (staff version)
    */
   async getPlatformRevenueForStaff(staffId: string, dateRange?: { start: string; end: string }) {
-    // Verify staff has permission
-    await this.verifyContentModerator(staffId);
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
 
     const startDate = dateRange?.start || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     const endDate = dateRange?.end || new Date().toISOString();
@@ -312,8 +315,8 @@ export class AdminService {
    * Get escrow health for staff (staff version)
    */
   async getEscrowHealthForStaff(staffId: string) {
-    // Verify staff has permission
-    await this.verifyContentModerator(staffId);
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
 
     this.logger.log(`Staff ${staffId} fetching escrow health metrics`);
 
@@ -383,18 +386,66 @@ export class AdminService {
     staffId: string,
     filters: { status?: string; page?: number; limit?: number },
   ) {
-    // Verify staff has permission
-    await this.verifyContentModerator(staffId);
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
     
-    // TODO: Implement payout fetching from database
-    // For now, return empty array
-    this.logger.log(`Staff ${staffId} fetching payouts with filters:`, filters);
+    // Fetch payouts from database
+    this.logger.log(`Finance staff ${staffId} fetching payouts with filters:`, filters);
     
+    let query = this.supabase
+      .from('payout_requests')
+      .select(`
+        id,
+        user_id,
+        freti_amount,
+        estimated_local_amount,
+        local_currency,
+        status,
+        external_payout_id,
+        requested_at,
+        processed_at,
+        paid_at,
+        failure_reason,
+        retry_count,
+        created_at,
+        updated_at,
+        user:user_profiles!payout_requests_user_id_fkey(
+          id,
+          username,
+          email,
+          first_name,
+          last_name
+        )
+      `)
+      .order('created_at', { ascending: false });
+
+    if (filters.status) {
+      query = query.eq('status', filters.status);
+    }
+
+    const page = filters.page || 1;
+    const limit = filters.limit || 20;
+    const offset = (page - 1) * limit;
+
+    // Get total count
+    const { count } = await this.supabase
+      .from('payout_requests')
+      .select('*', { count: 'exact', head: true })
+      .then((result) => ({ count: result.count || 0 }));
+
+    const { data: payouts, error } = await query.range(offset, offset + limit - 1);
+
+    if (error) {
+      this.logger.error(`Failed to fetch payouts: ${error.message}`);
+      throw new Error(`Failed to fetch payouts: ${error.message}`);
+    }
+
     return {
-      payouts: [],
-      total: 0,
-      page: filters.page || 1,
-      limit: filters.limit || 20,
+      payouts: payouts || [],
+      total: count || 0,
+      page,
+      limit,
+      totalPages: Math.ceil((count || 0) / limit),
     };
   }
 
@@ -402,13 +453,348 @@ export class AdminService {
    * Process payout for staff
    */
   async processPayoutForStaff(staffId: string, payoutId: string) {
-    // Verify staff has permission
-    await this.verifyContentModerator(staffId);
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
     
-    // TODO: Implement payout processing
-    this.logger.log(`Staff ${staffId} processing payout ${payoutId}`);
+    // TODO: Implement payout processing (manual retry, etc.)
+    this.logger.log(`Finance staff ${staffId} processing payout ${payoutId}`);
     
     return { message: 'Payout processed successfully' };
+  }
+
+  /**
+   * Manually refund a failed withdrawal (Finance staff only)
+   * POST /admin/finance/withdrawals/:payoutId/refund
+   */
+  async refundWithdrawalManually(
+    staffId: string,
+    payoutId: string,
+    reason: string,
+  ): Promise<{ success: boolean; message: string }> {
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
+
+    this.logger.log(`Finance staff ${staffId} attempting manual refund for withdrawal ${payoutId}`);
+
+    try {
+      // Get payout request
+      const { data: payout, error: payoutError } = await this.supabase
+        .from('payout_requests')
+        .select('*')
+        .eq('id', payoutId)
+        .single();
+
+      if (payoutError || !payout) {
+        throw new NotFoundException(`Payout request ${payoutId} not found`);
+      }
+
+      // Only allow refund for failed or pending withdrawals with funds stuck
+      if (payout.status === 'paid') {
+        throw new BadRequestException('Cannot refund a completed payout');
+      }
+
+      if (payout.status === 'cancelled') {
+        throw new BadRequestException('Payout is already cancelled');
+      }
+
+      // Get wallet to check current state
+      const wallet = await this.walletService.getWallet(payout.user_id);
+
+      // Check if funds are in pending_withdrawal (they should be if withdrawal failed)
+      if (wallet.pendingWithdrawal < payout.freti_amount) {
+        this.logger.warn(
+          `Payout ${payoutId}: Funds not fully in pending_withdrawal. Current: ${wallet.pendingWithdrawal}, Expected: ${payout.freti_amount}`
+        );
+      }
+
+      // Refund funds from pending_withdrawal back to available_balance
+      // Using withdrawal_burn type with positive availableDelta to refund funds
+      const refundIdempotencyKey = `manual_refund_${payoutId}_${Date.now()}_${staffId}`;
+      
+      await this.walletService.createLedgerEntry(
+        {
+          walletId: wallet.id,
+          transactionType: 'admin_adjustment', // Use admin_adjustment for manual refunds
+          availableDelta: payout.freti_amount, // Refund to available
+          escrowDelta: 0,
+          pendingWithdrawalDelta: -payout.freti_amount, // Remove from pending
+          referenceType: 'payout_request',
+          referenceId: payoutId,
+          idempotencyKey: refundIdempotencyKey,
+          description: `Manual refund by finance staff. Reason: ${reason}`,
+          metadata: {
+            refunded_by: staffId,
+            refund_reason: reason,
+            refund_type: 'manual_admin_refund',
+            original_status: payout.status,
+            original_payout_id: payoutId,
+          },
+        },
+        payout.user_id
+      );
+
+      // Update payout status
+      await this.supabase
+        .from('payout_requests')
+        .update({
+          status: 'cancelled',
+          failure_reason: `Manually refunded by finance staff. ${reason}`,
+          metadata: {
+            ...payout.metadata,
+            refunded_by: staffId,
+            refund_reason: reason,
+            refunded_at: new Date().toISOString(),
+            manual_refund: true,
+          },
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', payoutId);
+
+      // Send notification to user
+      await this.notificationHelper.notifySystemUpdate(
+        payout.user_id,
+        'Withdrawal Refunded',
+        `Your withdrawal of ₣${payout.freti_amount} FRETI has been refunded to your available balance by our finance team. Reason: ${reason}`,
+        { payoutId, amount: payout.freti_amount, type: 'wallet_withdrawal_refunded' }
+      );
+
+      // Log audit trail
+      await this.auditService.logAction({
+        staffId: staffId,
+        action: AuditAction.PROCESS_REFUND,
+        entityType: AuditEntityType.WALLET,
+        entityId: payoutId,
+        details: {
+          description: `Finance staff manually refunded withdrawal ${payoutId}. Amount: ₣${payout.freti_amount}. Reason: ${reason}`,
+          payoutId,
+          amount: payout.freti_amount,
+          reason,
+          refundedUserId: payout.user_id,
+        },
+      });
+
+      this.logger.log(`✅ Finance staff ${staffId} successfully refunded withdrawal ${payoutId}`);
+
+      return {
+        success: true,
+        message: `Withdrawal ${payoutId} refunded successfully. ₣${payout.freti_amount} FRETI has been returned to user's available balance.`,
+      };
+    } catch (error: any) {
+      this.logger.error(`Failed to refund withdrawal ${payoutId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get reconciliation alerts for finance team
+   * These alerts track when fallback exchange rates are used instead of Flutterwave's actual rates
+   */
+  async getReconciliationAlertsForStaff(
+    staffId: string,
+    filters: {
+      status?: 'pending' | 'reviewed' | 'resolved' | 'dismissed';
+      severity?: 'low' | 'medium' | 'high' | 'critical';
+      page?: number;
+      limit?: number;
+      startDate?: string;
+      endDate?: string;
+    },
+  ) {
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
+
+    this.logger.log(`Staff ${staffId} fetching reconciliation alerts with filters:`, filters);
+
+    let query = this.supabase
+      .from('reconciliation_alerts')
+      .select(`
+        id,
+        deposit_id,
+        user_id,
+        local_amount,
+        local_currency,
+        fallback_rate_used,
+        estimated_freti_amount,
+        actual_freti_amount,
+        actual_rate,
+        amount_discrepancy,
+        discrepancy_percentage,
+        alert_type,
+        alert_severity,
+        alert_reason,
+        status,
+        resolved_by,
+        resolved_at,
+        resolution_notes,
+        metadata,
+        created_at,
+        updated_at,
+        deposits!inner(
+          id,
+          status,
+          external_payment_id,
+          initiated_at,
+          completed_at
+        )
+      `)
+      .order('created_at', { ascending: false });
+
+    if (filters.status) {
+      query = query.eq('status', filters.status);
+    }
+
+    if (filters.severity) {
+      query = query.eq('alert_severity', filters.severity);
+    }
+
+    if (filters.startDate) {
+      query = query.gte('created_at', filters.startDate);
+    }
+
+    if (filters.endDate) {
+      query = query.lte('created_at', filters.endDate);
+    }
+
+    const { data: alerts, error } = await query;
+
+    if (error) {
+      this.logger.error(`Failed to fetch reconciliation alerts: ${error.message}`);
+      throw new Error(`Failed to fetch reconciliation alerts: ${error.message}`);
+    }
+
+    // Get user data for all alerts
+    const userIds = alerts?.map(a => a.user_id).filter(Boolean) || [];
+    const { data: users } = userIds.length > 0
+      ? await this.supabase
+          .from('user_profiles')
+          .select('id, username, preferences')
+          .in('id', userIds)
+      : { data: [] };
+
+    const userMap = new Map(users?.map(u => [u.id, u]) || []);
+
+    // Get resolver data if any alerts are resolved
+    const resolverIds = alerts?.map(a => a.resolved_by).filter(Boolean) || [];
+    const { data: resolvers } = resolverIds.length > 0
+      ? await this.supabase
+          .from('user_profiles')
+          .select('id, username, preferences')
+          .in('id', resolverIds)
+      : { data: [] };
+
+    const resolverMap = new Map(resolvers?.map(r => [r.id, r]) || []);
+
+    // Apply pagination
+    const page = filters.page || 1;
+    const limit = filters.limit || 20;
+    const from = (page - 1) * limit;
+    const to = from + limit;
+    const paginatedAlerts = (alerts || []).slice(from, to);
+
+    // Format response
+    const formattedAlerts = paginatedAlerts.map(alert => {
+      const user = userMap.get(alert.user_id) as { username?: string; preferences?: { fullName?: string } } | undefined;
+      const resolver = alert.resolved_by ? resolverMap.get(alert.resolved_by) as { username?: string; preferences?: { fullName?: string } } | undefined : null;
+
+      return {
+        id: alert.id,
+        depositId: alert.deposit_id,
+        userId: alert.user_id,
+        userName: user?.username || 'Unknown',
+        userFullName: user?.preferences?.fullName || null,
+        localAmount: parseFloat(alert.local_amount),
+        localCurrency: alert.local_currency,
+        fallbackRateUsed: parseFloat(alert.fallback_rate_used),
+        estimatedFretiAmount: parseFloat(alert.estimated_freti_amount),
+        actualFretiAmount: alert.actual_freti_amount ? parseFloat(alert.actual_freti_amount) : null,
+        actualRate: alert.actual_rate ? parseFloat(alert.actual_rate) : null,
+        amountDiscrepancy: alert.amount_discrepancy ? parseFloat(alert.amount_discrepancy) : null,
+        discrepancyPercentage: alert.discrepancy_percentage ? parseFloat(alert.discrepancy_percentage) : null,
+        alertType: alert.alert_type,
+        alertSeverity: alert.alert_severity,
+        alertReason: alert.alert_reason,
+        status: alert.status,
+        resolvedBy: alert.resolved_by,
+        resolvedByName: resolver?.username || null,
+        resolvedAt: alert.resolved_at,
+        resolutionNotes: alert.resolution_notes,
+        metadata: alert.metadata || {},
+        deposit: alert.deposits,
+        createdAt: alert.created_at,
+        updatedAt: alert.updated_at,
+      };
+    });
+
+    return {
+      alerts: formattedAlerts,
+      pagination: {
+        page,
+        limit,
+        total: alerts?.length || 0,
+        totalPages: Math.ceil((alerts?.length || 0) / limit),
+      },
+      summary: {
+        total: alerts?.length || 0,
+        pending: alerts?.filter(a => a.status === 'pending').length || 0,
+        reviewed: alerts?.filter(a => a.status === 'reviewed').length || 0,
+        resolved: alerts?.filter(a => a.status === 'resolved').length || 0,
+        bySeverity: {
+          low: alerts?.filter(a => a.alert_severity === 'low').length || 0,
+          medium: alerts?.filter(a => a.alert_severity === 'medium').length || 0,
+          high: alerts?.filter(a => a.alert_severity === 'high').length || 0,
+          critical: alerts?.filter(a => a.alert_severity === 'critical').length || 0,
+        },
+      },
+    };
+  }
+
+  /**
+   * Update reconciliation alert status (resolve, review, dismiss)
+   */
+  async updateReconciliationAlertStatus(
+    staffId: string,
+    alertId: string,
+    status: 'reviewed' | 'resolved' | 'dismissed',
+    resolutionNotes?: string,
+  ) {
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
+
+    this.logger.log(`Staff ${staffId} updating reconciliation alert ${alertId} to status ${status}`);
+
+    const updateData: any = {
+      status,
+      updated_at: new Date().toISOString(),
+    };
+
+    if (status === 'resolved' || status === 'reviewed') {
+      updateData.resolved_by = staffId;
+      updateData.resolved_at = new Date().toISOString();
+      if (resolutionNotes) {
+        updateData.resolution_notes = resolutionNotes;
+      }
+    }
+
+    const { data, error } = await this.supabase
+      .from('reconciliation_alerts')
+      .update(updateData)
+      .eq('id', alertId)
+      .select()
+      .single();
+
+    if (error) {
+      this.logger.error(`Failed to update reconciliation alert: ${error.message}`);
+      throw new Error(`Failed to update reconciliation alert: ${error.message}`);
+    }
+
+    return {
+      id: data.id,
+      status: data.status,
+      resolvedBy: data.resolved_by,
+      resolvedAt: data.resolved_at,
+      resolutionNotes: data.resolution_notes,
+      updatedAt: data.updated_at,
+    };
   }
 
   /**
@@ -424,8 +810,8 @@ export class AdminService {
       limit?: number;
     },
   ) {
-    // Verify staff has permission
-    await this.verifyContentModerator(staffId);
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
 
     this.logger.log(`Staff ${staffId} fetching deposits with filters:`, filters);
 
@@ -535,8 +921,8 @@ export class AdminService {
    * Get total platform funds for staff
    */
   async getTotalPlatformFundsForStaff(staffId: string) {
-    // Verify staff has permission
-    await this.verifyContentModerator(staffId);
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
 
     this.logger.log(`Staff ${staffId} fetching total platform funds`);
 
@@ -604,8 +990,8 @@ export class AdminService {
       limit?: number;
     },
   ) {
-    // Verify staff has permission
-    await this.verifyContentModerator(staffId);
+    // Verify staff has finance permission
+    await this.verifyFinanceStaff(staffId);
 
     this.logger.log(`Staff ${staffId} fetching user balances with filters:`, filters);
 
@@ -2738,6 +3124,50 @@ export class AdminService {
 
     if (!staff || !staff.is_active) {
       throw new UnauthorizedException('Staff not found or inactive');
+    }
+
+    return true;
+  }
+
+  /**
+   * Verify staff has permission for finance operations
+   * Checks if staff belongs to finance department or has finance role
+   */
+  async verifyFinanceStaff(staffId: string): Promise<boolean> {
+    const { data: staff, error } = await this.supabase
+      .from('staff_accounts')
+      .select(`
+        id,
+        role,
+        is_active,
+        department_id,
+        department:departments(
+          id,
+          name,
+          slug
+        )
+      `)
+      .eq('id', staffId)
+      .single();
+
+    if (error || !staff) {
+      this.logger.warn(`Finance staff verification failed: Staff not found for ID ${staffId}`);
+      throw new UnauthorizedException('Staff not found');
+    }
+
+    if (!staff.is_active) {
+      this.logger.warn(`Finance staff verification failed: Staff ${staffId} is inactive`);
+      throw new UnauthorizedException('Staff account is inactive');
+    }
+
+    // Check if staff is in finance department or has finance-related role
+    const departmentSlug = (staff.department as any)?.slug || '';
+    const isFinanceDepartment = departmentSlug === 'finance' || departmentSlug === 'financial';
+    const isFinanceRole = staff.role === 'finance_manager' || staff.role === 'financial_analyst' || staff.role === 'super_admin';
+
+    if (!isFinanceDepartment && !isFinanceRole) {
+      this.logger.warn(`Finance staff verification failed: Staff ${staffId} (role: ${staff.role}, dept: ${departmentSlug}) does not have finance permissions`);
+      throw new UnauthorizedException('Finance department access required');
     }
 
     return true;

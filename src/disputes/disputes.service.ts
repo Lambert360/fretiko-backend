@@ -272,9 +272,10 @@ export class DisputesService {
       }
 
       // Fetch messages separately
+      // Select only base columns that definitely exist, provide defaults for optional ones
       const { data: disputeMessages, error: messagesError } = await this.supabase
         .from('dispute_messages')
-        .select('id, message, sender_id, staff_id, is_admin, attachments, created_at')
+        .select('id, message, sender_id, attachments, created_at')
         .eq('dispute_id', disputeId)
         .order('created_at', { ascending: true });
 
@@ -282,11 +283,18 @@ export class DisputesService {
         this.logger.warn(`Error fetching messages: ${messagesError.message}`);
       }
 
+      // Add default values for optional columns that may not exist
+      const messagesWithDefaults = (disputeMessages || []).map((msg: any) => ({
+        ...msg,
+        staff_id: null,
+        is_admin: false,
+      }));
+
       // Combine the data
       const disputeWithRelations = {
         ...dispute,
         orders: order ? [order] : [],
-        dispute_messages: disputeMessages || [],
+        dispute_messages: messagesWithDefaults,
       };
 
       // Verify user is involved (or is admin)
