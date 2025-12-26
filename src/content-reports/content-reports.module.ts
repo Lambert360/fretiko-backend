@@ -1,10 +1,11 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { ContentReportsController } from './content-reports.controller';
 import { ContentReportsService } from './content-reports.service';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { AdminModule } from '../admin/admin.module';
 
 @Module({
-  imports: [NotificationsModule],
+  imports: [NotificationsModule, forwardRef(() => AdminModule)],
   controllers: [ContentReportsController],
   providers: [ContentReportsService],
   exports: [ContentReportsService],

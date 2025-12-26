@@ -275,7 +275,7 @@ export class DisputesService {
       // Select only base columns that definitely exist, provide defaults for optional ones
       const { data: disputeMessages, error: messagesError } = await this.supabase
         .from('dispute_messages')
-        .select('id, message, sender_id, attachments, created_at')
+        .select('id, message, sender_id, staff_id, is_admin, attachments, created_at')
         .eq('dispute_id', disputeId)
         .order('created_at', { ascending: true });
 
@@ -286,8 +286,8 @@ export class DisputesService {
       // Add default values for optional columns that may not exist
       const messagesWithDefaults = (disputeMessages || []).map((msg: any) => ({
         ...msg,
-        staff_id: null,
-        is_admin: false,
+        staff_id: msg.staff_id ?? null,
+        is_admin: msg.is_admin ?? false,
       }));
 
       // Combine the data

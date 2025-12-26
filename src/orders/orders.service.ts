@@ -1031,7 +1031,7 @@ export class OrdersService {
           .from('disputes')
           .insert({
             order_id: orderId,
-            complainant_id: userId,
+            disputant_id: userId,
             respondent_id: order.vendor_id,
             reason: reason,
             description: description || '',

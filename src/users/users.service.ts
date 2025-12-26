@@ -1,14 +1,16 @@
-import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { UpdateProfileDto, UserProfileResponse, PublicProfileResponse } from '../shared/dto/user-profile.dto';
 
 @Injectable()
 export class UsersService {
   private supabase;
+  private serviceSupabase; // Service role client for operations that need to bypass RLS
 
   constructor(private configService: ConfigService) {
     this.supabase = createSupabaseClient(this.configService);
+    this.serviceSupabase = createServiceSupabaseClient(this.configService);
   }
 
   async getProfile(userId: string): Promise<UserProfileResponse> {
@@ -416,6 +418,119 @@ export class UsersService {
     }
   }
 
+  /**
+   * Get current user's warnings
+   */
+  async getMyWarnings(userId: string) {
+    const { data: warnings, error } = await this.supabase
+      .from('user_warnings')
+      .select(`
+        id,
+        severity,
+        reason,
+        related_content_id,
+        related_content_type,
+        created_at,
+        warned_by,
+        staff_accounts:staff_accounts!warned_by(
+          id,
+          full_name,
+          email
+        )
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      throw new Error(`Failed to fetch warnings: ${error.message}`);
+    }
+
+    return (warnings || []).map((warning: any) => ({
+      id: warning.id,
+      severity: warning.severity,
+      reason: warning.reason,
+      relatedContentId: warning.related_content_id,
+      relatedContentType: warning.related_content_type,
+      createdAt: warning.created_at,
+      warnedBy: warning.staff_accounts
+        ? {
+            id: warning.staff_accounts.id,
+            fullName: warning.staff_accounts.full_name,
+            email: warning.staff_accounts.email,
+          }
+        : null,
+    }));
+  }
+
+  /**
+   * Get account status (warnings, suspension, ban)
+   */
+  async getAccountStatus(userId: string) {
+    // Get warnings
+    const { data: warnings, error: warningsError } = await this.supabase
+      .from('user_warnings')
+      .select('severity, created_at')
+      .eq('user_id', userId);
+
+    if (warningsError) {
+      throw new Error(`Failed to fetch warning stats: ${warningsError.message}`);
+    }
+
+    const totalWarnings = warnings?.length || 0;
+    const highCount = warnings?.filter((w) => w.severity === 'high').length || 0;
+    const mediumCount = warnings?.filter((w) => w.severity === 'medium').length || 0;
+    const lowCount = warnings?.filter((w) => w.severity === 'low').length || 0;
+
+    const lastWarning = warnings && warnings.length > 0
+      ? warnings.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0]
+      : null;
+
+    // Get user profile for suspension/ban status
+    const { data: user, error: userError } = await this.supabase
+      .from('user_profiles')
+      .select('preferences')
+      .eq('id', userId)
+      .single();
+
+    if (userError) {
+      throw new Error(`Failed to fetch user profile: ${userError.message}`);
+    }
+
+    const isSuspended = user?.preferences?.isSuspended === true;
+    const isDeleted = user?.preferences?.isDeleted === true;
+    const accountStatus = isDeleted ? 'deleted' : isSuspended ? 'suspended' : 'active';
+
+    return {
+      accountStatus,
+      warnings: {
+        total: totalWarnings,
+        high: highCount,
+        medium: mediumCount,
+        low: lowCount,
+        lastWarningAt: lastWarning?.created_at || null,
+      },
+      suspension: isSuspended
+        ? {
+            isSuspended: true,
+            suspendedAt: user?.preferences?.suspendedAt || null,
+            suspendedBy: user?.preferences?.suspendedBy || null,
+            suspensionReason: user?.preferences?.suspensionReason || null,
+          }
+        : {
+            isSuspended: false,
+          },
+      deletion: isDeleted
+        ? {
+            isDeleted: true,
+            deletedAt: user?.preferences?.deletedAt || null,
+            deletedBy: user?.preferences?.deletedBy || null,
+          }
+        : {
+            isDeleted: false,
+          },
+    };
+  }
+
   private mapToProfileResponse(data: any): UserProfileResponse {
     return {
       id: data.id,
@@ -431,6 +546,140 @@ export class UsersService {
       isRider: data.is_rider,
       createdAt: data.created_at,
       updatedAt: data.updated_at,
+    };
+  }
+
+  /**
+   * Submit a suspension appeal
+   */
+  async submitAppeal(userId: string, appealReason: string, authenticatedUserId?: string): Promise<{ message: string; appealId: string }> {
+    // Security: Ensure userId matches authenticated user (prevent users from appealing for others)
+    if (authenticatedUserId && userId !== authenticatedUserId) {
+      throw new ForbiddenException('You can only submit appeals for your own account');
+    }
+
+    // Input validation: Sanitize and validate appeal reason
+    const sanitizedReason = appealReason.trim();
+    if (!sanitizedReason || sanitizedReason.length < 10) {
+      throw new BadRequestException('Appeal reason must be at least 10 characters long');
+    }
+    if (sanitizedReason.length > 5000) {
+      throw new BadRequestException('Appeal reason must be less than 5000 characters');
+    }
+
+    // Use service role client to bypass RLS and avoid infinite recursion
+    // Check if user is suspended
+    const { data: user, error: userError } = await this.serviceSupabase
+      .from('user_profiles')
+      .select('preferences')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user) {
+      throw new NotFoundException('User not found');
+    }
+
+    const preferences = user.preferences || {};
+    if (!preferences.isSuspended) {
+      throw new BadRequestException('You can only appeal if your account is suspended');
+    }
+
+    // Check if user already has a pending appeal (use service client to avoid RLS recursion)
+    const { data: existingAppeal } = await this.serviceSupabase
+      .from('suspension_appeals')
+      .select('id, status')
+      .eq('user_id', userId)
+      .in('status', ['pending', 'under_review'])
+      .maybeSingle();
+
+    if (existingAppeal) {
+      throw new Error('You already have a pending appeal. Please wait for it to be reviewed.');
+    }
+
+    // Create appeal using service role client to bypass RLS
+    // This prevents infinite recursion in RLS policies
+    const { data: appeal, error: appealError } = await this.serviceSupabase
+      .from('suspension_appeals')
+      .insert({
+        user_id: userId,
+        suspension_reason: preferences.suspensionReason || null,
+        appeal_reason: sanitizedReason, // Use sanitized reason
+        status: 'pending',
+      })
+      .select('id')
+      .single();
+
+    if (appealError || !appeal) {
+      throw new Error(`Failed to submit appeal: ${appealError?.message || 'Unknown error'}`);
+    }
+
+    return {
+      message: 'Appeal submitted successfully. We will review it and get back to you.',
+      appealId: appeal.id,
+    };
+  }
+
+  /**
+   * Get user's appeals
+   * Uses service role client to bypass RLS and avoid infinite recursion
+   */
+  async getMyAppeals(userId: string, authenticatedUserId?: string): Promise<any[]> {
+    // Security: Ensure userId matches authenticated user (prevent users from accessing others' appeals)
+    if (authenticatedUserId && userId !== authenticatedUserId) {
+      throw new ForbiddenException('You can only view your own appeals');
+    }
+
+    const { data: appeals, error } = await this.serviceSupabase
+      .from('suspension_appeals')
+      .select(`
+        id,
+        suspension_reason,
+        appeal_reason,
+        status,
+        reviewed_by,
+        reviewed_at,
+        review_notes,
+        created_at,
+        updated_at,
+        reviewed_by_staff:staff_accounts!reviewed_by(full_name, email)
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      throw new Error(`Failed to fetch appeals: ${error.message}`);
+    }
+
+    return appeals || [];
+  }
+
+  /**
+   * Get appeal status for current user
+   * Uses service role client to bypass RLS and avoid infinite recursion
+   */
+  async getAppealStatus(userId: string, authenticatedUserId?: string): Promise<{ hasPendingAppeal: boolean; latestAppeal: any | null }> {
+    // Security: Ensure userId matches authenticated user (prevent users from accessing others' appeal status)
+    if (authenticatedUserId && userId !== authenticatedUserId) {
+      throw new ForbiddenException('You can only view your own appeal status');
+    }
+
+    const { data: appeals, error } = await this.serviceSupabase
+      .from('suspension_appeals')
+      .select('id, status, created_at, reviewed_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (error) {
+      throw new Error(`Failed to fetch appeal status: ${error.message}`);
+    }
+
+    const latestAppeal = appeals && appeals.length > 0 ? appeals[0] : null;
+    const hasPendingAppeal = latestAppeal && ['pending', 'under_review'].includes(latestAppeal.status);
+
+    return {
+      hasPendingAppeal,
+      latestAppeal,
     };
   }
 }

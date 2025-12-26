@@ -67,14 +67,20 @@ export class AuthService {
       );
     }
 
+    // Set the session on the client so RLS policies allow the user to read their own profile
+    if (data.session) {
+      await this.supabase.auth.setSession({
+        access_token: data.session.access_token,
+        refresh_token: data.session.refresh_token,
+      });
+    }
+
     // Fetch complete user profile from user_profiles table (for new signups this might be empty initially)
+    // Note: email, first_name, last_name are stored in auth.users, not user_profiles
     const { data: profileData, error: profileError } = await this.supabase
       .from('user_profiles')
       .select(`
         id,
-        email,
-        first_name,
-        last_name,
         username,
         avatar_url,
         user_role,
@@ -85,11 +91,15 @@ export class AuthService {
       .eq('id', data.user.id)
       .single();
 
+    // Extract name from user_metadata or preferences (use different variable names to avoid conflict with destructured values)
+    const extractedFirstName = data.user.user_metadata?.first_name || profileData?.preferences?.fullName?.split(' ')[0] || '';
+    const extractedLastName = data.user.user_metadata?.last_name || profileData?.preferences?.fullName?.split(' ').slice(1).join(' ') || '';
+
     const userData = {
       id: data.user.id,
       email: data.user.email,
-      firstName: profileData?.first_name || data.user.user_metadata?.first_name,
-      lastName: profileData?.last_name || data.user.user_metadata?.last_name,
+      firstName: extractedFirstName,
+      lastName: extractedLastName,
       username: profileData?.username,
       avatar_url: profileData?.avatar_url,
       user_role: profileData?.user_role || 'citizen', // Default for new users
@@ -165,29 +175,58 @@ export class AuthService {
 
     console.log('✅ Signin successful - fetching complete user profile');
 
+    // Set the session on the client so RLS policies allow the user to read their own profile
+    if (data.session) {
+      await this.supabase.auth.setSession({
+        access_token: data.session.access_token,
+        refresh_token: data.session.refresh_token,
+      });
+    }
+
     // Fetch complete user profile from user_profiles table
+    // Using authenticated client so RLS allows user to read their own profile
+    // Note: email, first_name, last_name are stored in auth.users, not user_profiles
     const { data: profileData, error: profileError } = await this.supabase
       .from('user_profiles')
       .select(`
         id,
-        email,
-        first_name,
-        last_name,
         username,
         avatar_url,
         user_role,
         is_seller,
         is_rider,
-        is_verified
+        is_verified,
+        preferences
       `)
       .eq('id', data.user.id)
       .single();
 
+    if (profileError || !profileData) {
+      console.log('⚠️ Profile not found, but auth succeeded');
+      console.log('Profile error:', profileError?.message, profileError?.code);
+      throw new UnauthorizedException('User profile not found');
+    }
+
+    // Check if account is deleted (stored in preferences)
+    const preferences = profileData.preferences || {};
+    if (preferences.isDeleted === true || preferences.deletedAt) {
+      console.log('🚫 Login attempt for deleted account:', data.user.email);
+      throw new UnauthorizedException('This account has been deleted');
+    }
+
+    // Check if account is suspended (stored in preferences)
+    // Industry standard: Allow suspended users to authenticate but mark them as suspended
+    const isSuspended = preferences.isSuspended === true;
+
+    // Extract name from user_metadata or preferences
+    const firstName = data.user.user_metadata?.first_name || profileData?.preferences?.fullName?.split(' ')[0] || '';
+    const lastName = data.user.user_metadata?.last_name || profileData?.preferences?.fullName?.split(' ').slice(1).join(' ') || '';
+
     const userData = {
       id: data.user.id,
       email: data.user.email,
-      firstName: profileData?.first_name || data.user.user_metadata?.first_name,
-      lastName: profileData?.last_name || data.user.user_metadata?.last_name,
+      firstName: firstName,
+      lastName: lastName,
       username: profileData?.username,
       avatar_url: profileData?.avatar_url,
       user_role: profileData?.user_role,
@@ -201,14 +240,17 @@ export class AuthService {
       is_seller: userData.is_seller,
       is_rider: userData.is_rider,
       profileFound: !!profileData,
-      profileError: profileError?.message
+      profileError: profileError?.message,
+      isSuspended: isSuspended
     });
 
     // Return Supabase session tokens with complete user profile
+    // Industry standard: Allow suspended users to authenticate but mark them
     return {
       user: userData,
       accessToken: data.session?.access_token || '',
       refreshToken: data.session?.refresh_token || '',
+      isSuspended: isSuspended, // Suspended users can authenticate but have limited access
     };
   }
 

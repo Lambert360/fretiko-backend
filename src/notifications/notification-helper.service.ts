@@ -1100,6 +1100,56 @@ export class NotificationHelperService {
   }
 
   // ============================================
+  // USER WARNING NOTIFICATIONS
+  // ============================================
+
+  /**
+   * Notify user when they receive a warning
+   */
+  async notifyUserWarning(userId: string, warningData: {
+    warningId: string;
+    severity: 'low' | 'medium' | 'high';
+    reason: string;
+    warningCount: number;
+    relatedContentId?: string;
+    relatedContentType?: string;
+  }): Promise<void> {
+    try {
+      const severityLabels = {
+        low: 'Low',
+        medium: 'Medium',
+        high: 'High',
+      };
+
+      const notification: CreateNotificationDto = {
+        user_id: userId,
+        type: NotificationType.USER_WARNING,
+        title: `Warning: ${severityLabels[warningData.severity]} Severity`,
+        message: warningData.reason,
+        priority: warningData.severity === 'high' ? NotificationPriority.HIGH : NotificationPriority.MEDIUM,
+        badge: 'WARNING',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Account Status', type: ActionButtonType.PRIMARY },
+        ],
+        data: {
+          warning_id: warningData.warningId,
+          severity: warningData.severity,
+          warning_count: warningData.warningCount,
+          reason: warningData.reason,
+          related_content_id: warningData.relatedContentId,
+          related_content_type: warningData.relatedContentType,
+        },
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Created warning notification for user ${userId}`);
+    } catch (error) {
+      this.logger.error('Failed to create warning notification:', error);
+    }
+  }
+
+  // ============================================
   // PRIVATE HELPER METHOD
   // ============================================
 

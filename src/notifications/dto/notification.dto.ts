@@ -22,7 +22,8 @@ export enum NotificationType {
   CHAT = 'chat',
   AI_CHECKIN = 'ai_checkin',
   AI_REMINDER = 'ai_reminder',
-  AI_ENGAGEMENT = 'ai_engagement'
+  AI_ENGAGEMENT = 'ai_engagement',
+  USER_WARNING = 'user_warning'
 }
 
 export enum NotificationPriority {

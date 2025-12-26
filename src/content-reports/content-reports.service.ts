@@ -1,9 +1,10 @@
-import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, Logger, HttpException, HttpStatus, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { NotificationType, NotificationPriority, ActionButtonType } from '../notifications/dto/notification.dto';
+import { AdminService } from '../admin/admin.service';
 
 export interface CreateContentReportDto {
   reportCategory: 'product' | 'service' | 'chat' | 'user';
@@ -27,7 +28,7 @@ export interface CreateContentReportDto {
 
 export interface ReviewContentReportDto {
   status: 'approved' | 'action_taken' | 'dismissed';
-  actionTaken?: 'no_action' | 'content_removed' | 'content_hidden' | 'user_warned' | 'user_suspended' | 'user_banned';
+  actionTaken?: 'no_action' | 'content_removed' | 'user_warned' | 'user_suspended';
   actionReason: string;
 }
 
@@ -61,6 +62,8 @@ export class ContentReportsService {
     private configService: ConfigService,
     private notificationHelper: NotificationHelperService,
     private notificationsService: NotificationsService,
+    @Inject(forwardRef(() => AdminService))
+    private adminService: AdminService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -383,14 +386,14 @@ export class ContentReportsService {
   }
 
   /**
-   * Review content report (moderators only)
+   * Review content report (staff with content moderation permissions)
    */
   async reviewContentReport(moderatorId: string, reportId: string, reviewDto: ReviewContentReportDto): Promise<ContentReport> {
     try {
-      // Verify moderator
-      const isModerator = await this.isModerator(moderatorId);
-      if (!isModerator) {
-        throw new HttpException('Only moderators can review content reports', HttpStatus.FORBIDDEN);
+      // Verify staff has permission (super admin can always review, others need content moderation permissions)
+      const hasPermission = await this.hasContentModerationPermission(moderatorId);
+      if (!hasPermission) {
+        throw new HttpException('You do not have permission to review content reports', HttpStatus.FORBIDDEN);
       }
 
       // Get report
@@ -405,9 +408,11 @@ export class ContentReportsService {
       }
 
       // Update report
+      // Note: After migration 125, moderated_by can store staff_accounts IDs
+      // The foreign key constraint has been removed to allow staff moderators
       const updateData: any = {
         status: reviewDto.status,
-        moderated_by: moderatorId,
+        moderated_by: moderatorId, // Staff ID from staff_accounts
         moderated_at: new Date().toISOString(),
       };
 
@@ -428,7 +433,63 @@ export class ContentReportsService {
         throw new HttpException('Failed to review report', HttpStatus.INTERNAL_SERVER_ERROR);
       }
 
-      // TODO: Implement actual moderation actions (remove content, warn user, etc.)
+      // Implement actual moderation actions
+      if (reviewDto.actionTaken && reviewDto.actionTaken !== 'no_action') {
+        try {
+          if (reviewDto.actionTaken === 'content_removed') {
+            // Reject the reported content (set status to inactive)
+            if (report.product_id) {
+              await this.adminService.rejectProduct(moderatorId, report.product_id, reviewDto.actionReason || 'Content removed due to report');
+              this.logger.log(`Product ${report.product_id} rejected as part of report review`);
+            } else if (report.service_id) {
+              await this.adminService.rejectService(moderatorId, report.service_id, reviewDto.actionReason || 'Content removed due to report');
+              this.logger.log(`Service ${report.service_id} rejected as part of report review`);
+            } else {
+              this.logger.warn(`Content removal requested but no product_id or service_id found in report ${reportId}`);
+            }
+          } else if (reviewDto.actionTaken === 'user_warned') {
+            // Warn the reported user
+            const userIdToWarn = report.reported_user_id || (report.product_id ? await this.getProductOwnerId(report.product_id) : null) || (report.service_id ? await this.getServiceOwnerId(report.service_id) : null);
+            
+            if (userIdToWarn) {
+              // Determine severity based on report type
+              let severity: 'low' | 'medium' | 'high' = 'low';
+              if (['fraudulent_listing', 'harassment', 'threats'].includes(report.report_type)) {
+                severity = 'high';
+              } else if (['spam', 'inappropriate_language'].includes(report.report_type)) {
+                severity = 'medium';
+              }
+              
+              await this.adminService.warnUser(
+                moderatorId,
+                userIdToWarn,
+                severity,
+                reviewDto.actionReason || `Warning due to content report: ${report.reason}`,
+                report.product_id || report.service_id || undefined,
+                (report.product_id ? 'product' : report.service_id ? 'service' : undefined) as 'product' | 'service' | 'chat' | 'user' | undefined,
+              );
+              this.logger.log(`User ${userIdToWarn} warned as part of report review with ${severity} severity`);
+            } else {
+              this.logger.warn(`User warning requested but no user ID found in report ${reportId}`);
+            }
+          } else if (reviewDto.actionTaken === 'user_suspended') {
+            // Suspend the reported user
+            const userIdToSuspend = report.reported_user_id || (report.product_id ? await this.getProductOwnerId(report.product_id) : null) || (report.service_id ? await this.getServiceOwnerId(report.service_id) : null);
+            
+            if (userIdToSuspend) {
+              await this.adminService.suspendUser(moderatorId, userIdToSuspend, reviewDto.actionReason || 'User suspended due to content report');
+              this.logger.log(`User ${userIdToSuspend} suspended as part of report review`);
+            } else {
+              this.logger.warn(`User suspension requested but no user ID found in report ${reportId}`);
+            }
+          }
+        } catch (actionError: any) {
+          // Log the error but don't fail the review - the report is still updated
+          this.logger.error(`Failed to execute moderation action ${reviewDto.actionTaken}: ${actionError.message}`, actionError.stack);
+          // Optionally, you could throw here if you want the review to fail if the action fails
+          // throw new HttpException(`Failed to execute moderation action: ${actionError.message}`, HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+      }
 
       this.logger.log(`Content report ${reportId} reviewed by ${moderatorId}`);
 
@@ -486,7 +547,71 @@ export class ContentReportsService {
   }
 
   /**
-   * Check if user is a moderator
+   * Check if staff has content moderation permission
+   * Super admins can always moderate, others need appropriate permissions
+   */
+  private async hasContentModerationPermission(staffId: string): Promise<boolean> {
+    try {
+      // Check if staff exists and is active
+      const { data: staff, error } = await this.supabase
+        .from('staff_accounts')
+        .select(`
+          id,
+          role,
+          is_active,
+          department_id,
+          department:departments(
+            id,
+            name,
+            permissions
+          )
+        `)
+        .eq('id', staffId)
+        .single();
+
+      if (error || !staff || !staff.is_active) {
+        return false;
+      }
+
+      // Super admin can always moderate
+      if (staff.role === 'super_admin') {
+        return true;
+      }
+
+      // Check if staff's department has content moderation permissions
+      if (staff.department && staff.department.permissions) {
+        const permissions = Array.isArray(staff.department.permissions) 
+          ? staff.department.permissions 
+          : [];
+        // Check for any content moderation related permissions
+        const contentModerationPermissions = [
+          'view_products',
+          'approve_products',
+          'remove_products',
+          'view_services',
+          'approve_services',
+          'remove_services',
+          'view_stories',
+          'remove_stories',
+          'view_live_streams',
+          'end_live_streams'
+        ];
+        
+        if (contentModerationPermissions.some(perm => permissions.includes(perm))) {
+          return true;
+        }
+      }
+
+      return false;
+    } catch (error) {
+      this.logger.error('Error checking content moderation permission:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Check if user is a moderator (for user-reported content, checks user_profiles)
+   * @deprecated Use hasContentModerationPermission for staff accounts
    */
   private async isModerator(userId: string): Promise<boolean> {
     try {
@@ -558,6 +683,52 @@ export class ContentReportsService {
       this.logger.log(`Successfully notified moderators about content report ${reportId}`);
     } catch (error) {
       this.logger.error('Error notifying moderators:', error);
+    }
+  }
+
+  /**
+   * Get product owner ID
+   */
+  private async getProductOwnerId(productId: string): Promise<string | null> {
+    try {
+      const { data: product, error } = await this.supabase
+        .from('products')
+        .select('user_id')
+        .eq('id', productId)
+        .single();
+
+      if (error || !product) {
+        this.logger.warn(`Failed to get product owner for ${productId}: ${error?.message}`);
+        return null;
+      }
+
+      return product.user_id;
+    } catch (error) {
+      this.logger.error(`Error getting product owner: ${error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get service owner ID
+   */
+  private async getServiceOwnerId(serviceId: string): Promise<string | null> {
+    try {
+      const { data: service, error } = await this.supabase
+        .from('services')
+        .select('user_id')
+        .eq('id', serviceId)
+        .single();
+
+      if (error || !service) {
+        this.logger.warn(`Failed to get service owner for ${serviceId}: ${error?.message}`);
+        return null;
+      }
+
+      return service.user_id;
+    } catch (error) {
+      this.logger.error(`Error getting service owner: ${error}`);
+      return null;
     }
   }
 

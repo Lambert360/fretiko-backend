@@ -54,4 +54,5 @@ export class AuthResponse {
   };
   accessToken: string;
   refreshToken: string;
+  isSuspended?: boolean; // Industry standard: allow suspended users to authenticate
 }

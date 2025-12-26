@@ -17,13 +17,14 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { UsersService } from './users.service';
 import { UpdateProfileDto } from '../shared/dto/user-profile.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { SuspendedUserGuard } from '../auth/suspended-user.guard';
 
 @Controller('users')
 export class UsersController {
   constructor(private readonly usersService: UsersService) {}
 
   @Get('profile')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, SuspendedUserGuard)
   async getMyProfile(@Request() req) {
     return this.usersService.getProfile(req.user.sub);
   }
@@ -137,5 +138,63 @@ export class UsersController {
     console.log('🗑️ Account deletion requested by user:', req.user.sub);
     const token = req.headers.authorization?.replace('Bearer ', '');
     return this.usersService.deleteAccount(req.user.sub, token);
+  }
+
+  /**
+   * Get current user's warnings
+   * GET /users/me/warnings
+   * Requires: User authentication
+   */
+  @Get('me/warnings')
+  @UseGuards(JwtAuthGuard)
+  async getMyWarnings(@Request() req) {
+    return this.usersService.getMyWarnings(req.user.sub);
+  }
+
+  /**
+   * Get current user's account status
+   * GET /users/me/account-status
+   * Requires: User authentication
+   */
+  @Get('me/account-status')
+  @UseGuards(JwtAuthGuard, SuspendedUserGuard)
+  async getAccountStatus(@Request() req) {
+    return this.usersService.getAccountStatus(req.user.sub);
+  }
+
+  /**
+   * Submit a suspension appeal
+   * POST /users/me/appeals
+   * Requires: User authentication (suspended users allowed)
+   */
+  @Post('me/appeals')
+  @UseGuards(JwtAuthGuard, SuspendedUserGuard)
+  async submitAppeal(@Request() req, @Body() body: { reason: string }) {
+    // Pass authenticated user ID for security validation
+    return this.usersService.submitAppeal(req.user.sub, body.reason, req.user.sub);
+  }
+
+  /**
+   * Get current user's appeals
+   * GET /users/me/appeals
+   * Requires: User authentication (suspended users allowed)
+   */
+  @Get('me/appeals')
+  @UseGuards(JwtAuthGuard, SuspendedUserGuard)
+  async getMyAppeals(@Request() req) {
+    // Pass authenticated user ID for security validation
+    return this.usersService.getMyAppeals(req.user.sub, req.user.sub);
+  }
+
+  /**
+   * Get current user's appeal status
+   * GET /users/me/appeals/status
+   * Requires: User authentication (suspended users allowed)
+   */
+  @Get('me/appeals/status')
+  @UseGuards(JwtAuthGuard, SuspendedUserGuard)
+  async getAppealStatus(@Request() req) {
+    // Pass authenticated user ID for security validation
+    return this.usersService.getAppealStatus(req.user.sub, req.user.sub);
   }
 }

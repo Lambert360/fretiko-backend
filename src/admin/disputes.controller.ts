@@ -1,4 +1,5 @@
-import { Controller, Get, Post, Param, Query, UseGuards, Req, Body } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, UseGuards, Req, Body, UseInterceptors, UploadedFile, UploadedFiles, BadRequestException } from '@nestjs/common';
+import { FileInterceptor, FilesInterceptor } from '@nestjs/platform-express';
 import { AdminService } from './admin.service';
 import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
 import { PermissionsGuard } from '../staff/guards/permissions.guard';
@@ -90,9 +91,21 @@ export class DisputesController {
   async escalateDispute(
     @Req() req,
     @Param('id') id: string,
-    @Body() body: { reason: string },
+    @Body() body: { 
+      reason: string;
+      departmentId?: string;
+      createReport?: boolean;
+      attachments?: Array<{ type: string; url: string; name: string; size?: string }>;
+    },
   ) {
-    return this.adminService.escalateDisputeForStaff(req.user.sub, id, body.reason);
+    return this.adminService.escalateDisputeForStaff(
+      req.user.sub, 
+      id, 
+      body.reason,
+      body.departmentId,
+      body.createReport,
+      body.attachments
+    );
   }
 
   /**
@@ -125,6 +138,44 @@ export class DisputesController {
     @Body() body: { message: string; attachments?: Array<{ type: string; url: string }> },
   ) {
     return this.adminService.addStaffMessageToDispute(req.user.sub, id, body.message, body.attachments);
+  }
+
+  /**
+   * Upload file for dispute attachments
+   * POST /admin/disputes/upload
+   * Requires: escalate_disputes permission
+   */
+  @Post('upload')
+  @UseGuards(PermissionsGuard)
+  @Permissions('escalate_disputes')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadFile(
+    @Req() req,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    if (!file) {
+      throw new BadRequestException('No file provided');
+    }
+    return this.adminService.uploadFileForStaff(req.user.sub, file);
+  }
+
+  /**
+   * Upload multiple files for dispute attachments
+   * POST /admin/disputes/upload-multiple
+   * Requires: escalate_disputes permission
+   */
+  @Post('upload-multiple')
+  @UseGuards(PermissionsGuard)
+  @Permissions('escalate_disputes')
+  @UseInterceptors(FilesInterceptor('files', 10)) // Max 10 files
+  async uploadMultipleFiles(
+    @Req() req,
+    @UploadedFiles() files: Express.Multer.File[],
+  ) {
+    if (!files || files.length === 0) {
+      throw new BadRequestException('No files provided');
+    }
+    return this.adminService.uploadMultipleFilesForStaff(req.user.sub, files);
   }
 }
 

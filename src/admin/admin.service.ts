@@ -2,9 +2,10 @@ import { Injectable, Logger, UnauthorizedException, NotFoundException, Inject, f
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { AuditService } from '../audit/audit.service';
-import { AuditAction, AuditEntityType } from '../audit/dto/audit.dto';
+import { AuditAction, AuditEntityType, AuditStatus } from '../audit/dto/audit.dto';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { WalletService } from '../wallet/wallet.service';
+import { EmailService } from '../shared/email.service';
 
 /**
  * Admin Service
@@ -22,6 +23,7 @@ export class AdminService {
     private notificationHelper: NotificationHelperService,
     @Inject(forwardRef(() => WalletService))
     private walletService: WalletService,
+    private emailService: EmailService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -2071,7 +2073,7 @@ export class AdminService {
       .select(`
         id,
         order_id,
-        complainant_id,
+        disputant_id,
         respondent_id,
         dispute_type,
         status,
@@ -2080,7 +2082,7 @@ export class AdminService {
         priority,
         created_at,
         updated_at,
-        order:orders!inner(
+        order:orders(
           id,
           order_number,
           total_amount,
@@ -2119,7 +2121,7 @@ export class AdminService {
     // Fetch user profiles separately
     const userIds = new Set<string>();
     disputes?.forEach(dispute => {
-      if (dispute.complainant_id) userIds.add(dispute.complainant_id);
+      if (dispute.disputant_id) userIds.add(dispute.disputant_id);
       if (dispute.respondent_id) userIds.add(dispute.respondent_id);
     });
 
@@ -2137,7 +2139,7 @@ export class AdminService {
 
     // Transform to response format
     const formattedDisputes = disputes?.map(dispute => {
-      const complainantProfile = userProfilesMap[dispute.complainant_id];
+      const complainantProfile = userProfilesMap[dispute.disputant_id];
       const respondentProfile = userProfilesMap[dispute.respondent_id];
 
       return {
@@ -2192,7 +2194,7 @@ export class AdminService {
       .from('disputes')
       .select(`
         *,
-        order:orders!inner(
+        order:orders(
           id,
           order_number,
           total_amount,
@@ -2215,12 +2217,18 @@ export class AdminService {
       .eq('id', disputeId)
       .single();
 
-    if (error || !dispute) {
+    if (error) {
+      this.logger.error(`Failed to fetch dispute ${disputeId}: ${error.message}`);
+      throw new NotFoundException(`Dispute not found: ${error.message}`);
+    }
+
+    if (!dispute) {
+      this.logger.warn(`Dispute ${disputeId} not found`);
       throw new NotFoundException('Dispute not found');
     }
 
     // Fetch user profiles separately
-    const userIds = [dispute.complainant_id, dispute.respondent_id].filter(Boolean);
+    const userIds = [dispute.disputant_id, dispute.respondent_id].filter(Boolean);
     const userProfilesMap: Record<string, any> = {};
     
     if (userIds.length > 0) {
@@ -2234,10 +2242,11 @@ export class AdminService {
       });
     }
 
-    const complainantProfile = userProfilesMap[dispute.complainant_id];
+    const complainantProfile = userProfilesMap[dispute.disputant_id];
     const respondentProfile = userProfilesMap[dispute.respondent_id];
 
-    // Fetch staff information for staff messages
+    // Fetch staff information for staff messages (if staff_id column exists)
+    // Check if any message has staff_id (migration 116 may not have run)
     const staffIds = (dispute.dispute_messages || [])
       .filter((msg: any) => msg.staff_id)
       .map((msg: any) => msg.staff_id);
@@ -2256,14 +2265,29 @@ export class AdminService {
 
     // Map messages with sender information
     const mappedMessages = (dispute.dispute_messages || []).map((msg: any) => {
-      if (msg.staff_id) {
-        // Staff message
+      // Check if this is a staff message (either has staff_id or is_admin flag)
+      const isStaffMessage = msg.staff_id || (msg.is_admin && !msg.sender_id);
+      
+      if (isStaffMessage && msg.staff_id) {
+        // Staff message with staff_id (migration 116 applied)
         const staff = staffMap[msg.staff_id];
         return {
           id: msg.id,
           message: msg.message,
           senderId: msg.staff_id,
           senderName: staff?.full_name || 'Customer Care',
+          isAdminMessage: true,
+          isStaffMessage: true,
+          attachments: msg.attachments || [],
+          createdAt: msg.created_at,
+        };
+      } else if (msg.is_admin && !msg.sender_id) {
+        // Staff message without staff_id (migration 116 not applied yet)
+        return {
+          id: msg.id,
+          message: msg.message,
+          senderId: null,
+          senderName: 'Customer Care',
           isAdminMessage: true,
           isStaffMessage: true,
           attachments: msg.attachments || [],
@@ -2291,7 +2315,7 @@ export class AdminService {
       orderNumber: dispute.order?.order_number || 'N/A',
       orderId: dispute.order_id,
       complainant: {
-        id: dispute.complainant_id,
+        id: dispute.disputant_id,
         name: complainantProfile?.preferences?.fullName || complainantProfile?.username || 'Unknown',
       },
       respondent: {
@@ -2330,6 +2354,18 @@ export class AdminService {
 
     this.logger.log(`Staff ${staffId} resolving dispute ${disputeId}`);
 
+    // First, verify dispute exists
+    const { data: dispute, error: disputeError } = await this.supabase
+      .from('disputes')
+      .select('id, status')
+      .eq('id', disputeId)
+      .single();
+
+    if (disputeError || !dispute) {
+      this.logger.error(`Dispute ${disputeId} not found for resolution`);
+      throw new NotFoundException('Dispute not found');
+    }
+
     // Map outcome to resolution type
     const resolutionType = outcome === 'favor_complainant' 
       ? 'refund_buyer'
@@ -2338,21 +2374,47 @@ export class AdminService {
       : 'partial_refund';
 
     // Update dispute status
+    // Note: resolved_by might reference user_profiles, not staff_accounts
+    // We'll store staffId but it may not have a foreign key constraint
+    const updateData: any = {
+      status: 'resolved',
+      resolution: resolutionType,
+      resolution_reason: resolution,
+      resolved_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    // Only set resolved_by if the column accepts it (may fail if FK constraint exists)
+    // If it fails, we'll catch the error and continue without it
+    try {
+      updateData.resolved_by = staffId;
+    } catch (e) {
+      this.logger.warn(`Could not set resolved_by to staffId (may require user ID): ${e}`);
+    }
+
     const { error } = await this.supabase
       .from('disputes')
-      .update({
-        status: 'resolved',
-        resolution: resolutionType,
-        resolution_reason: resolution,
-        resolved_by: staffId,
-        resolved_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
+      .update(updateData)
       .eq('id', disputeId);
 
     if (error) {
-      this.logger.error(`Failed to resolve dispute: ${error.message}`);
-      throw new Error(`Failed to resolve dispute: ${error.message}`);
+      // If error is about resolved_by foreign key, try without it
+      if (error.message?.includes('resolved_by') || error.message?.includes('foreign key')) {
+        this.logger.warn(`resolved_by FK constraint issue, updating without it`);
+        delete updateData.resolved_by;
+        const retryResult = await this.supabase
+          .from('disputes')
+          .update(updateData)
+          .eq('id', disputeId);
+        
+        if (retryResult.error) {
+          this.logger.error(`Failed to resolve dispute: ${retryResult.error.message}`);
+          throw new Error(`Failed to resolve dispute: ${retryResult.error.message}`);
+        }
+      } else {
+        this.logger.error(`Failed to resolve dispute: ${error.message}`);
+        throw new Error(`Failed to resolve dispute: ${error.message}`);
+      }
     }
 
     // TODO: Handle escrow release/refund based on outcome
@@ -2363,13 +2425,34 @@ export class AdminService {
 
   /**
    * Escalate dispute for staff
+   * Optionally creates a report and sends it to a department
    */
-  async escalateDisputeForStaff(staffId: string, disputeId: string, reason: string) {
+  async escalateDisputeForStaff(
+    staffId: string, 
+    disputeId: string, 
+    reason: string,
+    departmentId?: string,
+    createReport?: boolean,
+    attachments?: Array<{ type: string; url: string; name: string; size?: string }>
+  ) {
     // Verify staff has permission
     await this.verifyContentModerator(staffId);
 
     this.logger.log(`Staff ${staffId} escalating dispute ${disputeId}`);
 
+    // First, verify dispute exists and get full details
+    const { data: dispute, error: disputeError } = await this.supabase
+      .from('disputes')
+      .select('id, status, dispute_type, reason, description, order_id, disputant_id, respondent_id')
+      .eq('id', disputeId)
+      .single();
+
+    if (disputeError || !dispute) {
+      this.logger.error(`Dispute ${disputeId} not found for escalation`);
+      throw new NotFoundException('Dispute not found');
+    }
+
+    // Update dispute status
     const { error } = await this.supabase
       .from('disputes')
       .update({
@@ -2384,7 +2467,106 @@ export class AdminService {
       throw new Error(`Failed to escalate dispute: ${error.message}`);
     }
 
-    return { message: 'Dispute escalated successfully' };
+    // If createReport is true and departmentId is provided, create a report
+    let reportCreated = false;
+    let reportNumber = null;
+    
+    if (createReport && departmentId) {
+      try {
+        // Get staff details for report creation
+        const { data: staff } = await this.supabase
+          .from('staff_accounts')
+          .select('id, full_name, department_id')
+          .eq('id', staffId)
+          .single();
+
+        if (!staff) {
+          this.logger.warn(`Staff ${staffId} not found, skipping report creation`);
+        } else {
+          // Get dispute details for report content
+          let disputeDetails: any;
+          try {
+            disputeDetails = await this.getDisputeByIdForStaff(staffId, disputeId);
+          } catch (err) {
+            this.logger.warn(`Could not fetch full dispute details: ${err.message}`);
+            // Use basic dispute info if full details unavailable
+            disputeDetails = {
+              disputeId: dispute.id,
+              orderNumber: 'N/A',
+              type: dispute.dispute_type,
+              status: dispute.status,
+              complainant: { name: 'Unknown' },
+              respondent: { name: 'Unknown' },
+              reason: dispute.reason || 'N/A',
+              description: dispute.description || 'N/A',
+            };
+          }
+          
+          // Create report from dispute
+          const reportTitle = `Escalated Dispute: ${disputeDetails.disputeId || dispute.id}`;
+          const reportContent = `Dispute Escalation Report
+
+Dispute ID: ${disputeDetails.disputeId || dispute.id}
+Order Number: ${disputeDetails.orderNumber || 'N/A'}
+Dispute Type: ${disputeDetails.type || dispute.dispute_type}
+Status: ${disputeDetails.status || dispute.status}
+
+Complainant: ${disputeDetails.complainant?.name || 'Unknown'}
+Respondent: ${disputeDetails.respondent?.name || 'Unknown'}
+
+Reason for Escalation:
+${reason}
+
+Original Dispute Reason:
+${disputeDetails.reason || dispute.reason || 'N/A'}
+
+Description:
+${disputeDetails.description || dispute.description || 'N/A'}`;
+
+          const { data: report, error: reportError } = await this.supabase
+            .from('reports')
+            .insert({
+              title: reportTitle,
+              report_type: 'incident',
+              content: reportContent,
+              data: {
+                disputeId: disputeId,
+                disputeType: dispute.dispute_type,
+                orderId: dispute.order_id,
+                escalatedBy: staffId,
+                escalatedAt: new Date().toISOString(),
+              },
+              created_by: staffId,
+              department_id: departmentId, // Target department
+              visibility: 'department',
+              status: 'submitted', // Auto-submit the report
+              priority: 'high',
+              attachments: attachments || [],
+              tags: ['dispute', 'escalation', dispute.dispute_type],
+            })
+            .select('report_number')
+            .single();
+
+          if (reportError) {
+            this.logger.error(`Failed to create report for escalated dispute: ${reportError.message}`);
+            // Don't throw error - dispute escalation succeeded, report creation is optional
+          } else {
+            reportCreated = true;
+            reportNumber = report.report_number;
+            this.logger.log(`Report ${report.report_number} created for escalated dispute ${disputeId}`);
+          }
+        }
+      } catch (reportErr) {
+        this.logger.warn(`Failed to create report for escalated dispute (non-critical): ${reportErr.message}`);
+        // Don't fail the escalation if report creation fails
+      }
+    }
+
+    return { 
+      message: 'Dispute escalated successfully',
+      reportCreated,
+      reportNumber,
+    };
   }
 
   /**
@@ -2394,12 +2576,17 @@ export class AdminService {
     // Verify staff has permission
     await this.verifyContentModerator(staffId);
 
-    // Get existing notes
-    const { data: dispute } = await this.supabase
+    // First, verify dispute exists
+    const { data: dispute, error: disputeError } = await this.supabase
       .from('disputes')
       .select('admin_notes')
       .eq('id', disputeId)
       .single();
+
+    if (disputeError || !dispute) {
+      this.logger.error(`Dispute ${disputeId} not found for admin note`);
+      throw new NotFoundException('Dispute not found');
+    }
 
     const existingNotes = dispute?.admin_notes || '';
     const newNote = existingNotes 
@@ -2440,28 +2627,68 @@ export class AdminService {
     // Get dispute to verify it exists and get parties
     const { data: dispute, error: disputeError } = await this.supabase
       .from('disputes')
-      .select('complainant_id, respondent_id, order:orders!inner(order_number)')
+      .select('disputant_id, respondent_id, order:orders(order_number)')
       .eq('id', disputeId)
       .single();
 
-    if (disputeError || !dispute) {
+    if (disputeError) {
+      this.logger.error(`Failed to fetch dispute ${disputeId} for message: ${disputeError.message}`);
+      throw new NotFoundException(`Dispute not found: ${disputeError.message}`);
+    }
+
+    if (!dispute) {
+      this.logger.warn(`Dispute ${disputeId} not found for message`);
       throw new NotFoundException('Dispute not found');
     }
 
     // Insert message with staff_id (sender_id will be null for staff messages)
-    const { data: messageData, error: messageError } = await this.supabase
+    // Try with staff_id first (if migration 116 has been applied)
+    let messageData: any;
+    let messageError: any;
+    
+    // First, try inserting with staff_id
+    const insertData: any = {
+      dispute_id: disputeId,
+      sender_id: null, // Staff messages don't have a user sender
+      message,
+      attachments: attachments || [],
+      is_admin: true,
+      created_at: new Date().toISOString(),
+    };
+    
+    // Only include staff_id if the column exists (migration 116 applied)
+    // We'll try with it first, and if it fails, we'll try without it
+    insertData.staff_id = staffId;
+    
+    const result = await this.supabase
       .from('dispute_messages')
-      .insert({
-        dispute_id: disputeId,
-        sender_id: null, // Staff messages don't have a user sender
-        staff_id: staffId,
-        message,
-        attachments: attachments || [],
-        is_admin: true,
-        created_at: new Date().toISOString(),
-      })
+      .insert(insertData)
       .select()
       .single();
+
+    messageData = result.data;
+    messageError = result.error;
+
+    // If error is about staff_id column not existing, try without it
+    if (messageError && messageError.message?.includes('staff_id')) {
+      this.logger.warn(`staff_id column not found, inserting without it (migration 116 not applied)`);
+      delete insertData.staff_id;
+      
+      const retryResult = await this.supabase
+        .from('dispute_messages')
+        .insert(insertData)
+        .select()
+        .single();
+      
+      messageData = retryResult.data;
+      messageError = retryResult.error;
+    }
+
+    // If error is about sender_id being null (migration 116 not applied), provide helpful error
+    if (messageError && (messageError.message?.includes('sender_id') || messageError.message?.includes('null value'))) {
+      this.logger.error(`Cannot send staff message: Migration 116 (add_staff_id_to_dispute_messages) must be applied first`);
+      throw new Error('Staff messaging requires database migration 116. Please run the migration to enable staff messages.');
+    }
 
     if (messageError) {
       this.logger.error(`Failed to send staff message: ${messageError.message}`);
@@ -2477,8 +2704,8 @@ export class AdminService {
     // Notify both parties about the new message
     const orderNumber = dispute.order?.order_number || 'N/A';
     try {
-      await this.notificationHelper.notifyDisputeMessage(dispute.complainant_id, disputeId);
-      if (dispute.respondent_id && dispute.respondent_id !== dispute.complainant_id) {
+      await this.notificationHelper.notifyDisputeMessage(dispute.disputant_id, disputeId);
+      if (dispute.respondent_id && dispute.respondent_id !== dispute.disputant_id) {
         await this.notificationHelper.notifyDisputeMessage(dispute.respondent_id, disputeId);
       }
     } catch (notifyError) {
@@ -2586,14 +2813,14 @@ export class AdminService {
       .from('disputes')
       .select(`
         *,
-        order:orders!inner(
+        order:orders(
           id,
           order_number,
           total_amount,
           vendor_id,
           buyer_id
         ),
-        complainant:user_profiles!complainant_id(username, email, phone),
+        complainant:user_profiles!disputant_id(username, email, phone),
         respondent:user_profiles!respondent_id(username, email, phone)
       `)
       .eq('status', 'open')
@@ -2606,7 +2833,7 @@ export class AdminService {
       disputeType: d.dispute_type,
       reason: d.reason,
       complainant: {
-        id: d.complainant_id,
+        id: d.disputant_id,
         name: d.complainant?.username,
         email: d.complainant?.email,
         phone: d.complainant?.phone,
@@ -2739,11 +2966,22 @@ export class AdminService {
     }
 
     // Apply status filter (using preferences or a status field if it exists)
-    // For now, we'll check if user is suspended based on preferences
     if (filters?.status === 'suspended') {
-      query = query.eq('preferences->>isSuspended', 'true');
+      // Suspended but not deleted
+      // Use AND: isSuspended=true AND (isDeleted is null OR false)
+      query = query.eq('preferences->>isSuspended', 'true')
+        .or('preferences->>isDeleted.is.null,preferences->>isDeleted.eq.false');
     } else if (filters?.status === 'active') {
+      // Active (not suspended AND not deleted)
+      // Filter out suspended: (isSuspended is null OR false)
+      // Filter out deleted: (isDeleted is null OR false)
+      // In Supabase, chained filters are ANDed by default
       query = query.or('preferences->>isSuspended.is.null,preferences->>isSuspended.eq.false');
+      // Add deleted filter - this will be ANDed with the previous condition
+      query = query.or('preferences->>isDeleted.is.null,preferences->>isDeleted.eq.false');
+    } else if (filters?.status === 'deleted') {
+      // Deleted users
+      query = query.eq('preferences->>isDeleted', 'true');
     }
 
     // Apply search filter (only search by username since email is not in user_profiles)
@@ -2766,8 +3004,25 @@ export class AdminService {
       throw new Error(`Failed to fetch users: ${error.message}`);
     }
 
+    // Filter users in JavaScript if needed (for complex AND conditions that Supabase might not handle well)
+    let filteredUsers = users || [];
+    if (filters?.status === 'active') {
+      // Additional client-side filtering to ensure both conditions are met
+      filteredUsers = filteredUsers.filter(user => {
+        const isSuspended = user.preferences?.isSuspended === true;
+        const isDeleted = user.preferences?.isDeleted === true;
+        return !isSuspended && !isDeleted;
+      });
+    } else if (filters?.status === 'suspended') {
+      // Additional client-side filtering to exclude deleted
+      filteredUsers = filteredUsers.filter(user => {
+        const isDeleted = user.preferences?.isDeleted === true;
+        return !isDeleted;
+      });
+    }
+
     // Get order counts for each user
-    const userIds = users?.map(u => u.id) || [];
+    const userIds = filteredUsers?.map(u => u.id) || [];
     const { data: orderCounts } = await this.supabase
       .from('orders')
       .select('buyer_id')
@@ -2783,7 +3038,7 @@ export class AdminService {
     const emailsMap: Record<string, string> = {};
 
     // Map to response format
-    const mappedUsers = users?.map(user => {
+    const mappedUsers = filteredUsers?.map(user => {
       // Determine role: prioritize is_seller and is_rider flags over user_role
       // This ensures users who are actually vendors/riders show the correct role
       let userRole: 'citizen' | 'vendor' | 'rider';
@@ -2796,6 +3051,7 @@ export class AdminService {
         userRole = (user.user_role as 'citizen' | 'vendor' | 'rider') || 'citizen';
       }
       const isSuspended = user.preferences?.isSuspended === true;
+      const isDeleted = user.preferences?.isDeleted === true;
 
       return {
         id: user.id,
@@ -2803,7 +3059,10 @@ export class AdminService {
         email: emailsMap[user.id] || '', // Email not available from user_profiles
         fullName: user.preferences?.fullName || user.username,
         userRole: userRole as 'citizen' | 'vendor' | 'rider',
-        isActive: !isSuspended,
+        isActive: !isSuspended && !isDeleted, // User is active only if not suspended and not deleted
+        isDeleted: isDeleted,
+        deletedAt: user.preferences?.deletedAt || null,
+        deletedBy: user.preferences?.deletedBy || null,
         createdAt: user.created_at,
         avatarUrl: user.avatar_url,
         ordersCount: ordersByUser[user.id] || 0,
@@ -2826,9 +3085,16 @@ export class AdminService {
     }
 
     if (filters?.status === 'suspended') {
-      countQuery = countQuery.eq('preferences->>isSuspended', 'true');
+      // Suspended but not deleted
+      countQuery = countQuery.eq('preferences->>isSuspended', 'true')
+        .or('preferences->>isDeleted.is.null,preferences->>isDeleted.eq.false');
     } else if (filters?.status === 'active') {
-      countQuery = countQuery.or('preferences->>isSuspended.is.null,preferences->>isSuspended.eq.false');
+      // Active (not suspended and not deleted)
+      countQuery = countQuery.or('preferences->>isSuspended.is.null,preferences->>isSuspended.eq.false')
+        .or('preferences->>isDeleted.is.null,preferences->>isDeleted.eq.false');
+    } else if (filters?.status === 'deleted') {
+      // Deleted users
+      countQuery = countQuery.eq('preferences->>isDeleted', 'true');
     }
 
     if (filters?.search) {
@@ -2938,6 +3204,7 @@ export class AdminService {
       userRole = (user.user_role as 'citizen' | 'vendor' | 'rider') || 'citizen';
     }
     const isSuspended = user.preferences?.isSuspended === true;
+    const isDeleted = user.preferences?.isDeleted === true;
 
     // Get order count
     const { count: ordersCount } = await this.supabase
@@ -2951,7 +3218,10 @@ export class AdminService {
       email: email,
       fullName: user.preferences?.fullName || user.username,
       userRole: userRole as 'citizen' | 'vendor' | 'rider',
-      isActive: !isSuspended,
+      isActive: !isSuspended && !isDeleted, // User is active only if not suspended and not deleted
+      isDeleted: isDeleted,
+      deletedAt: user.preferences?.deletedAt || null,
+      deletedBy: user.preferences?.deletedBy || null,
       createdAt: user.created_at,
       avatarUrl: user.avatar_url,
       ordersCount: ordersCount || 0,
@@ -3055,6 +3325,259 @@ export class AdminService {
     this.logger.log(`User ${userId} activated by staff ${staffId}`);
 
     return { message: 'User activated successfully' };
+  }
+
+  /**
+   * Warn a user
+   * Creates a warning record and updates user preferences
+   */
+  async warnUser(
+    staffId: string,
+    userId: string,
+    severity: 'low' | 'medium' | 'high',
+    reason: string,
+    relatedContentId?: string,
+    relatedContentType?: 'product' | 'service' | 'chat' | 'user',
+  ) {
+    // Verify staff
+    const { data: staff } = await this.supabase
+      .from('staff_accounts')
+      .select('role, full_name')
+      .eq('id', staffId)
+      .single();
+
+    if (!staff) {
+      throw new UnauthorizedException('Staff not found');
+    }
+
+    // Get current user preferences
+    const { data: user } = await this.supabase
+      .from('user_profiles')
+      .select('preferences')
+      .eq('id', userId)
+      .single();
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    // Insert warning into user_warnings table
+    const { data: warning, error: warningError } = await this.supabase
+      .from('user_warnings')
+      .insert({
+        user_id: userId,
+        warned_by: staffId,
+        severity,
+        reason,
+        related_content_id: relatedContentId || null,
+        related_content_type: relatedContentType || null,
+      })
+      .select()
+      .single();
+
+    if (warningError) {
+      this.logger.error(`Failed to create warning: ${warningError.message}`);
+      throw new Error(`Failed to create warning: ${warningError.message}`);
+    }
+
+    // Get current warning count
+    const { data: warnings, error: countError } = await this.supabase
+      .from('user_warnings')
+      .select('severity')
+      .eq('user_id', userId);
+
+    if (countError) {
+      this.logger.warn(`Failed to count warnings: ${countError.message}`);
+    }
+
+    // Calculate warning statistics
+    const warningCount = warnings?.length || 0;
+    const highSeverityCount = warnings?.filter((w) => w.severity === 'high').length || 0;
+    const mediumSeverityCount = warnings?.filter((w) => w.severity === 'medium').length || 0;
+    const lowSeverityCount = warnings?.filter((w) => w.severity === 'low').length || 0;
+
+    // Determine highest severity
+    const highestSeverity = highSeverityCount > 0 ? 'high' : mediumSeverityCount > 0 ? 'medium' : 'low';
+
+    // Update user preferences with warning summary
+    const updatedPreferences = {
+      ...(user.preferences || {}),
+      warningCount,
+      warningSeverity: highestSeverity,
+      lastWarningAt: new Date().toISOString(),
+      autoSuspendThreshold: highestSeverity === 'high' ? 3 : highestSeverity === 'medium' ? 5 : 10,
+    };
+
+    const { error: updateError } = await this.supabase
+      .from('user_profiles')
+      .update({ preferences: updatedPreferences })
+      .eq('id', userId);
+
+    if (updateError) {
+      this.logger.error(`Failed to update user preferences: ${updateError.message}`);
+      // Don't throw - warning was created successfully
+    }
+
+    // Check if auto-suspend threshold reached
+    const AUTO_SUSPEND_THRESHOLD_HIGH = 3;
+    const AUTO_SUSPEND_THRESHOLD_MEDIUM = 5;
+    const AUTO_SUSPEND_THRESHOLD_LOW = 10;
+
+    let shouldAutoSuspend = false;
+    // Check if any severity level has reached its threshold
+    if (highSeverityCount >= AUTO_SUSPEND_THRESHOLD_HIGH) {
+      shouldAutoSuspend = true;
+    } else if (mediumSeverityCount >= AUTO_SUSPEND_THRESHOLD_MEDIUM) {
+      shouldAutoSuspend = true;
+    } else if (lowSeverityCount >= AUTO_SUSPEND_THRESHOLD_LOW) {
+      shouldAutoSuspend = true;
+    }
+
+    if (shouldAutoSuspend) {
+      try {
+        await this.suspendUser(staffId, userId, `Auto-suspended after ${warningCount} warnings (${highSeverityCount} high, ${mediumSeverityCount} medium, ${lowSeverityCount} low)`);
+        this.logger.log(`User ${userId} auto-suspended after reaching warning threshold`);
+      } catch (suspendError) {
+        this.logger.error(`Failed to auto-suspend user: ${suspendError.message}`);
+        // Don't throw - warning was created successfully
+      }
+    }
+
+    // Send notification to user
+    try {
+      await this.notificationHelper.notifyUserWarning(userId, {
+        warningId: warning.id,
+        severity,
+        reason,
+        warningCount,
+        relatedContentId,
+        relatedContentType,
+      });
+    } catch (notifError) {
+      this.logger.warn(`Failed to send warning notification: ${notifError.message}`);
+      // Don't throw - warning was created successfully
+    }
+
+    // Log audit action
+    try {
+      await this.auditService.logAction({
+        staffId,
+        action: AuditAction.EDIT_USER,
+        entityType: AuditEntityType.USER,
+        entityId: userId,
+        details: {
+          action: 'warn_user',
+          severity,
+          reason,
+          warning_count: warningCount,
+          auto_suspended: shouldAutoSuspend,
+        },
+        status: AuditStatus.SUCCESS,
+      });
+    } catch (auditError) {
+      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+    }
+
+    this.logger.log(`User ${userId} warned by staff ${staffId} with ${severity} severity`);
+
+    return {
+      message: 'User warned successfully',
+      warning: {
+        id: warning.id,
+        severity,
+        reason,
+        warningCount,
+        autoSuspended: shouldAutoSuspend,
+      },
+    };
+  }
+
+  /**
+   * Get user warnings
+   */
+  async getUserWarnings(userId: string) {
+    const { data: warnings, error } = await this.supabase
+      .from('user_warnings')
+      .select(`
+        id,
+        severity,
+        reason,
+        related_content_id,
+        related_content_type,
+        created_at,
+        warned_by,
+        staff_accounts:staff_accounts!warned_by(
+          id,
+          full_name,
+          email
+        )
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      this.logger.error(`Failed to fetch warnings: ${error.message}`);
+      throw new Error(`Failed to fetch warnings: ${error.message}`);
+    }
+
+    return (warnings || []).map((warning: any) => ({
+      id: warning.id,
+      severity: warning.severity,
+      reason: warning.reason,
+      relatedContentId: warning.related_content_id,
+      relatedContentType: warning.related_content_type,
+      createdAt: warning.created_at,
+      warnedBy: warning.staff_accounts
+        ? {
+            id: warning.staff_accounts.id,
+            fullName: warning.staff_accounts.full_name,
+            email: warning.staff_accounts.email,
+          }
+        : null,
+    }));
+  }
+
+  /**
+   * Get warning statistics for a user
+   */
+  async getWarningStats(userId: string) {
+    const { data: warnings, error } = await this.supabase
+      .from('user_warnings')
+      .select('severity, created_at')
+      .eq('user_id', userId);
+
+    if (error) {
+      this.logger.error(`Failed to fetch warning stats: ${error.message}`);
+      throw new Error(`Failed to fetch warning stats: ${error.message}`);
+    }
+
+    const totalWarnings = warnings?.length || 0;
+    const highCount = warnings?.filter((w) => w.severity === 'high').length || 0;
+    const mediumCount = warnings?.filter((w) => w.severity === 'medium').length || 0;
+    const lowCount = warnings?.filter((w) => w.severity === 'low').length || 0;
+
+    const lastWarning = warnings && warnings.length > 0
+      ? warnings.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0]
+      : null;
+
+    // Get user suspension status
+    const { data: user } = await this.supabase
+      .from('user_profiles')
+      .select('preferences')
+      .eq('id', userId)
+      .single();
+
+    const isSuspended = user?.preferences?.isSuspended === true;
+
+    return {
+      totalWarnings,
+      highCount,
+      mediumCount,
+      lowCount,
+      lastWarningAt: lastWarning?.created_at || null,
+      isSuspended,
+      suspensionReason: isSuspended ? user?.preferences?.suspensionReason : null,
+    };
   }
 
   /**
@@ -3243,6 +3766,56 @@ export class AdminService {
   }
 
   /**
+   * Get product by ID for moderation (bypasses pagination)
+   */
+  async getProductByIdForModeration(staffId: string, productId: string) {
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`[getProductByIdForModeration] Fetching product ${productId} for staff ${staffId}`);
+
+    const { data: product, error } = await this.supabase
+      .from('products')
+      .select(`
+        id,
+        name,
+        description,
+        price,
+        quantity,
+        status,
+        primary_image_url,
+        images,
+        videos,
+        primary_video_url,
+        media_type,
+        view_count,
+        like_count,
+        created_at,
+        updated_at,
+        user:user_profiles(id, username, avatar_url, preferences)
+      `)
+      .eq('id', productId)
+      .single();
+
+    if (error) {
+      this.logger.error(`[getProductByIdForModeration] Failed to fetch product ${productId}:`, {
+        error: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint,
+      });
+      throw new NotFoundException(`Product not found: ${error.message}`);
+    }
+
+    if (!product) {
+      this.logger.warn(`[getProductByIdForModeration] Product ${productId} not found (null result)`);
+      throw new NotFoundException('Product not found');
+    }
+
+    this.logger.log(`[getProductByIdForModeration] Successfully fetched product ${productId}: ${product.name}`);
+    return product;
+  }
+
+  /**
    * Approve product
    */
   async approveProduct(staffId: string, productId: string, reason?: string) {
@@ -3387,6 +3960,56 @@ export class AdminService {
     this.logger.log(`Service ${serviceId} approved by staff ${staffId}`);
 
     return { message: 'Service approved successfully' };
+  }
+
+  /**
+   * Get service by ID for moderation (bypasses pagination)
+   */
+  async getServiceByIdForModeration(staffId: string, serviceId: string) {
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`[getServiceByIdForModeration] Fetching service ${serviceId} for staff ${staffId}`);
+
+    const { data: service, error } = await this.supabase
+      .from('services')
+      .select(`
+        id,
+        name,
+        description,
+        base_price,
+        duration,
+        status,
+        primary_media_url,
+        images,
+        videos,
+        media_type,
+        view_count,
+        like_count,
+        booking_count,
+        created_at,
+        updated_at,
+        user:user_profiles(id, username, avatar_url, preferences)
+      `)
+      .eq('id', serviceId)
+      .single();
+
+    if (error) {
+      this.logger.error(`[getServiceByIdForModeration] Failed to fetch service ${serviceId}:`, {
+        error: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint,
+      });
+      throw new NotFoundException(`Service not found: ${error.message}`);
+    }
+
+    if (!service) {
+      this.logger.warn(`[getServiceByIdForModeration] Service ${serviceId} not found (null result)`);
+      throw new NotFoundException('Service not found');
+    }
+
+    this.logger.log(`[getServiceByIdForModeration] Successfully fetched service ${serviceId}: ${service.name}`);
+    return service;
   }
 
   /**
@@ -4296,6 +4919,369 @@ export class AdminService {
     };
 
     return statusMap[status] || 'pending';
+  }
+
+  /**
+   * Upload file for staff (disputes, reports, etc.)
+   * Uploads file to Supabase Storage and returns public URL
+   */
+  async uploadFileForStaff(staffId: string, file: Express.Multer.File): Promise<{
+    url: string;
+    fileData: {
+      name: string;
+      size: number;
+      type: string;
+      mimeType: string;
+    };
+  }> {
+    this.logger.log(`Uploading file for staff: ${staffId}, file: ${file.originalname}`);
+
+    // Validate file size (max 50MB)
+    const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+    if (file.size > MAX_FILE_SIZE) {
+      throw new BadRequestException('File too large. Maximum size is 50MB');
+    }
+
+    try {
+      // Generate unique filename
+      const fileExtension = file.originalname.split('.').pop();
+      const uniqueFileName = `admin/${staffId}/${Date.now()}_${Math.random().toString(36).substring(2)}.${fileExtension}`;
+      
+      // Determine storage bucket based on file type
+      const bucket = this.getStorageBucket(file.mimetype);
+      
+      // Upload file to Supabase Storage
+      const { data: uploadData, error: uploadError } = await this.supabase.storage
+        .from(bucket)
+        .upload(uniqueFileName, file.buffer, {
+          contentType: file.mimetype,
+          upsert: false,
+        });
+
+      if (uploadError) {
+        this.logger.error('File upload failed:', uploadError);
+        throw new BadRequestException(`Upload failed: ${uploadError.message}`);
+      }
+
+      // Get public URL
+      const { data: urlData } = this.supabase.storage
+        .from(bucket)
+        .getPublicUrl(uniqueFileName);
+
+      const publicUrl = urlData.publicUrl;
+
+      this.logger.log(`File uploaded successfully: ${publicUrl}`);
+
+      return {
+        url: publicUrl,
+        fileData: {
+          name: file.originalname,
+          size: file.size,
+          type: this.getFileType(file.mimetype),
+          mimeType: file.mimetype,
+        },
+      };
+    } catch (error) {
+      this.logger.error('Error uploading file:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Upload multiple files for staff
+   */
+  async uploadMultipleFilesForStaff(staffId: string, files: Express.Multer.File[]): Promise<{
+    files: Array<{
+      url: string;
+      fileData: {
+        name: string;
+        size: number;
+        type: string;
+        mimeType: string;
+      };
+    }>;
+  }> {
+    this.logger.log(`Uploading ${files.length} files for staff: ${staffId}`);
+
+    const uploadPromises = files.map(file => this.uploadFileForStaff(staffId, file));
+
+    try {
+      const results = await Promise.all(uploadPromises);
+      
+      return {
+        files: results,
+      };
+    } catch (error) {
+      this.logger.error('Error uploading multiple files:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get storage bucket based on file MIME type
+   */
+  private getStorageBucket(mimeType: string): string {
+    // Use 'media' bucket for all admin uploads (disputes, reports, etc.)
+    return 'media';
+  }
+
+  /**
+   * Get file type from MIME type
+   */
+  private getFileType(mimeType: string): string {
+    if (mimeType.startsWith('image/')) return 'image';
+    if (mimeType.startsWith('video/')) return 'video';
+    if (mimeType.startsWith('audio/')) return 'audio';
+    if (mimeType.includes('pdf')) return 'document';
+    if (mimeType.includes('word') || mimeType.includes('document')) return 'document';
+    if (mimeType.includes('excel') || mimeType.includes('spreadsheet')) return 'document';
+    if (mimeType.includes('text/')) return 'document';
+    return 'file';
+  }
+
+  /**
+   * Get all suspension appeals for staff review
+   */
+  async getAppealsForStaff(
+    staffId: string,
+    filters?: {
+      status?: 'pending' | 'under_review' | 'approved' | 'rejected';
+      page?: number;
+      limit?: number;
+    },
+  ) {
+    // Verify staff exists and is active
+    const { data: staff } = await this.supabase
+      .from('staff_accounts')
+      .select('id, is_active, is_suspended, deleted_at')
+      .eq('id', staffId)
+      .single();
+
+    if (!staff || !staff.is_active || staff.is_suspended || staff.deleted_at) {
+      throw new UnauthorizedException('Staff access denied');
+    }
+
+    const page = filters?.page || 1;
+    const limit = filters?.limit || 20;
+    const offset = (page - 1) * limit;
+
+    let query = this.supabase
+      .from('suspension_appeals')
+      .select(`
+        id,
+        user_id,
+        suspension_reason,
+        appeal_reason,
+        status,
+        reviewed_by,
+        reviewed_at,
+        review_notes,
+        created_at,
+        updated_at,
+        user:user_profiles!user_id(
+          id,
+          username
+        ),
+        reviewed_by_staff:staff_accounts!reviewed_by(
+          id,
+          full_name,
+          email
+        )
+      `, { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (filters?.status) {
+      query = query.eq('status', filters.status);
+    }
+
+    const { data: appeals, error, count } = await query;
+
+    if (error) {
+      this.logger.error(`Failed to fetch appeals: ${error.message}`);
+      throw new Error(`Failed to fetch appeals: ${error.message}`);
+    }
+
+    // Map appeals to include proper user data structure
+    const mappedAppeals = (appeals || []).map((appeal: any) => ({
+      id: appeal.id,
+      userId: appeal.user_id,
+      suspensionReason: appeal.suspension_reason,
+      appealReason: appeal.appeal_reason,
+      status: appeal.status,
+      reviewedBy: appeal.reviewed_by,
+      reviewedAt: appeal.reviewed_at,
+      reviewNotes: appeal.review_notes,
+      createdAt: appeal.created_at,
+      updatedAt: appeal.updated_at,
+      user: appeal.user ? {
+        id: appeal.user.id,
+        username: appeal.user.username,
+        email: '', // Email not available from user_profiles
+        firstName: null, // first_name not in user_profiles table
+        lastName: null, // last_name not in user_profiles table
+      } : null,
+      reviewedByStaff: appeal.reviewed_by_staff ? {
+        id: appeal.reviewed_by_staff.id,
+        fullName: appeal.reviewed_by_staff.full_name,
+        email: appeal.reviewed_by_staff.email,
+      } : null,
+    }));
+
+    return {
+      appeals: mappedAppeals,
+      total: count || 0,
+      page,
+      limit,
+    };
+  }
+
+  /**
+   * Review a suspension appeal
+   */
+  async reviewAppeal(
+    staffId: string,
+    appealId: string,
+    decision: 'approved' | 'rejected',
+    notes?: string,
+  ) {
+    // Verify staff exists and is active
+    const { data: staff } = await this.supabase
+      .from('staff_accounts')
+      .select('id, is_active, is_suspended, deleted_at')
+      .eq('id', staffId)
+      .single();
+
+    if (!staff || !staff.is_active || staff.is_suspended || staff.deleted_at) {
+      throw new UnauthorizedException('Staff access denied');
+    }
+
+    // Get appeal details
+    const { data: appeal, error: appealError } = await this.supabase
+      .from('suspension_appeals')
+      .select('id, user_id, status')
+      .eq('id', appealId)
+      .single();
+
+    if (appealError || !appeal) {
+      throw new NotFoundException('Appeal not found');
+    }
+
+    if (appeal.status !== 'pending' && appeal.status !== 'under_review') {
+      throw new BadRequestException('This appeal has already been reviewed');
+    }
+
+    // Update appeal
+    const updateData: any = {
+      status: decision === 'approved' ? 'approved' : 'rejected',
+      reviewed_by: staffId,
+      reviewed_at: new Date().toISOString(),
+      review_notes: notes || null,
+    };
+
+    const { error: updateError } = await this.supabase
+      .from('suspension_appeals')
+      .update(updateData)
+      .eq('id', appealId);
+
+    if (updateError) {
+      this.logger.error(`Failed to review appeal: ${updateError.message}`);
+      throw new Error(`Failed to review appeal: ${updateError.message}`);
+    }
+
+    // Get user details for email
+    let userEmail: string | null = null;
+    let username: string | null = null;
+    try {
+      userEmail = await this.emailService.getUserEmail(appeal.user_id);
+      // Get username from user_profiles
+      const { data: userProfile } = await this.supabase
+        .from('user_profiles')
+        .select('username')
+        .eq('id', appeal.user_id)
+        .single();
+      username = userProfile?.username || null;
+    } catch (error) {
+      this.logger.warn(`Failed to fetch user details for email: ${error.message}`);
+    }
+
+    // If approved, unsuspend the user
+    if (decision === 'approved') {
+      try {
+        await this.activateUser(staffId, appeal.user_id);
+        this.logger.log(`User ${appeal.user_id} unsuspended after appeal approval`);
+        
+        // Send email notification for approval
+        if (userEmail) {
+          try {
+            await this.emailService.sendAppealApprovalEmail(appeal.user_id, username || undefined);
+            this.logger.log(`Appeal approval email sent to ${userEmail}`);
+          } catch (emailError) {
+            this.logger.warn(`Failed to send appeal approval email: ${emailError.message}`);
+            // Don't fail the appeal review if email fails
+          }
+        }
+      } catch (error) {
+        this.logger.warn(`Failed to unsuspend user after appeal approval: ${error.message}`);
+        // Don't fail the appeal review if unsuspension fails
+      }
+    } else {
+      // Send email notification for rejection
+      if (userEmail && username) {
+        try {
+          await this.emailService.sendAppealRejectionEmail(appeal.user_id, username, notes || undefined);
+          this.logger.log(`Appeal rejection email sent to ${userEmail}`);
+        } catch (emailError) {
+          this.logger.warn(`Failed to send appeal rejection email: ${emailError.message}`);
+          // Don't fail the appeal review if email fails
+        }
+      }
+    }
+
+    // Send in-app notification to user
+    try {
+      await this.notificationHelper.notifySystemUpdate(
+        appeal.user_id,
+        decision === 'approved' ? 'Appeal Approved' : 'Appeal Rejected',
+        decision === 'approved'
+          ? 'Your suspension appeal has been approved. Your account has been reactivated.'
+          : `Your suspension appeal has been rejected. ${notes ? `Reason: ${notes}` : ''}`,
+        {
+          appeal_id: appealId,
+          decision,
+          review_notes: notes,
+        },
+      );
+    } catch (notifError) {
+      this.logger.warn(`Failed to send appeal notification: ${notifError.message}`);
+    }
+
+    // Log audit action
+    try {
+      await this.auditService.logAction({
+        staffId,
+        action: AuditAction.EDIT_USER,
+        entityType: AuditEntityType.USER,
+        entityId: appeal.user_id,
+        details: {
+          action: 'review_appeal',
+          appealId,
+          decision,
+          notes,
+        },
+        status: AuditStatus.SUCCESS,
+      });
+    } catch (auditError) {
+      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+    }
+
+    return {
+      message: `Appeal ${decision} successfully`,
+      appeal: {
+        id: appealId,
+        status: decision === 'approved' ? 'approved' : 'rejected',
+      },
+    };
   }
 }
 

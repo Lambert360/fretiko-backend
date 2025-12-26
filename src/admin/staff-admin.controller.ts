@@ -101,5 +101,85 @@ export class StaffAdminController {
   async deleteUser(@Request() req, @Param('id') id: string) {
     return this.adminService.deleteUserForStaff(req.user.sub, id);
   }
+
+  /**
+   * Warn a user
+   * POST /admin/users/:id/warn
+   * Requires: suspend_users permission
+   */
+  @Post('users/:id/warn')
+  @UseGuards(PermissionsGuard)
+  @Permissions('suspend_users')
+  async warnUser(
+    @Request() req,
+    @Param('id') id: string,
+    @Body() body: {
+      severity: 'low' | 'medium' | 'high';
+      reason: string;
+      relatedContentId?: string;
+      relatedContentType?: 'product' | 'service' | 'chat' | 'user';
+    },
+  ) {
+    return this.adminService.warnUser(
+      req.user.sub,
+      id,
+      body.severity,
+      body.reason,
+      body.relatedContentId,
+      body.relatedContentType,
+    );
+  }
+
+  /**
+   * Get user's warning history
+   * GET /admin/users/:id/warnings
+   * Requires: view_users permission
+   */
+  @Get('users/:id/warnings')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_users')
+  async getUserWarnings(@Request() req, @Param('id') id: string) {
+    return this.adminService.getUserWarnings(id);
+  }
+
+  /**
+   * Get all suspension appeals
+   * GET /admin/appeals
+   * Requires: suspend_users permission
+   */
+  @Get('appeals')
+  @UseGuards(PermissionsGuard)
+  @Permissions('suspend_users')
+  async getAppeals(
+    @Request() req,
+    @Query('status') status?: 'pending' | 'under_review' | 'approved' | 'rejected' | 'all',
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.adminService.getAppealsForStaff(req.user.sub, {
+      status: status === 'all' ? undefined : status,
+      page: page ? parseInt(page) : 1,
+      limit: limit ? parseInt(limit) : 20,
+    });
+  }
+
+  /**
+   * Review a suspension appeal
+   * POST /admin/appeals/:id/review
+   * Requires: suspend_users permission
+   */
+  @Post('appeals/:id/review')
+  @UseGuards(PermissionsGuard)
+  @Permissions('suspend_users')
+  async reviewAppeal(
+    @Request() req,
+    @Param('id') id: string,
+    @Body() body: {
+      decision: 'approved' | 'rejected';
+      notes?: string;
+    },
+  ) {
+    return this.adminService.reviewAppeal(req.user.sub, id, body.decision, body.notes);
+  }
 }
 

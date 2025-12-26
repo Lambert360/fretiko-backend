@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AdminController } from './admin.controller';
 import { StaffAdminController } from './staff-admin.controller';
@@ -14,11 +14,13 @@ import { StaffModule } from '../staff/staff.module';
 import { AuditModule } from '../audit/audit.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { WalletModule } from '../wallet/wallet.module';
+import { ContentReportsModule } from '../content-reports/content-reports.module';
+import { EmailService } from '../shared/email.service';
 
 @Module({
-  imports: [ConfigModule, StaffModule, AuditModule, NotificationsModule, WalletModule],
+  imports: [ConfigModule, StaffModule, AuditModule, NotificationsModule, WalletModule, forwardRef(() => ContentReportsModule)],
   controllers: [AdminController, StaffAdminController, ContentModerationController, FinanceController, StaffAnalyticsController, LogisticsController, DashboardController, OrdersController, DisputesController],
-  providers: [AdminService],
+  providers: [AdminService, EmailService],
   exports: [AdminService],
 })
 export class AdminModule {

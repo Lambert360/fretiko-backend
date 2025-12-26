@@ -1,8 +1,10 @@
 import { Controller, Get, Patch, Post, Param, Query, Body, UseGuards, Req } from '@nestjs/common';
 import { AdminService } from './admin.service';
+import { ContentReportsService } from '../content-reports/content-reports.service';
 import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
 import { PermissionsGuard } from '../staff/guards/permissions.guard';
 import { Permissions } from '../staff/decorators/permissions.decorator';
+import type { ReviewContentReportDto } from '../content-reports/content-reports.service';
 
 /**
  * Content Moderation Controller
@@ -12,7 +14,10 @@ import { Permissions } from '../staff/decorators/permissions.decorator';
 @Controller('admin/content')
 @UseGuards(StaffJwtAuthGuard)
 export class ContentModerationController {
-  constructor(private readonly adminService: AdminService) {}
+  constructor(
+    private readonly adminService: AdminService,
+    private readonly contentReportsService: ContentReportsService,
+  ) {}
 
   /**
    * Get products for moderation
@@ -65,6 +70,18 @@ export class ContentModerationController {
   }
 
   /**
+   * Get product by ID for moderation
+   * GET /admin/content/products/:id
+   * Requires: view_products permission
+   */
+  @Get('products/:id')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_products')
+  async getProductById(@Req() req, @Param('id') id: string) {
+    return this.adminService.getProductByIdForModeration(req.user.sub, id);
+  }
+
+  /**
    * Get services for moderation
    * GET /admin/content/services
    * Requires: view_services permission
@@ -112,6 +129,18 @@ export class ContentModerationController {
   @Permissions('remove_services')
   async rejectService(@Req() req, @Param('id') id: string, @Body() body: { reason: string }) {
     return this.adminService.rejectService(req.user.sub, id, body.reason);
+  }
+
+  /**
+   * Get service by ID for moderation
+   * GET /admin/content/services/:id
+   * Requires: view_services permission
+   */
+  @Get('services/:id')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_services')
+  async getServiceById(@Req() req, @Param('id') id: string) {
+    return this.adminService.getServiceByIdForModeration(req.user.sub, id);
   }
 
   /**
@@ -246,6 +275,59 @@ export class ContentModerationController {
   @Permissions('view_products')
   async getContentModerationStats(@Req() req) {
     return this.adminService.getContentModerationStats(req.user.sub);
+  }
+
+  /**
+   * Get reported content for moderation (staff)
+   * GET /admin/content/reported
+   * Requires: view_products permission
+   */
+  @Get('reported')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_products')
+  async getReportedContent(
+    @Req() req,
+    @Query('status') status?: 'pending' | 'under_review' | 'approved' | 'action_taken' | 'dismissed',
+    @Query('category') category?: 'product' | 'service' | 'chat' | 'user',
+    @Query('search') search?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.contentReportsService.getAllReports({
+      status,
+      category,
+      search,
+      page: page ? parseInt(page) : undefined,
+      limit: limit ? parseInt(limit) : undefined,
+    });
+  }
+
+  /**
+   * Get reported content statistics (staff)
+   * GET /admin/content/reported/stats
+   * Requires: view_products permission
+   */
+  @Get('reported/stats')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_products')
+  async getReportedContentStats(@Req() req) {
+    return this.contentReportsService.getContentReportStats();
+  }
+
+  /**
+   * Review reported content (staff)
+   * POST /admin/content/reported/:id/review
+   * Requires: view_products permission
+   */
+  @Post('reported/:id/review')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_products')
+  async reviewReportedContent(
+    @Req() req,
+    @Param('id') reportId: string,
+    @Body() reviewDto: ReviewContentReportDto,
+  ) {
+    return this.contentReportsService.reviewContentReport(req.user.sub, reportId, reviewDto);
   }
 }
 
