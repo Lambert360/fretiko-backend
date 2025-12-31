@@ -7,15 +7,21 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 
 export interface CreateDisputeDto {
   // Dispute category (customer care only)
-  disputeCategory: 'order_dispute' | 'bug_report' | 'general';
+  disputeCategory: 'order_dispute' | 'auction_dispute' | 'bug_report' | 'general';
   
   // Order dispute fields (optional)
   orderId?: string;
+  
+  // Auction dispute fields (optional)
+  auctionId?: string;
   
   // Dispute type (varies by category)
   disputeType: 
     // Order dispute types
     | 'item_not_received' | 'item_not_as_described' | 'damaged_item' | 'wrong_item' | 'refund_request' | 'quality_issue' | 'delivery_issue'
+    // Auction dispute types (NEW)
+    | 'auction_winner_no_payment' | 'auction_item_not_as_described' | 'auction_seller_no_ship' 
+    | 'auction_buyer_remorse' | 'auction_shill_bidding' | 'auction_bid_manipulation'
     // Bug report types
     | 'app_crash' | 'payment_issue' | 'login_issue' | 'feature_not_working' | 'performance_issue'
     // General
@@ -35,8 +41,9 @@ export interface ResolveDisputeDto {
 
 export interface Dispute {
   id: string;
-  disputeCategory: 'order_dispute' | 'bug_report' | 'general';
+  disputeCategory: 'order_dispute' | 'auction_dispute' | 'bug_report' | 'general';
   orderId?: string;
+  auctionId?: string;
   escrowId?: string;
   disputantId: string;
   respondentId?: string;
@@ -219,6 +226,7 @@ export class DisputesService {
         id: dispute.id,
         disputeCategory: dispute.dispute_category,
         orderId: dispute.order_id || undefined,
+        auctionId: undefined,
         escrowId: dispute.escrow_id || undefined,
         disputantId: dispute.disputant_id,
         respondentId: dispute.respondent_id || undefined,
@@ -232,6 +240,162 @@ export class DisputesService {
       };
     } catch (error) {
       this.logger.error('Error creating dispute:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Create an auction dispute
+   * Similar to order disputes but for auction-related issues
+   */
+  async createAuctionDispute(userId: string, createDisputeDto: CreateDisputeDto): Promise<Dispute> {
+    try {
+      this.logger.log(`Creating auction dispute for auction ${createDisputeDto.auctionId} by user ${userId}`);
+
+      if (!createDisputeDto.auctionId) {
+        throw new HttpException('Auction ID is required for auction disputes', HttpStatus.BAD_REQUEST);
+      }
+
+      // 1. Fetch auction details
+      const { data: auction, error: auctionError } = await this.supabase
+        .from('auctions')
+        .select('*')
+        .eq('id', createDisputeDto.auctionId)
+        .single();
+
+      if (auctionError || !auction) {
+        throw new HttpException('Auction not found', HttpStatus.NOT_FOUND);
+      }
+
+      // 2. Verify user is involved in the auction (seller or winner)
+      if (![auction.seller_id, auction.winner_id].includes(userId)) {
+        throw new HttpException('You are not authorized to dispute this auction', HttpStatus.FORBIDDEN);
+      }
+
+      // 3. Check if auction has ended and has a winner
+      if (auction.status !== 'sold' && auction.status !== 'ended') {
+        throw new HttpException('Disputes can only be filed for completed auctions', HttpStatus.BAD_REQUEST);
+      }
+
+      // 4. Check if dispute already exists for this auction
+      const { data: existingDispute } = await this.supabase
+        .from('disputes')
+        .select('id, status')
+        .eq('auction_id', createDisputeDto.auctionId)
+        .in('status', ['pending', 'under_review', 'awaiting_info'])
+        .single();
+
+      if (existingDispute) {
+        throw new HttpException('A dispute is already open for this auction', HttpStatus.CONFLICT);
+      }
+
+      // 5. Determine respondent (the other party)
+      const respondentId = userId === auction.seller_id ? auction.winner_id : auction.seller_id;
+
+      // 6. Check if there's an escrow/order associated with this auction
+      let escrowId: string | null = null;
+      const { data: auctionOrder } = await this.supabase
+        .from('orders')
+        .select('id, escrow_enabled')
+        .eq('auction_id', createDisputeDto.auctionId)
+        .single();
+
+      if (auctionOrder && auctionOrder.escrow_enabled) {
+        const { data: escrowData } = await this.supabase
+          .from('escrows')
+          .select('id, status')
+          .eq('order_id', auctionOrder.id)
+          .single();
+
+        if (escrowData && escrowData.status === 'held') {
+          escrowId = escrowData.id;
+          
+          // Mark escrow as disputed (update directly via Supabase)
+          const { error: escrowUpdateError } = await this.supabase
+            .from('escrows')
+            .update({ status: 'dispute' })
+            .eq('id', escrowId);
+          
+          if (escrowUpdateError) {
+            this.logger.warn(`Failed to update escrow status: ${escrowUpdateError.message}`);
+          }
+        }
+      }
+
+      // 7. Create dispute record
+      const disputeData: any = {
+        dispute_category: 'auction_dispute',
+        auction_id: createDisputeDto.auctionId,
+        disputant_id: userId,
+        respondent_id: respondentId,
+        dispute_type: createDisputeDto.disputeType,
+        status: 'pending',
+        reason: createDisputeDto.reason,
+        description: createDisputeDto.description || null,
+        evidence: createDisputeDto.evidence || [],
+        priority: createDisputeDto.priority || 'medium',
+        escrow_id: escrowId,
+      };
+
+      const { data: dispute, error } = await this.supabase
+        .from('disputes')
+        .insert(disputeData)
+        .select()
+        .single();
+
+      if (error) {
+        this.logger.error(`Failed to create auction dispute: ${error.message}`);
+        throw new HttpException(`Failed to create dispute: ${error.message}`, HttpStatus.INTERNAL_SERVER_ERROR);
+      }
+
+      // 8. Send notifications to both parties
+      try {
+        // Notify respondent (create notification directly)
+        await this.supabase
+          .from('notifications')
+          .insert({
+            user_id: respondentId,
+            type: 'dispute',
+            title: 'Auction Dispute Opened',
+            message: `A dispute has been filed for auction "${auction.title}". Reason: ${createDisputeDto.reason}`,
+            data: {
+              dispute_id: dispute.id,
+              auction_id: createDisputeDto.auctionId,
+            },
+            priority: 'high',
+          });
+
+        // Notify support staff via realtime
+        this.realtimeGateway.server.emit('new_dispute', {
+          dispute_id: dispute.id,
+          category: 'auction_dispute',
+          priority: createDisputeDto.priority,
+          auction_id: createDisputeDto.auctionId,
+        });
+      } catch (notifError) {
+        this.logger.warn(`Failed to send dispute notifications: ${notifError}`);
+      }
+
+      this.logger.log(`Auction dispute ${dispute.id} created successfully`);
+
+      return {
+        id: dispute.id,
+        disputeCategory: dispute.dispute_category,
+        auctionId: dispute.auction_id,
+        orderId: undefined,
+        escrowId: dispute.escrow_id,
+        disputantId: dispute.disputant_id,
+        respondentId: dispute.respondent_id || undefined,
+        disputeType: dispute.dispute_type,
+        status: dispute.status,
+        reason: dispute.reason,
+        description: dispute.description,
+        evidence: dispute.evidence,
+        createdAt: dispute.created_at,
+        updatedAt: dispute.updated_at,
+      };
+    } catch (error) {
+      this.logger.error('Error creating auction dispute:', error);
       throw error;
     }
   }

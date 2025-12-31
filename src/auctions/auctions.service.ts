@@ -1,19 +1,25 @@
-import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException, forwardRef, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto, WatchlistDto } from './dto';
 import { Auction, AuctionWithDetails, AuctionBid, AuctionCategory, AuctionCategoryWithStats, PublicBidHistoryItem } from './entities';
 import { WalletService } from '../wallet/wallet.service';
+import { AuctionGateway } from './auction.gateway';
 
 @Injectable()
 export class AuctionsService {
   private supabase;
+  private serviceSupabase;
+  private processingProxyBids = new Set<string>(); // Track auctions currently processing proxy bids
 
   constructor(
     private configService: ConfigService,
     private walletService: WalletService,
+    @Inject(forwardRef(() => AuctionGateway))
+    private auctionGateway: AuctionGateway,
   ) {
     this.supabase = createSupabaseClient(this.configService);
+    this.serviceSupabase = createServiceSupabaseClient(this.configService);
   }
 
   /**
@@ -351,6 +357,36 @@ export class AuctionsService {
       }
     }
 
+    // Generate bidder_display_id - check if this bidder has already bid on this auction
+    let bidderDisplayId: string;
+    const existingBid = await client
+      .from('auction_bids')
+      .select('bidder_display_id')
+      .eq('auction_id', placeBidDto.auction_id)
+      .eq('bidder_id', userId)
+      .eq('is_valid', true)
+      .limit(1)
+      .maybeSingle();
+
+    if (existingBid.data && existingBid.data.bidder_display_id) {
+      // Use existing display ID if this bidder has bid before
+      bidderDisplayId = existingBid.data.bidder_display_id;
+    } else {
+      // Count unique bidders for this auction to generate new display ID
+      // Fetch all bidder_ids and count unique ones
+      const { data: allBids } = await client
+        .from('auction_bids')
+        .select('bidder_id')
+        .eq('auction_id', placeBidDto.auction_id)
+        .eq('is_valid', true);
+
+      // Count unique bidder_ids
+      const uniqueBidderIds = new Set((allBids || []).map(bid => bid.bidder_id));
+      const uniqueBidderCount = uniqueBidderIds.size;
+      const bidderNumber = uniqueBidderCount + 1;
+      bidderDisplayId = `Bidder #${bidderNumber}`;
+    }
+
     // Place the bid
     const bidData = {
       auction_id: placeBidDto.auction_id,
@@ -359,6 +395,7 @@ export class AuctionsService {
       bid_type: placeBidDto.bid_type || 'manual',
       max_bid_amount: placeBidDto.max_bid_amount,
       is_proxy_bid: placeBidDto.bid_type === 'proxy',
+      bidder_display_id: bidderDisplayId,
     };
 
     const { data, error } = await client
@@ -369,6 +406,241 @@ export class AuctionsService {
 
     if (error) {
       throw new BadRequestException(`Failed to place bid: ${error.message}`);
+    }
+
+    // Broadcast WebSocket event for real-time updates
+    // Query auction stats directly from auctions table (faster, more reliable, ensures fresh data)
+    try {
+      const { data: auctionStats, error: statsError } = await this.serviceSupabase
+        .from('auctions')
+        .select('current_bid, total_bids, unique_bidders')
+        .eq('id', placeBidDto.auction_id)
+        .single();
+
+      if (!statsError && auctionStats) {
+        await this.auctionGateway.broadcastBidUpdate(placeBidDto.auction_id, {
+          amount: data.amount,
+          bidder_display_id: data.bidder_display_id,
+          current_bid: auctionStats.current_bid,
+          total_bids: auctionStats.total_bids,
+          unique_bidders: auctionStats.unique_bidders,
+          is_winning: true,
+        });
+      }
+    } catch (error) {
+      console.error(`[Auction ${placeBidDto.auction_id}] Error broadcasting bid update:`, error);
+      // Don't throw - WebSocket broadcast failure shouldn't fail the bid
+    }
+
+    // Process proxy bids only if this is a manual bid (not a proxy counter-bid)
+    // Proxy counter-bids are identified by checking if we're already processing this auction
+    if (placeBidDto.bid_type !== 'proxy' && !this.processingProxyBids.has(placeBidDto.auction_id)) {
+      // Process proxy bids asynchronously (don't block the response)
+      this.processProxyBids(placeBidDto.auction_id, data.amount, data.bidder_id, data.id).catch(err => {
+        console.error(`[Auction ${placeBidDto.auction_id}] Error processing proxy bids:`, err);
+        // Don't throw - proxy bid processing failure shouldn't fail the original bid
+      });
+    }
+
+    return data;
+  }
+
+  /**
+   * Process proxy bids after a manual bid is placed
+   * Automatically places counter-bids for proxy bidders who can outbid
+   * Uses service role client to bypass RLS for automatic system actions
+   */
+  private async processProxyBids(
+    auctionId: string,
+    newBidAmount: number,
+    newBidderId: string,
+    newBidId: string,
+    isRecursive: boolean = false, // Track if this is a recursive call
+  ): Promise<void> {
+    // Prevent concurrent processing from different initial calls (but allow recursion)
+    if (!isRecursive && this.processingProxyBids.has(auctionId)) {
+      return; // Another process is already handling proxy bids for this auction
+    }
+
+    if (!isRecursive) {
+      this.processingProxyBids.add(auctionId);
+    }
+
+    try {
+      // Get auction details for bid_increment and current state
+      const auction = await this.findById(auctionId);
+      if (!auction || auction.status !== 'active') {
+        return; // Auction is no longer active
+      }
+
+      const bidIncrement = auction.bid_increment;
+      const minimumCounterBid = newBidAmount + bidIncrement;
+
+      // Find the highest active ORIGINAL proxy bid where max_bid_amount >= minimum counter bid
+      // We only look at original proxy bids (proxy_bid_parent_id IS NULL), not system-generated counter-bids
+      // Exclude the bidder who just placed this bid
+      // Only get the highest one (we'll process one at a time to avoid race conditions)
+      const { data: proxyBids, error: findError } = await this.serviceSupabase
+        .from('auction_bids')
+        .select('id, bidder_id, max_bid_amount, bidder_display_id')
+        .eq('auction_id', auctionId)
+        .eq('is_proxy_bid', true)
+        .eq('is_valid', true)
+        .is('proxy_bid_parent_id', null) // Only original proxy bids (not system-generated counter-bids)
+        .neq('bidder_id', newBidderId) // Exclude the current bidder
+        .gte('max_bid_amount', minimumCounterBid) // Only those who can outbid
+        .order('max_bid_amount', { ascending: false })
+        .limit(1); // Only process the highest proxy bidder
+
+      if (findError || !proxyBids || proxyBids.length === 0) {
+        return; // No proxy bids to process
+      }
+
+      const proxyBid = proxyBids[0];
+
+      // Calculate counter-bid: minimum to beat new bid, but don't exceed proxy max
+      const counterBidAmount = Math.min(minimumCounterBid, proxyBid.max_bid_amount);
+
+      // Double-check: only proceed if counter-bid is actually higher
+      if (counterBidAmount <= newBidAmount) {
+        return;
+      }
+
+      // Check proxy bidder's wallet balance before placing counter-bid
+      const proxyBidderWallet = await this.walletService.getWallet(proxyBid.bidder_id);
+      if (proxyBidderWallet.availableBalance < counterBidAmount) {
+        console.log(`[Auction ${auctionId}] Proxy bidder ${proxyBid.bidder_id} has insufficient balance for counter-bid`);
+        return; // Skip this proxy bidder (they can't afford the counter-bid)
+      }
+
+      // Fetch the latest auction state to ensure we have the correct current_bid
+      const currentAuction = await this.findById(auctionId);
+      const currentMinBid = currentAuction.current_bid + currentAuction.bid_increment;
+
+      // Ensure counter-bid still meets minimum (race condition protection)
+      if (counterBidAmount < currentMinBid) {
+        // Recalculate based on current state
+        const recalculatedCounterBid = Math.min(currentMinBid, proxyBid.max_bid_amount);
+        if (recalculatedCounterBid <= currentAuction.current_bid) {
+          return; // Proxy bidder's max is no longer sufficient
+        }
+
+        // Place counter-bid using the service client (bypasses RLS)
+        await this.placeBidInternal(
+          proxyBid.bidder_id,
+          auctionId,
+          recalculatedCounterBid,
+          proxyBid.max_bid_amount,
+          proxyBid.bidder_display_id,
+          proxyBid.id, // parent proxy bid id
+        );
+      } else {
+        // Place counter-bid using the service client (bypasses RLS)
+        await this.placeBidInternal(
+          proxyBid.bidder_id,
+          auctionId,
+          counterBidAmount,
+          proxyBid.max_bid_amount,
+          proxyBid.bidder_display_id,
+          proxyBid.id, // parent proxy bid id
+        );
+      }
+
+      // Recursively process proxy bids for the new counter-bid
+      // (in case there are other proxy bidders who can outbid this counter-bid)
+      // Get the new current bid amount
+      const updatedAuction = await this.findById(auctionId);
+      if (updatedAuction.current_bid > newBidAmount) {
+        // Find the counter-bid we just placed
+        const { data: counterBid } = await this.serviceSupabase
+          .from('auction_bids')
+          .select('id, amount, bidder_id')
+          .eq('auction_id', auctionId)
+          .eq('bidder_id', proxyBid.bidder_id)
+          .eq('proxy_bid_parent_id', proxyBid.id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+
+        if (counterBid) {
+          // Recursively process proxy bids (pass isRecursive=true to allow recursion)
+          await this.processProxyBids(
+            auctionId,
+            counterBid.amount,
+            counterBid.bidder_id,
+            counterBid.id,
+            true, // Mark as recursive call
+          );
+        }
+      }
+    } catch (error) {
+      console.error(`[Auction ${auctionId}] Error in processProxyBids:`, error);
+      // Don't throw - proxy bid processing failure shouldn't fail the original bid
+    } finally {
+      // Only remove from set if this was the initial (non-recursive) call
+      if (!isRecursive) {
+        this.processingProxyBids.delete(auctionId);
+      }
+    }
+  }
+
+  /**
+   * Internal method to place a bid (used for proxy counter-bids)
+   * Bypasses some validations since this is a system-generated bid
+   */
+  private async placeBidInternal(
+    bidderId: string,
+    auctionId: string,
+    amount: number,
+    maxBidAmount: number,
+    bidderDisplayId: string,
+    proxyBidParentId: string,
+  ): Promise<AuctionBid> {
+    const bidData = {
+      auction_id: auctionId,
+      bidder_id: bidderId,
+      amount: amount,
+      bid_type: 'proxy' as const,
+      max_bid_amount: maxBidAmount,
+      is_proxy_bid: true,
+      bidder_display_id: bidderDisplayId,
+      proxy_bid_parent_id: proxyBidParentId,
+    };
+
+    const { data, error } = await this.serviceSupabase
+      .from('auction_bids')
+      .insert(bidData)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to place proxy counter-bid: ${error.message}`);
+    }
+
+    // Broadcast WebSocket event for proxy counter-bid
+    // Query auction stats directly from auctions table using serviceSupabase
+    // (same client = same connection = consistent reads, bypasses RLS, ensures fresh data)
+    try {
+      const { data: auctionStats, error: statsError } = await this.serviceSupabase
+        .from('auctions')
+        .select('current_bid, total_bids, unique_bidders')
+        .eq('id', auctionId)
+        .single();
+
+      if (!statsError && auctionStats) {
+        await this.auctionGateway.broadcastBidUpdate(auctionId, {
+          amount: amount,
+          bidder_display_id: bidderDisplayId,
+          current_bid: auctionStats.current_bid,
+          total_bids: auctionStats.total_bids,
+          unique_bidders: auctionStats.unique_bidders,
+          is_winning: true,
+          is_proxy_bid: true,
+        });
+      }
+    } catch (error) {
+      console.error(`[Auction ${auctionId}] Error broadcasting proxy bid update:`, error);
+      // Don't throw - WebSocket broadcast failure shouldn't fail the bid
     }
 
     return data;
@@ -480,33 +752,46 @@ export class AuctionsService {
    * Update proxy bid maximum amount
    */
   async updateProxyBid(userId: string, auctionId: string, maxBidAmount: number): Promise<any> {
-    // Find user's proxy bid for this auction
-    const { data: existingBid, error: findError } = await this.supabase
+    // Find user's active proxy bid for this auction (highest max_bid_amount if multiple)
+    const { data: existingBids, error: findError } = await this.supabase
       .from('auction_bids')
       .select('*')
       .eq('auction_id', auctionId)
-      .eq('user_id', userId)
-      .eq('bid_type', 'proxy')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
+      .eq('bidder_id', userId) // Fixed: was 'user_id', should be 'bidder_id'
+      .eq('is_proxy_bid', true)
+      .eq('is_valid', true)
+      .order('max_bid_amount', { ascending: false })
+      .limit(1);
 
-    if (findError && findError.code !== 'PGRST116') throw findError;
+    if (findError) throw findError;
 
-    if (existingBid) {
-      // Update existing proxy bid
-      const { data, error } = await this.supabase
-        .from('auction_bids')
-        .update({ max_bid_amount: maxBidAmount, updated_at: new Date().toISOString() })
-        .eq('id', existingBid.id)
-        .select()
-        .single();
-
-      if (error) throw error;
-      return { message: 'Proxy bid updated successfully', bid: data };
-    } else {
-      throw new Error('No proxy bid found for this auction. Place a proxy bid first.');
+    if (!existingBids || existingBids.length === 0) {
+      throw new BadRequestException('No active proxy bid found for this auction. Place a proxy bid first.');
     }
+
+    const existingBid = existingBids[0];
+
+    // Validate the new max_bid_amount is higher than current bid
+    const auction = await this.findById(auctionId);
+    if (maxBidAmount < auction.current_bid + auction.bid_increment) {
+      throw new BadRequestException(`Maximum bid amount must be at least ${auction.current_bid + auction.bid_increment} Freti (current bid + increment)`);
+    }
+
+    // Update the proxy bid's max_bid_amount
+    // Update all proxy bids from this user for this auction to keep them in sync
+    const { data, error } = await this.supabase
+      .from('auction_bids')
+      .update({ max_bid_amount: maxBidAmount })
+      .eq('auction_id', auctionId)
+      .eq('bidder_id', userId) // Fixed: was 'user_id', should be 'bidder_id'
+      .eq('is_proxy_bid', true)
+      .eq('is_valid', true)
+      .select()
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    return { message: 'Proxy bid updated successfully', bid: data[0] };
   }
 
   /**
@@ -686,6 +971,98 @@ export class AuctionsService {
       console.error('Error processing winning bid payment:', error);
       return { success: false, message: 'Payment processing failed' };
     }
+  }
+
+  /**
+   * Emergency extend auction (Admin only - for critical system failures)
+   * Prominently logs to audit trail and notifies all bidders
+   */
+  async emergencyExtendAuction(
+    adminId: string,
+    auctionId: string,
+    extensionMinutes: number,
+    reason: string,
+  ): Promise<{ success: boolean; message: string; new_end_time: string }> {
+    // Get auction details
+    const { data: auction, error: auctionError } = await this.supabase
+      .from('auctions')
+      .select('*, end_time, status, title')
+      .eq('id', auctionId)
+      .single();
+
+    if (auctionError || !auction) {
+      throw new NotFoundException('Auction not found');
+    }
+
+    if (auction.status !== 'active') {
+      throw new BadRequestException('Can only extend active auctions');
+    }
+
+    // Validate extension (maximum 60 minutes)
+    if (extensionMinutes < 1 || extensionMinutes > 60) {
+      throw new BadRequestException('Extension must be between 1 and 60 minutes');
+    }
+
+    // Calculate new end time
+    const oldEndTime = new Date(auction.end_time);
+    const newEndTime = new Date(oldEndTime.getTime() + extensionMinutes * 60 * 1000);
+
+    // Update auction end time
+    const { error: updateError } = await this.supabase
+      .from('auctions')
+      .update({ 
+        end_time: newEndTime.toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', auctionId);
+
+    if (updateError) {
+      throw new Error(`Failed to extend auction: ${updateError.message}`);
+    }
+
+    // Get all bidders to notify
+    const { data: bids } = await this.supabase
+      .from('auction_bids')
+      .select('bidder_id')
+      .eq('auction_id', auctionId)
+      .eq('is_valid', true);
+
+    const uniqueBidders = [...new Set((bids || []).map(b => b.bidder_id))];
+
+    // Send notifications to all bidders
+    if (uniqueBidders.length > 0) {
+      const notifications = uniqueBidders.map(bidderId => ({
+        user_id: bidderId,
+        type: 'auction_extended',
+        title: '⏰ Auction Extended',
+        message: `Auction "${auction.title}" has been extended by ${extensionMinutes} minutes. Reason: ${reason}`,
+        data: {
+          auction_id: auctionId,
+          extension_minutes: extensionMinutes,
+          new_end_time: newEndTime.toISOString(),
+          reason,
+        },
+      }));
+
+      await this.supabase.from('notifications').insert(notifications);
+    }
+
+    console.log(
+      `🚨 EMERGENCY AUCTION EXTENSION 🚨\n` +
+      `Auction: ${auction.title} (${auctionId})\n` +
+      `Admin: ${adminId}\n` +
+      `Extension: ${extensionMinutes} minutes\n` +
+      `Old End: ${oldEndTime.toISOString()}\n` +
+      `New End: ${newEndTime.toISOString()}\n` +
+      `Reason: ${reason}\n` +
+      `Bidders Notified: ${uniqueBidders.length}`,
+    );
+
+    return {
+      success: true,
+      message: `Auction extended by ${extensionMinutes} minutes`,
+      new_end_time: newEndTime.toISOString(),
+    };
   }
 
   /**

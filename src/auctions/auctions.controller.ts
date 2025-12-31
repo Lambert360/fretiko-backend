@@ -52,7 +52,7 @@ export class AuctionsController {
     @Query(ValidationPipe) filters: AuctionFilterDto,
     @Request() req?: any,
   ) {
-    const userId = req?.user?.id; // Optional user ID for personalization
+    const userId = req?.user?.sub; // Optional user ID for personalization
     return this.auctionsService.findAuctions(filters, userId);
   }
 
@@ -61,7 +61,7 @@ export class AuctionsController {
    */
   @Get('featured')
   async getFeaturedAuctions(@Request() req?: any) {
-    const userId = req?.user?.id;
+    const userId = req?.user?.sub;
     const filters: AuctionFilterDto = {
       featured_only: true,
       status: 'active',
@@ -76,7 +76,7 @@ export class AuctionsController {
    */
   @Get('ending-soon')
   async getAuctionsEndingSoon(@Request() req?: any) {
-    const userId = req?.user?.id;
+    const userId = req?.user?.sub;
     const filters: AuctionFilterDto = {
       time_filter: 'ending_soon',
       status: 'active',
@@ -95,7 +95,7 @@ export class AuctionsController {
     @Query(ValidationPipe) filters: AuctionFilterDto,
     @Request() req?: any,
   ) {
-    const userId = req?.user?.id;
+    const userId = req?.user?.sub;
     const categoryFilters: AuctionFilterDto = {
       ...filters,
       category_slug: categorySlug,
@@ -108,7 +108,7 @@ export class AuctionsController {
    */
   @Get(':id')
   async getAuction(@Param('id') id: string, @Request() req?: any) {
-    const userId = req?.user?.id;
+    const userId = req?.user?.sub;
     return this.auctionsService.findById(id, userId);
   }
 
@@ -158,7 +158,7 @@ export class AuctionsController {
     @Request() req: any,
   ) {
     return this.auctionsService.placeBid(
-      req.user.id,
+      req.user.sub,
       placeBidDto,
       req.headers.authorization?.replace('Bearer ', ''),
     );
@@ -175,7 +175,7 @@ export class AuctionsController {
     @Request() req: any,
   ) {
     return this.auctionsService.updateProxyBid(
-      req.user.id,
+      req.user.sub,
       updateProxyBidDto.auction_id,
       updateProxyBidDto.max_bid_amount,
     );
@@ -191,7 +191,7 @@ export class AuctionsController {
     @Body(ValidationPipe) watchlistDto: WatchlistDto,
     @Request() req: any,
   ) {
-    return this.auctionsService.toggleWatchlist(req.user.id, watchlistDto);
+    return this.auctionsService.toggleWatchlist(req.user.sub, watchlistDto);
   }
 
   /**
@@ -202,7 +202,7 @@ export class AuctionsController {
   @UseGuards(JwtAuthGuard)
   async getUserWatchlist(@Request() req: any, @Query('limit') limit?: string) {
     const watchlistLimit = limit ? parseInt(limit) : 50;
-    return this.auctionsService.getUserWatchlist(req.user.id, watchlistLimit);
+    return this.auctionsService.getUserWatchlist(req.user.sub, watchlistLimit);
   }
 
   /**
@@ -214,9 +214,9 @@ export class AuctionsController {
   async getMyAuctions(@Request() req: any, @Query(ValidationPipe) filters: AuctionFilterDto) {
     const sellerFilters: AuctionFilterDto = {
       ...filters,
-      seller_id: req.user.id,
+      seller_id: req.user.sub,
     };
-    return this.auctionsService.findAuctions(sellerFilters, req.user.id);
+    return this.auctionsService.findAuctions(sellerFilters, req.user.sub);
   }
 
   /**
@@ -231,14 +231,14 @@ export class AuctionsController {
     @Request() req: any,
   ) {
     // Verify auction exists and is a live auction
-    const auction = await this.auctionsService.findById(auctionId, req.user.id);
+    const auction = await this.auctionsService.findById(auctionId, req.user.sub);
     
     if (auction.auction_type !== 'live') {
       throw new BadRequestException('This auction is not a live auction');
     }
     
     // For hosts, verify they own the auction
-    if (role === 'host' && auction.seller_id !== req.user.id) {
+    if (role === 'host' && auction.seller_id !== req.user.sub) {
       throw new UnauthorizedException('Only the auction owner can host the stream');
     }
     
@@ -264,7 +264,7 @@ export class AuctionsController {
   @Get('user/my-bids')
   @UseGuards(JwtAuthGuard)
   async getMyBids(@Request() req: any) {
-    return this.auctionsService.getUserBidHistory(req.user.id);
+    return this.auctionsService.getUserBidHistory(req.user.sub);
     throw new Error('User bid history not yet implemented');
   }
 
@@ -279,7 +279,7 @@ export class AuctionsController {
     @Body() updateData: Partial<CreateAuctionDto>,
     @Request() req: any,
   ) {
-    return this.auctionsService.updateAuction(id, req.user.id, updateData);
+    return this.auctionsService.updateAuction(id, req.user.sub, updateData);
   }
 
   /**
@@ -290,7 +290,7 @@ export class AuctionsController {
   @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
   @HttpCode(HttpStatus.NO_CONTENT)
   async deleteAuction(@Param('id') id: string, @Request() req: any) {
-    return this.auctionsService.cancelAuction(id, req.user.id);
+    return this.auctionsService.cancelAuction(id, req.user.sub);
   }
 
   /**
@@ -300,6 +300,6 @@ export class AuctionsController {
   @Post(':id/complete-sale')
   @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
   async completeSale(@Param('id') id: string, @Request() req: any) {
-    return this.auctionsService.completeAuctionSale(id, req.user.id);
+    return this.auctionsService.completeAuctionSale(id, req.user.sub);
   }
 }

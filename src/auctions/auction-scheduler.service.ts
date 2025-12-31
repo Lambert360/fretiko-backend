@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { AuctionGateway } from './auction.gateway';
 import { AuctionPaymentService } from './auction-payment.service';
 
@@ -24,7 +24,7 @@ export class AuctionSchedulerService {
     private auctionGateway: AuctionGateway,
     private auctionPaymentService: AuctionPaymentService,
   ) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   /**
@@ -35,10 +35,10 @@ export class AuctionSchedulerService {
     try {
       const now = new Date();
 
-      // Find auctions that should start
+      // Find auctions that should start (include end_time to check if already expired)
       const { data: auctionsToStart, error } = await this.supabase
         .from('auctions')
-        .select('id, title, seller_id')
+        .select('id, title, seller_id, start_time, end_time')
         .eq('status', 'scheduled')
         .lte('start_time', now.toISOString());
 
@@ -48,7 +48,21 @@ export class AuctionSchedulerService {
       }
 
       for (const auction of auctionsToStart || []) {
-        await this.startAuction(auction.id);
+        // Check if end_time has also passed - if so, skip starting and mark as ended directly
+        const startTime = new Date(auction.start_time);
+        const endTime = new Date(auction.end_time);
+        
+        console.log(`[Auction ${auction.id}] Checking: start_time=${startTime.toISOString()}, end_time=${endTime.toISOString()}, now=${now.toISOString()}`);
+        
+        if (endTime <= now) {
+          console.log(`[Auction ${auction.id}] Already expired (end_time: ${endTime.toISOString()}). Marking as ended.`);
+          await this.markAuctionAsExpired(auction.id);
+        } else if (startTime <= now && endTime > now) {
+          console.log(`[Auction ${auction.id}] Should start now. start_time passed, end_time in future. Starting auction...`);
+          await this.startAuction(auction.id);
+        } else {
+          console.log(`[Auction ${auction.id}] Unexpected state: start_time=${startTime.toISOString()}, end_time=${endTime.toISOString()}`);
+        }
       }
 
     } catch (error) {
@@ -184,16 +198,80 @@ export class AuctionSchedulerService {
    */
   private async startAuction(auctionId: string) {
     try {
-      // Update auction status to active
-      const { error } = await this.supabase
+      // First verify the auction is still scheduled (prevent race conditions)
+      const { data: auction, error: fetchError } = await this.supabase
         .from('auctions')
-        .update({ status: 'active', updated_at: new Date().toISOString() })
-        .eq('id', auctionId);
+        .select('id, status, start_time, end_time')
+        .eq('id', auctionId)
+        .single();
 
-      if (error) {
-        console.error(`Error starting auction ${auctionId}:`, error);
+      if (fetchError || !auction) {
+        console.error(`Error fetching auction ${auctionId} for start:`, fetchError);
         return;
       }
+
+      // Double-check status to prevent duplicate processing
+      if (auction.status !== 'scheduled') {
+        console.log(`[Auction ${auctionId}] Skipping start - status is already '${auction.status}'`);
+        return;
+      }
+
+      // Verify end_time is still in the future
+      const endTime = new Date(auction.end_time);
+      const now = new Date();
+      if (endTime <= now) {
+        console.log(`[Auction ${auctionId}] End time has passed, marking as expired instead`);
+        await this.markAuctionAsExpired(auctionId);
+        return;
+      }
+
+      // Update auction status to active
+      // Using service client which bypasses RLS, so we can update directly
+      const { data: updatedAuction, error: updateError } = await this.supabase
+        .from('auctions')
+        .update({ status: 'active' })
+        .eq('id', auctionId)
+        .eq('status', 'scheduled') // Atomic check: only update if still scheduled
+        .select()
+        .single();
+
+      if (updateError) {
+        // Check if error is because no rows matched (status already changed)
+        if (updateError.code === 'PGRST116') {
+          const { data: currentAuction } = await this.supabase
+            .from('auctions')
+            .select('id, status')
+            .eq('id', auctionId)
+            .single();
+          
+          if (currentAuction) {
+            console.log(`[Auction ${auctionId}] Update failed - current status is: '${currentAuction.status}'. Likely already processed by another instance.`);
+            if (currentAuction.status === 'active') {
+              console.log(`[Auction ${auctionId}] Already active - no action needed.`);
+            }
+          }
+          return;
+        }
+        
+        console.error(`[Auction ${auctionId}] Error starting auction:`, updateError);
+        return;
+      }
+
+      if (!updatedAuction) {
+        console.log(`[Auction ${auctionId}] Update returned no data. Checking current status...`);
+        const { data: currentAuction } = await this.supabase
+          .from('auctions')
+          .select('id, status')
+          .eq('id', auctionId)
+          .single();
+        
+        if (currentAuction) {
+          console.log(`[Auction ${auctionId}] Current status: '${currentAuction.status}'`);
+        }
+        return;
+      }
+
+      console.log(`✅ [Auction ${auctionId}] Successfully started - status changed from 'scheduled' to 'active'`);
 
       // Log auction start event
       await this.supabase
@@ -209,8 +287,6 @@ export class AuctionSchedulerService {
       await this.auctionGateway.broadcastAuctionStatusChange(auctionId, 'active', {
         message: 'Auction has started! Bidding is now open.',
       });
-
-      console.log(`Started auction: ${auctionId}`);
 
     } catch (error) {
       console.error(`Error starting auction ${auctionId}:`, error);
@@ -313,6 +389,45 @@ export class AuctionSchedulerService {
 
     } catch (error) {
       console.error(`Error ending auction ${auction.id}:`, error);
+    }
+  }
+
+  /**
+   * Mark an auction as ended without going through active state
+   * Used for auctions that were never started on time
+   */
+  private async markAuctionAsExpired(auctionId: string) {
+    try {
+      const { error } = await this.supabase
+        .from('auctions')
+        .update({ 
+          status: 'ended', 
+          updated_at: new Date().toISOString() 
+        })
+        .eq('id', auctionId);
+
+      if (error) {
+        console.error(`Error marking auction ${auctionId} as expired:`, error);
+        return;
+      }
+
+      // Log the expiration
+      await this.supabase
+        .from('auction_events')
+        .insert({
+          auction_id: auctionId,
+          event_type: 'auction_expired',
+          event_data: { 
+            timestamp: new Date().toISOString(),
+            reason: 'Auction expired before it could start'
+          },
+          auctioneer_message: 'This auction has expired.',
+        });
+
+      console.log(`Marked auction as expired: ${auctionId}`);
+
+    } catch (error) {
+      console.error(`Error marking auction ${auctionId} as expired:`, error);
     }
   }
 

@@ -4401,6 +4401,183 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
   }
 
   /**
+   * Get full auction bid history with real user identities (Admin only)
+   * Used for fraud detection and dispute resolution
+   */
+  async getFullAuctionBidHistory(staffId: string, auctionId: string) {
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`Staff ${staffId} viewing full bid history for auction ${auctionId}`);
+
+    // Use the admin view that includes full user details
+    const { data, error } = await this.supabase
+      .from('admin_auction_bids_view')
+      .select('*')
+      .eq('auction_id', auctionId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      this.logger.error(`Failed to fetch auction bid history: ${error.message}`);
+      throw new Error(`Failed to fetch bid history: ${error.message}`);
+    }
+
+    // Log audit trail for viewing sensitive data
+    await this.auditService.logContentAction(
+      staffId,
+      'view_auction_bids' as AuditAction,
+      AuditEntityType.AUCTION,
+      auctionId,
+      { bid_count: data?.length || 0 },
+    );
+
+    return data || [];
+  }
+
+  /**
+   * Invalidate a fraudulent bid (Admin only)
+   * Recalculates auction current bid and notifies bidder
+   */
+  async invalidateAuctionBid(staffId: string, bidId: string, reason: string) {
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`Staff ${staffId} invalidating bid ${bidId}. Reason: ${reason}`);
+
+    // Get bid details first
+    const { data: bid, error: bidError } = await this.supabase
+      .from('auction_bids')
+      .select('*, auction_id, bidder_id, amount')
+      .eq('id', bidId)
+      .single();
+
+    if (bidError || !bid) {
+      throw new Error('Bid not found');
+    }
+
+    // Mark bid as invalid
+    const { error: updateError } = await this.supabase
+      .from('auction_bids')
+      .update({
+        is_valid: false,
+        invalidation_reason: reason,
+        invalidated_by: staffId,
+        invalidated_at: new Date().toISOString(),
+      })
+      .eq('id', bidId);
+
+    if (updateError) {
+      this.logger.error(`Failed to invalidate bid: ${updateError.message}`);
+      throw new Error(`Failed to invalidate bid: ${updateError.message}`);
+    }
+
+    // Recalculate auction's current bid
+    const { data: validBids } = await this.supabase
+      .from('auction_bids')
+      .select('amount')
+      .eq('auction_id', bid.auction_id)
+      .eq('is_valid', true)
+      .order('amount', { ascending: false })
+      .limit(1);
+
+    const newCurrentBid = validBids?.[0]?.amount || 0;
+
+    // Update auction current bid and total bids count
+    await this.supabase
+      .from('auctions')
+      .update({
+        current_bid: newCurrentBid,
+        total_bids: this.supabase.raw('total_bids - 1'),
+      })
+      .eq('id', bid.auction_id);
+
+    // Log audit trail
+    await this.auditService.logContentAction(
+      staffId,
+      'invalidate_bid' as AuditAction,
+      'auction_bid' as AuditEntityType,
+      bidId,
+      { 
+        reason, 
+        previous_amount: bid.amount,
+        auction_id: bid.auction_id,
+        new_current_bid: newCurrentBid,
+      },
+    );
+
+    // Send notification to bidder
+    try {
+      await this.supabase.from('notifications').insert({
+        user_id: bid.bidder_id,
+        type: 'bid_invalidated',
+        title: 'Bid Invalidated',
+        message: `Your bid of ₣${bid.amount} has been invalidated. Reason: ${reason}`,
+        data: {
+          auction_id: bid.auction_id,
+          bid_id: bidId,
+          reason,
+        },
+      });
+    } catch (notifError) {
+      this.logger.warn(`Failed to send notification to bidder: ${notifError}`);
+    }
+
+    this.logger.log(`Bid ${bidId} invalidated successfully. New current bid: ${newCurrentBid}`);
+
+    return { 
+      success: true, 
+      message: 'Bid invalidated successfully',
+      new_current_bid: newCurrentBid,
+    };
+  }
+
+  /**
+   * Update auction category (Super Admin only)
+   * Only allows editing description, display_order, and is_active
+   */
+  async updateAuctionCategory(
+    staffId: string,
+    categoryId: string,
+    updates: Partial<{ description: string; display_order: number; is_active: boolean }>,
+  ) {
+    // Permission check is handled by @Permissions('super_admin') decorator in controller
+    this.logger.log(`Staff ${staffId} updating auction category ${categoryId}`);
+
+    // Only allow editing specific fields (not name, slug, icon, color)
+    const allowedFields = ['description', 'display_order', 'is_active'];
+    const sanitized = Object.keys(updates)
+      .filter(key => allowedFields.includes(key))
+      .reduce((obj, key) => ({ ...obj, [key]: updates[key] }), {});
+
+    if (Object.keys(sanitized).length === 0) {
+      throw new Error('No valid fields to update');
+    }
+
+    const { data, error } = await this.supabase
+      .from('auction_categories')
+      .update(sanitized)
+      .eq('id', categoryId)
+      .select()
+      .single();
+
+    if (error) {
+      this.logger.error(`Failed to update category: ${error.message}`);
+      throw new Error(`Failed to update category: ${error.message}`);
+    }
+
+    // Log audit trail
+    await this.auditService.logContentAction(
+      staffId,
+      'update_category' as AuditAction,
+      'auction_category' as AuditEntityType,
+      categoryId,
+      sanitized,
+    );
+
+    this.logger.log(`Auction category ${categoryId} updated successfully`);
+
+    return data;
+  }
+
+  /**
    * Get dashboard overview for staff
    */
   async getDashboardOverviewForStaff(staffId: string) {
