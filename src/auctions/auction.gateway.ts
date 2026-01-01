@@ -9,7 +9,7 @@ import {
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { UseGuards } from '@nestjs/common';
+import { UseGuards, Inject, forwardRef } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AuctionsService } from './auctions.service';
 
@@ -34,7 +34,10 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
 
   private activeConnections = new Map<string, { userId?: string; auctionRooms: Set<string> }>();
 
-  constructor(private auctionsService: AuctionsService) {}
+  constructor(
+    @Inject(forwardRef(() => AuctionsService))
+    private auctionsService: AuctionsService,
+  ) {}
 
   afterInit(server: Server) {
     console.log('Auction WebSocket Gateway initialized');
@@ -232,18 +235,52 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   }
 
   /**
+   * Broadcast watch count update to auction room
+   * Called when watchlist is toggled
+   */
+  async broadcastWatchCountUpdate(auctionId: string, watchCount: number) {
+    const roomName = `auction_${auctionId}`;
+
+    this.server.to(roomName).emit('watch_count_updated', {
+      auction_id: auctionId,
+      watch_count: watchCount,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Broadcast view count update to auction room
+   * Called when auction is viewed
+   */
+  async broadcastViewCountUpdate(auctionId: string, viewCount: number) {
+    const roomName = `auction_${auctionId}`;
+
+    this.server.to(roomName).emit('view_count_updated', {
+      auction_id: auctionId,
+      view_count: viewCount,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
    * Broadcast auction status change
    * Called from scheduler service
+   * Broadcasts to both the specific auction room AND all connected clients (for discovery screen)
    */
   async broadcastAuctionStatusChange(auctionId: string, status: string, data?: any) {
     const roomName = `auction_${auctionId}`;
-
-    this.server.to(roomName).emit('auction_status_changed', {
+    const statusChangeEvent = {
       auction_id: auctionId,
       status,
       ...data,
       timestamp: new Date().toISOString(),
-    });
+    };
+
+    // Broadcast to specific auction room (for users viewing that auction)
+    this.server.to(roomName).emit('auction_status_changed', statusChangeEvent);
+
+    // Also broadcast globally (for discovery screen to receive all status changes)
+    this.server.emit('auction_status_changed', statusChangeEvent);
   }
 
   /**

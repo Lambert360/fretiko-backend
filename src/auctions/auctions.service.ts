@@ -203,11 +203,33 @@ export class AuctionsService {
       auction = auctionsWithUserData[0];
     }
 
-    // Increment view count
-    await this.supabase
+    // Increment view count and fetch updated value
+    const { error: updateError } = await this.serviceSupabase
       .from('auctions')
       .update({ view_count: auction.view_count + 1 })
       .eq('id', id);
+
+    if (!updateError) {
+      // Fetch updated view_count
+      const { data: updatedStats } = await this.serviceSupabase
+        .from('auctions')
+        .select('view_count')
+        .eq('id', id)
+        .single();
+
+      if (updatedStats) {
+        // Update the auction object with the new view_count
+        auction.view_count = updatedStats.view_count;
+
+        // Broadcast view count update via WebSocket
+        try {
+          await this.auctionGateway.broadcastViewCountUpdate(id, updatedStats.view_count);
+        } catch (error) {
+          console.error(`[Auction ${id}] Error broadcasting view count update:`, error);
+          // Don't throw - WebSocket broadcast failure shouldn't fail the request
+        }
+      }
+    }
 
     return auction;
   }
@@ -413,7 +435,7 @@ export class AuctionsService {
     try {
       const { data: auctionStats, error: statsError } = await this.serviceSupabase
         .from('auctions')
-        .select('current_bid, total_bids, unique_bidders')
+        .select('current_bid, total_bids, unique_bidders, view_count, watch_count')
         .eq('id', placeBidDto.auction_id)
         .single();
 
@@ -424,6 +446,8 @@ export class AuctionsService {
           current_bid: auctionStats.current_bid,
           total_bids: auctionStats.total_bids,
           unique_bidders: auctionStats.unique_bidders,
+          view_count: auctionStats.view_count,
+          watch_count: auctionStats.watch_count,
           is_winning: true,
         });
       }
@@ -432,9 +456,10 @@ export class AuctionsService {
       // Don't throw - WebSocket broadcast failure shouldn't fail the bid
     }
 
-    // Process proxy bids only if this is a manual bid (not a proxy counter-bid)
-    // Proxy counter-bids are identified by checking if we're already processing this auction
-    if (placeBidDto.bid_type !== 'proxy' && !this.processingProxyBids.has(placeBidDto.auction_id)) {
+    // Process proxy bids for ANY bid type (both manual and proxy bids should trigger proxy processing)
+    // This allows proxy bidders to counter-bid when other proxy bids are placed
+    // Only skip if we're already processing proxy bids for this auction (prevents recursion loops)
+    if (!this.processingProxyBids.has(placeBidDto.auction_id)) {
       // Process proxy bids asynchronously (don't block the response)
       this.processProxyBids(placeBidDto.auction_id, data.amount, data.bidder_id, data.id).catch(err => {
         console.error(`[Auction ${placeBidDto.auction_id}] Error processing proxy bids:`, err);
@@ -446,7 +471,7 @@ export class AuctionsService {
   }
 
   /**
-   * Process proxy bids after a manual bid is placed
+   * Process proxy bids after any bid is placed (manual or proxy)
    * Automatically places counter-bids for proxy bidders who can outbid
    * Uses service role client to bypass RLS for automatic system actions
    */
@@ -476,11 +501,24 @@ export class AuctionsService {
       const bidIncrement = auction.bid_increment;
       const minimumCounterBid = newBidAmount + bidIncrement;
 
+      // Get current winning bidder to exclude them (they're already winning, no need to counter-bid)
+      const { data: currentWinningBid } = await this.serviceSupabase
+        .from('auction_bids')
+        .select('bidder_id, amount')
+        .eq('auction_id', auctionId)
+        .eq('is_winning', true)
+        .eq('is_valid', true)
+        .maybeSingle();
+
+      const currentWinningBidderId = currentWinningBid?.bidder_id;
+
       // Find the highest active ORIGINAL proxy bid where max_bid_amount >= minimum counter bid
       // We only look at original proxy bids (proxy_bid_parent_id IS NULL), not system-generated counter-bids
-      // Exclude the bidder who just placed this bid
+      // Exclude:
+      //   - The bidder who just placed this bid
+      //   - The current winning bidder (they're already winning, no need to counter-bid)
       // Only get the highest one (we'll process one at a time to avoid race conditions)
-      const { data: proxyBids, error: findError } = await this.serviceSupabase
+      let proxyBidsQuery = this.serviceSupabase
         .from('auction_bids')
         .select('id, bidder_id, max_bid_amount, bidder_display_id')
         .eq('auction_id', auctionId)
@@ -488,7 +526,14 @@ export class AuctionsService {
         .eq('is_valid', true)
         .is('proxy_bid_parent_id', null) // Only original proxy bids (not system-generated counter-bids)
         .neq('bidder_id', newBidderId) // Exclude the current bidder
-        .gte('max_bid_amount', minimumCounterBid) // Only those who can outbid
+        .gte('max_bid_amount', minimumCounterBid); // Only those who can outbid
+
+      // Exclude current winning bidder if they exist
+      if (currentWinningBidderId) {
+        proxyBidsQuery = proxyBidsQuery.neq('bidder_id', currentWinningBidderId);
+      }
+
+      const { data: proxyBids, error: findError } = await proxyBidsQuery
         .order('max_bid_amount', { ascending: false })
         .limit(1); // Only process the highest proxy bidder
 
@@ -514,37 +559,37 @@ export class AuctionsService {
       }
 
       // Fetch the latest auction state to ensure we have the correct current_bid
+      // (This accounts for any bids that may have been placed since we started processing)
       const currentAuction = await this.findById(auctionId);
       const currentMinBid = currentAuction.current_bid + currentAuction.bid_increment;
 
-      // Ensure counter-bid still meets minimum (race condition protection)
-      if (counterBidAmount < currentMinBid) {
-        // Recalculate based on current state
-        const recalculatedCounterBid = Math.min(currentMinBid, proxyBid.max_bid_amount);
-        if (recalculatedCounterBid <= currentAuction.current_bid) {
-          return; // Proxy bidder's max is no longer sufficient
-        }
+      // Calculate the final counter-bid amount based on current auction state
+      // Use the higher of: calculated counterBidAmount OR current minimum bid
+      // But never exceed the proxy bidder's max_bid_amount
+      const finalCounterBid = Math.min(
+        Math.max(counterBidAmount, currentMinBid),
+        proxyBid.max_bid_amount
+      );
 
-        // Place counter-bid using the service client (bypasses RLS)
-        await this.placeBidInternal(
-          proxyBid.bidder_id,
-          auctionId,
-          recalculatedCounterBid,
-          proxyBid.max_bid_amount,
-          proxyBid.bidder_display_id,
-          proxyBid.id, // parent proxy bid id
-        );
-      } else {
-        // Place counter-bid using the service client (bypasses RLS)
-        await this.placeBidInternal(
-          proxyBid.bidder_id,
-          auctionId,
-          counterBidAmount,
-          proxyBid.max_bid_amount,
-          proxyBid.bidder_display_id,
-          proxyBid.id, // parent proxy bid id
-        );
+      // Validate: counter-bid must be higher than current winning bid
+      if (finalCounterBid <= currentAuction.current_bid) {
+        return; // Proxy bidder's max is no longer sufficient to beat current bid
       }
+
+      // Validate: counter-bid must be at least the minimum required
+      if (finalCounterBid < currentMinBid) {
+        return; // Counter-bid doesn't meet minimum requirement
+      }
+
+      // Place counter-bid using the service client (bypasses RLS)
+      await this.placeBidInternal(
+        proxyBid.bidder_id,
+        auctionId,
+        finalCounterBid,
+        proxyBid.max_bid_amount,
+        proxyBid.bidder_display_id,
+        proxyBid.id, // parent proxy bid id
+      );
 
       // Recursively process proxy bids for the new counter-bid
       // (in case there are other proxy bidders who can outbid this counter-bid)
@@ -623,7 +668,7 @@ export class AuctionsService {
     try {
       const { data: auctionStats, error: statsError } = await this.serviceSupabase
         .from('auctions')
-        .select('current_bid, total_bids, unique_bidders')
+        .select('current_bid, total_bids, unique_bidders, view_count, watch_count')
         .eq('id', auctionId)
         .single();
 
@@ -634,6 +679,8 @@ export class AuctionsService {
           current_bid: auctionStats.current_bid,
           total_bids: auctionStats.total_bids,
           unique_bidders: auctionStats.unique_bidders,
+          view_count: auctionStats.view_count,
+          watch_count: auctionStats.watch_count,
           is_winning: true,
           is_proxy_bid: true,
         });
@@ -668,31 +715,94 @@ export class AuctionsService {
   /**
    * Add/remove auction from watchlist
    */
-  async toggleWatchlist(userId: string, watchlistDto: WatchlistDto): Promise<{ watched: boolean }> {
-    const { data: existing } = await this.supabase
+  async toggleWatchlist(userId: string, watchlistDto: WatchlistDto, userToken?: string): Promise<{ watched: boolean }> {
+    // Use user token if provided (for RLS compliance), otherwise fall back to service client
+    // The RLS policy requires auth.uid() = user_id, so we need the user's JWT token
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.serviceSupabase;
+    
+    // Check if watchlist entry exists using maybeSingle (returns null if not found)
+    const { data: existing, error: findError } = await client
       .from('auction_watchlist')
       .select('id')
       .eq('user_id', userId)
       .eq('auction_id', watchlistDto.auction_id)
-      .single();
+      .maybeSingle();
+
+    if (findError) {
+      const errorMessage = findError.message || findError.details || 'Unknown database error';
+      throw new BadRequestException(`Failed to check watchlist: ${errorMessage}`);
+    }
 
     if (existing) {
       // Remove from watchlist
-      await this.supabase
+      const { error: deleteError } = await client
         .from('auction_watchlist')
         .delete()
         .eq('id', existing.id);
 
+      if (deleteError) {
+        const errorMessage = deleteError.message || deleteError.details || 'Unknown database error';
+        throw new BadRequestException(`Failed to remove from watchlist: ${errorMessage}`);
+      }
+
+      // Broadcast updated watch count
+      try {
+        const { data: updatedStats } = await this.serviceSupabase
+          .from('auctions')
+          .select('watch_count')
+          .eq('id', watchlistDto.auction_id)
+          .single();
+
+        if (updatedStats) {
+          await this.auctionGateway.broadcastWatchCountUpdate(
+            watchlistDto.auction_id,
+            updatedStats.watch_count
+          );
+        }
+      } catch (error) {
+        console.error('Error broadcasting watch count update:', error);
+        // Don't throw - watch count broadcast failure shouldn't fail the operation
+      }
+
       return { watched: false };
     } else {
       // Add to watchlist
-      await this.supabase
+      // Database foreign key constraint will ensure auction exists
+      const { error: insertError } = await client
         .from('auction_watchlist')
         .insert({
           user_id: userId,
           auction_id: watchlistDto.auction_id,
           notification_enabled: watchlistDto.notification_enabled ?? true,
         });
+
+      if (insertError) {
+        // Check if error is due to invalid auction_id (foreign key violation)
+        if (insertError.code === '23503' || insertError.message?.includes('foreign key')) {
+          throw new NotFoundException('Auction not found');
+        }
+        const errorMessage = insertError.message || insertError.details || 'Unknown database error';
+        throw new BadRequestException(`Failed to add to watchlist: ${errorMessage}`);
+      }
+
+      // Broadcast updated watch count
+      try {
+        const { data: updatedStats } = await this.serviceSupabase
+          .from('auctions')
+          .select('watch_count')
+          .eq('id', watchlistDto.auction_id)
+          .single();
+
+        if (updatedStats) {
+          await this.auctionGateway.broadcastWatchCountUpdate(
+            watchlistDto.auction_id,
+            updatedStats.watch_count
+          );
+        }
+      } catch (error) {
+        console.error('Error broadcasting watch count update:', error);
+        // Don't throw - watch count broadcast failure shouldn't fail the operation
+      }
 
       return { watched: true };
     }
@@ -701,22 +811,53 @@ export class AuctionsService {
   /**
    * Get user's watchlist
    */
-  async getUserWatchlist(userId: string, limit = 50): Promise<AuctionWithDetails[]> {
-    const { data, error } = await this.supabase
+  async getUserWatchlist(userId: string, limit = 50, userToken?: string): Promise<AuctionWithDetails[]> {
+    // Use user token if provided (for RLS compliance), otherwise fall back to service client
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.serviceSupabase;
+    
+    // First, get the auction IDs from the watchlist
+    const { data: watchlistData, error: watchlistError } = await client
       .from('auction_watchlist')
-      .select(`
-        auction_id,
-        auction_summary (*)
-      `)
+      .select('auction_id')
       .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .limit(limit);
 
-    if (error) {
-      throw new Error(`Database error: ${error.message}`);
+    if (watchlistError) {
+      throw new Error(`Database error: ${watchlistError.message}`);
     }
 
-    return (data || []).map(item => item.auction_summary).filter(Boolean);
+    if (!watchlistData || watchlistData.length === 0) {
+      return [];
+    }
+
+    // Extract auction IDs
+    const auctionIds = watchlistData.map(item => item.auction_id);
+
+    // Query auction_summary view with those IDs
+    const { data: auctions, error: auctionsError } = await this.supabase
+      .from('auction_summary')
+      .select('*')
+      .in('id', auctionIds);
+
+    if (auctionsError) {
+      throw new Error(`Database error: ${auctionsError.message}`);
+    }
+
+    if (!auctions || auctions.length === 0) {
+      return [];
+    }
+
+    // Preserve the order from watchlist (most recently added first)
+    const auctionMap = new Map(auctions.map(auction => [auction.id, auction]));
+    const orderedAuctions = auctionIds
+      .map(id => auctionMap.get(id))
+      .filter(Boolean) as AuctionWithDetails[];
+
+    // Add user-specific data (watchlist status, bid status, etc.)
+    const auctionsWithUserData = await this.addUserSpecificData(orderedAuctions, userId);
+
+    return auctionsWithUserData;
   }
 
   /**
@@ -1072,7 +1213,8 @@ export class AuctionsService {
     const auctionIds = auctions.map(a => a.id);
 
     // Check which auctions user is watching
-    const { data: watchedAuctions } = await this.supabase
+    // Use serviceSupabase to bypass RLS since we're already filtering by userId (safe read operation)
+    const { data: watchedAuctions } = await this.serviceSupabase
       .from('auction_watchlist')
       .select('auction_id')
       .eq('user_id', userId)
@@ -1081,7 +1223,8 @@ export class AuctionsService {
     const watchedIds = new Set((watchedAuctions || []).map(w => w.auction_id));
 
     // Check which auctions user has bid on
-    const { data: userBids } = await this.supabase
+    // Use serviceSupabase for consistency (safe read operation, already filtering by userId)
+    const { data: userBids } = await this.serviceSupabase
       .from('auction_bids')
       .select('auction_id')
       .eq('bidder_id', userId)

@@ -19,10 +19,10 @@ import {
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { AuctionsService } from './auctions.service';
-import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto } from './dto';
-import type { WatchlistDto } from './dto';
+import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto, WatchlistDto } from './dto';
 import { AuctionOwnerGuard, AuctionActiveGuard } from './guards';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard'; // Assuming you have this from auth module
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { OptionalJwtAuthGuard } from '../auth/optional-jwt-auth.guard';
 
 /**
  * Auctions Controller
@@ -105,8 +105,10 @@ export class AuctionsController {
 
   /**
    * Get single auction details
+   * Optional authentication - if user is logged in, includes user-specific data (watchlist status, etc.)
    */
   @Get(':id')
+  @UseGuards(OptionalJwtAuthGuard)
   async getAuction(@Param('id') id: string, @Request() req?: any) {
     const userId = req?.user?.sub;
     return this.auctionsService.findById(id, userId);
@@ -188,10 +190,32 @@ export class AuctionsController {
   @Post('watchlist')
   @UseGuards(JwtAuthGuard)
   async toggleWatchlist(
-    @Body(ValidationPipe) watchlistDto: WatchlistDto,
+    @Body() body: any,
     @Request() req: any,
   ) {
-    return this.auctionsService.toggleWatchlist(req.user.sub, watchlistDto);
+    // Debug logging
+    console.log('🔍 toggleWatchlist - req.user:', req.user);
+    console.log('🔍 toggleWatchlist - req.user?.sub:', req.user?.sub);
+    console.log('🔍 toggleWatchlist - body:', body);
+    console.log('🔍 toggleWatchlist - body.auction_id:', body?.auction_id);
+    console.log('🔍 toggleWatchlist - typeof body:', typeof body);
+    
+    if (!req.user || !req.user.sub) {
+      throw new UnauthorizedException('User not authenticated');
+    }
+    
+    // Manually validate and create DTO
+    const watchlistDto: WatchlistDto = {
+      auction_id: body?.auction_id,
+      notification_enabled: body?.notification_enabled !== false,
+    };
+    
+    if (!watchlistDto.auction_id) {
+      throw new BadRequestException('auction_id is required');
+    }
+    
+    // Pass the user token so the service can use createUserSupabaseClient for RLS compliance
+    return this.auctionsService.toggleWatchlist(req.user.sub, watchlistDto, req.supabaseToken);
   }
 
   /**
@@ -202,7 +226,8 @@ export class AuctionsController {
   @UseGuards(JwtAuthGuard)
   async getUserWatchlist(@Request() req: any, @Query('limit') limit?: string) {
     const watchlistLimit = limit ? parseInt(limit) : 50;
-    return this.auctionsService.getUserWatchlist(req.user.sub, watchlistLimit);
+    // Pass the user token so the service can use createUserSupabaseClient for RLS compliance
+    return this.auctionsService.getUserWatchlist(req.user.sub, watchlistLimit, req.supabaseToken);
   }
 
   /**
