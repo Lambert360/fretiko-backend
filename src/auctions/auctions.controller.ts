@@ -17,7 +17,7 @@ import {
   BadRequestException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { FilesInterceptor } from '@nestjs/platform-express';
+import { FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 import { AuctionsService } from './auctions.service';
 import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto, WatchlistDto } from './dto';
 import { AuctionOwnerGuard, AuctionActiveGuard } from './guards';
@@ -132,19 +132,26 @@ export class AuctionsController {
    */
   @Post()
   @UseGuards(JwtAuthGuard)
-  @UseInterceptors(FilesInterceptor('images', 10)) // Max 10 images
+  @UseInterceptors(
+    FileFieldsInterceptor([
+      { name: 'images', maxCount: 10 },
+      { name: 'video', maxCount: 1 }, // Single video for auctions
+    ]),
+  )
   @HttpCode(HttpStatus.CREATED)
   async createAuction(
     @Body() createAuctionDto: CreateAuctionDto,
-    @UploadedFiles() images: Express.Multer.File[],
+    @UploadedFiles() files: { images?: Express.Multer.File[]; video?: Express.Multer.File[] },
     @Request() req: any,
   ) {
-    console.log('📸 Received', images?.length || 0, 'images for auction creation');
+    console.log('📸 Received', files?.images?.length || 0, 'images for auction creation');
+    console.log('🎥 Received', files?.video?.length || 0, 'video for auction creation');
     return this.auctionsService.createAuction(
       req.user.sub,
       createAuctionDto,
       req.supabaseToken,
-      images,
+      files?.images || [],
+      files?.video?.[0], // Single video file
     );
   }
 
@@ -290,7 +297,17 @@ export class AuctionsController {
   @UseGuards(JwtAuthGuard)
   async getMyBids(@Request() req: any) {
     return this.auctionsService.getUserBidHistory(req.user.sub);
-    throw new Error('User bid history not yet implemented');
+  }
+
+  /**
+   * Get auctions that the user has participated in (placed bids)
+   * Returns unique auctions, not individual bids
+   * Requires authentication
+   */
+  @Get('user/my-participated')
+  @UseGuards(JwtAuthGuard)
+  async getMyParticipatedAuctions(@Request() req: any, @Query(ValidationPipe) filters: AuctionFilterDto) {
+    return this.auctionsService.getMyParticipatedAuctions(req.user.sub, filters);
   }
 
   /**
@@ -318,13 +335,4 @@ export class AuctionsController {
     return this.auctionsService.cancelAuction(id, req.user.sub);
   }
 
-  /**
-   * Mark auction as sold and process payment
-   * Requires authentication and ownership
-   */
-  @Post(':id/complete-sale')
-  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
-  async completeSale(@Param('id') id: string, @Request() req: any) {
-    return this.auctionsService.completeAuctionSale(id, req.user.sub);
-  }
 }

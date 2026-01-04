@@ -25,7 +25,7 @@ export class AuctionOwnerGuard implements CanActivate {
         throw new ForbiddenException('Auction not found');
       }
 
-      if (auction.seller_id !== user.id) {
+      if (auction.seller_id !== user.sub) {
         throw new ForbiddenException('You can only modify your own auctions');
       }
 

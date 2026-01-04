@@ -103,6 +103,7 @@ export class OrdersService {
       buyerId: order.buyer_id,
       vendorId: order.vendor_id,
       riderId: order.rider_id,
+      metadata: order.metadata, // ✅ Include metadata for auction_id and other data
       items: order.order_items.map(item => ({
         id: item.id,
         productId: item.product_id,
@@ -192,7 +193,7 @@ export class OrdersService {
     }
 
     const { data, error } = await supabase
-      .from('order_tracking')
+      .from('order_tracking_events')
       .select('*')
       .eq('order_id', orderId)
       .order('timestamp', { ascending: true });
@@ -313,7 +314,7 @@ export class OrdersService {
     // 1) Verify buyer owns order and status is cancellable
     const { data: order, error: fetchError } = await supabase
       .from('orders')
-      .select('id, buyer_id, status')
+      .select('id, buyer_id, status, source, metadata')
       .eq('id', orderId)
       .eq('buyer_id', userId)
       .single();
@@ -351,6 +352,24 @@ export class OrdersService {
 
     if (updateError) {
       throw new Error(`Failed to cancel order: ${updateError.message}`);
+    }
+
+    // 4) Update auction_sales status if this is an auction order
+    if (order.source === 'auction' && order.metadata?.auction_id) {
+      try {
+        await supabase
+          .from('auction_sales')
+          .update({
+            payment_status: 'refunded',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('auction_id', order.metadata.auction_id)
+          .eq('payment_transaction_id', orderId);
+        console.log(`✅ Auction sale updated to refunded`);
+      } catch (error) {
+        console.error('Failed to update auction_sales (non-critical):', error);
+        // Don't throw - auction_sales update is not critical to order cancellation
+      }
     }
   }
 
@@ -659,6 +678,25 @@ export class OrdersService {
     } else if (status === 'delivered') {
       updateData.delivered_at = new Date().toISOString();
       updateData.escrow_release_at = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString(); // 6 hours
+      
+      // Update escrow auto_release_at (24 hours from delivery for dispute window)
+      const { data: escrow } = await supabase
+        .from('escrows')
+        .select('id')
+        .eq('order_id', orderId)
+        .eq('status', 'held')
+        .single();
+      
+      if (escrow) {
+        const autoReleaseAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 hours
+        await supabase
+          .from('escrows')
+          .update({
+            auto_release_at: autoReleaseAt,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', escrow.id);
+      }
     }
 
     const { error } = await supabase
@@ -882,6 +920,24 @@ export class OrdersService {
       } catch (error) {
         console.error('Failed to mark invoice as paid:', error);
         // Don't throw - invoice marking is not critical to order completion
+      }
+    }
+
+    // Update auction_sales status if this is an auction order
+    if (order.source === 'auction' && order.metadata?.auction_id) {
+      try {
+        await supabase
+          .from('auction_sales')
+          .update({
+            payment_status: 'completed',
+            completed_at: new Date().toISOString(),
+          })
+          .eq('auction_id', order.metadata.auction_id)
+          .eq('payment_transaction_id', orderId);
+        console.log(`✅ Auction sale updated to completed`);
+      } catch (error) {
+        console.error('Failed to update auction_sales (non-critical):', error);
+        // Don't throw - auction_sales update is not critical to order completion
       }
     }
 
@@ -1340,19 +1396,47 @@ export class OrdersService {
     };
   }
 
+  /**
+   * Check if user can update order status
+   * 
+   * Order Status Flow:
+   * - Regular orders: created → paid → assigned → in_transit → delivered → completed
+   * - Auction orders: created → paid → [delivered] → completed
+   *   - Auction orders skip delivery workflow (no rider assignment)
+   *   - After payment, vendor/buyer can mark as delivered
+   *   - Escrow release happens automatically after delivery confirmation period
+   * 
+   * @param userId - User attempting to update status
+   * @param order - Order object with buyer_id, seller_id, rider_id, status, source
+   * @param newStatus - New status to transition to
+   */
   private canUserUpdateStatus(userId: string, order: any, newStatus: string): boolean {
-    // Vendor can update to processing/ready_for_pickup
-    if (order.seller_id === userId && ['processing', 'ready_for_pickup'].includes(newStatus)) {
+    // Auction orders have simplified flow - no rider assignment
+    const isAuctionOrder = order.source === 'auction';
+
+    // Vendor can update to processing/ready_for_pickup (for regular orders)
+    // For auction orders, vendor can mark as delivered directly
+    if (order.seller_id === userId) {
+      if (isAuctionOrder && newStatus === 'delivered') {
+        return true;
+      }
+      if (!isAuctionOrder && ['processing', 'ready_for_pickup'].includes(newStatus)) {
+        return true;
+      }
+    }
+
+    // Rider can update to picked_up/delivered (only for regular orders with rider)
+    if (!isAuctionOrder && order.rider_id === userId && ['picked_up', 'in_transit', 'delivered'].includes(newStatus)) {
       return true;
     }
 
-    // Rider can update to picked_up/delivered
-    if (order.rider_id === userId && ['picked_up', 'in_transit', 'delivered'].includes(newStatus)) {
-      return true;
-    }
-
-    // Buyer can confirm receipt
+    // Buyer can confirm receipt (mark as completed)
     if (order.buyer_id === userId && newStatus === 'completed') {
+      return true;
+    }
+
+    // For auction orders, buyer can also mark as delivered if seller hasn't
+    if (isAuctionOrder && order.buyer_id === userId && newStatus === 'delivered') {
       return true;
     }
 

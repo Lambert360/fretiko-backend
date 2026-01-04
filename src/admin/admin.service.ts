@@ -6,6 +6,8 @@ import { AuditAction, AuditEntityType, AuditStatus } from '../audit/dto/audit.dt
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { WalletService } from '../wallet/wallet.service';
 import { EmailService } from '../shared/email.service';
+import { BankAccountService, CreateBankAccountDto, UpdateBankAccountDto } from '../wallet/bank-account.service';
+import { WithdrawRequestDto } from '../wallet/dto/wallet.dto';
 
 /**
  * Admin Service
@@ -24,9 +26,13 @@ export class AdminService {
     @Inject(forwardRef(() => WalletService))
     private walletService: WalletService,
     private emailService: EmailService,
+    private bankAccountService: BankAccountService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
+
+  // Platform wallet user ID constant
+  private readonly PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
 
   /**
    * Verify user is an admin (check user_profiles.role)
@@ -5459,6 +5465,163 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         status: decision === 'approved' ? 'approved' : 'rejected',
       },
     };
+  }
+
+  /**
+   * Get platform wallet balance
+   * Admin-only endpoint to view platform wallet
+   */
+  async getPlatformWallet(adminId: string) {
+    await this.verifyAdmin(adminId);
+    
+    this.logger.log(`Admin ${adminId} fetching platform wallet`);
+    
+    const wallet = await this.walletService.getWallet(this.PLATFORM_USER_ID);
+    
+    return {
+      wallet,
+      platformUserId: this.PLATFORM_USER_ID,
+    };
+  }
+
+  /**
+   * Get platform bank accounts
+   * Admin-only endpoint to view platform bank accounts
+   */
+  async getPlatformBankAccounts(adminId: string) {
+    await this.verifyAdmin(adminId);
+    
+    this.logger.log(`Admin ${adminId} fetching platform bank accounts`);
+    
+    return this.bankAccountService.getUserBankAccounts(this.PLATFORM_USER_ID);
+  }
+
+  /**
+   * Add bank account for platform user
+   * Admin-only endpoint
+   */
+  async addPlatformBankAccount(adminId: string, dto: CreateBankAccountDto) {
+    await this.verifyAdmin(adminId);
+    
+    this.logger.log(`Admin ${adminId} adding bank account for platform`);
+    
+    // Log audit action
+    try {
+      await this.auditService.logAction({
+        staffId: adminId,
+        action: AuditAction.PROCESS_PAYOUT,
+        entityType: AuditEntityType.WALLET,
+        entityId: this.PLATFORM_USER_ID,
+        details: {
+          action: 'add_platform_bank_account',
+          bankName: dto.bankName,
+          accountNumber: dto.accountNumber,
+        },
+        status: AuditStatus.SUCCESS,
+      });
+    } catch (auditError) {
+      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+    }
+    
+    return this.bankAccountService.createBankAccount(this.PLATFORM_USER_ID, dto);
+  }
+
+  /**
+   * Update platform bank account
+   * Admin-only endpoint
+   */
+  async updatePlatformBankAccount(adminId: string, accountId: string, dto: UpdateBankAccountDto) {
+    await this.verifyAdmin(adminId);
+    
+    this.logger.log(`Admin ${adminId} updating platform bank account ${accountId}`);
+    
+    // Log audit action
+    try {
+      await this.auditService.logAction({
+        staffId: adminId,
+        action: AuditAction.PROCESS_PAYOUT,
+        entityType: AuditEntityType.WALLET,
+        entityId: this.PLATFORM_USER_ID,
+        details: {
+          action: 'update_platform_bank_account',
+          accountId,
+        },
+        status: AuditStatus.SUCCESS,
+      });
+    } catch (auditError) {
+      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+    }
+    
+    return this.bankAccountService.updateBankAccount(this.PLATFORM_USER_ID, accountId, dto);
+  }
+
+  /**
+   * Delete platform bank account
+   * Admin-only endpoint
+   */
+  async deletePlatformBankAccount(adminId: string, accountId: string) {
+    await this.verifyAdmin(adminId);
+    
+    this.logger.log(`Admin ${adminId} deleting platform bank account ${accountId}`);
+    
+    // Log audit action
+    try {
+      await this.auditService.logAction({
+        staffId: adminId,
+        action: AuditAction.PROCESS_PAYOUT,
+        entityType: AuditEntityType.WALLET,
+        entityId: this.PLATFORM_USER_ID,
+        details: {
+          action: 'delete_platform_bank_account',
+          accountId,
+        },
+        status: AuditStatus.SUCCESS,
+      });
+    } catch (auditError) {
+      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+    }
+    
+    return this.bankAccountService.deleteBankAccount(this.PLATFORM_USER_ID, accountId);
+  }
+
+  /**
+   * Create withdrawal request for platform wallet
+   * Admin-only endpoint
+   */
+  async createPlatformWithdrawal(adminId: string, dto: WithdrawRequestDto) {
+    await this.verifyAdmin(adminId);
+    
+    this.logger.log(`Admin ${adminId} creating platform withdrawal request: ₣${dto.fretiAmount}`);
+    
+    // Verify bank account belongs to platform user
+    const bankAccount = await this.bankAccountService.getBankAccount(this.PLATFORM_USER_ID, dto.bankAccountId);
+    if (!bankAccount.isActive) {
+      throw new BadRequestException('Bank account is not active');
+    }
+    if (!bankAccount.isVerified) {
+      throw new BadRequestException('Bank account must be verified before withdrawal');
+    }
+    
+    // Log audit action
+    try {
+      await this.auditService.logAction({
+        staffId: adminId,
+        action: AuditAction.PROCESS_PAYOUT,
+        entityType: AuditEntityType.WALLET,
+        entityId: this.PLATFORM_USER_ID,
+        details: {
+          action: 'create_platform_withdrawal',
+          amount: dto.fretiAmount,
+          bankAccountId: dto.bankAccountId,
+        },
+        status: AuditStatus.SUCCESS,
+      });
+    } catch (auditError) {
+      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+    }
+    
+    // Use wallet service to create withdrawal request for platform user
+    return this.walletService.createWithdrawRequest(this.PLATFORM_USER_ID, dto);
   }
 }
 

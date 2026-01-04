@@ -1,6 +1,6 @@
 import { Injectable, BadRequestException, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { WalletService } from '../wallet/wallet.service';
 import { EscrowService } from '../escrow/escrow.service';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
@@ -25,11 +25,13 @@ export class AuctionPaymentService {
     private escrowService: EscrowService,
     private notificationHelper: NotificationHelperService,
   ) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   /**
    * Process winning bid payment after auction ends
+   * NEW: Creates a pending sale record instead of processing payment immediately
+   * Payment will be processed when winner completes checkout
    */
   async processWinningBidPayment(auctionId: string): Promise<{ success: boolean; message: string }> {
     try {
@@ -55,131 +57,40 @@ export class AuctionPaymentService {
         .eq('auction_id', auctionId)
         .single();
 
-      if (existingSale?.payment_status === 'paid') {
+      if (existingSale?.payment_status === 'completed') {
         return { success: true, message: 'Payment already processed' };
       }
 
-      // Check buyer's wallet balance
-      const buyerWallet = await this.walletService.getWallet(auction.winner_id);
+      // Check if order already exists for this auction (prevent duplicate)
+      const { data: existingOrder } = await this.supabase
+        .from('orders')
+        .select('id, status, order_number')
+        .eq('source', 'auction')
+        .eq('metadata->>auction_id', auctionId)
+        .single();
 
-      if (buyerWallet.availableBalance < auction.winning_bid) {
-        // Mark auction as payment failed
-        await this.supabase
-          .from('auction_sales')
-          .upsert({
-            auction_id: auctionId,
-            seller_id: auction.seller_id,
-            buyer_id: auction.winner_id,
-            final_bid_amount: auction.winning_bid,
-            commission_amount: auction.winning_bid * (auction.commission_rate / 100),
-            total_amount: auction.winning_bid,
-            payment_status: 'failed',
-          });
-
-        return { success: false, message: 'Buyer has insufficient funds' };
+      if (existingOrder) {
+        console.log(`Order already exists for auction ${auctionId}: ${existingOrder.order_number}`);
+        // Update auction_sales to link to existing order if not already linked
+        if (existingSale && !existingSale.payment_transaction_id) {
+          await this.supabase
+            .from('auction_sales')
+            .update({
+              payment_status: existingOrder.status === 'paid' ? 'completed' : 'pending',
+              payment_transaction_id: existingOrder.id,
+            })
+            .eq('auction_id', auctionId);
+        }
+        return { success: true, message: 'Order already exists for this auction' };
       }
 
       // Calculate amounts
       const commissionAmount = auction.winning_bid * (auction.commission_rate / 100);
-      const sellerAmount = auction.winning_bid - commissionAmount;
-      const orderNumber = `AUC-${Date.now()}-${Math.random().toString(36).substring(7).toUpperCase()}`;
 
-      console.log(`Processing auction payment - Total: ₣${auction.winning_bid}, Commission: ₣${commissionAmount}, Seller: ₣${sellerAmount}`);
+      console.log(`📋 Creating pending sale for auction ${auctionId} - Winner must complete checkout`);
 
-      // 1. Create order record for auction
-      const { data: order, error: orderError } = await this.supabase
-        .from('orders')
-        .insert({
-          order_number: orderNumber,
-          buyer_id: auction.winner_id,
-          vendor_id: auction.seller_id,
-          total_amount: auction.winning_bid,
-          delivery_fee: 0, // Auctions typically don't include delivery
-          platform_fee: commissionAmount,
-          status: 'pending',
-          escrow_enabled: true,
-          source: 'auction',
-          metadata: {
-            auction_id: auctionId,
-            auction_title: auction.title,
-            final_bid_amount: auction.winning_bid,
-            commission_rate: auction.commission_rate,
-          }
-        })
-        .select()
-        .single();
-
-      if (orderError) {
-        console.error('Error creating order:', orderError);
-        return { success: false, message: 'Failed to create order' };
-      }
-
-      console.log(`✅ Order created: ${order.id}, ${order.order_number}`);
-
-      // 2. Create order item for auction win
-      const { error: orderItemError } = await this.supabase
-        .from('order_items')
-        .insert({
-          order_id: order.id,
-          product_id: null, // Auctions don't have product IDs
-          product_name: auction.title,
-          unit_price: auction.winning_bid,
-          quantity: 1,
-          total_price: auction.winning_bid,
-          product_metadata: {
-            auction_lot: auction.lot_number,
-            description: auction.description,
-          }
-        });
-
-      if (orderItemError) {
-        console.error('Error creating order item:', orderItemError);
-      }
-
-      // 3. Deduct from buyer wallet
-      const { error: deductError } = await this.supabase.rpc(
-        'process_wallet_transaction',
-        {
-          p_user_id: auction.winner_id,
-          p_transaction_type: 'purchase',
-          p_amount: -auction.winning_bid,
-          p_description: `Auction win: ${auction.title}`,
-          p_reference_id: order.id,
-          p_reference_type: 'order'
-        }
-      );
-
-      if (deductError) {
-        console.error('❌ Wallet deduction failed:', deductError);
-        return { success: false, message: 'Failed to process payment' };
-      }
-
-      console.log(`✅ Buyer wallet deducted: ₣${auction.winning_bid}`);
-
-      // 4. Create escrow for buyer protection
-      try {
-        const escrowBreakdown = {
-          totalAmount: auction.winning_bid,
-          vendorAmount: sellerAmount,
-          riderAmount: 0, // No delivery for auctions
-          platformAmount: commissionAmount,
-        };
-
-        await this.escrowService.createEscrow(order.id, escrowBreakdown);
-        console.log(`✅ Escrow created for auction order ${order.order_number}: ₣${auction.winning_bid}`);
-
-        // Update order status to paid
-        await this.supabase
-          .from('orders')
-          .update({ status: 'paid' })
-          .eq('id', order.id);
-
-      } catch (escrowError) {
-        console.error('❌ Escrow creation failed (non-critical):', escrowError);
-        // Continue - payment already processed
-      }
-
-      // 5. Create/update auction sale record
+      // Create/update auction sale record with PENDING status (not completed)
+      // This allows the winner to go through checkout to provide delivery details
       const { data: saleData, error: saleError } = await this.supabase
         .from('auction_sales')
         .upsert({
@@ -189,44 +100,51 @@ export class AuctionPaymentService {
           final_bid_amount: auction.winning_bid,
           commission_amount: commissionAmount,
           total_amount: auction.winning_bid,
-          payment_status: 'paid',
-          payment_transaction_id: order.id, // Link to order
+          payment_status: 'pending', // PENDING - will be completed after checkout
+          payment_transaction_id: null, // Will be set when order is created during checkout
         })
         .select()
         .single();
 
       if (saleError) {
-        console.error('Error creating sale record:', saleError);
+        console.error('Error creating pending sale record:', saleError);
+        return { success: false, message: 'Failed to create sale record' };
       }
 
-      // 6. Notify seller of sale and payment in escrow
+      // Notify buyer that they won and need to complete checkout
+      try {
+        await this.notificationHelper.notifyOrderCreated(auction.winner_id, {
+          id: null, // No order yet
+          order_number: null,
+          total_amount: auction.winning_bid,
+        });
+
+        console.log(`✅ Buyer ${auction.winner_id} notified to complete checkout for auction win`);
+      } catch (notifyError) {
+        console.error('⚠️  Failed to notify buyer (non-critical):', notifyError);
+      }
+
+      // Notify seller that auction sold (but payment pending)
       try {
         await this.notificationHelper.notifyVendorNewOrder(auction.seller_id, {
-          id: order.id,
-          orderNumber: order.order_number,
+          id: null, // No order yet
+          orderNumber: null,
           totalAmount: auction.winning_bid,
           itemCount: 1,
           buyerName: 'Auction Winner',
         });
 
-        await this.notificationHelper.notifyVendorOrderPaid(auction.seller_id, {
-          orderId: order.id,
-          orderNumber: order.order_number,
-          vendorAmount: sellerAmount,
-          escrowId: order.id,
-        });
-
-        console.log(`✅ Seller ${auction.seller_id} notified of auction sale`);
+        console.log(`✅ Seller ${auction.seller_id} notified of auction sale (awaiting checkout)`);
       } catch (notifyError) {
         console.error('⚠️  Failed to notify seller (non-critical):', notifyError);
       }
 
-      console.log(`✅ Auction ${auctionId} payment processed successfully`);
-      return { success: true, message: 'Payment processed successfully' };
+      console.log(`✅ Auction ${auctionId} - Pending sale created. Winner must complete checkout.`);
+      return { success: true, message: 'Pending sale created - winner must complete checkout' };
 
     } catch (error) {
-      console.error('Error processing winning bid payment:', error);
-      return { success: false, message: 'Payment processing failed' };
+      console.error('Error creating pending sale:', error);
+      return { success: false, message: 'Failed to create pending sale' };
     }
   }
 
@@ -241,7 +159,7 @@ export class AuctionPaymentService {
         .eq('auction_id', auctionId)
         .single();
 
-      if (!sale || sale.payment_status !== 'paid') {
+      if (!sale || sale.payment_status !== 'completed') {
         return { success: false, amount: 0 };
       }
 
@@ -271,25 +189,41 @@ export class AuctionPaymentService {
         return { success: false, message: 'Sale record not found' };
       }
 
-      if (sale.payment_status !== 'paid') {
+      if (sale.payment_status !== 'completed') {
         return { success: false, message: 'Payment not yet processed' };
       }
 
-      // Calculate seller amount (minus commission)
-      const sellerAmount = sale.final_bid_amount - sale.commission_amount;
+      if (!sale.payment_transaction_id) {
+        return { success: false, message: 'Order ID not found in sale record' };
+      }
 
-      // TODO: Transfer from escrow to seller wallet
-      // This would integrate with your existing wallet escrow system
+      // Get escrow ID from order
+      const { data: escrow } = await this.supabase
+        .from('escrows')
+        .select('id')
+        .eq('order_id', sale.payment_transaction_id)
+        .single();
+
+      if (!escrow) {
+        return { success: false, message: 'Escrow not found for this order' };
+      }
+
+      // Use EscrowService to release escrow
+      await this.escrowService.releaseEscrow(
+        escrow.id,
+        'Auction sale completed - seller delivered item'
+      );
 
       // Update sale as completed
       await this.supabase
         .from('auction_sales')
         .update({
-          sale_completed_at: new Date().toISOString(),
+          completed_at: new Date().toISOString(),
         })
         .eq('id', sale.id);
 
-      console.log(`Escrow released for auction ${auctionId}: ${sellerAmount} Freti to seller`);
+      const sellerAmount = sale.final_bid_amount - sale.commission_amount;
+      console.log(`Escrow released for auction ${auctionId}: ₣${sellerAmount} Freti to seller`);
 
       return { success: true, message: 'Escrow released to seller' };
 
@@ -314,8 +248,23 @@ export class AuctionPaymentService {
         return { success: false, message: 'Sale record not found' };
       }
 
-      // TODO: Refund buyer from escrow
-      // This would integrate with your existing wallet refund system
+      if (!sale.payment_transaction_id) {
+        return { success: false, message: 'Order ID not found in sale record' };
+      }
+
+      // Get escrow ID from order
+      const { data: escrow } = await this.supabase
+        .from('escrows')
+        .select('id')
+        .eq('order_id', sale.payment_transaction_id)
+        .single();
+
+      if (!escrow) {
+        return { success: false, message: 'Escrow not found for this order' };
+      }
+
+      // Use EscrowService to refund buyer
+      await this.escrowService.refundEscrow(escrow.id, reason);
 
       // Update sale status
       await this.supabase

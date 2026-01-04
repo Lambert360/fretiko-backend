@@ -3,11 +3,13 @@ import { WishlistController } from './wishlist.controller';
 import { WishlistService } from './wishlist.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { ChatModule } from '../chat/chat.module';
+import { EscrowModule } from '../escrow/escrow.module';
 
 @Module({
   imports: [
     NotificationsModule,
     forwardRef(() => ChatModule), // Use forwardRef to avoid circular dependency
+    forwardRef(() => EscrowModule), // EscrowService needed for wishlist orders
   ],
   controllers: [WishlistController],
   providers: [WishlistService],

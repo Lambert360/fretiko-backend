@@ -175,6 +175,25 @@ export class EscrowService {
         }
       }
 
+      // 2b. Credit platform wallet with commission (if applicable)
+      const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
+      if (escrow.platform_amount > 0) {
+        this.logger.log(`Crediting platform wallet with ₣${escrow.platform_amount}`);
+        const { error: platformError } = await this.supabase.rpc('process_wallet_transaction', {
+          p_user_id: PLATFORM_USER_ID,
+          p_transaction_type: 'platform_commission',
+          p_amount: parseFloat(escrow.platform_amount),
+          p_description: `Platform commission for order ${order.order_number}`,
+          p_reference_id: order.id,
+          p_reference_type: 'order',
+        });
+
+        if (platformError) {
+          this.logger.error('Failed to credit platform wallet:', platformError);
+          // Don't throw - vendor/rider already paid, log and continue
+        }
+      }
+
       // 3. Update escrow status
       const { error: updateError } = await this.supabase
         .from('escrows')

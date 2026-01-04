@@ -81,7 +81,7 @@ export class AuctionSchedulerService {
       // Find auctions that should end
       const { data: auctionsToEnd, error } = await this.supabase
         .from('auctions')
-        .select('id, title, seller_id, winner_id, winning_bid, current_bid, reserve_price')
+        .select('id, title, seller_id, winner_id, winning_bid, current_bid, reserve_price, unique_bidders')
         .eq('status', 'active')
         .lte('end_time', now.toISOString());
 
@@ -138,32 +138,75 @@ export class AuctionSchedulerService {
 
   /**
    * Check for soft close extensions (every 30 seconds)
+   * Anti-snipe system: Extends auction end time if bids are placed near the end time
    */
   @Cron('*/30 * * * * *')
   async processSoftCloseExtensions() {
     try {
       const now = new Date();
-      const extensionWindow = new Date(now.getTime() - 5 * 60 * 1000); // 5 minutes ago
+      const extensionWindowSeconds = 300; // 5 minutes window
+      const extensionThreshold = new Date(now.getTime() + extensionWindowSeconds * 1000);
+      const minTimeSinceLastExtension = 60; // Don't extend again if extended within last 60 seconds
 
-      // Find auctions with recent bids near end time that might need extension
-      const { data: auctionsWithRecentBids, error } = await this.supabase
+      // Find active auctions with soft close enabled that are about to end
+      // and have bids within the extension window
+      const { data: activeAuctions, error: auctionsError } = await this.supabase
         .from('auctions')
         .select(`
-          id, end_time, soft_close_enabled, soft_close_extension,
-          auction_bids!inner(created_at)
+          id, 
+          end_time, 
+          soft_close_enabled, 
+          soft_close_extension,
+          updated_at
         `)
         .eq('status', 'active')
         .eq('soft_close_enabled', true)
-        .gte('auction_bids.created_at', extensionWindow.toISOString())
-        .lte('end_time', now.toISOString());
+        .gte('end_time', now.toISOString()) // Not ended yet
+        .lte('end_time', extensionThreshold.toISOString()); // Within extension window
 
-      if (error) {
-        console.error('Error fetching auctions for soft close:', error);
+      if (auctionsError) {
+        console.error('Error fetching auctions for soft close:', auctionsError);
         return;
       }
 
-      for (const auction of auctionsWithRecentBids || []) {
-        await this.extendAuction(auction.id, auction.soft_close_extension);
+      if (!activeAuctions || activeAuctions.length === 0) {
+        return;
+      }
+
+      // For each auction, check if there's a recent bid within the extension window
+      for (const auction of activeAuctions) {
+        const endTime = new Date(auction.end_time);
+        const extensionWindowStart = new Date(endTime.getTime() - extensionWindowSeconds * 1000);
+        
+        // Check if auction was extended recently (within last 60 seconds)
+        // This prevents duplicate extensions from multiple cron runs
+        const lastUpdated = new Date(auction.updated_at);
+        const secondsSinceLastUpdate = (now.getTime() - lastUpdated.getTime()) / 1000;
+        
+        if (secondsSinceLastUpdate < minTimeSinceLastExtension) {
+          // Auction was recently extended, skip to avoid duplicate extensions
+          continue;
+        }
+        
+        // Check for bids within the extension window (5 minutes before end time)
+        const { data: recentBids, error: bidsError } = await this.supabase
+          .from('auction_bids')
+          .select('id, created_at')
+          .eq('auction_id', auction.id)
+          .gte('created_at', extensionWindowStart.toISOString())
+          .lte('created_at', endTime.toISOString())
+          .limit(1);
+
+        if (bidsError) {
+          console.error(`Error checking bids for auction ${auction.id}:`, bidsError);
+          continue;
+        }
+
+        // If there's a recent bid, extend the auction
+        if (recentBids && recentBids.length > 0) {
+          console.log(`🔄 Extending auction ${auction.id} due to recent bid`);
+          await this.extendAuction(auction.id, auction.soft_close_extension);
+        }
       }
 
     } catch (error) {
@@ -286,6 +329,8 @@ export class AuctionSchedulerService {
       // Broadcast auction start
       await this.auctionGateway.broadcastAuctionStatusChange(auctionId, 'active', {
         message: 'Auction has started! Bidding is now open.',
+        seller_id: updatedAuction.seller_id,
+        auction_type: updatedAuction.auction_type,
       });
 
     } catch (error) {
@@ -301,11 +346,12 @@ export class AuctionSchedulerService {
       let newStatus = 'ended';
       let eventMessage = 'Auction has ended.';
 
-      // Check if auction has bids and reserve price is met
+      // Check if auction has bids, reserve price is met, AND minimum 2 unique bidders
       if (auction.current_bid > 0) {
         const reserveMet = !auction.reserve_price || auction.current_bid >= auction.reserve_price;
+        const hasMinimumBidders = (auction.unique_bidders || 0) >= 2;
 
-        if (reserveMet) {
+        if (reserveMet && hasMinimumBidders) {
           newStatus = 'sold';
           eventMessage = `Auction sold! Winning bid: ${auction.current_bid} Freti`;
 
@@ -317,12 +363,16 @@ export class AuctionSchedulerService {
               seller_id: auction.seller_id,
               buyer_id: auction.winner_id,
               final_bid_amount: auction.current_bid,
-              commission_amount: auction.current_bid * 0.05, // 5% commission
+              commission_amount: auction.current_bid * (auction.commission_rate / 100), // Use auction's commission_rate
               total_amount: auction.current_bid,
               payment_status: 'pending',
             });
         } else {
-          eventMessage = `Auction ended. Reserve price not met.`;
+          if (!reserveMet) {
+            eventMessage = `Auction ended. Reserve price not met.`;
+          } else if (!hasMinimumBidders) {
+            eventMessage = `Auction ended. Minimum 2 bidders required (only ${auction.unique_bidders || 0} bidder(s) participated).`;
+          }
         }
       }
 
@@ -360,6 +410,7 @@ export class AuctionSchedulerService {
         message: eventMessage,
         final_bid: auction.current_bid,
         winner_id: auction.winner_id,
+        seller_id: auction.seller_id,
       });
 
       // Send notifications if auction was sold

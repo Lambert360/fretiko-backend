@@ -953,28 +953,30 @@ export class NotificationHelperService {
   /**
    * Notify rider and buyer that order is ready for pickup
    */
-  async notifyOrderReadyForPickup(riderId: string, buyerId: string, orderData: { id: string; orderNumber: string; vendorName?: string }): Promise<void> {
+  async notifyOrderReadyForPickup(riderId: string | null, buyerId: string, orderData: { id: string; orderNumber: string; vendorName?: string }): Promise<void> {
     try {
-      // Notify rider
-      const riderNotification: CreateNotificationDto = {
-        user_id: riderId,
-        type: NotificationType.DELIVERY,
-        title: '📦 Order Ready for Pickup!',
-        message: `Order #${orderData.orderNumber} is ready for pickup${orderData.vendorName ? ` from ${orderData.vendorName}` : ''}. Head to the pickup location.`,
-        priority: NotificationPriority.HIGH,
-        badge: 'READY_FOR_PICKUP',
-        has_actions: true,
-        action_buttons: [
-          { label: 'View Details', type: ActionButtonType.PRIMARY },
-          { label: 'Navigate', type: ActionButtonType.SECONDARY }
-        ],
-        data: {
-          order_id: orderData.id,
-          order_number: orderData.orderNumber
-        }
-      };
+      // Notify rider (only if rider exists, skip for self-pickup orders)
+      if (riderId) {
+        const riderNotification: CreateNotificationDto = {
+          user_id: riderId,
+          type: NotificationType.DELIVERY,
+          title: '📦 Order Ready for Pickup!',
+          message: `Order #${orderData.orderNumber} is ready for pickup${orderData.vendorName ? ` from ${orderData.vendorName}` : ''}. Head to the pickup location.`,
+          priority: NotificationPriority.HIGH,
+          badge: 'READY_FOR_PICKUP',
+          has_actions: true,
+          action_buttons: [
+            { label: 'View Details', type: ActionButtonType.PRIMARY },
+            { label: 'Navigate', type: ActionButtonType.SECONDARY }
+          ],
+          data: {
+            order_id: orderData.id,
+            order_number: orderData.orderNumber
+          }
+        };
 
-      await this.createAndSendNotification(riderNotification);
+        await this.createAndSendNotification(riderNotification);
+      }
 
       // Notify buyer
       const buyerNotification: CreateNotificationDto = {
@@ -995,7 +997,11 @@ export class NotificationHelperService {
       };
 
       await this.createAndSendNotification(buyerNotification);
-      this.logger.log(`Notified rider ${riderId} and buyer ${buyerId} that order ${orderData.orderNumber} is ready`);
+      if (riderId) {
+        this.logger.log(`Notified rider ${riderId} and buyer ${buyerId} that order ${orderData.orderNumber} is ready`);
+      } else {
+        this.logger.log(`Notified buyer ${buyerId} that order ${orderData.orderNumber} is ready (self-pickup)`);
+      }
     } catch (error) {
       this.logger.error('Failed to notify order ready for pickup:', error);
     }

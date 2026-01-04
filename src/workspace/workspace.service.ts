@@ -752,7 +752,7 @@ export class WorkspaceService {
       // ✅ Verify vendor owns order and it's in processing status
       const { data: order, error: fetchError } = await supabaseClient
         .from('orders')
-        .select('id, order_number, rider_id, buyer_id, vendor_id')
+        .select('id, order_number, rider_id, buyer_id, vendor_id, delivery_type')
         .eq('id', orderId)
         .eq('vendor_id', userId)
         .eq('status', 'processing')
@@ -778,6 +778,7 @@ export class WorkspaceService {
       }
 
       // ✅ Notify rider and buyer that order is ready
+      // Skip rider notification for self-pickup orders (rider_id is null)
       try {
         // Get vendor name for notifications
         const { data: vendorProfile } = await supabaseClient
@@ -786,8 +787,11 @@ export class WorkspaceService {
           .eq('id', userId)
           .single();
 
+        // Only notify rider if there's a rider (not self-pickup)
+        const riderId = order.delivery_type === 'pickup' ? null : order.rider_id;
+        
         await this.notificationHelper.notifyOrderReadyForPickup(
-          order.rider_id,
+          riderId,
           order.buyer_id,
           {
             id: orderId,
@@ -795,7 +799,11 @@ export class WorkspaceService {
             vendorName: vendorProfile?.username,
           }
         );
-        console.log(`✅ Notified rider ${order.rider_id} and buyer ${order.buyer_id} that order is ready`);
+        if (riderId) {
+          console.log(`✅ Notified rider ${riderId} and buyer ${order.buyer_id} that order is ready`);
+        } else {
+          console.log(`✅ Notified buyer ${order.buyer_id} that order is ready (self-pickup)`);
+        }
       } catch (notifyError) {
         console.error('Failed to send ready notifications (non-critical):', notifyError);
       }

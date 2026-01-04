@@ -5,6 +5,10 @@ import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto, Wat
 import { Auction, AuctionWithDetails, AuctionBid, AuctionCategory, AuctionCategoryWithStats, PublicBidHistoryItem } from './entities';
 import { WalletService } from '../wallet/wallet.service';
 import { AuctionGateway } from './auction.gateway';
+import ffmpeg from 'fluent-ffmpeg';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 @Injectable()
 export class AuctionsService {
@@ -203,41 +207,145 @@ export class AuctionsService {
       auction = auctionsWithUserData[0];
     }
 
-    // Increment view count and fetch updated value
-    const { error: updateError } = await this.serviceSupabase
+    // Track view count (only for authenticated users, unique per user)
+    if (userId) {
+      try {
+        // Check if user has already viewed this auction
+        const { data: existingView } = await this.serviceSupabase
+          .from('auction_views')
+          .select('id')
+          .eq('auction_id', id)
+          .eq('viewer_id', userId)
+          .single();
+
+        if (!existingView) {
+          // Insert view record (trigger will auto-increment view_count)
+          const { error: insertError } = await this.serviceSupabase
+            .from('auction_views')
+            .insert({
+              auction_id: id,
+              viewer_id: userId,
+            });
+
+          if (!insertError) {
+            // Fetch updated view_count after trigger execution
+            const { data: updatedStats } = await this.serviceSupabase
       .from('auctions')
-      .update({ view_count: auction.view_count + 1 })
-      .eq('id', id);
+              .select('view_count')
+              .eq('id', id)
+              .single();
 
-    if (!updateError) {
-      // Fetch updated view_count
-      const { data: updatedStats } = await this.serviceSupabase
-        .from('auctions')
-        .select('view_count')
-        .eq('id', id)
-        .single();
+            if (updatedStats) {
+              // Update the auction object with the new view_count
+              auction.view_count = updatedStats.view_count;
 
-      if (updatedStats) {
-        // Update the auction object with the new view_count
-        auction.view_count = updatedStats.view_count;
-
-        // Broadcast view count update via WebSocket
-        try {
-          await this.auctionGateway.broadcastViewCountUpdate(id, updatedStats.view_count);
-        } catch (error) {
-          console.error(`[Auction ${id}] Error broadcasting view count update:`, error);
-          // Don't throw - WebSocket broadcast failure shouldn't fail the request
+              // Broadcast view count update via WebSocket
+              try {
+                await this.auctionGateway.broadcastViewCountUpdate(id, updatedStats.view_count);
+              } catch (error) {
+                console.error(`[Auction ${id}] Error broadcasting view count update:`, error);
+                // Don't throw - WebSocket broadcast failure shouldn't fail the request
+              }
+            }
+          } else {
+            // Log error but don't fail the request
+            console.error(`[Auction ${id}] Error recording view for user ${userId}:`, insertError);
+          }
         }
+        // If view already exists, do nothing (view already counted)
+      } catch (error) {
+        // Log error but don't fail the request - view tracking is non-critical
+        console.error(`[Auction ${id}] Error in view tracking:`, error);
       }
     }
+    // If userId is not provided (unauthenticated), don't increment view count
 
     return auction;
   }
 
   /**
+   * Generate a thumbnail from a video file using ffmpeg
+   */
+  private async generateVideoThumbnail(
+    videoFile: Express.Multer.File,
+    userId: string,
+    supabaseClient: any
+  ): Promise<string | null> {
+    return new Promise((resolve, reject) => {
+      // Create temporary paths
+      const tempDir = os.tmpdir();
+      const videoPath = path.join(tempDir, `video-${Date.now()}.mp4`);
+      const thumbnailPath = path.join(tempDir, `thumbnail-${Date.now()}.jpg`);
+
+      try {
+        // Write video buffer to temporary file
+        fs.writeFileSync(videoPath, videoFile.buffer);
+
+        // Extract thumbnail at 1 second mark
+        ffmpeg(videoPath)
+          .screenshots({
+            timestamps: ['00:00:01.000'],
+            filename: path.basename(thumbnailPath),
+            folder: path.dirname(thumbnailPath),
+            size: '640x?', // Maintain aspect ratio
+          })
+          .on('end', async () => {
+            try {
+              // Read the generated thumbnail
+              const thumbnailBuffer = fs.readFileSync(thumbnailPath);
+
+              // Upload thumbnail to Supabase Storage
+              const timestamp = Date.now();
+              const uniqueFileName = `${userId}/${timestamp}-auction-video-thumbnail.jpg`;
+
+              const { error: uploadError } = await supabaseClient.storage
+                .from('media')
+                .upload(uniqueFileName, thumbnailBuffer, {
+                  contentType: 'image/jpeg',
+                  upsert: false,
+                });
+
+              if (uploadError) {
+                console.error('❌ Thumbnail upload error:', uploadError);
+                resolve(null);
+              } else {
+                // Get public URL
+                const { data: urlData } = supabaseClient.storage
+                  .from('media')
+                  .getPublicUrl(uniqueFileName);
+
+                resolve(urlData.publicUrl);
+              }
+
+              // Clean up temporary files
+              fs.unlinkSync(videoPath);
+              fs.unlinkSync(thumbnailPath);
+            } catch (error) {
+              console.error('❌ Error processing thumbnail:', error);
+              // Clean up on error
+              if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+              if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+              resolve(null);
+            }
+          })
+          .on('error', (error) => {
+            console.error('❌ FFmpeg error:', error);
+            // Clean up on error
+            if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+            resolve(null);
+          });
+      } catch (error) {
+        console.error('❌ Error writing video file:', error);
+        if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+        resolve(null);
+      }
+    });
+  }
+
+  /**
    * Create a new auction
    */
-  async createAuction(userId: string, createAuctionDto: CreateAuctionDto, userToken?: string, images?: Express.Multer.File[]): Promise<Auction> {
+  async createAuction(userId: string, createAuctionDto: CreateAuctionDto, userToken?: string, images?: Express.Multer.File[], video?: Express.Multer.File): Promise<Auction> {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     // Verify user is a seller
@@ -305,6 +413,71 @@ export class AuctionsService {
       }
     }
 
+    // Upload video to Supabase Storage if provided
+    let videoUrl: string | undefined = createAuctionDto.video_url;
+    if (video) {
+      console.log(`🎥 Uploading video to Supabase Storage...`);
+
+      // Validate video file type
+      const allowedVideoTypes = ['video/mp4', 'video/quicktime', 'video/x-msvideo'];
+      if (!allowedVideoTypes.includes(video.mimetype)) {
+        throw new BadRequestException('Invalid video file type. Only MP4, MOV, and AVI are allowed.');
+      }
+
+      // Validate video file size (50MB max)
+      const maxVideoSize = 50 * 1024 * 1024; // 50MB
+      if (video.size > maxVideoSize) {
+        throw new BadRequestException('Video file too large. Maximum size is 50MB.');
+      }
+
+      const fileExtension = video.originalname.split('.').pop() || 'mp4';
+      const timestamp = Date.now();
+      const fileName = `${userId}/${timestamp}-auction-video.${fileExtension}`;
+
+      const { data: uploadData, error: uploadError } = await client.storage
+        .from('media')
+        .upload(fileName, video.buffer, {
+          contentType: video.mimetype,
+          cacheControl: '3600',
+        });
+
+      if (uploadError) {
+        console.error('❌ Video upload failed:', uploadError);
+        throw new BadRequestException(`Failed to upload video: ${uploadError.message}`);
+      }
+
+      // Get public URL
+      const { data: publicUrlData } = client.storage
+        .from('media')
+        .getPublicUrl(fileName);
+
+      videoUrl = publicUrlData.publicUrl;
+      console.log(`✅ Video uploaded: ${publicUrlData.publicUrl}`);
+    }
+
+    // Generate thumbnail from video if no images provided
+    let thumbnailUrl: string | null | undefined = createAuctionDto.thumbnail_url;
+    if (imageUrls.length > 0) {
+      // If images provided, use first image as thumbnail
+      thumbnailUrl = imageUrls[0];
+    } else if (video && !createAuctionDto.thumbnail_url) {
+      // If no images but video provided, generate thumbnail from video
+      console.log('📸 No images provided, generating thumbnail from video...');
+      try {
+        const generatedThumbnail = await this.generateVideoThumbnail(video, userId, client);
+        if (generatedThumbnail) {
+          thumbnailUrl = generatedThumbnail;
+          console.log('✅ Video thumbnail generated successfully:', generatedThumbnail);
+        } else {
+          console.warn('⚠️ Failed to generate video thumbnail, using null');
+          thumbnailUrl = null;
+        }
+      } catch (error) {
+        console.error('⚠️ Error generating video thumbnail:', error);
+        thumbnailUrl = null;
+      }
+    }
+
     // Prepare auction data
     const auctionData = {
       seller_id: userId,
@@ -321,8 +494,8 @@ export class AuctionsService {
       soft_close_enabled: createAuctionDto.soft_close_enabled ?? true,
       soft_close_extension: createAuctionDto.soft_close_extension || 300,
       images: imageUrls.length > 0 ? imageUrls : (createAuctionDto.images || []),
-      video_url: createAuctionDto.video_url,
-      thumbnail_url: createAuctionDto.thumbnail_url || (imageUrls.length > 0 ? imageUrls[0] : null),
+      video_url: videoUrl,
+      thumbnail_url: thumbnailUrl,
       stream_url: createAuctionDto.stream_url,
       auctioneer_enabled: createAuctionDto.auctioneer_enabled ?? true,
       crowd_sounds_enabled: createAuctionDto.crowd_sounds_enabled ?? true,
@@ -336,6 +509,15 @@ export class AuctionsService {
 
     if (error) {
       throw new BadRequestException(`Failed to create auction: ${error.message}`);
+    }
+
+    // Broadcast auction creation event for scheduled auctions (so discovery screen can update)
+    if (data.status === 'scheduled') {
+      await this.auctionGateway.broadcastAuctionStatusChange(data.id, 'scheduled', {
+        message: 'New auction created',
+        seller_id: data.seller_id,
+        auction_type: data.auction_type,
+      });
     }
 
     return data;
@@ -440,16 +622,16 @@ export class AuctionsService {
         .single();
 
       if (!statsError && auctionStats) {
-        await this.auctionGateway.broadcastBidUpdate(placeBidDto.auction_id, {
-          amount: data.amount,
-          bidder_display_id: data.bidder_display_id,
+      await this.auctionGateway.broadcastBidUpdate(placeBidDto.auction_id, {
+        amount: data.amount,
+        bidder_display_id: data.bidder_display_id,
           current_bid: auctionStats.current_bid,
           total_bids: auctionStats.total_bids,
           unique_bidders: auctionStats.unique_bidders,
           view_count: auctionStats.view_count,
           watch_count: auctionStats.watch_count,
-          is_winning: true,
-        });
+        is_winning: true,
+      });
       }
     } catch (error) {
       console.error(`[Auction ${placeBidDto.auction_id}] Error broadcasting bid update:`, error);
@@ -579,17 +761,17 @@ export class AuctionsService {
       // Validate: counter-bid must be at least the minimum required
       if (finalCounterBid < currentMinBid) {
         return; // Counter-bid doesn't meet minimum requirement
-      }
+        }
 
-      // Place counter-bid using the service client (bypasses RLS)
-      await this.placeBidInternal(
-        proxyBid.bidder_id,
-        auctionId,
+        // Place counter-bid using the service client (bypasses RLS)
+        await this.placeBidInternal(
+          proxyBid.bidder_id,
+          auctionId,
         finalCounterBid,
-        proxyBid.max_bid_amount,
-        proxyBid.bidder_display_id,
-        proxyBid.id, // parent proxy bid id
-      );
+          proxyBid.max_bid_amount,
+          proxyBid.bidder_display_id,
+          proxyBid.id, // parent proxy bid id
+        );
 
       // Recursively process proxy bids for the new counter-bid
       // (in case there are other proxy bidders who can outbid this counter-bid)
@@ -673,17 +855,17 @@ export class AuctionsService {
         .single();
 
       if (!statsError && auctionStats) {
-        await this.auctionGateway.broadcastBidUpdate(auctionId, {
-          amount: amount,
-          bidder_display_id: bidderDisplayId,
+      await this.auctionGateway.broadcastBidUpdate(auctionId, {
+        amount: amount,
+        bidder_display_id: bidderDisplayId,
           current_bid: auctionStats.current_bid,
           total_bids: auctionStats.total_bids,
           unique_bidders: auctionStats.unique_bidders,
           view_count: auctionStats.view_count,
           watch_count: auctionStats.watch_count,
-          is_winning: true,
-          is_proxy_bid: true,
-        });
+        is_winning: true,
+        is_proxy_bid: true,
+      });
       }
     } catch (error) {
       console.error(`[Auction ${auctionId}] Error broadcasting proxy bid update:`, error);
@@ -881,12 +1063,115 @@ export class AuctionsService {
           end_time
         )
       `)
-      .eq('user_id', userId)
+      .eq('bidder_id', userId)
       .order('created_at', { ascending: false })
       .limit(50);
 
     if (error) throw error;
     return data || [];
+  }
+
+  /**
+   * Get unique auctions that a user has bid on
+   * Returns distinct auctions (not individual bids) with full details
+   */
+  async getMyParticipatedAuctions(userId: string, filters?: AuctionFilterDto): Promise<{ auctions: AuctionWithDetails[]; total: number }> {
+    // First, get distinct auction IDs from auction_bids where user has bid
+    const { data: userBids, error: bidsError } = await this.serviceSupabase
+      .from('auction_bids')
+      .select('auction_id')
+      .eq('bidder_id', userId)
+      .eq('is_valid', true);
+
+    if (bidsError) {
+      throw new Error(`Database error: ${bidsError.message}`);
+    }
+
+    if (!userBids || userBids.length === 0) {
+      return { auctions: [], total: 0 };
+    }
+
+    // Get unique auction IDs
+    const auctionIds = [...new Set(userBids.map(bid => bid.auction_id))];
+
+    // Now fetch auctions from auction_summary
+    let query = this.supabase
+      .from('auction_summary')
+      .select('*')
+      .in('id', auctionIds);
+
+    // Apply filters if provided
+    if (filters) {
+      if (filters.status) {
+        query = query.eq('status', filters.status);
+      }
+
+      if (filters.auction_type) {
+        query = query.eq('auction_type', filters.auction_type);
+      }
+
+      if (filters.category_id) {
+        query = query.eq('category_id', filters.category_id);
+      }
+
+      if (filters.search) {
+        query = query.or(`title.ilike.%${filters.search}%,description.ilike.%${filters.search}%`);
+      }
+
+      // Apply sorting
+      switch (filters.sort) {
+        case 'price_asc':
+          query = query.order('current_bid', { ascending: true });
+          break;
+        case 'price_desc':
+          query = query.order('current_bid', { ascending: false });
+          break;
+        case 'time_asc':
+          query = query.order('end_time', { ascending: true });
+          break;
+        case 'time_desc':
+          query = query.order('end_time', { ascending: false });
+          break;
+        case 'bids_desc':
+          query = query.order('total_bids', { ascending: false });
+          break;
+        case 'created_desc':
+        default:
+          query = query.order('created_at', { ascending: false });
+          break;
+      }
+    } else {
+      // Default sorting: most recent first
+      query = query.order('created_at', { ascending: false });
+    }
+
+    // Get total count
+    const { count } = await this.supabase
+      .from('auction_summary')
+      .select('*', { count: 'exact', head: true })
+      .in('id', auctionIds);
+
+    // Apply pagination
+    const limit = filters?.limit || 50;
+    const offset = filters?.offset || 0;
+    query = query.range(offset, offset + limit - 1);
+
+    const { data: auctions, error: auctionsError } = await query;
+
+    if (auctionsError) {
+      throw new Error(`Database error: ${auctionsError.message}`);
+    }
+
+    // Add user-specific data (watchlist status, etc.)
+    let auctionsWithUserData = auctions || [];
+    if (auctionsWithUserData.length > 0) {
+      auctionsWithUserData = await this.addUserSpecificData(auctionsWithUserData, userId);
+    }
+
+    return {
+      auctions: auctionsWithUserData,
+      total: count || 0,
+    };
   }
 
   /**
@@ -991,8 +1276,8 @@ export class AuctionsService {
       throw new Error('Cannot cancel sold auctions');
     }
 
-    // Check for bids
-    const { count } = await this.supabase
+    // Check for bids using serviceSupabase to bypass RLS
+    const { count } = await this.serviceSupabase
       .from('auction_bids')
       .select('id', { count: 'exact', head: true })
       .eq('auction_id', auctionId);
@@ -1001,118 +1286,29 @@ export class AuctionsService {
       throw new Error('Cannot cancel auction with existing bids. Contact support.');
     }
 
-    // Mark as cancelled
-    const { error } = await this.supabase
+    // Mark as cancelled using serviceSupabase to bypass RLS
+    const { error } = await this.serviceSupabase
       .from('auctions')
       .update({ status: 'cancelled', updated_at: new Date().toISOString() })
       .eq('id', auctionId);
 
     if (error) throw error;
 
+    // Broadcast status change via WebSocket
+    try {
+      await this.auctionGateway.broadcastAuctionStatusChange(auctionId, 'cancelled', {
+        message: 'Auction has been cancelled',
+        seller_id: auction.seller_id,
+      });
+    } catch (error) {
+      console.error(`[Auction ${auctionId}] Error broadcasting cancellation status:`, error);
+      // Don't throw - WebSocket broadcast failure shouldn't fail the cancellation
+    }
+
     return { message: 'Auction cancelled successfully' };
   }
 
-  async completeAuctionSale(auctionId: string, sellerId: string): Promise<{ success: boolean; transactionId?: string }> {
-    // Get auction details
-    const auction = await this.findById(auctionId);
 
-    if (auction.status !== 'sold') {
-      throw new BadRequestException('Auction is not in sold status');
-    }
-
-    if (auction.seller_id !== sellerId) {
-      throw new ForbiddenException('Only the seller can complete the sale');
-    }
-
-    if (!auction.winner_id || !auction.winning_bid) {
-      throw new BadRequestException('No winner found for this auction');
-    }
-
-    try {
-      // Create auction sale record
-      const { data: saleData, error: saleError } = await this.supabase
-        .from('auction_sales')
-        .insert({
-          auction_id: auctionId,
-          seller_id: sellerId,
-          buyer_id: auction.winner_id,
-          final_bid_amount: auction.winning_bid,
-          commission_amount: auction.winning_bid * (auction.commission_rate / 100),
-          total_amount: auction.winning_bid,
-          payment_status: 'pending',
-        })
-        .select()
-        .single();
-
-      if (saleError) {
-        throw new Error(`Failed to create sale record: ${saleError.message}`);
-      }
-
-      // Process payment through wallet system
-      // 1. Transfer from buyer to escrow
-      // 2. Calculate and deduct commission
-      // 3. Transfer remaining to seller
-
-      const commissionAmount = auction.winning_bid * (auction.commission_rate / 100);
-      const sellerAmount = auction.winning_bid - commissionAmount;
-
-      // TODO: Create wallet transaction for auction purchase
-      // This would integrate with the existing wallet transaction system
-
-      // Update auction as sale completed
-      await this.supabase
-        .from('auctions')
-        .update({ sale_completed: true })
-        .eq('id', auctionId);
-
-      return { success: true, transactionId: saleData.id };
-
-    } catch (error) {
-      console.error('Error completing auction sale:', error);
-      throw new BadRequestException('Failed to complete auction sale');
-    }
-  }
-
-  /**
-   * Process winning bid payment (called after auction ends)
-   */
-  async processWinningBidPayment(auctionId: string): Promise<{ success: boolean; message: string }> {
-    const auction = await this.findById(auctionId);
-
-    if (!auction.winner_id || !auction.winning_bid) {
-      return { success: false, message: 'No winner to process payment for' };
-    }
-
-    try {
-      // Check if buyer has sufficient balance
-      const buyerWallet = await this.walletService.getWallet(auction.winner_id);
-
-      if (buyerWallet.availableBalance < auction.winning_bid) {
-        // Mark auction as payment failed
-        await this.supabase
-          .from('auction_sales')
-          .update({ payment_status: 'failed' })
-          .eq('auction_id', auctionId);
-
-        return { success: false, message: 'Buyer has insufficient funds' };
-      }
-
-      // Create escrow hold for the winning bid amount
-      // TODO: Integrate with wallet service to create escrow transaction
-
-      // Update payment status
-      await this.supabase
-        .from('auction_sales')
-        .update({ payment_status: 'paid' })
-        .eq('auction_id', auctionId);
-
-      return { success: true, message: 'Payment processed successfully' };
-
-    } catch (error) {
-      console.error('Error processing winning bid payment:', error);
-      return { success: false, message: 'Payment processing failed' };
-    }
-  }
 
   /**
    * Emergency extend auction (Admin only - for critical system failures)

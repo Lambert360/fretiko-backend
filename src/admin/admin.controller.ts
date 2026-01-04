@@ -1,6 +1,8 @@
-import { Controller, Get, Query, Request, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Put, Query, Request, Body, Param, UseGuards, ValidationPipe } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import type { CreateBankAccountDto, UpdateBankAccountDto } from '../wallet/bank-account.service';
+import { WithdrawRequestDto } from '../wallet/dto/wallet.dto';
 
 /**
  * Admin Controller
@@ -45,6 +47,73 @@ export class AdminController {
   @Get('stats')
   async getPlatformStats(@Request() req) {
     return this.adminService.getPlatformStats(req.user.sub);
+  }
+
+  /**
+   * Get platform wallet balance
+   * GET /admin/platform/wallet
+   */
+  @Get('platform/wallet')
+  async getPlatformWallet(@Request() req) {
+    return this.adminService.getPlatformWallet(req.user.sub);
+  }
+
+  /**
+   * Get platform bank accounts
+   * GET /admin/platform/bank-accounts
+   */
+  @Get('platform/bank-accounts')
+  async getPlatformBankAccounts(@Request() req) {
+    return this.adminService.getPlatformBankAccounts(req.user.sub);
+  }
+
+  /**
+   * Add bank account for platform user
+   * POST /admin/platform/bank-accounts
+   */
+  @Post('platform/bank-accounts')
+  async addPlatformBankAccount(
+    @Request() req,
+    @Body(ValidationPipe) dto: CreateBankAccountDto,
+  ) {
+    return this.adminService.addPlatformBankAccount(req.user.sub, dto);
+  }
+
+  /**
+   * Update platform bank account
+   * PUT /admin/platform/bank-accounts/:accountId
+   */
+  @Put('platform/bank-accounts/:accountId')
+  async updatePlatformBankAccount(
+    @Request() req,
+    @Param('accountId') accountId: string,
+    @Body(ValidationPipe) dto: UpdateBankAccountDto,
+  ) {
+    return this.adminService.updatePlatformBankAccount(req.user.sub, accountId, dto);
+  }
+
+  /**
+   * Delete platform bank account
+   * DELETE /admin/platform/bank-accounts/:accountId
+   */
+  @Delete('platform/bank-accounts/:accountId')
+  async deletePlatformBankAccount(
+    @Request() req,
+    @Param('accountId') accountId: string,
+  ) {
+    return this.adminService.deletePlatformBankAccount(req.user.sub, accountId);
+  }
+
+  /**
+   * Create withdrawal request for platform wallet
+   * POST /admin/platform/withdraw
+   */
+  @Post('platform/withdraw')
+  async createPlatformWithdrawal(
+    @Request() req,
+    @Body(ValidationPipe) dto: WithdrawRequestDto,
+  ) {
+    return this.adminService.createPlatformWithdrawal(req.user.sub, dto);
   }
 }
 

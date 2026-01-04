@@ -1354,9 +1354,8 @@ export class AnalyticsService {
         .select(`
           id,
           title,
-          category,
+          category_id,
           status,
-          time_status,
           current_bid,
           winning_bid,
           total_bids,
@@ -1376,6 +1375,32 @@ export class AnalyticsService {
         console.error('Error fetching auctions:', auctionsError);
         throw auctionsError;
       }
+
+      // 1a. Fetch categories to map category_id to category name
+      const { data: categories, error: categoriesError } = await supabaseClient
+        .from('auction_categories')
+        .select('id, name');
+      
+      const categoryMap = new Map<string, string>();
+      if (categories) {
+        categories.forEach(cat => {
+          categoryMap.set(cat.id, cat.name);
+        });
+      }
+
+      // 1b. Compute time_status for each auction (upcoming, active, ended)
+      const now = new Date();
+      const auctionsWithTimeStatus = auctions?.map(auction => ({
+        ...auction,
+        time_status: (() => {
+          const startTime = new Date(auction.start_time);
+          const endTime = new Date(auction.end_time);
+          if (now < startTime) return 'upcoming';
+          if (now >= startTime && now <= endTime) return 'active';
+          return 'ended';
+        })(),
+        category: categoryMap.get(auction.category_id) || 'Uncategorized'
+      })) || [];
 
       // 2. Get auction sales data
       const { data: auctionSales, error: salesError } = await supabaseClient
@@ -1400,15 +1425,15 @@ export class AnalyticsService {
         console.error('Error fetching bids:', bidsError);
       }
 
-      // 4. Calculate metrics
-      const totalAuctions = auctions?.length || 0;
-      const activeAuctions = auctions?.filter(a => a.time_status === 'active').length || 0;
-      const completedAuctions = auctions?.filter(a => a.time_status === 'ended').length || 0;
-      const soldAuctions = auctions?.filter(a => a.status === 'sold').length || 0;
+      // 4. Calculate metrics (use auctionsWithTimeStatus instead of auctions)
+      const totalAuctions = auctionsWithTimeStatus.length || 0;
+      const activeAuctions = auctionsWithTimeStatus.filter(a => a.time_status === 'active').length || 0;
+      const completedAuctions = auctionsWithTimeStatus.filter(a => a.time_status === 'ended').length || 0;
+      const soldAuctions = auctionsWithTimeStatus.filter(a => a.status === 'sold').length || 0;
 
       const totalRevenue = auctionSales?.reduce((sum, sale) => sum + (sale.final_bid_amount || 0), 0) || 0;
       const totalCommission = auctionSales?.reduce((sum, sale) => sum + (sale.commission_amount || 0), 0) || 0;
-      const totalBids = auctions?.reduce((sum, auction) => sum + (auction.total_bids || 0), 0) || 0;
+      const totalBids = auctionsWithTimeStatus.reduce((sum, auction) => sum + (auction.total_bids || 0), 0) || 0;
       const averageBidsPerAuction = totalAuctions > 0 ? totalBids / totalAuctions : 0;
       const averageFinalPrice = soldAuctions > 0 ? totalRevenue / soldAuctions : 0;
       const conversionRate = completedAuctions > 0 ? (soldAuctions / completedAuctions) * 100 : 0;
@@ -1417,8 +1442,8 @@ export class AnalyticsService {
       const uniqueBidders = new Set(allBids?.map(bid => bid.bidder_id) || []).size;
 
       // 5. Get top performing auctions
-      const topAuctions = auctions
-        ?.filter(a => a.status === 'sold')
+      const topAuctions = auctionsWithTimeStatus
+        .filter(a => a.status === 'sold')
         .sort((a, b) => (b.winning_bid || 0) - (a.winning_bid || 0))
         .slice(0, 5)
         .map(a => ({
@@ -1427,23 +1452,23 @@ export class AnalyticsService {
           final_bid: a.winning_bid || 0,
           total_bids: a.total_bids || 0,
           winner_id: a.winner_id || '',
-        })) || [];
+        }));
 
       // 6. Calculate category performance
-      const categoryMap = new Map<string, { auction_count: number; total_revenue: number; total_bids: number }>();
+      const categoryPerformanceMap = new Map<string, { auction_count: number; total_revenue: number; total_bids: number }>();
 
-      auctions?.forEach(auction => {
-        const category = auction.category || 'Uncategorized';
-        const existing = categoryMap.get(category) || { auction_count: 0, total_revenue: 0, total_bids: 0 };
+      auctionsWithTimeStatus.forEach(auction => {
+        const categoryName = auction.category || 'Uncategorized';
+        const existing = categoryPerformanceMap.get(categoryName) || { auction_count: 0, total_revenue: 0, total_bids: 0 };
 
         existing.auction_count += 1;
         existing.total_revenue += auction.status === 'sold' ? (auction.winning_bid || 0) : 0;
         existing.total_bids += auction.total_bids || 0;
 
-        categoryMap.set(category, existing);
+        categoryPerformanceMap.set(categoryName, existing);
       });
 
-      const categoryPerformance = Array.from(categoryMap.entries()).map(([category, stats]) => ({
+      const categoryPerformance = Array.from(categoryPerformanceMap.entries()).map(([category, stats]) => ({
         category,
         auction_count: stats.auction_count,
         total_revenue: stats.total_revenue,
@@ -1451,7 +1476,7 @@ export class AnalyticsService {
       }));
 
       // 7. Generate chart data
-      const chartData = this.generateAuctionChartData(auctions || [], period);
+      const chartData = this.generateAuctionChartData(auctionsWithTimeStatus, period);
 
       // 8. Calculate trends (compare with previous period)
       const previousDateRange = this.getPreviousDateRange(period, date);

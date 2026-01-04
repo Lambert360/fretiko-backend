@@ -4,6 +4,7 @@ import { SupabaseClient } from '@supabase/supabase-js';
 import { createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { CreateInvoiceDto, UpdateInvoiceDto, InvoiceResponseDto, InvoiceItemResponseDto } from './dto/invoice.dto';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { EscrowService } from '../escrow/escrow.service';
 
 @Injectable()
 export class InvoiceService {
@@ -13,6 +14,8 @@ export class InvoiceService {
     private configService: ConfigService,
     @Inject(forwardRef(() => RealtimeGateway))
     private realtimeGateway: RealtimeGateway,
+    @Inject(forwardRef(() => EscrowService))
+    private escrowService: EscrowService,
   ) {
     this.supabase = createServiceSupabaseClient(configService);
   }
@@ -381,7 +384,7 @@ export class InvoiceService {
           vendor_id: invoice.vendorId,
           total_amount: invoice.totalAmount,
           delivery_fee: 0,
-          platform_fee: 0,
+          platform_fee: invoice.totalAmount * 0.02, // 2% platform commission
           status: 'created',
           escrow_enabled: true,
           source: 'invoice',
@@ -420,6 +423,10 @@ export class InvoiceService {
         .eq('id', invoiceId);
 
       if (updateError) throw updateError;
+
+      // Note: Escrow will be created when payment is processed
+      // For now, order is created with escrow_enabled: true
+      // Payment processing should call escrowService.createEscrow() after payment
 
       return { orderId: order.id };
     } catch (error) {

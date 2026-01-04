@@ -4,6 +4,7 @@ import { createSupabaseClient, createUserSupabaseClient } from '../shared/supaba
 import { NotificationsService } from '../notifications/notifications.service';
 import { NotificationType, NotificationPriority } from '../notifications/dto/notification.dto';
 import { ChatService } from '../chat/chat.service';
+import { EscrowService } from '../escrow/escrow.service';
 
 @Injectable()
 export class WishlistService {
@@ -14,6 +15,8 @@ export class WishlistService {
     private notificationsService: NotificationsService,
     @Inject(forwardRef(() => ChatService))
     private chatService: ChatService,
+    @Inject(forwardRef(() => EscrowService))
+    private escrowService: EscrowService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
   }
@@ -1008,12 +1011,10 @@ export class WishlistService {
     // Calculate costs (using same logic as regular checkout)
     const subtotal = wishlistItem.products.price;
     const tax = Math.round(subtotal * 0.075); // 7.5% VAT
-    // Escrow fee - Currently FREE (0%)
-    const escrowRate = 0; // 0% = FREE (change to 0.025 for 2.5%)
-    const minimumEscrowFee = 0; // ₣0 minimum (change to 50 for ₣50 minimum)
-    const escrowFee = Math.max(minimumEscrowFee, Math.round((subtotal + tax) * escrowRate));
     const shipping = subtotal >= 10000 ? 0 : 500; // Free shipping over ₣10,000
-    const total = subtotal + tax + escrowFee + shipping;
+    const total = subtotal + tax + shipping;
+    const platformFee = total * 0.02; // 2% platform commission
+    const deliveryFee = shipping; // Delivery fee is the shipping cost
 
     if (giverWallet.available_balance < total) {
       throw new Error(`Insufficient wallet balance. Need ₣${total.toFixed(2)}, available: ₣${giverWallet.available_balance.toFixed(2)}`);
@@ -1034,20 +1035,21 @@ export class WishlistService {
     // Generate order number
     const orderNumber = `GIFT-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
 
-    // Create the order first
+    // Get vendor_id from product
+    const vendorId = wishlistItem.products.seller_id;
+
+    // Create the order with correct schema
     const { data: createdOrder, error: orderError } = await client
       .from('orders')
       .insert({
-        user_id: giftRecipientId, // Order belongs to recipient
+        buyer_id: giftGiverId, // Gift giver is the buyer
+        vendor_id: vendorId, // Product seller is the vendor
         order_number: orderNumber,
-        status: 'confirmed', // Will be set to confirmed after payment
-        payment_method: 'wallet',
-        use_escrow: true, // Gifts always use escrow
-        subtotal: subtotal,
-        shipping_cost: shipping,
-        tax_amount: tax,
-        escrow_fee: escrowFee,
+        status: 'created', // Start as created, will be updated to paid after payment
+        escrow_enabled: true, // Gifts always use escrow
         total_amount: total,
+        delivery_fee: deliveryFee,
+        platform_fee: platformFee, // 2% platform commission
         rider_id: null, // Will be assigned later
         delivery_type: 'delivery',
         delivery_address: {
@@ -1060,9 +1062,14 @@ export class WishlistService {
         },
         delivery_instructions: giftMessage ? `Gift from ${giverUser.username}: ${giftMessage}` : `Gift from ${giverUser.username}`,
         estimated_delivery: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(), // 3 days
-        order_source: 'gift',
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        source: 'wishlist', // Use 'wishlist' as source
+        metadata: {
+          gift_giver_id: giftGiverId,
+          gift_recipient_id: giftRecipientId,
+          wishlist_item_id: wishlistItemId,
+          gift_message: giftMessage,
+          is_surprise: isSurprise,
+        },
       })
       .select()
       .single();
@@ -1082,8 +1089,12 @@ export class WishlistService {
         quantity: 1,
         unit_price: wishlistItem.products.price,
         total_price: wishlistItem.products.price,
-        seller_id: wishlistItem.products.seller_id,
-        created_at: new Date().toISOString(),
+        product_metadata: {
+          gift_giver: giverUser.username,
+          gift_recipient: recipientUser.username,
+          gift_message: giftMessage,
+          is_surprise: isSurprise,
+        },
       });
 
     if (orderItemError) {
@@ -1123,11 +1134,26 @@ export class WishlistService {
         created_at: new Date().toISOString(),
       });
 
-    // Update order payment status
+    // Create escrow for the order
+    try {
+      const escrowBreakdown = {
+        totalAmount: total,
+        vendorAmount: total - platformFee - deliveryFee,
+        riderAmount: deliveryFee,
+        platformAmount: platformFee,
+      };
+      await this.escrowService.createEscrow(createdOrder.id, escrowBreakdown);
+      console.log(`✅ Escrow created for wishlist gift order ${createdOrder.id}`);
+    } catch (escrowError) {
+      console.error('Failed to create escrow for wishlist order (non-critical):', escrowError);
+      // Don't throw - payment already processed, escrow can be created manually if needed
+    }
+
+    // Update order status to paid
     await client
       .from('orders')
       .update({
-        payment_status: 'paid',
+        status: 'paid',
         updated_at: new Date().toISOString(),
       })
       .eq('id', createdOrder.id);

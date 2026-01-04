@@ -177,10 +177,9 @@ export class CheckoutService {
 
   // Get auction winner checkout summary
   async getAuctionCheckoutSummary(userId: string, auctionId: string, userToken?: string) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    // Get auction details
-    const { data: auction, error: auctionError } = await client
+    // Use service role client to read auction (bypasses RLS)
+    // Authorization is validated below by checking winner_id matches userId
+    const { data: auction, error: auctionError } = await this.supabase
       .from('auctions')
       .select(`
         id,
@@ -189,7 +188,8 @@ export class CheckoutService {
         winner_id,
         seller_id,
         status,
-        time_status,
+        start_time,
+        end_time,
         commission_rate,
         thumbnail_url
       `)
@@ -197,28 +197,48 @@ export class CheckoutService {
       .single();
 
     if (auctionError || !auction) {
+      console.error('Error fetching auction:', auctionError);
       throw new HttpException('Auction not found', HttpStatus.NOT_FOUND);
     }
 
-    // Verify user is the winner
+    // ✅ CRITICAL: Verify user is the winner (authorization check)
     if (auction.winner_id !== userId) {
       throw new HttpException('You are not the winner of this auction', HttpStatus.FORBIDDEN);
     }
 
-    // Verify auction is ended
-    if (auction.time_status !== 'ended') {
+    // Verify auction is ended (check end_time instead of time_status which is a computed field)
+    const now = new Date();
+    const endTime = new Date(auction.end_time);
+    if (endTime > now) {
       throw new HttpException('Auction has not ended yet', HttpStatus.BAD_REQUEST);
     }
 
-    // Check if already paid
-    const { data: existingSale } = await client
+    // Check if sale record exists and its status (use service role client)
+    const { data: existingSale } = await this.supabase
       .from('auction_sales')
-      .select('payment_status')
+      .select('payment_status, payment_transaction_id')
       .eq('auction_id', auctionId)
       .single();
 
-    if (existingSale?.payment_status === 'paid') {
+    // If payment is already completed, don't allow checkout
+    if (existingSale?.payment_status === 'completed') {
       throw new HttpException('Auction already paid for', HttpStatus.BAD_REQUEST);
+    }
+
+    // If order already exists and is paid, don't allow duplicate checkout
+    if (existingSale?.payment_transaction_id) {
+      const { data: existingOrder } = await this.supabase
+        .from('orders')
+        .select('id, order_number, status')
+        .eq('id', existingSale.payment_transaction_id)
+        .single();
+
+      if (existingOrder && existingOrder.status === 'paid') {
+        throw new HttpException(
+          `Order already created for this auction. Order #${existingOrder.order_number}`,
+          HttpStatus.BAD_REQUEST
+        );
+      }
     }
 
     const items = [{
@@ -640,7 +660,7 @@ export class CheckoutService {
       escrow_enabled: orderData.useEscrow || false,  // ✅ Correct column name
       total_amount: actualTotal,
       delivery_fee: actualDeliveryFee,  // ✅ Correct column name
-      platform_fee: actualTotal * 0.05, // 5% platform fee
+      platform_fee: actualTotal * 0.02, // 2% platform fee
       rider_id: riderId,
       delivery_type: orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery',
       delivery_address: {
@@ -670,6 +690,10 @@ export class CheckoutService {
         escrow_fee: orderData.useEscrow ? summary.escrowFee : 0,
         payment_method: orderData.paymentMethodId,
         original_shipping: summary.shipping,
+        // Add auction_id to metadata for easier querying
+        ...(isAuctionOrder && orderData.auctionCheckout ? {
+          auction_id: orderData.auctionCheckout.auctionId,
+        } : {}),
       },
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -686,13 +710,14 @@ export class CheckoutService {
       throw new HttpException('Failed to create order', HttpStatus.INTERNAL_SERVER_ERROR);
     }
 
-    // Create order items - handle BOTH products AND services
+    // Create order items - handle BOTH products AND services AND auctions
     const orderItems = summary.items.map(item => {
       const isService = item.itemType === 'service';
+      const isAuction = item.itemType === 'auction';
       
       return {
         order_id: order.id,
-        product_id: isService ? null : item.id,
+        product_id: isService || isAuction ? null : item.id,
         service_id: isService ? item.id : null,
         product_name: item.name,
         category: item.category || 'General',  // ✅ Store category for countdown calculation
@@ -702,6 +727,11 @@ export class CheckoutService {
         scheduled_date: isService ? item.serviceDate : null,
         scheduled_time: isService ? item.serviceTime : null,
         service_notes: isService ? item.serviceNotes : null,
+        product_metadata: isAuction ? {
+          auction_id: orderData.auctionCheckout?.auctionId,
+          auction_lot: item.product_metadata?.auction_lot,
+          description: item.product_metadata?.description,
+        } : null,
         created_at: new Date().toISOString(),
       };
     });
@@ -828,28 +858,16 @@ export class CheckoutService {
 
     // Handle auction-specific logic
     if (isAuctionOrder && orderData.auctionCheckout) {
-      // Create auction sale record
+      // Update auction sale record to link to order and mark as completed
+      // The sale record was created as 'pending' when auction ended
       await client
         .from('auction_sales')
-        .upsert({
-          auction_id: orderData.auctionCheckout.auctionId,
-          seller_id: summary.sellerId,
-          buyer_id: userId,
-          final_bid_amount: summary.subtotal,
-          commission_amount: summary.commissionFee || 0,
-          total_amount: summary.total,
-          payment_status: 'paid',
-          order_id: order.id,
-        });
-
-      // Update auction status
-      await client
-        .from('auctions')
         .update({
-          payment_status: 'paid',
-          updated_at: new Date().toISOString(),
+          payment_status: 'completed',
+          payment_transaction_id: order.id,
         })
-        .eq('id', orderData.auctionCheckout.auctionId);
+        .eq('auction_id', orderData.auctionCheckout.auctionId)
+        .eq('buyer_id', userId);
     }
 
     // ✅ NOTIFY VENDOR OF NEW ORDER
@@ -1215,7 +1233,7 @@ export class CheckoutService {
       escrow_enabled: orderData.useEscrow || false,
       total_amount: vendorGroup.subtotal,
       delivery_fee: riderAssignment.pricing.total / riderAssignment.vendorIds.length, // Split delivery fee
-      platform_fee: vendorGroup.subtotal * 0.05,
+      platform_fee: vendorGroup.subtotal * 0.02, // 2% platform fee
       rider_id: riderAssignment.rider.id,
       delivery_type: 'delivery',
       delivery_address: orderData.deliveryAddress,
