@@ -789,7 +789,7 @@ export class WorkspaceService {
 
         // Only notify rider if there's a rider (not self-pickup)
         const riderId = order.delivery_type === 'pickup' ? null : order.rider_id;
-        
+
         await this.notificationHelper.notifyOrderReadyForPickup(
           riderId,
           order.buyer_id,

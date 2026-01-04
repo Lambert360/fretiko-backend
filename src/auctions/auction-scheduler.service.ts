@@ -205,7 +205,7 @@ export class AuctionSchedulerService {
         // If there's a recent bid, extend the auction
         if (recentBids && recentBids.length > 0) {
           console.log(`🔄 Extending auction ${auction.id} due to recent bid`);
-          await this.extendAuction(auction.id, auction.soft_close_extension);
+        await this.extendAuction(auction.id, auction.soft_close_extension);
         }
       }
 
@@ -369,7 +369,7 @@ export class AuctionSchedulerService {
             });
         } else {
           if (!reserveMet) {
-            eventMessage = `Auction ended. Reserve price not met.`;
+          eventMessage = `Auction ended. Reserve price not met.`;
           } else if (!hasMinimumBidders) {
             eventMessage = `Auction ended. Minimum 2 bidders required (only ${auction.unique_bidders || 0} bidder(s) participated).`;
           }

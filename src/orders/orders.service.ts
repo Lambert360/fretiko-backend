@@ -1418,7 +1418,7 @@ export class OrdersService {
     // For auction orders, vendor can mark as delivered directly
     if (order.seller_id === userId) {
       if (isAuctionOrder && newStatus === 'delivered') {
-        return true;
+      return true;
       }
       if (!isAuctionOrder && ['processing', 'ready_for_pickup'].includes(newStatus)) {
         return true;
