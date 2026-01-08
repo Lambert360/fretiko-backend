@@ -4,6 +4,8 @@ import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { ConnectionsService } from '../connections/connections.service';
+import { WalletService } from '../wallet/wallet.service';
+import { WalletTransactionType } from '../wallet/constants/transaction-types';
 
 export interface EscrowBreakdown {
   totalAmount: number;
@@ -41,6 +43,7 @@ export class EscrowService {
     private realtimeGateway: RealtimeGateway,
     @Inject(forwardRef(() => ConnectionsService))
     private connectionsService: ConnectionsService,
+    private walletService: WalletService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -51,6 +54,17 @@ export class EscrowService {
   async createEscrow(orderId: string, breakdown: EscrowBreakdown): Promise<Escrow> {
     try {
       this.logger.log(`Creating escrow for order ${orderId}`);
+
+      // ✅ FIX Bug 18: Validate breakdown amounts sum correctly
+      const sum = breakdown.vendorAmount + breakdown.riderAmount + breakdown.platformAmount;
+      const difference = Math.abs(sum - breakdown.totalAmount);
+      if (difference > 0.000001) {
+        this.logger.error(`Invalid escrow breakdown for order ${orderId}: amounts sum to ${sum} but total is ${breakdown.totalAmount}`);
+        throw new HttpException(
+          `Invalid escrow breakdown: amounts sum to ${sum.toFixed(6)} but total is ${breakdown.totalAmount.toFixed(6)}`,
+          HttpStatus.BAD_REQUEST
+        );
+      }
 
       const { data: escrow, error } = await this.supabase
         .from('escrows')
@@ -68,6 +82,11 @@ export class EscrowService {
         .single();
 
       if (error) {
+        // ✅ FIX Bug 21: Better duplicate escrow error handling
+        if (error.code === '23505') { // PostgreSQL unique constraint violation
+          this.logger.warn(`Escrow already exists for order ${orderId}`);
+          throw new HttpException('Escrow already exists for this order', HttpStatus.CONFLICT);
+        }
         this.logger.error(`Failed to create escrow for order ${orderId}:`, error);
         throw new HttpException('Failed to create escrow', HttpStatus.INTERNAL_SERVER_ERROR);
       }
@@ -99,7 +118,7 @@ export class EscrowService {
   /**
    * Release escrow funds to vendor and rider
    */
-  async releaseEscrow(escrowId: string, reason: string): Promise<void> {
+  async releaseEscrow(escrowId: string, reason: string, userId?: string): Promise<void> {
     try {
       this.logger.log(`Releasing escrow ${escrowId}: ${reason}`);
 
@@ -113,7 +132,10 @@ export class EscrowService {
             order_number,
             buyer_id,
             vendor_id,
-            rider_id
+            rider_id,
+            status,
+            delivered_at,
+            order_confirmed_at
           )
         `)
         .eq('id', escrowId)
@@ -126,51 +148,72 @@ export class EscrowService {
 
       const order = escrow.orders;
 
+      // ✅ FIX Bug 16: Validate authorization if userId provided
+      if (userId) {
+        const isVendor = order.vendor_id === userId;
+        const isBuyer = order.buyer_id === userId;
+        const isRider = order.rider_id === userId;
+        
+        // TODO: Check if user is admin (implement admin check when admin system is added)
+        // const isAdmin = await this.isAdmin(userId);
+        
+        if (!isVendor && !isBuyer && !isRider) {
+          throw new HttpException('Unauthorized - only vendor, buyer, or rider can release escrow', HttpStatus.FORBIDDEN);
+        }
+      }
+
+      // ✅ FIX Bug 19: Validate order status before release
+      if (order.status === 'cancelled') {
+        throw new HttpException('Cannot release escrow for cancelled order', HttpStatus.BAD_REQUEST);
+      }
+
+      // For manual releases (not auto-release), validate delivery/confirmation status
+      const isAutoRelease = reason.includes('Auto-released') || reason.includes('Auto-released after delivery confirmation period');
+      const isBuyerConfirmed = reason.includes('Buyer confirmed') || reason.includes('Buyer manually confirmed');
+      
+      if (!isAutoRelease && !isBuyerConfirmed) {
+        // Manual release - must verify order is delivered or confirmed
+        if (!order.delivered_at && !order.order_confirmed_at) {
+          throw new HttpException('Order must be delivered or confirmed before releasing escrow manually', HttpStatus.BAD_REQUEST);
+        }
+      }
+
       // 1. Credit vendor wallet using RPC function (escrow release)
       this.logger.log(`Crediting vendor ${order.vendor_id} with ₣${escrow.vendor_amount}`);
-      const { error: vendorError } = await this.supabase.rpc('process_wallet_transaction', {
-        p_user_id: order.vendor_id,
-        p_transaction_type: 'escrow_release',
-        p_amount: parseFloat(escrow.vendor_amount),
-        p_description: `Escrow release for order ${order.order_number}`,
-        p_reference_id: escrowId,
-        p_reference_type: 'escrow',
-      });
+      const vendorResult = await this.walletService.processWalletTransaction(
+        order.vendor_id,
+        WalletTransactionType.ESCROW_RELEASE,
+        parseFloat(escrow.vendor_amount),
+        `Escrow release for order ${order.order_number}`,
+        order.id,
+        'order',
+      );
 
-      if (vendorError) {
-        this.logger.error('Failed to credit vendor wallet:', vendorError);
-        throw new HttpException('Failed to credit vendor wallet', HttpStatus.INTERNAL_SERVER_ERROR);
+      if (!vendorResult.success) {
+        this.logger.error('Failed to credit vendor wallet:', vendorResult.error);
+        throw new HttpException(
+          `Failed to credit vendor wallet: ${vendorResult.error}`,
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
       }
 
-      // 1b. Create vendor sale transaction for sales tracking
-      const { error: vendorSaleError } = await this.supabase.rpc('process_wallet_transaction', {
-        p_user_id: order.vendor_id,
-        p_transaction_type: 'vendor_sale',
-        p_amount: parseFloat(escrow.vendor_amount),
-        p_description: `Sale for order ${order.order_number}`,
-        p_reference_id: order.id,
-        p_reference_type: 'order',
-      });
-
-      if (vendorSaleError) {
-        this.logger.error('Failed to create vendor sale transaction:', vendorSaleError);
-        // Don't throw error - this is for tracking, not critical
-      }
+      // Note: Sales tracking is already handled internally by 'escrow_release' transaction type
+      // in the process_wallet_transaction RPC function (see add-sales-tracking.sql migration)
 
       // 2. Credit rider wallet (if applicable)
       if (order.rider_id && escrow.rider_amount > 0) {
         this.logger.log(`Crediting rider ${order.rider_id} with ₣${escrow.rider_amount}`);
-        const { error: riderError } = await this.supabase.rpc('process_wallet_transaction', {
-          p_user_id: order.rider_id,
-          p_transaction_type: 'delivery_payment',
-          p_amount: parseFloat(escrow.rider_amount),
-          p_description: `Delivery fee for order ${order.order_number}`,
-          p_reference_id: order.id,
-          p_reference_type: 'order',
-        });
+        const riderResult = await this.walletService.processWalletTransaction(
+          order.rider_id,
+          WalletTransactionType.DELIVERY_PAYMENT,
+          parseFloat(escrow.rider_amount),
+          `Delivery fee for order ${order.order_number}`,
+          order.id,
+          'order',
+        );
 
-        if (riderError) {
-          this.logger.error('Failed to credit rider wallet:', riderError);
+        if (!riderResult.success) {
+          this.logger.error('Failed to credit rider wallet:', riderResult.error);
           // Don't throw - vendor already paid, log and continue
         }
       }
@@ -179,22 +222,25 @@ export class EscrowService {
       const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
       if (escrow.platform_amount > 0) {
         this.logger.log(`Crediting platform wallet with ₣${escrow.platform_amount}`);
-        const { error: platformError } = await this.supabase.rpc('process_wallet_transaction', {
-          p_user_id: PLATFORM_USER_ID,
-          p_transaction_type: 'platform_commission',
-          p_amount: parseFloat(escrow.platform_amount),
-          p_description: `Platform commission for order ${order.order_number}`,
-          p_reference_id: order.id,
-          p_reference_type: 'order',
-        });
+        const platformResult = await this.walletService.processWalletTransaction(
+          PLATFORM_USER_ID,
+          WalletTransactionType.PLATFORM_COMMISSION,
+          parseFloat(escrow.platform_amount),
+          `Platform commission for order ${order.order_number}`,
+          order.id,
+          'order',
+        );
 
-        if (platformError) {
-          this.logger.error('Failed to credit platform wallet:', platformError);
-          // Don't throw - vendor/rider already paid, log and continue
+        if (!platformResult.success) {
+          this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet:', platformResult.error);
+          // ⚠️ Vendor/rider already paid, but platform commission failed
+          // Log as critical for reconciliation - escrow release continues
+          // TODO: Implement reconciliation process for failed platform commissions
+          this.logger.warn(`Platform commission ${escrow.platform_amount} for order ${order.order_number} failed - requires manual reconciliation`);
         }
       }
 
-      // 3. Update escrow status
+      // 3. Update escrow status (with status check to prevent race conditions)
       const { error: updateError } = await this.supabase
         .from('escrows')
         .update({
@@ -203,20 +249,66 @@ export class EscrowService {
           release_reason: reason,
           updated_at: new Date().toISOString(),
         })
-        .eq('id', escrowId);
+        .eq('id', escrowId)
+        .eq('status', 'held'); // ✅ Prevent double-release race condition
 
       if (updateError) {
         this.logger.error('Failed to update escrow status:', updateError);
+        // ⚠️ Wallet transactions already succeeded, but escrow status update failed
+        // This requires manual reconciliation - throw to alert monitoring systems
+        throw new HttpException('Escrow release partially completed - wallet transactions succeeded but status update failed. Manual intervention required.', HttpStatus.INTERNAL_SERVER_ERROR);
       }
 
-      // 4. Update order status to completed
-      await this.supabase
+      // Verify the update succeeded by checking the escrow status
+      const { data: verifyEscrow, error: verifyError } = await this.supabase
+        .from('escrows')
+        .select('status')
+        .eq('id', escrowId)
+        .single();
+
+      if (!verifyError && verifyEscrow && verifyEscrow.status !== 'released') {
+        this.logger.warn(`⚠️ Escrow ${escrowId} status update may have failed - status is still ${verifyEscrow.status} after update`);
+        // Don't throw - wallet transactions already succeeded, but log warning
+        // This could happen if another process changed status between our check and update
+      }
+
+      // 4. Update order status to completed (only if not already cancelled) - ✅ FIX Bug 14
+      const { error: orderUpdateError } = await this.supabase
         .from('orders')
         .update({
           status: 'completed',
           updated_at: new Date().toISOString(),
         })
-        .eq('id', order.id);
+        .eq('id', order.id)
+        .neq('status', 'cancelled'); // Don't overwrite cancelled status
+
+      if (orderUpdateError) {
+        this.logger.warn(`⚠️ Failed to update order status to completed: ${orderUpdateError.message}`);
+        // Don't throw - escrow release already succeeded
+      }
+
+      // 🔥 FIX: Update gift_orders status if this is a gift order
+      const { data: orderData } = await this.supabase
+        .from('orders')
+        .select('source, metadata')
+        .eq('id', order.id)
+        .single();
+
+      if (orderData?.source === 'wishlist' && orderData.metadata?.wishlist_item_id) {
+        try {
+          await this.supabase
+            .from('gift_orders')
+            .update({
+              status: 'delivered',
+              updated_at: new Date().toISOString(),
+            })
+            .eq('order_id', order.id);
+          this.logger.log(`✅ Gift order status updated to delivered`);
+        } catch (error) {
+          this.logger.error('Failed to update gift_orders status (non-critical):', error);
+          // Don't throw - gift_orders update is not critical to escrow release
+        }
+      }
 
       // 5. Send notifications
       await this.notificationHelper.notifyVendorEscrowReleased(
@@ -276,7 +368,7 @@ export class EscrowService {
   /**
    * Refund escrow to buyer
    */
-  async refundEscrow(escrowId: string, reason: string): Promise<void> {
+  async refundEscrow(escrowId: string, reason: string, userId?: string): Promise<void> {
     try {
       this.logger.log(`Refunding escrow ${escrowId}: ${reason}`);
 
@@ -303,31 +395,55 @@ export class EscrowService {
 
       const order = escrow.orders;
 
-      // Credit buyer wallet (refund)
-      this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${escrow.total_amount}`);
-      const { error: refundError } = await this.supabase.rpc('process_wallet_transaction', {
-        p_user_id: order.buyer_id,
-        p_transaction_type: 'refund',
-        p_amount: parseFloat(escrow.total_amount),
-        p_description: `Refund for order ${order.order_number}`,
-        p_reference_id: order.id,
-        p_reference_type: 'order',
-      });
-
-      if (refundError) {
-        this.logger.error('Failed to refund buyer wallet:', refundError);
-        throw new HttpException('Failed to process refund', HttpStatus.INTERNAL_SERVER_ERROR);
+      // ✅ FIX Bug 17: Validate authorization if userId provided
+      if (userId) {
+        const isBuyer = order.buyer_id === userId;
+        const isVendor = order.vendor_id === userId;
+        
+        // TODO: Check if user is admin (implement admin check when admin system is added)
+        // const isAdmin = await this.isAdmin(userId);
+        
+        // Only buyer or vendor (or admin) can request refund
+        if (!isBuyer && !isVendor) {
+          throw new HttpException('Unauthorized - only buyer or vendor can refund escrow', HttpStatus.FORBIDDEN);
+        }
       }
 
-      // Update escrow status
-      await this.supabase
+      // Credit buyer wallet (refund)
+      this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${escrow.total_amount}`);
+      const refundResult = await this.walletService.processWalletTransaction(
+        order.buyer_id,
+        WalletTransactionType.ESCROW_REFUND,
+        parseFloat(escrow.total_amount),
+        `Refund for order ${order.order_number}`,
+        order.id,
+        'order',
+      );
+
+      if (!refundResult.success) {
+        this.logger.error('Failed to refund buyer wallet:', refundResult.error);
+        throw new HttpException(
+          `Failed to process refund: ${refundResult.error}`,
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
+      }
+
+      // Update escrow status (with status check to prevent double-refund)
+      const { error: updateError } = await this.supabase
         .from('escrows')
         .update({
           status: 'refunded',
           refund_reason: reason,
           updated_at: new Date().toISOString(),
         })
-        .eq('id', escrowId);
+        .eq('id', escrowId)
+        .eq('status', 'held'); // ✅ Prevent double-refund race condition
+
+      if (updateError) {
+        this.logger.error('Failed to update escrow status:', updateError);
+        // ⚠️ Refund already processed, but escrow status update failed
+        throw new HttpException('Escrow refund partially completed - refund succeeded but status update failed. Manual intervention required.', HttpStatus.INTERNAL_SERVER_ERROR);
+      }
 
       // Update order status
       await this.supabase
@@ -402,62 +518,97 @@ export class EscrowService {
       const order = escrow.orders;
       const remainingAmount = totalAmount - refundAmount;
 
+      // Helper function to round to 6 decimal places (matching DECIMAL(18,6) precision)
+      const round6 = (value: number): number => Math.round(value * 1000000) / 1000000;
+
       // 1. Refund buyer partial amount
       this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${refundAmount}`);
-      const { error: refundError } = await this.supabase.rpc('process_wallet_transaction', {
-        p_user_id: order.buyer_id,
-        p_transaction_type: 'refund',
-        p_amount: refundAmount,
-        p_description: `Partial refund for order ${order.order_number}: ${reason}`,
-        p_reference_id: order.id,
-        p_reference_type: 'order',
-      });
+      const refundResult = await this.walletService.processWalletTransaction(
+        order.buyer_id,
+        WalletTransactionType.ESCROW_REFUND,
+        round6(refundAmount),
+        `Partial refund for order ${order.order_number}: ${reason}`,
+        order.id,
+        'order',
+      );
 
-      if (refundError) {
-        this.logger.error('Failed to refund buyer wallet:', refundError);
-        throw new HttpException('Failed to process partial refund', HttpStatus.INTERNAL_SERVER_ERROR);
+      if (!refundResult.success) {
+        this.logger.error('Failed to refund buyer wallet:', refundResult.error);
+        throw new HttpException(
+          `Failed to process partial refund: ${refundResult.error}`,
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
       }
 
-      // 2. Calculate vendor and rider amounts proportionally
+      // 2. Calculate vendor and rider amounts proportionally (with rounding fix)
       const vendorProportion = parseFloat(escrow.vendor_amount) / totalAmount;
       const riderProportion = parseFloat(escrow.rider_amount) / totalAmount;
       const platformProportion = parseFloat(escrow.platform_amount) / totalAmount;
 
-      const vendorAmount = remainingAmount * vendorProportion;
-      const riderAmount = remainingAmount * riderProportion;
-      const platformAmount = remainingAmount * platformProportion;
+      // ✅ FIX: Round amounts and ensure sum equals remainingAmount exactly
+      const vendorAmount = round6(remainingAmount * vendorProportion);
+      const riderAmount = round6(remainingAmount * riderProportion);
+      // Platform amount gets any remainder to ensure sum equals remainingAmount exactly
+      const platformAmount = round6(remainingAmount - vendorAmount - riderAmount);
+
+      // Validate sum equals remainingAmount (within floating point tolerance)
+      const sum = round6(vendorAmount + riderAmount + platformAmount);
+      const difference = Math.abs(sum - remainingAmount);
+      if (difference > 0.000001) {
+        this.logger.warn(`⚠️ Partial refund calculation rounding adjustment: ${difference} difference`);
+      }
 
       // 3. Release remaining amount to vendor
       this.logger.log(`Releasing remaining ₣${vendorAmount} to vendor ${order.vendor_id}`);
-      const { error: vendorError } = await this.supabase.rpc('process_wallet_transaction', {
-        p_user_id: order.vendor_id,
-        p_transaction_type: 'escrow_release',
-        p_amount: vendorAmount,
-        p_description: `Partial escrow release for order ${order.order_number} (after partial refund)`,
-        p_reference_id: escrowId,
-        p_reference_type: 'escrow',
-      });
+      const vendorResult = await this.walletService.processWalletTransaction(
+        order.vendor_id,
+        WalletTransactionType.ESCROW_RELEASE,
+        vendorAmount,
+        `Partial escrow release for order ${order.order_number} (after partial refund)`,
+        escrowId,
+        'escrow',
+      );
 
-      if (vendorError) {
-        this.logger.error('Failed to credit vendor wallet:', vendorError);
+      if (!vendorResult.success) {
+        this.logger.error('Failed to credit vendor wallet:', vendorResult.error);
         // Don't throw - buyer already refunded, log and continue
       }
 
       // 4. Release rider amount if applicable
       if (order.rider_id && riderAmount > 0) {
         this.logger.log(`Releasing ₣${riderAmount} to rider ${order.rider_id}`);
-        const { error: riderError } = await this.supabase.rpc('process_wallet_transaction', {
-          p_user_id: order.rider_id,
-          p_transaction_type: 'delivery_payment',
-          p_amount: riderAmount,
-          p_description: `Delivery fee for order ${order.order_number} (partial)`,
-          p_reference_id: order.id,
-          p_reference_type: 'order',
-        });
+        const riderResult = await this.walletService.processWalletTransaction(
+          order.rider_id,
+          WalletTransactionType.DELIVERY_PAYMENT,
+          riderAmount,
+          `Delivery fee for order ${order.order_number} (partial)`,
+          order.id,
+          'order',
+        );
 
-        if (riderError) {
-          this.logger.error('Failed to credit rider wallet:', riderError);
+        if (!riderResult.success) {
+          this.logger.error('Failed to credit rider wallet:', riderResult.error);
           // Don't throw - log and continue
+        }
+      }
+
+      // 4b. Credit platform wallet with commission (if applicable) - ✅ FIX Bug 11
+      const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
+      if (platformAmount > 0) {
+        this.logger.log(`Crediting platform wallet with ₣${platformAmount} (partial refund)`);
+        const platformResult = await this.walletService.processWalletTransaction(
+          PLATFORM_USER_ID,
+          WalletTransactionType.PLATFORM_COMMISSION,
+          platformAmount,
+          `Platform commission for order ${order.order_number} (partial refund)`,
+          order.id,
+          'order',
+        );
+
+        if (!platformResult.success) {
+          this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet:', platformResult.error);
+          this.logger.warn(`Platform commission ${platformAmount} for order ${order.order_number} failed - requires manual reconciliation`);
+          // Don't throw - buyer/vendor/rider already paid, but log as critical
         }
       }
 
@@ -470,10 +621,13 @@ export class EscrowService {
           release_reason: `Partial refund: ${reason}. Refunded ₣${refundAmount}, released ₣${remainingAmount}`,
           updated_at: new Date().toISOString(),
         })
-        .eq('id', escrowId);
+        .eq('id', escrowId)
+        .in('status', ['held', 'dispute']); // ✅ Status check prevents updating if already processed
 
       if (updateError) {
         this.logger.error('Failed to update escrow status:', updateError);
+        // ⚠️ Wallet transactions already succeeded, but escrow status update failed
+        throw new HttpException('Partial refund partially completed - wallet transactions succeeded but status update failed. Manual intervention required.', HttpStatus.INTERNAL_SERVER_ERROR);
       }
 
       // 6. Update order status
@@ -563,45 +717,66 @@ export class EscrowService {
       const order = escrow.orders;
       const vendorAmount = totalAmount - buyerAmount;
 
+      // Helper function to round to 6 decimal places (matching DECIMAL(18,6) precision)
+      const round6 = (value: number): number => Math.round(value * 1000000) / 1000000;
+
       // 1. Refund buyer their portion
       if (buyerAmount > 0) {
         this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${buyerAmount}`);
-        const { error: refundError } = await this.supabase.rpc('process_wallet_transaction', {
-          p_user_id: order.buyer_id,
-          p_transaction_type: 'refund',
-          p_amount: buyerAmount,
-          p_description: `Split resolution for order ${order.order_number}: ${reason}`,
-          p_reference_id: order.id,
-          p_reference_type: 'order',
-        });
+        const refundResult = await this.walletService.processWalletTransaction(
+          order.buyer_id,
+          WalletTransactionType.ESCROW_REFUND,
+          round6(buyerAmount),
+          `Split resolution for order ${order.order_number}: ${reason}`,
+          order.id,
+          'order',
+        );
 
-        if (refundError) {
-          this.logger.error('Failed to refund buyer wallet:', refundError);
-          throw new HttpException('Failed to process buyer refund', HttpStatus.INTERNAL_SERVER_ERROR);
+        if (!refundResult.success) {
+          this.logger.error('Failed to refund buyer wallet:', refundResult.error);
+          throw new HttpException(
+            `Failed to process buyer refund: ${refundResult.error}`,
+            HttpStatus.INTERNAL_SERVER_ERROR
+          );
         }
       }
 
-      // 2. Calculate vendor and rider amounts proportionally from vendor portion
+      // 2. Calculate vendor, rider, and platform amounts proportionally from vendor portion (with rounding fix) - ✅ FIX Bug 12
       const vendorProportion = parseFloat(escrow.vendor_amount) / totalAmount;
       const riderProportion = parseFloat(escrow.rider_amount) / totalAmount;
+      const platformProportion = parseFloat(escrow.platform_amount) / totalAmount;
 
-      const vendorFinalAmount = vendorAmount * vendorProportion;
-      const riderFinalAmount = vendorAmount * riderProportion;
+      // Calculate proportions from the vendor portion (vendorAmount = totalAmount - buyerAmount)
+      // Platform fee comes from vendor's share, so we need to allocate vendorAmount proportionally
+      const totalProportion = vendorProportion + riderProportion + platformProportion;
+      
+      // ✅ FIX: Round amounts and ensure sum equals vendorAmount exactly
+      const vendorFinalAmount = round6(vendorAmount * (vendorProportion / totalProportion));
+      const riderFinalAmount = round6(vendorAmount * (riderProportion / totalProportion));
+      // Platform amount gets any remainder to ensure sum equals vendorAmount exactly
+      const platformFinalAmount = round6(vendorAmount - vendorFinalAmount - riderFinalAmount);
+
+      // Validate sum equals vendorAmount (within floating point tolerance)
+      const sum = round6(vendorFinalAmount + riderFinalAmount + platformFinalAmount);
+      const difference = Math.abs(sum - vendorAmount);
+      if (difference > 0.000001) {
+        this.logger.warn(`⚠️ Split escrow calculation rounding adjustment: ${difference} difference`);
+      }
 
       // 3. Release vendor portion
       if (vendorFinalAmount > 0) {
         this.logger.log(`Releasing ₣${vendorFinalAmount} to vendor ${order.vendor_id}`);
-        const { error: vendorError } = await this.supabase.rpc('process_wallet_transaction', {
-          p_user_id: order.vendor_id,
-          p_transaction_type: 'escrow_release',
-          p_amount: vendorFinalAmount,
-          p_description: `Split escrow release for order ${order.order_number}: ${reason}`,
-          p_reference_id: escrowId,
-          p_reference_type: 'escrow',
-        });
+        const vendorResult = await this.walletService.processWalletTransaction(
+          order.vendor_id,
+          WalletTransactionType.ESCROW_RELEASE,
+          vendorFinalAmount,
+          `Split escrow release for order ${order.order_number}: ${reason}`,
+          escrowId,
+          'escrow',
+        );
 
-        if (vendorError) {
-          this.logger.error('Failed to credit vendor wallet:', vendorError);
+        if (!vendorResult.success) {
+          this.logger.error('Failed to credit vendor wallet:', vendorResult.error);
           // Don't throw - buyer already refunded
         }
       }
@@ -609,18 +784,38 @@ export class EscrowService {
       // 4. Release rider amount if applicable
       if (order.rider_id && riderFinalAmount > 0) {
         this.logger.log(`Releasing ₣${riderFinalAmount} to rider ${order.rider_id}`);
-        const { error: riderError } = await this.supabase.rpc('process_wallet_transaction', {
-          p_user_id: order.rider_id,
-          p_transaction_type: 'delivery_payment',
-          p_amount: riderFinalAmount,
-          p_description: `Delivery fee for order ${order.order_number} (split resolution)`,
-          p_reference_id: order.id,
-          p_reference_type: 'order',
-        });
+        const riderResult = await this.walletService.processWalletTransaction(
+          order.rider_id,
+          WalletTransactionType.DELIVERY_PAYMENT,
+          riderFinalAmount,
+          `Delivery fee for order ${order.order_number} (split resolution)`,
+          order.id,
+          'order',
+        );
 
-        if (riderError) {
-          this.logger.error('Failed to credit rider wallet:', riderError);
+        if (!riderResult.success) {
+          this.logger.error('Failed to credit rider wallet:', riderResult.error);
           // Don't throw - log and continue
+        }
+      }
+
+      // 4b. Credit platform wallet with commission (if applicable) - ✅ FIX Bug 12
+      const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
+      if (platformFinalAmount > 0) {
+        this.logger.log(`Crediting platform wallet with ₣${platformFinalAmount} (split resolution)`);
+        const platformResult = await this.walletService.processWalletTransaction(
+          PLATFORM_USER_ID,
+          WalletTransactionType.PLATFORM_COMMISSION,
+          platformFinalAmount,
+          `Platform commission for order ${order.order_number} (split resolution)`,
+          order.id,
+          'order',
+        );
+
+        if (!platformResult.success) {
+          this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet:', platformResult.error);
+          this.logger.warn(`Platform commission ${platformFinalAmount} for order ${order.order_number} failed - requires manual reconciliation`);
+          // Don't throw - buyer/vendor/rider already paid, but log as critical
         }
       }
 
@@ -630,13 +825,16 @@ export class EscrowService {
         .update({
           status: 'released',
           released_at: new Date().toISOString(),
-          release_reason: `Split resolution: ${reason}. Buyer: ₣${buyerAmount}, Vendor: ₣${vendorFinalAmount}`,
+          release_reason: `Split resolution: ${reason}. Buyer: ₣${buyerAmount}, Vendor: ₣${vendorFinalAmount}, Platform: ₣${platformFinalAmount || 0}`,
           updated_at: new Date().toISOString(),
         })
-        .eq('id', escrowId);
+        .eq('id', escrowId)
+        .in('status', ['held', 'dispute']); // ✅ Status check prevents updating if already processed
 
       if (updateError) {
         this.logger.error('Failed to update escrow status:', updateError);
+        // ⚠️ Wallet transactions already succeeded, but escrow status update failed
+        throw new HttpException('Split resolution partially completed - wallet transactions succeeded but status update failed. Manual intervention required.', HttpStatus.INTERNAL_SERVER_ERROR);
       }
 
       // 6. Update order status
@@ -706,6 +904,7 @@ export class EscrowService {
         .update({
           status: 'dispute',
           dispute_reason: reason,
+          auto_release_at: null, // ✅ Clear auto-release timer when disputing
           updated_at: new Date().toISOString(),
         })
         .eq('id', escrowId)
@@ -742,6 +941,20 @@ export class EscrowService {
       if (error) {
         this.logger.error('Failed to fetch escrows for auto-release:', error);
         return 0;
+      }
+
+      // Check for escrows without auto_release_at (shouldn't happen after fix, but log for visibility)
+      const { data: escrowsWithoutTimer, error: checkError } = await this.supabase
+        .from('escrows')
+        .select('id, order_id, created_at')
+        .eq('status', 'held')
+        .is('auto_release_at', null);
+
+      if (!checkError && escrowsWithoutTimer && escrowsWithoutTimer.length > 0) {
+        this.logger.warn(
+          `⚠️ Found ${escrowsWithoutTimer.length} escrow(s) in 'held' status without auto_release_at. ` +
+          `These may be older escrows created before the fix. Escrow IDs: ${escrowsWithoutTimer.map(e => e.id).join(', ')}`
+        );
       }
 
       if (!escrows || escrows.length === 0) {

@@ -5,6 +5,7 @@ import { LiveStreamGateway } from './live-stream.gateway';
 import { AnalyticsModule } from '../analytics/analytics.module';
 import { EscrowModule } from '../escrow/escrow.module';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { WalletModule } from '../wallet/wallet.module';
 
 /**
  * Live Sales Module
@@ -20,6 +21,7 @@ import { NotificationsModule } from '../notifications/notifications.module';
     AnalyticsModule,
     forwardRef(() => EscrowModule),
     NotificationsModule,
+    WalletModule,
   ],
   controllers: [LiveSalesController],
   providers: [LiveSalesService, LiveStreamGateway],

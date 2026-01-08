@@ -561,7 +561,7 @@ export class NotificationHelperService {
         data: {
           amount: amount,
           order_number: orderNumber,
-          transaction_type: 'escrow_release'
+          transaction_type: 'escrow_release' // WalletTransactionType.ESCROW_RELEASE
         }
       };
 
@@ -592,7 +592,7 @@ export class NotificationHelperService {
         data: {
           amount: amount,
           order_number: orderNumber,
-          transaction_type: 'delivery_payment'
+          transaction_type: 'delivery_payment' // WalletTransactionType.DELIVERY_PAYMENT
         }
       };
 
@@ -653,7 +653,7 @@ export class NotificationHelperService {
           amount: amount,
           order_number: orderNumber,
           reason: reason,
-          transaction_type: 'refund'
+          transaction_type: 'escrow_refund' // WalletTransactionType.ESCROW_REFUND (fixed from 'refund')
         }
       };
 

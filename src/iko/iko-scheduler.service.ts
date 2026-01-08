@@ -46,7 +46,6 @@ export class IkoSchedulerService {
         .select(`
           id,
           username,
-          push_token,
           iko_context
         `)
         .not('iko_context->ongoing_plans', 'is', null)
@@ -83,7 +82,6 @@ export class IkoSchedulerService {
         .select(`
           id,
           username,
-          push_token,
           iko_context
         `)
         .not('iko_context->ongoing_plans', 'is', null)
@@ -120,7 +118,6 @@ export class IkoSchedulerService {
         .select(`
           id,
           username,
-          push_token,
           iko_context
         `)
         .gte('iko_context->conversation_count', 1); // Only users who have used Iko before

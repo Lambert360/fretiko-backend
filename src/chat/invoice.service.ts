@@ -385,7 +385,7 @@ export class InvoiceService {
           total_amount: invoice.totalAmount,
           delivery_fee: 0,
           platform_fee: invoice.totalAmount * 0.02, // 2% platform commission
-          status: 'created',
+          status: 'pending', // ✅ Start as pending so vendor can see it in workspace
           escrow_enabled: true,
           source: 'invoice',
           metadata: { invoiceId: invoice.id, invoiceNumber: invoice.invoiceNumber },

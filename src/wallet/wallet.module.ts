@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
 import { WalletController } from './wallet.controller';
 import { WalletService } from './wallet.service';
 import { PinService } from './pin.service';
@@ -12,7 +13,7 @@ import { WithdrawalValidationService } from './withdrawal-validation.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 
 @Module({
-  imports: [NotificationsModule],
+  imports: [NotificationsModule, ScheduleModule],
   controllers: [WalletController],
   providers: [
     WalletService, 

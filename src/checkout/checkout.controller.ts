@@ -276,6 +276,42 @@ export class CheckoutController {
     }
   }
 
+  // Get wishlist checkout summary
+  @Get('wishlist-summary')
+  async getWishlistCheckoutSummary(
+    @Query('itemIds') itemIds: string,
+    @Request() req,
+  ) {
+    try {
+      if (!itemIds) {
+        throw new HttpException(
+          'Wishlist item IDs are required',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
+      const wishlistItemIds = itemIds.split(',').filter(id => id.trim());
+      if (wishlistItemIds.length === 0) {
+        throw new HttpException(
+          'At least one wishlist item ID is required',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
+      return await this.checkoutService.getWishlistCheckoutSummary(
+        req.user.sub,
+        wishlistItemIds,
+        req.supabaseToken,
+      );
+    } catch (error) {
+      console.error('Error getting wishlist checkout summary:', error);
+      throw new HttpException(
+        error.message || 'Failed to get wishlist checkout summary',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
   // Preview rider assignments for multi-vendor checkout
   @Post('preview-riders')
   async previewRiderAssignments(@Body() previewData: any, @Request() req) {

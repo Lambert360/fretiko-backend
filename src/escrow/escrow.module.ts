@@ -6,11 +6,13 @@ import { EscrowSchedulerService } from './escrow-scheduler.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { ConnectionsModule } from '../connections/connections.module';
+import { WalletModule } from '../wallet/wallet.module';
 
 @Module({
   imports: [
     ConfigModule,
     NotificationsModule,
+    WalletModule,
     forwardRef(() => RealtimeModule),
     forwardRef(() => ConnectionsModule),
   ],

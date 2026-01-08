@@ -7,6 +7,7 @@ import { ChatModule } from '../chat/chat.module';
 import { ConnectionsModule } from '../connections/connections.module';
 import { EscrowModule } from '../escrow/escrow.module';
 import { RewardsModule } from '../rewards/rewards.module';
+import { WalletModule } from '../wallet/wallet.module';
 
 @Module({
   imports: [
@@ -15,7 +16,8 @@ import { RewardsModule } from '../rewards/rewards.module';
     forwardRef(() => ChatModule),
     forwardRef(() => ConnectionsModule),
     forwardRef(() => EscrowModule),
-    forwardRef(() => RewardsModule)
+    forwardRef(() => RewardsModule),
+    WalletModule,
   ],
   controllers: [OrdersController],
   providers: [OrdersService],

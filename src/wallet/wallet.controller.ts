@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, UseGuards, Req, Query, ValidationPipe, Param, Headers, Res, BadRequestException, Put, Delete } from '@nestjs/common';
+import { Controller, Get, Post, Body, UseGuards, Req, Query, ValidationPipe, Param, Headers, Res, BadRequestException, Put, Delete, ForbiddenException } from '@nestjs/common';
 import type { RawBodyRequest } from '@nestjs/common';
 import { Request } from 'express';
 import type { Response } from 'express';
@@ -10,6 +10,7 @@ import type { CreateBankAccountDto, UpdateBankAccountDto } from './bank-account.
 import { PinService } from './pin.service';
 import { ExchangeRateService } from '../shared/exchange-rate.service';
 import { ProcessingTimeService } from './processing-time.service';
+import { WalletReconciliationService } from './wallet-reconciliation.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { EscrowBypassCheckDto, DepositRequestDto, WithdrawRequestDto } from './dto/wallet.dto';
 
@@ -22,6 +23,7 @@ export class WalletController {
     private readonly pinService: PinService,
     private readonly exchangeRateService: ExchangeRateService,
     private readonly processingTimeService: ProcessingTimeService,
+    private readonly walletReconciliationService: WalletReconciliationService,
     private readonly configService: ConfigService,
   ) {}
 
@@ -1029,6 +1031,101 @@ export class WalletController {
     }
 
     return diagnostics;
+  }
+
+  // ================================
+  // RECONCILIATION ENDPOINTS (Admin Only)
+  // ================================
+
+  /**
+   * Trigger manual wallet balance reconciliation
+   * GET /wallet/admin/reconcile
+   * TODO: Add admin guard to restrict access
+   */
+  @Get('admin/reconcile')
+  @UseGuards(JwtAuthGuard)
+  async triggerReconciliation(@Req() req: any) {
+    // TODO: Add admin check
+    // if (!await this.isAdmin(req.user.sub)) {
+    //   throw new ForbiddenException('Admin access required');
+    // }
+
+    console.log('🔧 Manual wallet reconciliation triggered by:', req.user.sub);
+    return this.walletReconciliationService.triggerReconciliation();
+  }
+
+  /**
+   * Trigger manual escrow balance reconciliation
+   * GET /wallet/admin/reconcile/escrow
+   * TODO: Add admin guard to restrict access
+   */
+  @Get('admin/reconcile/escrow')
+  @UseGuards(JwtAuthGuard)
+  async triggerEscrowReconciliation(@Req() req: any) {
+    // TODO: Add admin check
+    // if (!await this.isAdmin(req.user.sub)) {
+    //   throw new ForbiddenException('Admin access required');
+    // }
+
+    console.log('🔧 Manual escrow reconciliation triggered by:', req.user.sub);
+    return this.walletReconciliationService.triggerEscrowReconciliation();
+  }
+
+  /**
+   * Reconcile specific user's wallet
+   * GET /wallet/admin/reconcile/user/:userId
+   * TODO: Add admin guard to restrict access
+   */
+  @Get('admin/reconcile/user/:userId')
+  @UseGuards(JwtAuthGuard)
+  async reconcileUserWallet(@Req() req: any, @Param('userId') userId: string) {
+    // TODO: Add admin check
+    // if (!await this.isAdmin(req.user.sub)) {
+    //   throw new ForbiddenException('Admin access required');
+    // }
+
+    console.log(`🔧 Manual wallet reconciliation for user ${userId} triggered by:`, req.user.sub);
+    return this.walletReconciliationService.reconcileUserWallet(userId);
+  }
+
+  /**
+   * Health check endpoint - verify platform wallet exists
+   * GET /wallet/health/platform-wallet
+   */
+  @Get('health/platform-wallet')
+  async checkPlatformWalletHealth() {
+    const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
+    
+    try {
+      const { data: wallet, error } = await this.walletService['supabase']
+        .from('wallets')
+        .select('id, kyc_status, available_balance, escrow_balance')
+        .eq('user_id', PLATFORM_USER_ID)
+        .single();
+
+      if (error || !wallet) {
+        return {
+          status: 'unhealthy',
+          message: 'Platform wallet not found',
+          error: error?.message,
+        };
+      }
+
+      return {
+        status: 'healthy',
+        walletId: wallet.id,
+        kycStatus: wallet.kyc_status,
+        availableBalance: parseFloat(wallet.available_balance || '0'),
+        escrowBalance: parseFloat(wallet.escrow_balance || '0'),
+        message: 'Platform wallet exists and is operational',
+      };
+    } catch (error: any) {
+      return {
+        status: 'error',
+        message: 'Failed to check platform wallet',
+        error: error.message,
+      };
+    }
   }
 
 }

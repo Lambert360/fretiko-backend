@@ -233,4 +233,36 @@ export class WorkspaceController {
       req.supabaseToken,
     );
   }
+
+  @Get('orders/source/:source')
+  async getOrdersBySource(
+    @Request() req,
+    @Param('source') source: 'regular' | 'live_stream' | 'auction' | 'service_booking',
+  ) {
+    return await this.workspaceService.getOrdersBySource(
+      req.user.sub,
+      source,
+      req.supabaseToken,
+    );
+  }
+
+  @Get('metrics/realtime')
+  async getRealTimeMetrics(@Request() req) {
+    return await this.workspaceService.getRealTimeMetrics(
+      req.user.sub,
+      req.supabaseToken,
+    );
+  }
+
+  @Get('analytics/live-streaming')
+  async getLiveStreamAnalytics(
+    @Request() req,
+    @Query('period') period?: 'today' | 'week' | 'month',
+  ) {
+    return await this.workspaceService.getLiveStreamAnalytics(
+      req.user.sub,
+      period || 'today',
+      req.supabaseToken,
+    );
+  }
 }

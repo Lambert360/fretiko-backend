@@ -548,11 +548,8 @@ export class AuctionsService {
       throw new BadRequestException(`Minimum bid is ${minimumBid} Freti`);
     }
 
-    // Check user's wallet balance
-    const userWallet = await this.walletService.getWallet(userId);
-    if (userWallet.availableBalance < placeBidDto.amount) {
-      throw new BadRequestException('Insufficient wallet balance to place bid');
-    }
+    // ✅ BUG FIX: Removed redundant balance check - validation happens atomically at payment time
+    // This prevents race conditions where balance could change between check and payment processing
 
     // For proxy bids, validate max_bid_amount
     if (placeBidDto.bid_type === 'proxy' && placeBidDto.max_bid_amount) {
@@ -733,12 +730,9 @@ export class AuctionsService {
         return;
       }
 
-      // Check proxy bidder's wallet balance before placing counter-bid
-      const proxyBidderWallet = await this.walletService.getWallet(proxyBid.bidder_id);
-      if (proxyBidderWallet.availableBalance < counterBidAmount) {
-        console.log(`[Auction ${auctionId}] Proxy bidder ${proxyBid.bidder_id} has insufficient balance for counter-bid`);
-        return; // Skip this proxy bidder (they can't afford the counter-bid)
-      }
+      // ✅ BUG FIX: Removed redundant balance check - validation happens atomically at payment time
+      // This prevents race conditions where balance could change between check and payment processing
+      // Note: If proxy bidder has insufficient balance at payment time, the payment will fail and be handled appropriately
 
       // Fetch the latest auction state to ensure we have the correct current_bid
       // (This accounts for any bids that may have been placed since we started processing)

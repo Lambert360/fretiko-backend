@@ -5,6 +5,8 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { NotificationType, NotificationPriority } from '../notifications/dto/notification.dto';
 import { ChatService } from '../chat/chat.service';
 import { EscrowService } from '../escrow/escrow.service';
+import { WalletService } from '../wallet/wallet.service';
+import { WalletTransactionType } from '../wallet/constants/transaction-types';
 
 @Injectable()
 export class WishlistService {
@@ -17,6 +19,7 @@ export class WishlistService {
     private chatService: ChatService,
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
+    private walletService: WalletService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
   }
@@ -138,6 +141,35 @@ export class WishlistService {
     }
 
     return { message: 'Item removed from wishlist' };
+  }
+
+  async removePurchasedItems(userId: string, wishlistItemIds: string[], userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+
+    if (!wishlistItemIds || wishlistItemIds.length === 0) {
+      console.log('💖 No wishlist item IDs provided for removal');
+      return { message: 'No items to remove', removedCount: 0 };
+    }
+
+    console.log('💖 Removing purchased wishlist items for user:', userId, 'itemIds:', wishlistItemIds);
+
+    // Delete wishlist items by their IDs (wishlist.id, not product_id)
+    const { data, error } = await client
+      .from('wishlist')
+      .delete()
+      .eq('user_id', userId)
+      .in('id', wishlistItemIds)
+      .select('id');
+
+    if (error) {
+      console.error('Wishlist remove purchased items error:', error);
+      throw new Error(`Failed to remove purchased items from wishlist: ${error.message}`);
+    }
+
+    const removedCount = data?.length || 0;
+    console.log(`✅ Removed ${removedCount} items from wishlist`);
+
+    return { message: 'Purchased items removed from wishlist', removedCount };
   }
 
   async clearWishlist(userId: string, userToken?: string) {
@@ -948,6 +980,7 @@ export class WishlistService {
           price,
           status,
           quantity,
+          stock_quantity,
           primary_image_url,
           images,
           user_id as seller_id
@@ -986,12 +1019,18 @@ export class WishlistService {
       throw new Error('Gift giver or recipient not found');
     }
 
-    // Check if gift order already exists for this wishlist item
-    const { data: existingGift } = await client
+    // 🔥 FIX: Check if gift order already exists for this wishlist item
+    // Note: This check happens early, but we'll also check right before creating gift_orders record
+    // to prevent race conditions. The final check will use the order_id to ensure atomicity.
+    const { data: existingGift, error: existingGiftError } = await client
       .from('gift_orders')
       .select('id, status')
       .eq('wishlist_item_id', wishlistItemId)
-      .single();
+      .maybeSingle();
+
+    if (existingGiftError && existingGiftError.code !== 'PGRST116') {
+      throw new Error(`Failed to check existing gift order: ${existingGiftError.message}`);
+    }
 
     if (existingGift) {
       throw new Error('A gift order already exists for this wishlist item');
@@ -1008,28 +1047,38 @@ export class WishlistService {
       throw new Error('Gift giver wallet not found');
     }
 
-    // Calculate costs (using same logic as regular checkout)
-    const subtotal = wishlistItem.products.price;
-    const tax = Math.round(subtotal * 0.075); // 7.5% VAT
-    const shipping = subtotal >= 10000 ? 0 : 500; // Free shipping over ₣10,000
-    const total = subtotal + tax + shipping;
-    const platformFee = total * 0.02; // 2% platform commission
-    const deliveryFee = shipping; // Delivery fee is the shipping cost
+    // 🔥 FIX: Gift purchases - buyer pays ONLY item price (no tax, no escrow fee, no platform fee)
+    // Platform fee is deducted from vendor during escrow release, not from buyer
+    const total = wishlistItem.products.price; // ONLY item price
+    const platformFee = total * 0.02; // 2% platform commission (deducted from vendor during escrow release)
+    const deliveryFee = 0; // No delivery fee for buyer in gift purchases
 
     if (giverWallet.available_balance < total) {
       throw new Error(`Insufficient wallet balance. Need ₣${total.toFixed(2)}, available: ₣${giverWallet.available_balance.toFixed(2)}`);
     }
 
-    // Get recipient's default delivery address
-    const { data: deliveryAddress } = await client
+    // 🔥 FIX: Get recipient's default delivery address with better error handling
+    const { data: deliveryAddress, error: addressError } = await client
       .from('delivery_addresses')
       .select('*')
       .eq('user_id', giftRecipientId)
       .eq('is_default', true)
       .single();
 
-    if (!deliveryAddress) {
-      throw new Error('Recipient does not have a default delivery address set');
+    if (addressError || !deliveryAddress) {
+      // Check if recipient has any addresses at all
+      const { data: anyAddress } = await client
+        .from('delivery_addresses')
+        .select('id')
+        .eq('user_id', giftRecipientId)
+        .limit(1)
+        .single();
+
+      if (!anyAddress) {
+        throw new Error(`${recipientUser.username} doesn't have a delivery address set. Please ask them to add an address before sending a gift.`);
+      } else {
+        throw new Error(`${recipientUser.username} doesn't have a default delivery address set. Please ask them to set a default address in their account settings.`);
+      }
     }
 
     // Generate order number
@@ -1045,11 +1094,11 @@ export class WishlistService {
         buyer_id: giftGiverId, // Gift giver is the buyer
         vendor_id: vendorId, // Product seller is the vendor
         order_number: orderNumber,
-        status: 'created', // Start as created, will be updated to paid after payment
+        status: 'pending', // 🔥 FIX: Start as pending (will be confirmed when vendor accepts)
         escrow_enabled: true, // Gifts always use escrow
-        total_amount: total,
-        delivery_fee: deliveryFee,
-        platform_fee: platformFee, // 2% platform commission
+        total_amount: total, // Only item price (no tax, no fees for buyer)
+        delivery_fee: deliveryFee, // 0 for gift purchases
+        platform_fee: platformFee, // 2% platform commission (deducted from vendor during escrow release)
         rider_id: null, // Will be assigned later
         delivery_type: 'delivery',
         delivery_address: {
@@ -1104,68 +1153,316 @@ export class WishlistService {
       throw new Error(`Failed to create order item: ${orderItemError.message}`);
     }
 
-    // Process wallet payment from gift giver
-    const { error: walletDeductError } = await client
-      .from('wallets')
-      .update({
-        available_balance: client.raw(`available_balance - ${total}`),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('user_id', giftGiverId);
+    // 🔥 FIX: Update stock BEFORE payment to prevent race conditions and ensure rollback capability
+    // If stock update fails, we can rollback before payment is processed
+    let stockUpdated = false;
+    try {
+      const { data: currentProduct } = await client
+        .from('products')
+        .select('quantity, stock_quantity')
+        .eq('id', wishlistItem.product_id)
+        .single();
 
-    if (walletDeductError) {
-      console.error('Wallet deduction error:', walletDeductError);
-      // Rollback order and items
+      if (currentProduct) {
+        // Use stock_quantity if available, otherwise use quantity
+        const currentStock = currentProduct.stock_quantity !== null 
+          ? currentProduct.stock_quantity 
+          : currentProduct.quantity;
+
+        if (currentStock !== null && currentStock < 1) {
+          // Rollback order and items
+          await client.from('order_items').delete().eq('order_id', createdOrder.id);
+          await client.from('orders').delete().eq('id', createdOrder.id);
+          throw new Error('Product is out of stock');
+        }
+
+        // Decrement stock atomically using database constraint
+        const newStock = Math.max(0, currentStock - 1);
+        
+        // Build update object conditionally
+        const updateData: any = {
+          quantity: newStock,
+          updated_at: new Date().toISOString(),
+        };
+        
+        // Only update stock_quantity if it exists
+        if (currentProduct.stock_quantity !== null) {
+          updateData.stock_quantity = newStock;
+        }
+
+        // Build query with conditional constraints
+        let updateQuery = client
+          .from('products')
+          .update(updateData)
+          .eq('id', wishlistItem.product_id)
+          .gte('quantity', 1); // Ensure stock is at least 1 before decrementing (prevents negative)
+
+        // Only add stock_quantity constraint if it exists
+        if (currentProduct.stock_quantity !== null) {
+          updateQuery = updateQuery.gte('stock_quantity', 1);
+        }
+
+        const { error: stockUpdateError } = await updateQuery;
+
+        if (stockUpdateError) {
+          console.error('Stock update error:', stockUpdateError);
+          // Rollback order and items
+          await client.from('order_items').delete().eq('order_id', createdOrder.id);
+          await client.from('orders').delete().eq('id', createdOrder.id);
+          throw new Error('Failed to update product stock. Item may be out of stock.');
+        }
+
+        stockUpdated = true;
+        console.log(`✅ Stock updated for product ${wishlistItem.product_id}: ${currentStock} -> ${newStock}`);
+      }
+    } catch (stockError: any) {
+      // Rollback order and items if stock update fails
       await client.from('order_items').delete().eq('order_id', createdOrder.id);
       await client.from('orders').delete().eq('id', createdOrder.id);
+      throw stockError;
+    }
+
+    // 🔥 FIX: Use process_wallet_transaction helper for proper escrow handling (consistent with other flows)
+    const walletResult = await this.walletService.processWalletTransaction(
+      giftGiverId,
+      WalletTransactionType.PURCHASE_HOLD, // Moves money to escrow
+      total,
+      `Gift purchase: ${wishlistItem.products.name} for ${recipientUser.username}`,
+      createdOrder.id,
+      'order',
+    );
+
+    if (!walletResult.success) {
+      console.error('Wallet transaction error:', walletResult.error);
+      // Rollback order, items, and stock
+      await client.from('order_items').delete().eq('order_id', createdOrder.id);
+      await client.from('orders').delete().eq('id', createdOrder.id);
+      
+      // 🔥 FIX: Rollback stock if it was updated
+      if (stockUpdated) {
+        try {
+          const { data: currentProduct } = await client
+            .from('products')
+            .select('quantity, stock_quantity')
+            .eq('id', wishlistItem.product_id)
+            .single();
+          
+          if (currentProduct) {
+            const currentStock = currentProduct.stock_quantity !== null 
+              ? currentProduct.stock_quantity 
+              : currentProduct.quantity;
+            
+            await client
+              .from('products')
+              .update({
+                quantity: currentStock !== null ? currentStock + 1 : null,
+                stock_quantity: currentProduct.stock_quantity !== null ? currentStock + 1 : null,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', wishlistItem.product_id);
+            console.log(`✅ Stock rolled back for product ${wishlistItem.product_id}`);
+          }
+        } catch (rollbackError) {
+          console.error('⚠️ Failed to rollback stock (non-critical):', rollbackError);
+        }
+      }
+      
       throw new Error('Payment processing failed');
     }
 
-    // Create transaction record for gift giver
-    await client
-      .from('wallet_transactions')
-      .insert({
-        user_id: giftGiverId,
-        type: 'debit',
-        amount: total,
-        description: `Gift purchase: ${wishlistItem.products.name} for ${recipientUser.username}`,
-        reference: createdOrder.id,
-        status: 'completed',
-        created_at: new Date().toISOString(),
-      });
+    console.log(`✅ Wallet payment processed via RPC:`, {
+      transactionId: walletResult.transactionId,
+      success: walletResult.success,
+    });
 
-    // Create escrow for the order
+    // 🔥 FIX: Create escrow for the order - platform fee deducted from vendor, not added to buyer total
+    // Make escrow creation critical - if it fails, we need to rollback payment
+    let escrowCreated = false;
     try {
       const escrowBreakdown = {
-        totalAmount: total,
-        vendorAmount: total - platformFee - deliveryFee,
-        riderAmount: deliveryFee,
-        platformAmount: platformFee,
+        totalAmount: total, // Buyer paid only item price
+        vendorAmount: total - platformFee, // Vendor receives item price minus platform fee
+        riderAmount: deliveryFee, // 0 for gift purchases
+        platformAmount: platformFee, // Platform fee deducted from vendor during escrow release
       };
       await this.escrowService.createEscrow(createdOrder.id, escrowBreakdown);
+      escrowCreated = true;
       console.log(`✅ Escrow created for wishlist gift order ${createdOrder.id}`);
     } catch (escrowError) {
-      console.error('Failed to create escrow for wishlist order (non-critical):', escrowError);
-      // Don't throw - payment already processed, escrow can be created manually if needed
+      console.error('Failed to create escrow for wishlist order:', escrowError);
+      // 🔥 FIX: If escrow creation fails, we need to refund the payment
+      // Payment is in escrow via RPC, so we need to refund it
+      try {
+        // Try to find escrow record (may not exist if RPC didn't create one in escrows table)
+        const { data: escrowRecord, error: escrowRecordError } = await client
+          .from('escrows')
+          .select('id, status')
+          .eq('order_id', createdOrder.id)
+          .maybeSingle();
+
+        if (escrowRecordError && escrowRecordError.code !== 'PGRST116') {
+          console.error('⚠️ Error checking escrow record:', escrowRecordError);
+        }
+
+        if (escrowRecord && escrowRecord.status === 'held') {
+          // Refund via escrow service
+          await this.escrowService.refundEscrow(escrowRecord.id, 'Escrow creation failed');
+          console.log(`✅ Escrow refunded due to creation failure`);
+        } else {
+          // No escrow record exists - refund via wallet RPC
+          // The RPC moved money to escrow in wallet, so we need to refund it via RPC
+          try {
+            const refundResult = await this.walletService.processWalletTransaction(
+              giftGiverId,
+              WalletTransactionType.ESCROW_REFUND,
+              total,
+              `Refund: Escrow creation failed for order ${createdOrder.id}`,
+              createdOrder.id,
+              'order',
+            );
+
+            if (!refundResult.success) {
+              console.error('⚠️ Failed to refund via wallet:', refundResult.error);
+            } else {
+              console.log(`✅ Payment refunded via wallet RPC`);
+            }
+          } catch (rpcError) {
+            console.error('⚠️ Failed to refund via wallet RPC:', rpcError);
+          }
+        }
+      } catch (refundError) {
+        console.error('⚠️ Failed to refund escrow after creation failure:', refundError);
+      }
+
+      // Rollback order, items, and stock
+      await client.from('order_items').delete().eq('order_id', createdOrder.id);
+      await client.from('orders').delete().eq('id', createdOrder.id);
+      
+      // Rollback stock
+      if (stockUpdated) {
+        try {
+          const { data: currentProduct } = await client
+            .from('products')
+            .select('quantity, stock_quantity')
+            .eq('id', wishlistItem.product_id)
+            .single();
+          
+          if (currentProduct) {
+            const currentStock = currentProduct.stock_quantity !== null 
+              ? currentProduct.stock_quantity 
+              : currentProduct.quantity;
+            
+            await client
+              .from('products')
+              .update({
+                quantity: currentStock !== null ? currentStock + 1 : null,
+                stock_quantity: currentProduct.stock_quantity !== null ? currentStock + 1 : null,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', wishlistItem.product_id);
+          }
+        } catch (rollbackError) {
+          console.error('⚠️ Failed to rollback stock after escrow failure:', rollbackError);
+        }
+      }
+
+      throw new Error('Failed to create escrow. Payment has been refunded.');
     }
 
-    // Update order status to paid
-    await client
-      .from('orders')
-      .update({
-        status: 'paid',
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', createdOrder.id);
+    // 🔥 FIX: Order status stays 'pending' (already set above) - no need to update here
+    // Status will change to 'confirmed' when vendor accepts the order
 
-    // Update product stock
-    await client
-      .from('products')
-      .update({
-        quantity: client.raw(`quantity - 1`),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', wishlistItem.product_id);
+    // 🔥 FIX: Check for duplicate gift order again right before creating gift_orders record
+    // This prevents race conditions where two requests pass the initial check
+    const { data: duplicateCheck, error: duplicateCheckError } = await client
+      .from('gift_orders')
+      .select('id')
+      .eq('wishlist_item_id', wishlistItemId)
+      .maybeSingle();
+
+    if (duplicateCheckError && duplicateCheckError.code !== 'PGRST116') {
+      console.error('⚠️ Error checking for duplicate gift order:', duplicateCheckError);
+      // Continue - this is a non-critical check, but log the error
+    }
+
+    if (duplicateCheck) {
+      // Rollback everything - order, items, stock, escrow, payment
+      console.error('⚠️ Duplicate gift order detected right before creation. Rolling back...');
+      
+      // Refund escrow
+      try {
+        const { data: escrowRecord, error: escrowRecordError } = await client
+          .from('escrows')
+          .select('id, status')
+          .eq('order_id', createdOrder.id)
+          .maybeSingle();
+
+        if (escrowRecordError && escrowRecordError.code !== 'PGRST116') {
+          console.error('⚠️ Error checking escrow record for duplicate:', escrowRecordError);
+        }
+
+        if (escrowRecord && escrowRecord.status === 'held') {
+          await this.escrowService.refundEscrow(escrowRecord.id, 'Duplicate gift order detected');
+          console.log(`✅ Escrow refunded for duplicate gift order`);
+        } else {
+          // No escrow record exists - refund via wallet helper
+          try {
+            const refundResult = await this.walletService.processWalletTransaction(
+              giftGiverId,
+              WalletTransactionType.ESCROW_REFUND,
+              total,
+              `Refund: Duplicate gift order detected for order ${createdOrder.id}`,
+              createdOrder.id,
+              'order',
+            );
+
+            if (!refundResult.success) {
+              console.error('⚠️ Failed to refund via wallet for duplicate:', refundResult.error);
+            } else {
+              console.log(`✅ Payment refunded via wallet for duplicate`);
+            }
+          } catch (rpcError) {
+            console.error('⚠️ Failed to refund via wallet RPC for duplicate:', rpcError);
+          }
+        }
+      } catch (refundError) {
+        console.error('⚠️ Failed to refund escrow for duplicate:', refundError);
+      }
+
+      // Delete order and items
+      await client.from('order_items').delete().eq('order_id', createdOrder.id);
+      await client.from('orders').delete().eq('id', createdOrder.id);
+      
+      // Rollback stock
+      if (stockUpdated) {
+        try {
+          const { data: currentProduct } = await client
+            .from('products')
+            .select('quantity, stock_quantity')
+            .eq('id', wishlistItem.product_id)
+            .single();
+          
+          if (currentProduct) {
+            const currentStock = currentProduct.stock_quantity !== null 
+              ? currentProduct.stock_quantity 
+              : currentProduct.quantity;
+            
+            await client
+              .from('products')
+              .update({
+                quantity: currentStock !== null ? currentStock + 1 : null,
+                stock_quantity: currentProduct.stock_quantity !== null ? currentStock + 1 : null,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', wishlistItem.product_id);
+          }
+        } catch (rollbackError) {
+          console.error('⚠️ Failed to rollback stock for duplicate:', rollbackError);
+        }
+      }
+
+      throw new Error('A gift order already exists for this wishlist item');
+    }
 
     // Create gift order record
     const { data: giftOrder, error: giftError } = await client
@@ -1177,7 +1474,7 @@ export class WishlistService {
         wishlist_item_id: wishlistItemId,
         gift_message: giftMessage,
         is_surprise: isSurprise,
-        status: 'paid'
+        status: 'pending' // 🔥 FIX: Align with orders.status - order is pending vendor acceptance
       })
       .select(`
         *,
@@ -1188,8 +1485,12 @@ export class WishlistService {
 
     if (giftError) {
       console.error('Gift order record creation error:', giftError);
-      // Order is already created and paid, so we log but don't throw
+      // 🔥 FIX: If gift_orders record creation fails, we should NOT remove wishlist item
+      // The order exists but gift_orders record doesn't - this is a data inconsistency
+      // We'll log it but continue - the order is still valid
       console.warn('⚠️ Gift order created but gift_orders record failed. Order ID:', createdOrder.id);
+      // Don't throw - order is valid, just missing gift_orders record
+      // Note: Wishlist item cleanup will be skipped if giftOrder is null
     }
 
     // Send notification to gift recipient (if not a surprise)
@@ -1233,6 +1534,20 @@ export class WishlistService {
         console.error('Error sending gift notification:', notifError);
         // Don't fail the gift order if notification fails
       }
+    }
+
+    // 🔥 FIX: Remove purchased wishlist item ONLY if gift_orders record was created successfully
+    // This prevents orphaned orders (order exists but no gift_orders record)
+    if (giftOrder && giftOrder.id) {
+      try {
+        await this.removePurchasedItems(giftRecipientId, [wishlistItemId], userToken);
+        console.log(`✅ Removed purchased wishlist item ${wishlistItemId} from recipient's wishlist`);
+      } catch (cleanupError) {
+        console.error('⚠️ Failed to remove wishlist item after gift purchase (non-critical):', cleanupError);
+        // Don't fail the gift order if cleanup fails
+      }
+    } else {
+      console.warn('⚠️ Skipping wishlist item cleanup - gift_orders record was not created');
     }
 
     return {
@@ -1591,7 +1906,12 @@ export class WishlistService {
       price: number;
       sellerId?: any;
       quantity: number;
+      wishlistItemId?: string;
+      productImage?: string;
     }> = [];
+
+    // 🔥 FIX: Track cumulative quantities per product for stock validation
+    const productQuantities: Record<string, number> = {};
 
     for (const item of items) {
       try {
@@ -1619,22 +1939,34 @@ export class WishlistService {
 
         const { data: product } = await client
           .from('products')
-          .select('stock_quantity, price')
+          .select('stock_quantity, price, primary_image_url, images')
           .eq('id', canPurchase.productInfo.id)
           .single();
 
-        if (product && product.stock_quantity !== null && product.stock_quantity < (item.quantity || 1)) {
+        // 🔥 FIX: Check cumulative quantity for same product across multiple wishlist items
+        const requestedQuantity = item.quantity || 1;
+        const productId = canPurchase.productInfo.id;
+        const currentRequestedTotal = (productQuantities[productId] || 0) + requestedQuantity;
+
+        if (product && product.stock_quantity !== null && product.stock_quantity < currentRequestedTotal) {
           validationResults.push({
             wishlistItemId: item.wishlistItemId,
             valid: false,
-            reason: `Only ${product.stock_quantity} available in stock! 📦 The seller doesn't have enough of this item.`
+            reason: `Only ${product.stock_quantity} available in stock, but ${currentRequestedTotal} requested across selected items! 📦 The seller doesn't have enough of this item.`
           });
           continue;
         }
 
-        // Step 3: Calculate price
+        // Track cumulative quantity for this product
+        productQuantities[productId] = currentRequestedTotal;
+
+        // 🔥 FIX: Step 3: Calculate price (item price only - no tax, no fees for gift purchases)
+        // Use the price from the product query (most recent) to ensure accuracy
         const itemPrice = (product?.price || canPurchase.productInfo.price) * (item.quantity || 1);
         totalPrice += itemPrice;
+        
+        // Store the validated price in the result for use during purchase
+        // This ensures the price used during purchase matches the validated price
 
         validationResults.push({
           wishlistItemId: item.wishlistItemId,
@@ -1645,8 +1977,10 @@ export class WishlistService {
 
         availableItems.push({
           ...canPurchase.productInfo,
+          wishlistItemId: item.wishlistItemId, // 🔥 FIX: Include wishlistItemId
           quantity: item.quantity || 1,
-          price: itemPrice
+          price: itemPrice,
+          productImage: product?.primary_image_url || (product?.images && product.images.length > 0 ? product.images[0] : null) || null // 🔥 FIX: Include productImage
         });
 
       } catch (error) {

@@ -301,11 +301,29 @@ export class WorkspaceService {
 
       console.log(`⏱️ [WORKSPACE] Stats calculated from ${todayOrdersCount} orders`);
 
-      // Calculate average preparation time from metadata
-      const averagePreparationTime = 25; // In minutes (TODO: Calculate from actual data)
+      // ✅ BUG FIX: Fetch actual customer rating from order_item_ratings
+      let customerRating = 0;
+      try {
+        const { data: orderRatings, error: ratingsError } = await supabaseClient
+          .from('order_item_ratings')
+          .select(`
+            rating,
+            orders!inner(vendor_id)
+          `)
+          .eq('orders.vendor_id', userId);
 
-      // Get customer rating (TODO: Get from actual ratings table)
-      const customerRating = 4.7;
+        if (!ratingsError && orderRatings && orderRatings.length > 0) {
+          const totalRating = orderRatings.reduce((sum, r) => sum + (r.rating || 0), 0);
+          const avgRating = totalRating / orderRatings.length;
+          customerRating = parseFloat(avgRating.toFixed(1));
+        } else {
+          // No ratings yet - use default of 0
+          customerRating = 0;
+        }
+      } catch (error) {
+        console.error('Error fetching customer ratings (non-critical):', error);
+        customerRating = 0; // Default to 0 on error
+      }
 
       // ✅ Get live stream and escrow data in parallel (non-blocking)
       const [activeStreamsResult, vendorEscrowsResult, riderEscrowsResult] = await Promise.all([
@@ -394,20 +412,26 @@ export class WorkspaceService {
       const riderHeldEscrows = riderEscrowsResult.data?.filter(e => e.status === 'held') || [];
       const riderInEscrow = riderHeldEscrows.reduce((sum, e) => sum + parseFloat(e.rider_amount || '0'), 0);
 
-      // ✅ VENDOR PERFORMANCE METRICS - Fetch all historical orders for stats
+      // ✅ VENDOR PERFORMANCE METRICS - Fetch historical orders for stats
+      // ✅ BUG FIX: Limit historical order queries to last 90 days for performance
       const performanceQueryStart = Date.now();
+      const ninetyDaysAgo = new Date();
+      ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+      
       const [allVendorOrdersResult, allRiderOrdersResult] = await Promise.all([
         supabaseClient
           .from('orders')
           .select('id, status, created_at, updated_at, metadata, estimated_delivery')
-          .eq('vendor_id', userId),
+          .eq('vendor_id', userId)
+          .gte('created_at', ninetyDaysAgo.toISOString()), // ✅ Limit to last 90 days
         supabaseClient
           .from('orders')
           .select('id, status, created_at, updated_at, metadata, estimated_delivery, delivery_address')
           .eq('rider_id', userId)
+          .gte('created_at', ninetyDaysAgo.toISOString()) // ✅ Limit to last 90 days
       ]);
       
-      console.log(`⏱️ [WORKSPACE] Performance queries: ${Date.now() - performanceQueryStart}ms`);
+      console.log(`⏱️ [WORKSPACE] Performance queries (last 90 days): ${Date.now() - performanceQueryStart}ms`);
 
       const allOrders = allVendorOrdersResult.data || [];
       const totalOrdersReceived = allOrders.length;
@@ -480,10 +504,36 @@ export class WorkspaceService {
         ? deliveryTimes.reduce((sum, time) => sum + time, 0) / deliveryTimes.length
         : 0;
 
-      // Get rider ratings from user_profiles or orders metadata
-      // For now, use a placeholder until rating system is fully implemented
-      const riderRating = 4.7; // TODO: Get from actual ratings table
-      const totalRatings = totalRiderDeliveries;
+      // ✅ BUG FIX: Fetch actual rider rating from order_item_ratings
+      // Note: Rider ratings may be stored in order_item_ratings or a dedicated rider_ratings table
+      // For now, we'll use order_item_ratings where the order has this rider
+      let riderRating = 0;
+      let totalRatings = 0;
+      try {
+        // Try to get ratings from order_item_ratings for orders where this user is the rider
+        const { data: riderOrderRatings, error: riderRatingsError } = await supabaseClient
+          .from('order_item_ratings')
+          .select(`
+            rating,
+            orders!inner(rider_id)
+          `)
+          .eq('orders.rider_id', userId);
+
+        if (!riderRatingsError && riderOrderRatings && riderOrderRatings.length > 0) {
+          const totalRating = riderOrderRatings.reduce((sum, r) => sum + (r.rating || 0), 0);
+          const avgRating = totalRating / riderOrderRatings.length;
+          riderRating = parseFloat(avgRating.toFixed(1));
+          totalRatings = riderOrderRatings.length;
+        } else {
+          // No ratings yet - use delivery count as total ratings
+          riderRating = 0;
+          totalRatings = totalRiderDeliveries;
+        }
+      } catch (error) {
+        console.error('Error fetching rider ratings (non-critical):', error);
+        riderRating = 0;
+        totalRatings = totalRiderDeliveries;
+      }
 
       console.log(`⏱️ [WORKSPACE] ✅ getWorkspaceStats completed in ${Date.now() - startTime}ms`);
 
@@ -602,6 +652,114 @@ export class WorkspaceService {
         has_delivery_pin: !!order.delivery_pin,
       });
 
+      // ✅ Fetch vendor location and details
+      let vendorLocation: { address: string; coordinates?: { latitude: number; longitude: number } } | null = null;
+      let vendorInfo: { id: string; name: string; phone: string | null } | null = null;
+      if (order.vendor_id) {
+        try {
+          const { data: vendorProfile } = await supabaseClient
+            .from('user_profiles')
+            .select('username, phone, location')
+            .eq('id', order.vendor_id)
+            .single();
+          
+          if (vendorProfile) {
+            // Extract vendor info
+            vendorInfo = {
+              id: order.vendor_id,
+              name: vendorProfile.username || 'Vendor',
+              phone: vendorProfile.phone || null,
+            };
+            
+            // Extract vendor location
+            if (vendorProfile?.location) {
+              vendorLocation = {
+                address: vendorProfile.location.address || 'Vendor Location',
+                coordinates: vendorProfile.location.latitude && vendorProfile.location.longitude
+                  ? {
+                      latitude: vendorProfile.location.latitude,
+                      longitude: vendorProfile.location.longitude,
+                    }
+                  : undefined,
+              };
+              
+              // If location is an object with more details, include them
+              if (typeof vendorProfile.location === 'object' && vendorLocation) {
+                if (vendorProfile.location.city || vendorProfile.location.state || vendorProfile.location.postalCode) {
+                  const addressParts = [
+                    vendorProfile.location.address,
+                    vendorProfile.location.city,
+                    vendorProfile.location.state,
+                    vendorProfile.location.postalCode
+                  ].filter(Boolean);
+                  if (addressParts.length > 1) {
+                    vendorLocation.address = addressParts.join(', ');
+                  }
+                }
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Error fetching vendor location:', error);
+        }
+      }
+
+      // ✅ Fetch rider location (if rider is assigned and order is in transit)
+      let riderLocation: { latitude: number; longitude: number; timestamp: string } | null = null;
+      if (order.rider_id && (order.status === 'out_for_delivery' || order.status === 'ready_for_pickup')) {
+        try {
+          const { data: riderLocationData } = await supabaseClient
+            .from('rider_locations')
+            .select('latitude, longitude, last_ping')
+            .eq('user_id', order.rider_id)
+            .single();
+          
+          if (riderLocationData) {
+            riderLocation = {
+              latitude: riderLocationData.latitude,
+              longitude: riderLocationData.longitude,
+              timestamp: riderLocationData.last_ping,
+            };
+          }
+        } catch (error) {
+          console.error('Error fetching rider location:', error);
+        }
+      }
+
+      // ✅ Extract coordinates from delivery_address (can be string or JSONB object)
+      let deliveryAddress = order.delivery_address;
+      let deliveryCoordinates: { latitude: number; longitude: number } | null = null;
+      
+      if (order.delivery_address) {
+        // Handle both string and JSONB object formats
+        if (typeof order.delivery_address === 'string') {
+          try {
+            const parsed = JSON.parse(order.delivery_address);
+            if (parsed.latitude && parsed.longitude) {
+              deliveryCoordinates = {
+                latitude: parsed.latitude,
+                longitude: parsed.longitude,
+              };
+              deliveryAddress = parsed.address || parsed.fullName || order.delivery_address;
+            }
+          } catch {
+            // Not JSON, treat as plain string
+            deliveryAddress = order.delivery_address;
+          }
+        } else if (typeof order.delivery_address === 'object') {
+          // Already an object
+          if (order.delivery_address.latitude && order.delivery_address.longitude) {
+            deliveryCoordinates = {
+              latitude: order.delivery_address.latitude,
+              longitude: order.delivery_address.longitude,
+            };
+          }
+          deliveryAddress = order.delivery_address.address 
+            || order.delivery_address.fullName 
+            || JSON.stringify(order.delivery_address);
+        }
+      }
+
       // Get order timeline (mock data for now)
       const timeline = [
         {
@@ -648,9 +806,13 @@ export class WorkspaceService {
           avatar: order.customer?.avatar_url,
         },
         deliveryDetails: {
-          address: order.delivery_address,
+          address: deliveryAddress,
+          coordinates: deliveryCoordinates,
           instructions: order.delivery_instructions,
         },
+        vendorLocation, // ✅ Add vendor location with address and coordinates
+        vendorInfo, // ✅ Add vendor info (name, phone)
+        riderLocation, // ✅ Add rider location (if assigned and in transit)
         timeline,
       };
     } catch (error) {
@@ -994,28 +1156,64 @@ export class WorkspaceService {
       }
 
       // ✅ SET ESCROW AUTO-RELEASE TIMER (category-based)
+      // ✅ ESCROW TIMER LOGIC:
+      // 1. Category-based countdown starts AFTER delivery confirmation (when buyer receives order)
+      // 2. Manual release can be requested after 24-hour dispute window
+      // 3. Auto-release timer is only set if escrow is in 'held' status
+      // 4. If auto-release is already set (e.g., from manual request), it won't be overwritten
+      // 5. This ensures no conflicts between manual and automatic release
       try {
-        const autoReleaseAt = new Date(Date.now() + countdownMs).toISOString();
-        
-        const { error: escrowError } = await supabaseClient
+        // ✅ BUG FIX: Enhanced error handling for missing escrow
+        const { data: escrowCheck, error: escrowCheckError } = await supabaseClient
           .from('escrows')
-          .update({
-            auto_release_at: autoReleaseAt,
-            countdown_hours: countdownHours,
-            category_based: true,
-            primary_category: primaryCategory,
-            updated_at: new Date().toISOString(),
-          })
+          .select('id, status, auto_release_at')
           .eq('order_id', orderId)
-          .eq('status', 'held');
+          .single();
 
-        if (escrowError) {
-          console.error('Failed to update escrow auto-release:', escrowError);
+        if (escrowCheckError) {
+          // Check if error is "not found" vs other errors
+          if (escrowCheckError.code === 'PGRST116') {
+            console.warn(`⚠️ No escrow found for order ${orderId} - order may not have escrow protection`);
+            // Don't throw - delivery confirmation can still succeed
+          } else {
+            console.error(`❌ Error checking escrow for order ${orderId}:`, escrowCheckError);
+            // Log but don't throw - non-critical operation
+          }
+        } else if (!escrowCheck) {
+          console.warn(`⚠️ No escrow found for order ${orderId} - order may not have escrow protection`);
+        } else if (escrowCheck.status === 'held') {
+          // Check if auto-release is already set (manual release may have been requested)
+          if (escrowCheck.auto_release_at) {
+            console.log(`ℹ️ Escrow for order ${orderId} already has auto-release timer set - skipping update`);
+          } else {
+            const autoReleaseAt = new Date(Date.now() + countdownMs).toISOString();
+            
+            const { error: escrowError } = await supabaseClient
+              .from('escrows')
+              .update({
+                auto_release_at: autoReleaseAt,
+                countdown_hours: countdownHours,
+                category_based: true,
+                primary_category: primaryCategory,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('order_id', orderId)
+              .eq('status', 'held'); // ✅ Status check prevents updating if already released/disputed
+
+            if (escrowError) {
+              console.error('Failed to update escrow auto-release:', escrowError);
+              // Don't throw - delivery confirmation succeeded
+            } else {
+              console.log(`✅ Escrow for self-pickup order ${orderId} will auto-release in ${countdownHours}h (Category: ${primaryCategory})`);
+            }
+          }
         } else {
-          console.log(`✅ Escrow for self-pickup order ${orderId} will auto-release in ${countdownHours}h (Category: ${primaryCategory})`);
+          console.warn(`⚠️ Escrow for order ${orderId} is not in 'held' status (status: ${escrowCheck.status}) - cannot set auto-release timer`);
         }
-      } catch (escrowError) {
+      } catch (escrowError: any) {
+        // ✅ BUG FIX: Comprehensive error handling
         console.error('Failed to set escrow auto-release timer (non-critical):', escrowError);
+        // Don't throw - delivery confirmation can still succeed
       }
 
       // ✅ Notify buyer that order was collected
@@ -1199,26 +1397,76 @@ export class WorkspaceService {
         throw new Error(`Failed to mark delivered: ${error.message}`);
       }
 
-      // ✅ UPDATE ESCROW AUTO-RELEASE TIMER (24 hours from delivery)
-      try {
-        const autoReleaseAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-        
-        const { error: escrowError } = await supabaseClient
-          .from('escrows')
-          .update({
-            auto_release_at: autoReleaseAt,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('order_id', orderId)
-          .eq('status', 'held');
+      // ✅ FETCH ORDER ITEMS WITH CATEGORIES FOR COUNTDOWN
+      const { data: orderItems } = await supabaseClient
+        .from('order_items')
+        .select('category')
+        .eq('order_id', orderId);
 
-        if (escrowError) {
-          console.error('Failed to update escrow auto-release (non-critical):', escrowError);
+      const categories = orderItems?.map(item => item.category).filter(Boolean) || ['General'];
+
+      // ✅ CALCULATE CATEGORY-BASED COUNTDOWN
+      const { countdownMs, countdownHours, primaryCategory } = this.getCategoryBasedCountdown(categories);
+
+      // ✅ SET ESCROW AUTO-RELEASE TIMER (category-based) - STARTS NOW AFTER DELIVERY CONFIRMATION
+      // ✅ ESCROW TIMER LOGIC:
+      // 1. Category-based countdown starts AFTER delivery confirmation (when buyer receives order)
+      // 2. Manual release can be requested after 24-hour dispute window
+      // 3. Auto-release timer is only set if escrow is in 'held' status
+      // 4. If auto-release is already set (e.g., from manual request), it won't be overwritten
+      // 5. This ensures no conflicts between manual and automatic release
+      try {
+        // ✅ BUG FIX: Enhanced error handling for missing escrow
+        const { data: escrowCheck, error: escrowCheckError } = await supabaseClient
+          .from('escrows')
+          .select('id, status, auto_release_at')
+          .eq('order_id', orderId)
+          .single();
+
+        if (escrowCheckError) {
+          // Check if error is "not found" vs other errors
+          if (escrowCheckError.code === 'PGRST116') {
+            console.warn(`⚠️ No escrow found for order ${orderId} - order may not have escrow protection`);
+            // Don't throw - delivery confirmation can still succeed
+          } else {
+            console.error(`❌ Error checking escrow for order ${orderId}:`, escrowCheckError);
+            // Log but don't throw - non-critical operation
+          }
+        } else if (!escrowCheck) {
+          console.warn(`⚠️ No escrow found for order ${orderId} - order may not have escrow protection`);
+        } else if (escrowCheck.status === 'held') {
+          // Check if auto-release is already set (manual release may have been requested)
+          if (escrowCheck.auto_release_at) {
+            console.log(`ℹ️ Escrow for order ${orderId} already has auto-release timer set - skipping update`);
+          } else {
+            const autoReleaseAt = new Date(Date.now() + countdownMs).toISOString();
+            
+            const { error: escrowError } = await supabaseClient
+              .from('escrows')
+              .update({
+                auto_release_at: autoReleaseAt,
+                countdown_hours: countdownHours,
+                category_based: true,
+                primary_category: primaryCategory,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('order_id', orderId)
+              .eq('status', 'held'); // ✅ Status check prevents updating if already released/disputed
+
+            if (escrowError) {
+              console.error('Failed to update escrow auto-release:', escrowError);
+              // Don't throw - delivery confirmation succeeded
+            } else {
+              console.log(`✅ Escrow for order ${orderId} will auto-release in ${countdownHours}h (Category: ${primaryCategory})`);
+            }
+          }
         } else {
-          console.log(`✅ Escrow for order ${orderId} will auto-release at ${autoReleaseAt}`);
+          console.warn(`⚠️ Escrow for order ${orderId} is not in 'held' status (status: ${escrowCheck.status}) - cannot set auto-release timer`);
         }
-      } catch (escrowError) {
+      } catch (escrowError: any) {
+        // ✅ BUG FIX: Comprehensive error handling
         console.error('Failed to set escrow auto-release timer (non-critical):', escrowError);
+        // Don't throw - delivery confirmation can still succeed
       }
 
       // ✅ Notify buyer and vendor that order was delivered
@@ -1237,11 +1485,11 @@ export class WorkspaceService {
         console.error('Failed to send delivery notifications (non-critical):', notifyError);
       }
 
-      console.log(`✅ Order ${orderId} marked as delivered and received. 24-hour dispute window started.`);
+      console.log(`✅ Order ${orderId} marked as delivered and received. ${countdownHours}-hour dispute window started.`);
 
       return { 
         success: true, 
-        message: 'Order delivered and received! Buyer has 24 hours to report issues or funds will be released automatically.' 
+        message: `Order delivered and received! Buyer has ${countdownHours} hours to report issues or funds will be released automatically.` 
       };
     } catch (error) {
       console.error('Error marking delivered:', error);
@@ -1488,6 +1736,301 @@ export class WorkspaceService {
       return transformedOrders;
     } catch (error) {
       console.error('Error fetching orders by status:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get orders filtered by source (regular, live_stream, auction, service_booking)
+   * ✅ BUG FIX: Missing endpoint implementation
+   */
+  async getOrdersBySource(userId: string, source: 'regular' | 'live_stream' | 'auction' | 'service_booking', userToken?: string) {
+    const supabaseClient = userToken
+      ? createUserSupabaseClient(this.configService, userToken)
+      : this.supabase;
+
+    try {
+      const { data: orders, error } = await supabaseClient
+        .from('orders')
+        .select(`
+          id,
+          order_number,
+          status,
+          total_amount,
+          created_at,
+          updated_at,
+          buyer_id,
+          delivery_address,
+          source,
+          order_items(
+            id,
+            product_name,
+            quantity,
+            total_price,
+            product_metadata
+          )
+        `)
+        .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+        .eq('source', source)
+        .order('created_at', { ascending: false })
+        .limit(100); // Limit to prevent large queries
+
+      if (error) {
+        throw new Error(`Failed to fetch orders by source: ${error.message}`);
+      }
+
+      if (!orders || orders.length === 0) {
+        return [];
+      }
+
+      // Fetch buyer profiles
+      const buyerIds = [...new Set(orders.map(o => o.buyer_id).filter(Boolean))];
+      const buyerProfiles: Record<string, any> = {};
+      
+      if (buyerIds.length > 0) {
+        const { data: profiles } = await supabaseClient
+          .from('user_profiles')
+          .select('id, username, avatar_url')
+          .in('id', buyerIds);
+        
+        profiles?.forEach(p => {
+          buyerProfiles[p.id] = p;
+        });
+      }
+
+      return orders.map(order => ({
+        id: order.id,
+        orderNumber: order.order_number,
+        status: order.status,
+        customerName: buyerProfiles[order.buyer_id]?.username || 'Unknown Customer',
+        customerId: order.buyer_id,
+        itemCount: order.order_items?.length || 0,
+        total: order.total_amount,
+        deliveryAddress: order.delivery_address,
+        createdAt: order.created_at,
+        updatedAt: order.updated_at,
+        source: order.source,
+        items: order.order_items?.map(item => ({
+          id: item.id,
+          name: item.product_name,
+          image: item.product_metadata?.image || item.product_metadata?.images?.[0] || null,
+          quantity: item.quantity,
+          totalPrice: item.total_price,
+        })) || [],
+      }));
+    } catch (error) {
+      console.error('Error fetching orders by source:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get real-time workspace metrics
+   * ✅ BUG FIX: Missing endpoint implementation
+   */
+  async getRealTimeMetrics(userId: string, userToken?: string) {
+    const supabaseClient = userToken
+      ? createUserSupabaseClient(this.configService, userToken)
+      : this.supabase;
+
+    try {
+      const today = new Date().toISOString().split('T')[0];
+
+      // Get active orders counts
+      const [activeOrdersResult, todayOrdersResult, liveStreamsResult] = await Promise.all([
+        supabaseClient
+          .from('orders')
+          .select('id, status, source, total_amount')
+          .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+          .in('status', ['pending', 'processing', 'ready_for_pickup', 'out_for_delivery']),
+        supabaseClient
+          .from('orders')
+          .select('id, total_amount, source')
+          .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+          .gte('created_at', `${today}T00:00:00.000Z`)
+          .lt('created_at', `${today}T23:59:59.999Z`),
+        supabaseClient
+          .from('live_streams')
+          .select('id, viewer_count')
+          .eq('vendor_id', userId)
+          .eq('status', 'live'),
+      ]);
+
+      const activeOrders = activeOrdersResult.data || [];
+      const todayOrders = todayOrdersResult.data || [];
+      const liveStreams = liveStreamsResult.data || [];
+
+      // Calculate metrics
+      const activeOrdersCount = activeOrders.filter(o => o.status === 'pending' || o.status === 'processing').length;
+      const processingOrders = activeOrders.filter(o => o.status === 'processing').length;
+      const readyForPickup = activeOrders.filter(o => o.status === 'ready_for_pickup').length;
+      const outForDelivery = activeOrders.filter(o => o.status === 'out_for_delivery').length;
+      const todayRevenue = todayOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
+      const activeLiveStreams = liveStreams.length;
+      const currentLiveViewers = liveStreams.reduce((sum, s) => sum + (s.viewer_count || 0), 0);
+      const liveStreamRevenue = todayOrders
+        .filter(o => o.source === 'live_stream')
+        .reduce((sum, o) => sum + (o.total_amount || 0), 0);
+
+      return {
+        activeOrders: activeOrdersCount,
+        processingOrders,
+        readyForPickup,
+        outForDelivery,
+        todayRevenue,
+        activeLiveStreams,
+        currentLiveViewers,
+        liveStreamRevenue,
+        lastUpdated: new Date().toISOString(),
+      };
+    } catch (error) {
+      console.error('Error fetching real-time metrics:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get live stream analytics
+   * ✅ BUG FIX: Missing endpoint implementation
+   */
+  async getLiveStreamAnalytics(userId: string, period: 'today' | 'week' | 'month' = 'today', userToken?: string) {
+    const supabaseClient = userToken
+      ? createUserSupabaseClient(this.configService, userToken)
+      : this.supabase;
+
+    try {
+      const now = new Date();
+      let startDate: Date;
+      
+      switch (period) {
+        case 'today':
+          startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+          break;
+        case 'week':
+          startDate = new Date(now);
+          startDate.setDate(startDate.getDate() - 7);
+          break;
+        case 'month':
+          startDate = new Date(now);
+          startDate.setMonth(startDate.getMonth() - 1);
+          break;
+        default:
+          startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      }
+
+      // Get live stream orders
+      const { data: liveOrders, error: ordersError } = await supabaseClient
+        .from('orders')
+        .select('id, total_amount, created_at, metadata')
+        .eq('vendor_id', userId)
+        .eq('source', 'live_stream')
+        .gte('created_at', startDate.toISOString());
+
+      if (ordersError) {
+        throw new Error(`Failed to fetch live stream orders: ${ordersError.message}`);
+      }
+
+      // Get live streams data
+      const { data: streams, error: streamsError } = await supabaseClient
+        .from('live_streams')
+        .select('id, title, created_at, viewer_count, metadata')
+        .eq('vendor_id', userId)
+        .gte('created_at', startDate.toISOString());
+
+      if (streamsError) {
+        console.error('Error fetching live streams (non-critical):', streamsError);
+      }
+
+      const totalLiveOrders = liveOrders?.length || 0;
+      const totalLiveRevenue = liveOrders?.reduce((sum, o) => sum + (o.total_amount || 0), 0) || 0;
+      const averageLiveOrderValue = totalLiveOrders > 0 ? totalLiveRevenue / totalLiveOrders : 0;
+
+      // Calculate growth (compare with previous period)
+      const previousStartDate = new Date(startDate);
+      const periodDays = period === 'today' ? 1 : period === 'week' ? 7 : 30;
+      previousStartDate.setDate(previousStartDate.getDate() - periodDays);
+
+      const { data: previousOrders } = await supabaseClient
+        .from('orders')
+        .select('id, total_amount')
+        .eq('vendor_id', userId)
+        .eq('source', 'live_stream')
+        .gte('created_at', previousStartDate.toISOString())
+        .lt('created_at', startDate.toISOString());
+
+      const previousLiveOrders = previousOrders?.length || 0;
+      const previousLiveRevenue = previousOrders?.reduce((sum, o) => sum + (o.total_amount || 0), 0) || 0;
+
+      const liveOrdersGrowth = previousLiveOrders > 0
+        ? ((totalLiveOrders - previousLiveOrders) / previousLiveOrders) * 100
+        : totalLiveOrders > 0 ? 100 : 0;
+
+      const liveRevenueGrowth = previousLiveRevenue > 0
+        ? ((totalLiveRevenue - previousLiveRevenue) / previousLiveRevenue) * 100
+        : totalLiveRevenue > 0 ? 100 : 0;
+
+      // Top performing streams
+      const streamOrdersMap = new Map<string, number>();
+      const streamRevenueMap = new Map<string, number>();
+      
+      liveOrders?.forEach(order => {
+        const streamId = order.metadata?.stream_id || order.metadata?.live_stream_id;
+        if (streamId) {
+          streamOrdersMap.set(streamId, (streamOrdersMap.get(streamId) || 0) + 1);
+          streamRevenueMap.set(streamId, (streamRevenueMap.get(streamId) || 0) + (order.total_amount || 0));
+        }
+      });
+
+      const topPerformingStreams = Array.from(streamOrdersMap.entries())
+        .map(([streamId, orderCount]) => {
+          const stream = streams?.find(s => s.id === streamId);
+          return {
+            streamId,
+            streamTitle: stream?.title || 'Untitled Stream',
+            orderCount,
+            revenue: streamRevenueMap.get(streamId) || 0,
+            date: stream?.created_at || new Date().toISOString(),
+          };
+        })
+        .sort((a, b) => b.revenue - a.revenue)
+        .slice(0, 10);
+
+      // Hourly performance
+      const hourlyPerformance = Array.from({ length: 24 }, (_, hour) => {
+        const hourOrders = liveOrders?.filter(o => {
+          const orderHour = new Date(o.created_at).getHours();
+          return orderHour === hour;
+        }) || [];
+        
+        return {
+          hour,
+          orderCount: hourOrders.length,
+          revenue: hourOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0),
+        };
+      });
+
+      // Conversion metrics (simplified)
+      const totalViewers = streams?.reduce((sum, s) => sum + (s.viewer_count || 0), 0) || 0;
+      const viewersToOrders = totalViewers > 0 ? (totalLiveOrders / totalViewers) * 100 : 0;
+      const averageOrdersPerStream = streams && streams.length > 0 ? totalLiveOrders / streams.length : 0;
+
+      return {
+        period,
+        totalLiveOrders,
+        totalLiveRevenue,
+        averageLiveOrderValue,
+        liveOrdersGrowth: Math.round(liveOrdersGrowth * 10) / 10,
+        liveRevenueGrowth: Math.round(liveRevenueGrowth * 10) / 10,
+        topPerformingStreams,
+        hourlyPerformance,
+        conversionMetrics: {
+          viewersToOrders: Math.round(viewersToOrders * 10) / 10,
+          averageOrdersPerStream: Math.round(averageOrdersPerStream * 10) / 10,
+          repeatCustomerRate: 0, // TODO: Calculate from order history
+        },
+      };
+    } catch (error) {
+      console.error('Error fetching live stream analytics:', error);
       throw error;
     }
   }

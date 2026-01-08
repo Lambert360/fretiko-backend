@@ -110,13 +110,20 @@ export class ChatService {
       }
 
       this.logger.debug(`📊 Fetched ${conversations?.length || 0} conversations from database`);
-      if (conversations && conversations.length > 0) {
+      // ✅ FIX: Add null check before accessing array element
+      if (conversations && conversations.length > 0 && conversations[0]?.chat_participants) {
         this.logger.debug(`📊 First conversation participants: ${JSON.stringify(conversations[0].chat_participants)}`);
+      }
+
+      // ✅ FIX: Early return if no conversations
+      if (!conversations || conversations.length === 0) {
+        return [];
       }
 
       // Fetch last message for each conversation
       const conversationIds = conversations.map(conv => conv.id);
-      const { data: lastMessages } = await client
+      
+      const { data: lastMessages, error: lastMessagesError } = await client
         .from('chat_messages')
         .select(`
           conversation_id,
@@ -131,13 +138,74 @@ export class ChatService {
         .eq('is_deleted', false)
         .order('created_at', { ascending: false });
 
-      // Get unread counts
-      const { data: unreadCounts } = await client
-        .from('chat_messages')
-        .select('conversation_id')
+      if (lastMessagesError) {
+        this.logger.error('Error fetching last messages:', lastMessagesError);
+        // Continue with empty array rather than failing
+      }
+
+      // ✅ FIX: Get unread counts efficiently using SQL aggregation (industry standard)
+      // First, fetch last_read_at for each conversation for this user
+      const { data: participantRecords, error: participantError } = await client
+        .from('chat_participants')
+        .select('conversation_id, last_read_at')
         .in('conversation_id', conversationIds)
-        .gt('created_at', client.from('chat_participants').select('last_read_at').eq('user_id', userId))
-        .eq('is_deleted', false);
+        .eq('user_id', userId);
+
+      if (participantError) {
+        this.logger.error('Error fetching participant records:', participantError);
+        // Continue with empty map
+      }
+
+      // Create a map of conversation_id -> last_read_at
+      const lastReadMap = new Map<string, string | null>();
+      participantRecords?.forEach(p => {
+        lastReadMap.set(p.conversation_id, p.last_read_at);
+      });
+
+      // ✅ Industry standard: keep unread counts as a map (conversationId -> count)
+      // This avoids building large arrays and is faster/more memory efficient.
+      const unreadCountByConversationId: Record<string, number> = {};
+      
+      if (conversationIds.length > 0) {
+        // Count unread messages per conversation using parallel queries
+        const unreadCountPromises = conversationIds.map(async (convId) => {
+          try {
+            const lastReadAt = lastReadMap.get(convId);
+            
+            // Build count query for this conversation
+            let countQuery = client
+              .from('chat_messages')
+              .select('*', { count: 'exact', head: true })
+              .eq('conversation_id', convId)
+              .eq('is_deleted', false);
+            
+            // If last_read_at exists, only count messages created after it
+            if (lastReadAt) {
+              countQuery = countQuery.gt('created_at', lastReadAt);
+            }
+            // If lastReadAt is null, all messages are unread (no date filter)
+            
+            const { count, error: countError } = await countQuery;
+            
+            if (countError) {
+              this.logger.error(`Error counting unread messages for conversation ${convId}:`, countError);
+              return { conversation_id: convId, count: 0 };
+            }
+            
+            return { conversation_id: convId, count: count || 0 };
+          } catch (error) {
+            this.logger.error(`Error processing unread count for conversation ${convId}:`, error);
+            return { conversation_id: convId, count: 0 };
+          }
+        });
+        
+        // Wait for all count queries to complete
+        const unreadCountResults = await Promise.all(unreadCountPromises);
+        
+        unreadCountResults.forEach(result => {
+          unreadCountByConversationId[result.conversation_id] = result.count || 0;
+        });
+      }
 
       // Get user profiles for participants and message senders
       const participantIds = conversations.flatMap(conv =>
@@ -183,7 +251,9 @@ export class ChatService {
       }
 
       // Transform and return data
-      return conversations.map(conv => this.mapConversationResponse(conv, lastMessages, unreadCounts, userProfiles, userId));
+      return conversations.map(conv =>
+        this.mapConversationResponse(conv, lastMessages || [], unreadCountByConversationId, userProfiles, userId)
+      );
     } catch (error) {
       this.logger.error('Error fetching conversations:', error);
       throw error;
@@ -212,11 +282,10 @@ export class ChatService {
       const participantHash = hashResult;
       this.logger.log(`Generated participant hash: ${participantHash}`);
 
-      // Look for existing conversation with this exact participant hash
-      // NOTE: We search by participant_hash ONLY, not by chat_type
-      // This ensures the same participants always use the same conversation room
-      // regardless of who initiates the conversation
-      this.logger.log(`Looking for conversation with hash: ${participantHash}`);
+      // ✅ FIX: Search by participant_hash AND chat_type to match the unique constraint
+      // The database has UNIQUE(participant_hash, chat_type), so we should search by both
+      // This ensures we find the correct conversation type (friend, vendor, etc.)
+      this.logger.log(`Looking for conversation with hash: ${participantHash}, type: ${chatType}`);
 
       const { data: existingConversations, error: queryError } = await client
         .from('chat_conversations')
@@ -234,6 +303,7 @@ export class ChatService {
           participant_hash
         `)
         .eq('participant_hash', participantHash)
+        .eq('chat_type', chatType) // ✅ Include chat_type in search
         .eq('is_active', true)
         .order('created_at', { ascending: false }); // Get most recent first
 
@@ -898,12 +968,18 @@ export class ChatService {
       userProfiles = profiles || [];
     }
 
-    return this.mapConversationResponse(conversation, [], [], userProfiles, userId);
+    return this.mapConversationResponse(conversation, [], {}, userProfiles, userId);
   }
 
-  private mapConversationResponse(conversation: any, lastMessages: any[] = [], unreadCounts: any[] = [], userProfiles: any[] = [], currentUserId?: string): ConversationResponseDto {
+  private mapConversationResponse(
+    conversation: any,
+    lastMessages: any[] = [],
+    unreadCountByConversationId: Record<string, number> = {},
+    userProfiles: any[] = [],
+    currentUserId?: string
+  ): ConversationResponseDto {
     const lastMessage = lastMessages?.find(msg => msg.conversation_id === conversation.id);
-    const unreadCount = unreadCounts?.filter(msg => msg.conversation_id === conversation.id).length || 0;
+    const unreadCount = unreadCountByConversationId?.[conversation.id] ?? 0;
 
     // Determine if this is an AI conversation
     const isAI = conversation.chat_type === 'ai';
@@ -1076,10 +1152,10 @@ export class ChatService {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     try {
-      // Verify user is participant
+      // ✅ Verify user is participant and get last_read_at in a single query
       const { data: participant } = await client
         .from('chat_participants')
-        .select('id')
+        .select('id, last_read_at')
         .eq('conversation_id', conversationId)
         .eq('user_id', userId)
         .single();
@@ -1088,13 +1164,21 @@ export class ChatService {
         throw new NotFoundException('Conversation not found or access denied');
       }
 
-      // Get all unread messages for this conversation
-      const { data: unreadMessages } = await client
+      const lastReadAt = participant?.last_read_at;
+
+      // Fetch unread messages (created after last_read_at, or all if last_read_at is null)
+      let unreadMessagesQuery = client
         .from('chat_messages')
         .select('id')
         .eq('conversation_id', conversationId)
-        .eq('is_deleted', false)
-        .gt('created_at', client.from('chat_participants').select('last_read_at').eq('conversation_id', conversationId).eq('user_id', userId));
+        .eq('is_deleted', false);
+
+      if (lastReadAt) {
+        unreadMessagesQuery = unreadMessagesQuery.gt('created_at', lastReadAt);
+      }
+      // If lastReadAt is null, all messages are considered unread (no filter needed)
+
+      const { data: unreadMessages } = await unreadMessagesQuery;
 
       if (unreadMessages && unreadMessages.length > 0) {
         // Mark all messages as read

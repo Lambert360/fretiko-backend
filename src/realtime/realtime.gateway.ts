@@ -83,14 +83,25 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
           return;
         }
 
-        // Log detailed state for debugging
-        this.logger.debug(`🔍 Heartbeat cycle - sockets=${!!this.server.sockets}, socketsMap=${!!this.server.sockets.sockets}, adapter=${!!this.server.sockets.adapter}`);
+        // 🔥 FIX: Check for sockets map more gracefully
+        const hasSocketsMap = !!(this.server.sockets.sockets);
+        const hasAdapter = !!(this.server.sockets.adapter);
+        
+        // Log detailed state for debugging (only if sockets map is available, or occasionally)
+        if (hasSocketsMap) {
+          this.logger.debug(`🔍 Heartbeat cycle - sockets=${!!this.server.sockets}, socketsMap=${hasSocketsMap}, adapter=${hasAdapter}`);
+        } else {
+          // 🔥 FIX: Only log warning occasionally to reduce noise (this is normal for some adapter types)
+          if (Math.random() < 0.1) { // Log ~10% of the time
+            this.logger.debug(`🔍 Heartbeat cycle - sockets map not available (this is normal for some adapter types)`);
+          }
+        }
 
         const now = Date.now();
         const staleConnections: string[] = [];
 
         // Only process clients if sockets map is available
-        if (this.server.sockets.sockets) {
+        if (hasSocketsMap) {
           this.connectedClients.forEach((clientInfo, socketId) => {
             try {
               const client = this.server.sockets.sockets.get(socketId);
@@ -134,7 +145,9 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
           }
           });
         } else {
-          this.logger.debug('🔍 Sockets map not available, skipping client ping cycle');
+          // 🔥 FIX: Don't log every cycle - this is expected for some adapter configurations
+          // The heartbeat still works, we just can't ping individual clients
+          // Clients will be cleaned up on disconnect events
         }
 
         // 🔥 FIX: Only clean up after multiple failed ping cycles (let handleDisconnect handle normal disconnects)

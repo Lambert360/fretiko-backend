@@ -1,8 +1,10 @@
-import { Injectable, BadRequestException, NotFoundException, ForbiddenException, Inject, forwardRef } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, ForbiddenException, HttpException, HttpStatus, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { EscrowService } from '../escrow/escrow.service';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
+import { WalletService } from '../wallet/wallet.service';
+import { WalletTransactionType } from '../wallet/constants/transaction-types';
 import {
   CreateLiveStreamDto,
   UpdateStreamStatusDto,
@@ -43,6 +45,7 @@ export class LiveSalesService {
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
     private notificationHelper: NotificationHelperService,
+    private walletService: WalletService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
   }
@@ -674,41 +677,36 @@ export class LiveSalesService {
         throw new BadRequestException('Insufficient wallet balance for gift');
       }
 
-      // 6. Start transaction - deduct from sender
-      const { error: deductError } = await this.supabase.rpc(
-        'process_wallet_transaction',
-        {
-          p_user_id: userId,
-          p_transaction_type: 'gift_send',
-          p_amount: -totalCost, // Negative for deduction
-          p_description: `Gift: ${sendGiftDto.quantity}x ${giftType.name} to stream "${stream.title}"`,
-          p_reference_id: sendGiftDto.stream_id,
-          p_reference_type: 'live_stream_gift'
-        }
+      // 6. Start transaction - deduct from sender (using fee_deduction for direct transfer)
+      const deductResult = await this.walletService.processWalletTransaction(
+        userId,
+        WalletTransactionType.FEE_DEDUCTION, // ✅ FIX: Use valid transaction type (gifts are direct transfers, not escrow)
+        totalCost, // Helper handles negative internally for debits
+        `Gift: ${sendGiftDto.quantity}x ${giftType.name} to stream "${stream.title}"`,
+        sendGiftDto.stream_id,
+        'live_stream_gift',
       );
 
-      if (deductError) {
-        console.error('❌ Gift wallet deduction failed:', deductError);
-        throw new BadRequestException('Failed to process gift payment');
+      if (!deductResult.success) {
+        console.error('❌ Gift wallet deduction failed:', deductResult.error);
+        throw new BadRequestException(`Failed to process gift payment: ${deductResult.error}`);
       }
 
       // 7. Credit vendor's wallet (platform takes no commission on gifts)
-      const { error: creditError } = await this.supabase.rpc(
-        'process_wallet_transaction',
-        {
-          p_user_id: stream.vendor_id,
-          p_transaction_type: 'gift_receive',
-          p_amount: totalCost, // Positive for credit
-          p_description: `Gift received: ${sendGiftDto.quantity}x ${giftType.name} from viewer`,
-          p_reference_id: sendGiftDto.stream_id,
-          p_reference_type: 'live_stream_gift'
-        }
+      // Note: fee_deduction doesn't support negative amounts, so we use reward_credit for the vendor
+      const creditResult = await this.walletService.processWalletTransaction(
+        stream.vendor_id,
+        WalletTransactionType.REWARD_CREDIT, // ✅ FIX: Use valid transaction type for direct credit
+        totalCost,
+        `Gift received: ${sendGiftDto.quantity}x ${giftType.name} from viewer`,
+        sendGiftDto.stream_id,
+        'live_stream_gift',
       );
 
-      if (creditError) {
-        console.error('❌ Gift vendor credit failed:', creditError);
+      if (!creditResult.success) {
+        console.error('❌ Gift vendor credit failed:', creditResult.error);
         // TODO: Implement rollback mechanism for failed credit
-        throw new BadRequestException('Failed to credit vendor for gift');
+        throw new BadRequestException(`Failed to credit vendor for gift: ${creditResult.error}`);
       }
 
       // 8. Record gift in live stream gifts table
@@ -927,22 +925,19 @@ export class LiveSalesService {
         console.error('❌ Order item creation failed:', orderItemError);
       }
 
-      // 10. Deduct from buyer wallet
-      const { error: deductError } = await this.supabase.rpc(
-        'process_wallet_transaction',
-        {
-          p_user_id: userId,
-          p_transaction_type: 'purchase',
-          p_amount: -totalAmount,
-          p_description: `Live purchase: ${purchaseDto.quantity}x ${liveProduct.product.name} from "${stream.title}"`,
-          p_reference_id: order.id,
-          p_reference_type: 'order'
-        }
+      // 10. Deduct from buyer wallet (move to escrow)
+      const deductResult = await this.walletService.processWalletTransaction(
+        userId,
+        WalletTransactionType.PURCHASE_HOLD, // ✅ FIX: Use valid transaction type (moves money to escrow)
+        totalAmount,
+        `Live purchase: ${purchaseDto.quantity}x ${liveProduct.product.name} from "${stream.title}"`,
+        order.id,
+        'order',
       );
 
-      if (deductError) {
-        console.error('❌ Purchase wallet deduction failed:', deductError);
-        throw new BadRequestException('Failed to process payment');
+      if (!deductResult.success) {
+        console.error('❌ Purchase wallet deduction failed:', deductResult.error);
+        throw new BadRequestException(`Failed to process payment: ${deductResult.error}`);
       }
 
       // 11. Create escrow for buyer protection
@@ -964,8 +959,13 @@ export class LiveSalesService {
           .eq('id', order.id);
 
       } catch (escrowError) {
-        console.error('❌ Escrow creation failed (non-critical):', escrowError);
-        // Continue - payment already processed, escrow can be created manually if needed
+        console.error('❌ CRITICAL: Failed to create escrow after payment:', escrowError);
+        // ⚠️ Payment is already processed (money in escrow balance), but escrow record doesn't exist
+        // This is a critical failure requiring manual intervention
+        throw new HttpException(
+          'Payment processed successfully but escrow creation failed. Payment is held in escrow but no escrow record exists. Manual intervention required.',
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
       }
 
       // 12. Notify vendor of new order
@@ -1255,22 +1255,19 @@ export class LiveSalesService {
         console.error('❌ Order item creation failed:', orderItemError);
       }
 
-      // 10. Deduct from customer wallet
-      const { error: deductError } = await this.supabase.rpc(
-        'process_wallet_transaction',
-        {
-          p_user_id: userId,
-          p_transaction_type: 'purchase',
-          p_amount: -servicePrice,
-          p_description: `Service booking: ${liveService.service.name} on ${bookingDto.service_date} ${bookingDto.service_time}`,
-          p_reference_id: order.id,
-          p_reference_type: 'order'
-        }
+      // 10. Deduct from customer wallet (move to escrow)
+      const deductResult = await this.walletService.processWalletTransaction(
+        userId,
+        WalletTransactionType.PURCHASE_HOLD, // ✅ FIX: Use valid transaction type (moves money to escrow)
+        servicePrice,
+        `Service booking: ${liveService.service.name} on ${bookingDto.service_date} ${bookingDto.service_time}`,
+        order.id,
+        'order',
       );
 
-      if (deductError) {
-        console.error('❌ Service booking wallet deduction failed:', deductError);
-        throw new BadRequestException('Failed to process booking payment');
+      if (!deductResult.success) {
+        console.error('❌ Service booking wallet deduction failed:', deductResult.error);
+        throw new BadRequestException(`Failed to process booking payment: ${deductResult.error}`);
       }
 
       console.log(`✅ Customer wallet deducted: ₣${servicePrice}`);
@@ -1294,8 +1291,13 @@ export class LiveSalesService {
           .eq('id', order.id);
 
       } catch (escrowError) {
-        console.error('❌ Escrow creation failed (non-critical):', escrowError);
-        // Continue - payment already processed
+        console.error('❌ CRITICAL: Failed to create escrow after payment:', escrowError);
+        // ⚠️ Payment is already processed (money in escrow balance), but escrow record doesn't exist
+        // This is a critical failure requiring manual intervention
+        throw new HttpException(
+          'Payment processed successfully but escrow creation failed. Payment is held in escrow but no escrow record exists. Manual intervention required.',
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
       }
 
       // 12. Create service booking record (for service-specific data)

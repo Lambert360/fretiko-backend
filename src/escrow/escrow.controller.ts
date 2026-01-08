@@ -21,19 +21,25 @@ export class EscrowController {
 
   @Post(':id/release')
   async releaseEscrow(
+    @Req() req,
     @Param('id') escrowId: string,
     @Body() body: { reason: string },
   ) {
-    await this.escrowService.releaseEscrow(escrowId, body.reason);
+    // ✅ FIX Bug 16: Add authorization check
+    const userId = req.user.sub;
+    await this.escrowService.releaseEscrow(escrowId, body.reason, userId);
     return { success: true, message: 'Escrow released successfully' };
   }
 
   @Post(':id/refund')
   async refundEscrow(
+    @Req() req,
     @Param('id') escrowId: string,
     @Body() body: { reason: string },
   ) {
-    await this.escrowService.refundEscrow(escrowId, body.reason);
+    // ✅ FIX Bug 17: Add authorization check
+    const userId = req.user.sub;
+    await this.escrowService.refundEscrow(escrowId, body.reason, userId);
     return { success: true, message: 'Escrow refunded successfully' };
   }
 

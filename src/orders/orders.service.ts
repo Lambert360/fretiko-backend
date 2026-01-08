@@ -6,6 +6,8 @@ import { InvoiceService } from '../chat/invoice.service';
 import { ConnectionsService } from '../connections/connections.service';
 import { EscrowService } from '../escrow/escrow.service';
 import { RewardsService } from '../rewards/rewards.service';
+import { WalletService } from '../wallet/wallet.service';
+import { WalletTransactionType } from '../wallet/constants/transaction-types';
 
 @Injectable()
 export class OrdersService {
@@ -19,7 +21,8 @@ export class OrdersService {
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
     @Inject(forwardRef(() => RewardsService))
-    private rewardsService: RewardsService
+    private rewardsService: RewardsService,
+    private walletService: WalletService,
   ) {}
 
   async getMyOrders(userId: string, filters?: any) {
@@ -141,6 +144,38 @@ export class OrdersService {
       throw new Error(`Failed to fetch order details: ${error.message}`);
     }
 
+    // Fetch vendor profile if vendor_id exists
+    let vendorInfo: { name: string; phone?: string; avatar?: string } | null = null;
+    let vendorLocation: { latitude: number; longitude: number; address: string } | null = null;
+    if (data.vendor_id) {
+      try {
+        const { data: vendorProfile } = await supabase
+          .from('user_profiles')
+          .select('username, phone, avatar_url, location')
+          .eq('id', data.vendor_id)
+          .single();
+        
+        if (vendorProfile) {
+          vendorInfo = {
+            name: vendorProfile.username || 'Vendor',
+            phone: vendorProfile.phone,
+            avatar: vendorProfile.avatar_url,
+          };
+          
+          // Extract vendor location if available
+          if (vendorProfile.location) {
+            vendorLocation = {
+              latitude: vendorProfile.location.latitude || 6.5200,
+              longitude: vendorProfile.location.longitude || 3.3750,
+              address: vendorProfile.location.address || 'Vendor Location',
+            };
+          }
+        }
+      } catch (error) {
+        console.error('Error fetching vendor profile:', error);
+      }
+    }
+
     // Transform data to match frontend interface
     return {
       id: data.id,
@@ -158,12 +193,16 @@ export class OrdersService {
       deliveryAddress: data.delivery_address,
       deliveryInstructions: data.delivery_instructions,
       deliveryType: data.delivery_type,
+      deliveryPin: data.delivery_pin, // ✅ Include delivery PIN for buyer
       riderInfo: data.rider_info,
       escrowEnabled: data.escrow_enabled,
+      escrowReleaseAt: data.escrow_release_at, // ✅ Include escrow release time
       source: data.source,
       buyerId: data.buyer_id,
       vendorId: data.vendor_id,
       riderId: data.rider_id,
+      vendorInfo, // ✅ Include vendor info for self-pickup orders
+      vendorLocation, // ✅ Include vendor location for self-pickup orders
       metadata: data.metadata,
       items: data.order_items.map(item => ({
         id: item.id,
@@ -371,6 +410,23 @@ export class OrdersService {
         // Don't throw - auction_sales update is not critical to order cancellation
       }
     }
+
+    // 🔥 FIX: Update gift_orders status if this is a gift order
+    if (order.source === 'wishlist' && order.metadata?.wishlist_item_id) {
+      try {
+        await supabase
+          .from('gift_orders')
+          .update({
+            status: 'cancelled',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('order_id', orderId);
+        console.log(`✅ Gift order status updated to cancelled`);
+      } catch (error) {
+        console.error('Failed to update gift_orders status (non-critical):', error);
+        // Don't throw - gift_orders update is not critical to order cancellation
+      }
+    }
   }
 
   async requestRefund(userId: string, orderId: string, reason: string) {
@@ -490,6 +546,7 @@ export class OrdersService {
     
     try {
       // Get order data first (faster, simpler query)
+      // Allow access if user is buyer, vendor, or rider (vendors/riders can also be buyers)
       const { data: order, error: orderError } = await supabase
       .from('orders')
         .select('*')
@@ -679,24 +736,9 @@ export class OrdersService {
       updateData.delivered_at = new Date().toISOString();
       updateData.escrow_release_at = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString(); // 6 hours
       
-      // Update escrow auto_release_at (24 hours from delivery for dispute window)
-      const { data: escrow } = await supabase
-        .from('escrows')
-        .select('id')
-        .eq('order_id', orderId)
-        .eq('status', 'held')
-        .single();
-      
-      if (escrow) {
-        const autoReleaseAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 hours
-        await supabase
-          .from('escrows')
-          .update({
-            auto_release_at: autoReleaseAt,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', escrow.id);
-      }
+      // Note: auto_release_at should only be set when vendor/rider confirms delivery
+      // (handled in workspace.service.ts:markDelivered() and confirmSelfPickupWithPin())
+      // Not here when order status is manually changed to 'delivered'
     }
 
     const { error } = await supabase
@@ -913,15 +955,8 @@ export class OrdersService {
       // Don't throw - client relationship update is not critical
     }
 
-    // Mark invoice as paid if this order came from an invoice
-    if (order.source === 'invoice' && order.metadata?.invoiceId) {
-      try {
-        await this.invoiceService.markInvoiceAsPaid(order.metadata.invoiceId, orderId);
-      } catch (error) {
-        console.error('Failed to mark invoice as paid:', error);
-        // Don't throw - invoice marking is not critical to order completion
-      }
-    }
+    // Note: Invoice is already marked as paid when payment is processed in checkout.service.ts
+    // No need to mark it again here on completion
 
     // Update auction_sales status if this is an auction order
     if (order.source === 'auction' && order.metadata?.auction_id) {
@@ -1103,18 +1138,18 @@ export class OrdersService {
 
       // Process refund to buyer (buyer gets total - rider fee)
       try {
-        const { error: refundError } = await supabase.rpc('process_wallet_transaction', {
-          p_user_id: userId,
-          p_transaction_type: 'refund',
-          p_amount: refundAmount,
-          p_description: `Refund for order ${order.order_number} (issue reported)`,
-          p_reference_id: orderId,
-          p_reference_type: 'order',
-        });
+        const refundResult = await this.walletService.processWalletTransaction(
+          userId,
+          WalletTransactionType.ESCROW_REFUND,
+          refundAmount,
+          `Refund for order ${order.order_number} (issue reported)`,
+          orderId,
+          'order',
+        );
 
-        if (refundError) {
-          console.error('Failed to process refund:', refundError);
-          throw new Error('Failed to process refund');
+        if (!refundResult.success) {
+          console.error('Failed to process refund:', refundResult.error);
+          throw new Error(`Failed to process refund: ${refundResult.error}`);
         }
 
         console.log(`✅ Refunded ₣${refundAmount} to buyer ${userId}`);
@@ -1126,17 +1161,17 @@ export class OrdersService {
       // Pay rider their delivery fee (they did their job)
       if (order.rider_id && order.delivery_fee && parseFloat(order.delivery_fee) > 0) {
         try {
-          const { error: riderPaymentError } = await supabase.rpc('process_wallet_transaction', {
-            p_user_id: order.rider_id,
-            p_transaction_type: 'delivery_payment',
-            p_amount: parseFloat(order.delivery_fee),
-            p_description: `Delivery fee for order ${order.order_number}`,
-            p_reference_id: orderId,
-            p_reference_type: 'order',
-          });
+          const riderPaymentResult = await this.walletService.processWalletTransaction(
+            order.rider_id,
+            WalletTransactionType.DELIVERY_PAYMENT,
+            parseFloat(order.delivery_fee),
+            `Delivery fee for order ${order.order_number}`,
+            orderId,
+            'order',
+          );
 
-          if (riderPaymentError) {
-            console.error('Failed to pay rider (non-critical):', riderPaymentError);
+          if (!riderPaymentResult.success) {
+            console.error('Failed to pay rider (non-critical):', riderPaymentResult.error);
           } else {
             console.log(`✅ Paid rider ${order.rider_id} delivery fee: ₣${order.delivery_fee}`);
           }
@@ -1258,15 +1293,8 @@ export class OrdersService {
       // Don't throw - client relationship update is not critical
     }
 
-    // Mark invoice as paid if this order came from an invoice
-    if (order.source === 'invoice' && order.metadata?.invoiceId) {
-      try {
-        await this.invoiceService.markInvoiceAsPaid(order.metadata.invoiceId, orderId);
-      } catch (error) {
-        console.error('Failed to mark invoice as paid:', error);
-        // Don't throw - invoice marking is not critical to order completion
-      }
-    }
+    // Note: Invoice is already marked as paid when payment is processed in checkout.service.ts
+    // No need to mark it again here on escrow auto-release
 
     return { success: true, message: 'Escrow funds automatically released' };
   }

@@ -7,6 +7,9 @@ import { EscrowModule } from '../escrow/escrow.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { RewardsModule } from '../rewards/rewards.module';
 import { RidersModule } from '../riders/riders.module';
+import { ChatModule } from '../chat/chat.module';
+import { WishlistModule } from '../wishlist/wishlist.module';
+import { WalletModule } from '../wallet/wallet.module';
 
 @Module({
   imports: [
@@ -16,6 +19,9 @@ import { RidersModule } from '../riders/riders.module';
     NotificationsModule,
     forwardRef(() => RewardsModule),
     RidersModule,
+    forwardRef(() => ChatModule),
+    WishlistModule,
+    WalletModule,
   ],
   controllers: [CheckoutController],
   providers: [CheckoutService],

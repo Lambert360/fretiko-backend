@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { FlutterwaveService } from './flutterwave.service';
@@ -7,6 +8,7 @@ import { BankAccountService } from './bank-account.service';
 import { ReconciliationService } from './reconciliation.service';
 import { ProcessingTimeService } from './processing-time.service';
 import { WithdrawalValidationService } from './withdrawal-validation.service';
+import { WalletTransactionType, isValidTransactionType, getAllTransactionTypes } from './constants/transaction-types';
 import { randomUUID } from 'crypto';
 import { 
   WalletResponseDto, 
@@ -34,6 +36,17 @@ export class WalletService {
   private readonly HIGH_RISK_CATEGORIES = ['electronics', 'jewelry', 'cash'];
   private readonly AUTO_RELEASE_HOURS = 72; // Auto-release escrow after 72 hours
 
+  // ✅ TASK 3.2: Wallet balance cache (in-memory with TTL)
+  // ✅ BUG FIX: Make cache TTL configurable via environment variable
+  private readonly BALANCE_CACHE_TTL: number;
+  private balanceCache = new Map<string, { data: WalletResponseDto; expiry: number }>();
+  // ✅ BUG FIX: Cache locks to prevent race conditions in concurrent requests
+  private cacheLocks = new Map<string, Promise<WalletResponseDto>>();
+
+  // ✅ BUG FIX: Configurable security alert thresholds (initialized in constructor)
+  private readonly SECURITY_ALERT_THRESHOLD: number;
+  private readonly SECURITY_ALERT_TIME_WINDOW: string;
+
   constructor(
     private configService: ConfigService,
     private notificationHelper: NotificationHelperService,
@@ -44,13 +57,575 @@ export class WalletService {
     private withdrawalValidation: WithdrawalValidationService
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
+    
+    // ✅ BUG FIX: Initialize configurable security alert thresholds
+    this.SECURITY_ALERT_THRESHOLD = this.configService.get<number>('WALLET_SECURITY_ALERT_THRESHOLD', 10);
+    this.SECURITY_ALERT_TIME_WINDOW = this.configService.get<string>('WALLET_SECURITY_ALERT_TIME_WINDOW', '5 minutes');
+    
+    // ✅ BUG FIX: Initialize configurable cache TTL (default: 30 seconds, can be increased for high-traffic scenarios)
+    const cacheTtlSeconds = this.configService.get<number>('WALLET_CACHE_TTL_SECONDS', 30);
+    this.BALANCE_CACHE_TTL = cacheTtlSeconds * 1000;
+    
+    // ✅ TASK 4.1: Ensure platform wallet exists on service startup
+    this.ensurePlatformWallet().catch(error => {
+      this.logger.error('Failed to ensure platform wallet exists:', error);
+      // Don't throw - service can still start, but log the error
+    });
+  }
+
+  /**
+   * Ensure platform wallet exists (called on service startup)
+   * Platform wallet is used to receive platform commissions
+   * ✅ BUG FIX: Added race condition handling using ON CONFLICT
+   */
+  private async ensurePlatformWallet(): Promise<void> {
+    const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
+    
+    try {
+      // ✅ BUG FIX: Use INSERT ... ON CONFLICT to handle race conditions
+      // This ensures only one instance creates the wallet, even if multiple start simultaneously
+      const { data: wallet, error: upsertError } = await this.supabase
+        .from('wallets')
+        .upsert({
+          user_id: PLATFORM_USER_ID,
+          available_balance: 0.0,
+          escrow_balance: 0.0,
+          pending_withdrawal: 0.0,
+          preferred_currency: 'USD',
+          kyc_status: 'approved',
+          daily_deposit_limit: 999999999.0,
+          daily_withdrawal_limit: 999999999.0,
+          updated_at: new Date().toISOString(),
+        }, {
+          onConflict: 'user_id',
+          ignoreDuplicates: false, // Update existing record
+        })
+        .select()
+        .single();
+
+      if (upsertError) {
+        // If upsert fails, try to fetch existing wallet
+        const { data: existingWallet, error: fetchError } = await this.supabase
+          .from('wallets')
+          .select('id, kyc_status')
+          .eq('user_id', PLATFORM_USER_ID)
+          .single();
+
+        if (fetchError || !existingWallet) {
+          this.logger.error('Failed to ensure platform wallet exists:', upsertError);
+          // Don't throw - this is a non-critical initialization check
+          return;
+        }
+
+        // Ensure KYC status is approved
+        if (existingWallet.kyc_status !== 'approved') {
+          await this.supabase
+            .from('wallets')
+            .update({ kyc_status: 'approved', updated_at: new Date().toISOString() })
+            .eq('id', existingWallet.id);
+          
+          this.logger.log(`✅ Platform wallet KYC status updated to approved`);
+        } else {
+          this.logger.debug('Platform wallet already exists and is approved');
+        }
+      } else if (wallet) {
+        this.logger.log(`✅ Platform wallet ensured: ${wallet.id}`);
+      }
+    } catch (error: any) {
+      this.logger.error('Error ensuring platform wallet exists:', error);
+      // Don't throw - this is a non-critical initialization check
+    }
   }
 
   // ================================
   // WALLET OPERATIONS
   // ================================
 
+  /**
+   * Helper function to safely call process_wallet_transaction RPC
+   * Validates both Supabase error and RPC return value success field
+   * Includes retry logic with exponential backoff for transient failures
+   * 
+   * @param maxRetries Maximum number of retry attempts (default: 3)
+   * @returns Object with success flag, transactionId if successful, or error message
+   */
+  async processWalletTransaction(
+    userId: string,
+    transactionType: string,
+    amount: number,
+    description: string,
+    referenceId?: string,
+    referenceType?: string,
+    maxRetries: number = 3
+  ): Promise<{ success: boolean; transactionId?: string; error?: string }> {
+    // ✅ BUG FIX: Validate transaction type before processing
+    if (!isValidTransactionType(transactionType)) {
+      const error = `Invalid transaction type: ${transactionType}. Valid types: ${getAllTransactionTypes().join(', ')}`;
+      this.logger.error(`[processWalletTransaction] ${error} (user: ${userId})`);
+      return { success: false, error };
+    }
+
+    // ✅ BUG FIX: Validate amount is a valid number and not zero
+    if (typeof amount !== 'number' || isNaN(amount) || !isFinite(amount)) {
+      const error = `Invalid amount: must be a valid number, got ${amount}`;
+      this.logger.error(`[processWalletTransaction] ${error} (user: ${userId})`);
+      return { success: false, error };
+    }
+
+    if (amount === 0) {
+      const error = `Invalid amount: cannot be zero for transaction type ${transactionType}`;
+      this.logger.error(`[processWalletTransaction] ${error} (user: ${userId})`);
+      return { success: false, error };
+    }
+
+    // ✅ BUG FIX: Validate amount is positive for credit transactions and negative for debit transactions
+    // Note: Some transaction types can be positive or negative (e.g., ADMIN_ADJUSTMENT)
+    // For most transactions, we validate based on their nature
+    const creditTypes = [
+      WalletTransactionType.DEPOSIT_MINT,
+      WalletTransactionType.ESCROW_RELEASE,
+      WalletTransactionType.ESCROW_REFUND,
+      WalletTransactionType.REWARD_CREDIT,
+      WalletTransactionType.DELIVERY_PAYMENT,
+      WalletTransactionType.PLATFORM_COMMISSION,
+    ];
+    
+    const debitTypes = [
+      WalletTransactionType.WITHDRAWAL_BURN,
+      WalletTransactionType.FEE_DEDUCTION,
+    ];
+
+    // ADMIN_ADJUSTMENT and PURCHASE_HOLD can be positive or negative
+    if (creditTypes.includes(transactionType as WalletTransactionType) && amount < 0) {
+      const error = `Invalid amount for credit transaction type ${transactionType}: amount must be positive, got ${amount}`;
+      this.logger.error(`[processWalletTransaction] ${error} (user: ${userId})`);
+      return { success: false, error };
+    }
+
+    if (debitTypes.includes(transactionType as WalletTransactionType) && amount > 0) {
+      const error = `Invalid amount for debit transaction type ${transactionType}: amount must be negative, got ${amount}`;
+      this.logger.error(`[processWalletTransaction] ${error} (user: ${userId})`);
+      return { success: false, error };
+    }
+
+    let lastError: string | undefined;
+    let lastException: any;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      // Add delay before retry (exponential backoff: 1s, 2s, 4s)
+      if (attempt > 0) {
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 4000); // Max 4 seconds
+        this.logger.warn(
+          `Retrying wallet transaction (attempt ${attempt + 1}/${maxRetries + 1}): ` +
+          `${transactionType} for user ${userId}, waiting ${delay}ms`
+        );
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+
+      try {
+        const { data, error } = await this.supabase.rpc('process_wallet_transaction', {
+          p_user_id: userId,
+          p_transaction_type: transactionType,
+          p_amount: amount,
+          p_description: description,
+          p_reference_id: referenceId || null,
+          p_reference_type: referenceType || null,
+        });
+
+        // Check for Supabase RPC call error
+        if (error) {
+          const errorMsg = error.message || 'RPC call failed';
+          lastError = errorMsg;
+
+          // ✅ TASK 3.1: Log negative balance attempts from RPC errors
+          if (errorMsg.toLowerCase().includes('insufficient')) {
+            await this.logSecurityEvent({
+              type: 'insufficient_balance_attempt',
+              userId,
+              transactionType,
+              amount,
+              currentBalance: null, // RPC error doesn't provide balance info
+              errorMessage: errorMsg,
+              timestamp: new Date().toISOString(),
+            });
+
+            // Check for suspicious pattern
+            const recentAttempts = await this.getRecentFailedAttempts(userId, this.SECURITY_ALERT_TIME_WINDOW);
+            if (recentAttempts.length > this.SECURITY_ALERT_THRESHOLD) {
+              await this.triggerSecurityAlert({
+                severity: 'medium',
+                event: 'repeated_insufficient_balance_attempts',
+                userId,
+                attemptCount: recentAttempts.length,
+                timeWindow: this.SECURITY_ALERT_TIME_WINDOW,
+              });
+            }
+          }
+
+          // Check if this is a retryable error
+          if (this.isRetryableError(error, errorMsg)) {
+            this.logger.warn(
+              `Retryable RPC error for ${transactionType} (user: ${userId}, attempt ${attempt + 1}):`,
+              errorMsg
+            );
+            continue; // Retry
+          } else {
+            // Non-retryable error - return immediately
+            this.logger.error(`Non-retryable RPC error for ${transactionType} (user: ${userId}):`, errorMsg);
+            // ✅ BUG FIX: Invalidate cache on RPC error to prevent stale data
+            this.invalidateWalletCache(userId);
+            return { success: false, error: errorMsg };
+          }
+        }
+
+        // Check for RPC function return value (data.success)
+        if (!data || !data.success) {
+          const errorMsg = data?.error || 'Transaction failed without error message';
+          lastError = errorMsg;
+
+          // ✅ TASK 3.1: Log negative balance attempts for security monitoring
+          if (errorMsg.toLowerCase().includes('insufficient')) {
+            await this.logSecurityEvent({
+              type: 'insufficient_balance_attempt',
+              userId,
+              transactionType,
+              amount,
+              currentBalance: data?.previous_available || null,
+              errorMessage: errorMsg,
+              timestamp: new Date().toISOString(),
+            });
+
+            // Check for suspicious pattern (multiple rapid attempts)
+            const recentAttempts = await this.getRecentFailedAttempts(userId, this.SECURITY_ALERT_TIME_WINDOW);
+            if (recentAttempts.length > this.SECURITY_ALERT_THRESHOLD) {
+              await this.triggerSecurityAlert({
+                severity: 'medium',
+                event: 'repeated_insufficient_balance_attempts',
+                userId,
+                attemptCount: recentAttempts.length,
+                timeWindow: this.SECURITY_ALERT_TIME_WINDOW,
+              });
+            }
+          }
+
+          // Check if this is a retryable error
+          if (this.isRetryableError(null, errorMsg)) {
+            this.logger.warn(
+              `Retryable transaction failure for ${transactionType} (user: ${userId}, attempt ${attempt + 1}):`,
+              errorMsg
+            );
+            continue; // Retry
+          } else {
+            // Non-retryable error - return immediately
+            this.logger.error(`Non-retryable transaction failure for ${transactionType} (user: ${userId}):`, errorMsg);
+            
+            // ✅ BUG FIX: Invalidate cache on failure to prevent stale data
+            this.invalidateWalletCache(userId);
+            
+            return { success: false, error: errorMsg };
+          }
+        }
+
+        // Success - return transaction details
+        if (attempt > 0) {
+          this.logger.log(
+            `✅ Wallet transaction successful after ${attempt} retries: ${transactionType} for user ${userId}, amount: ${amount}`
+          );
+        } else {
+          this.logger.log(`✅ Wallet transaction successful: ${transactionType} for user ${userId}, amount: ${amount}`);
+        }
+
+        // ✅ TASK 3.2: Invalidate cache after successful transaction
+        this.invalidateWalletCache(userId);
+
+        return { 
+          success: true, 
+          transactionId: data.transaction_id 
+        };
+      } catch (error: any) {
+        lastException = error;
+        const errorMsg = error.message || 'Unexpected error in wallet transaction';
+        lastError = errorMsg;
+
+        // Check if this is a retryable exception
+        if (this.isRetryableError(error, errorMsg)) {
+          this.logger.warn(
+            `Retryable exception in processWalletTransaction (attempt ${attempt + 1}):`,
+            errorMsg
+          );
+          continue; // Retry
+        } else {
+          // Non-retryable exception - return immediately
+          this.logger.error(`Non-retryable exception in processWalletTransaction:`, error);
+          
+          // ✅ BUG FIX: Invalidate cache on failure to prevent stale data
+          this.invalidateWalletCache(userId);
+          
+          return { success: false, error: errorMsg };
+        }
+      }
+    }
+
+    // All retries exhausted
+    const finalError = lastError || 'Transaction failed after all retries';
+    this.logger.error(
+      `❌ Wallet transaction failed after ${maxRetries + 1} attempts: ${transactionType} for user ${userId}:`,
+      finalError
+    );
+    
+    // ✅ BUG FIX: Invalidate cache on final failure
+    this.invalidateWalletCache(userId);
+    
+    return { success: false, error: finalError };
+  }
+
+  /**
+   * Log security event for monitoring and alerting
+   */
+  private async logSecurityEvent(event: {
+    type: string;
+    userId: string;
+    transactionType?: string;
+    amount?: number;
+    currentBalance?: number | null;
+    errorMessage?: string;
+    timestamp: string;
+  }): Promise<void> {
+    try {
+      // Log to wallet_audit_log table
+      await this.supabase
+        .from('wallet_audit_log')
+        .insert({
+          user_id: event.userId,
+          operation: event.type,
+          table_name: 'wallets',
+          old_values: {
+            current_balance: event.currentBalance,
+            transaction_type: event.transactionType,
+            amount: event.amount,
+          },
+          new_values: {
+            error_message: event.errorMessage,
+            timestamp: event.timestamp,
+          },
+          created_at: event.timestamp,
+        });
+
+      this.logger.warn(
+        `🔒 Security event logged: ${event.type} for user ${event.userId} ` +
+        `(Balance: ${event.currentBalance || 'unknown'}, Amount: ${event.amount || 'N/A'})`
+      );
+    } catch (error: any) {
+      // Don't throw - logging failures shouldn't break the flow
+      this.logger.error('Failed to log security event:', error);
+    }
+  }
+
+  /**
+   * Get recent failed attempts for a user within a time window
+   * ✅ BUG FIX: Properly parse time window strings like "5 minutes"
+   */
+  private async getRecentFailedAttempts(
+    userId: string,
+    timeWindow: string = '5 minutes'
+  ): Promise<any[]> {
+    try {
+      // Parse time window string (e.g., "5 minutes" -> 5 minutes in milliseconds)
+      let windowMs = 5 * 60 * 1000; // Default: 5 minutes
+      const timeWindowLower = timeWindow.toLowerCase().trim();
+      
+      if (timeWindowLower.includes('minute')) {
+        const minutes = parseInt(timeWindowLower) || 5;
+        windowMs = minutes * 60 * 1000;
+      } else if (timeWindowLower.includes('hour')) {
+        const hours = parseInt(timeWindowLower) || 1;
+        windowMs = hours * 60 * 60 * 1000;
+      } else if (timeWindowLower.includes('second')) {
+        const seconds = parseInt(timeWindowLower) || 30;
+        windowMs = seconds * 1000;
+      } else {
+        // Fallback: try to parse as number of minutes
+        const parsed = parseInt(timeWindowLower);
+        if (!isNaN(parsed)) {
+          windowMs = parsed * 60 * 1000;
+        }
+      }
+      
+      const cutoffTime = new Date(Date.now() - windowMs).toISOString();
+
+      const { data } = await this.supabase
+        .from('wallet_audit_log')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('operation', 'insufficient_balance_attempt')
+        .gte('created_at', cutoffTime)
+        .order('created_at', { ascending: false });
+
+      return data || [];
+    } catch (error: any) {
+      this.logger.error('Failed to get recent failed attempts:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Trigger security alert for suspicious activity
+   */
+  private async triggerSecurityAlert(alert: {
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    event: string;
+    userId: string;
+    attemptCount?: number;
+    timeWindow?: string;
+  }): Promise<void> {
+    try {
+      this.logger.error(
+        `🚨 SECURITY ALERT [${alert.severity.toUpperCase()}]: ${alert.event} ` +
+        `for user ${alert.userId} (${alert.attemptCount || 'N/A'} attempts in ${alert.timeWindow || 'N/A'})`
+      );
+
+      // Log to reconciliation_alerts for admin visibility
+      await this.supabase
+        .from('reconciliation_alerts')
+        .insert({
+          user_id: alert.userId,
+          alert_type: 'security_alert',
+          alert_severity: alert.severity,
+          alert_reason: `${alert.event}: ${alert.attemptCount || 'multiple'} attempts detected`,
+          status: 'pending',
+          local_amount: 0,
+          local_currency: 'USD',
+          metadata: {
+            event: alert.event,
+            attemptCount: alert.attemptCount,
+            timeWindow: alert.timeWindow,
+            timestamp: new Date().toISOString(),
+          },
+        });
+
+      // TODO: Send notification to admin team (email, Slack, etc.)
+      // For now, just log the alert
+    } catch (error: any) {
+      this.logger.error('Failed to trigger security alert:', error);
+      // Don't throw - alerting failures shouldn't break the flow
+    }
+  }
+
+  /**
+   * Determines if an error is retryable (transient failure)
+   * Retries are only attempted for network/timeout/database connection issues
+   * Business logic errors (insufficient balance, invalid types) are not retried
+   */
+  private isRetryableError(error: any, errorMessage: string): boolean {
+    if (!errorMessage) return false;
+
+    const message = errorMessage.toLowerCase();
+    const code = error?.code?.toLowerCase() || '';
+
+    // Non-retryable: Business logic errors
+    const nonRetryablePatterns = [
+      'insufficient',
+      'unknown transaction type',
+      'validation',
+      'invalid',
+      'not found',
+      'already exists',
+      'duplicate',
+      'unauthorized',
+      'forbidden',
+      'bad request',
+    ];
+
+    for (const pattern of nonRetryablePatterns) {
+      if (message.includes(pattern)) {
+        return false;
+      }
+    }
+
+    // Retryable: Network/database/transient errors
+    const retryablePatterns = [
+      'timeout',
+      'connection',
+      'network',
+      'econnreset',
+      'etimedout',
+      'enotfound',
+      'econnrefused',
+      'database',
+      'pg_',
+      'pgrst',
+      'service unavailable',
+      'internal server error',
+      'temporary',
+      'retry',
+    ];
+
+    // Check error codes
+    const retryableCodes = [
+      'pgrst100', // Connection error
+      'pgrst101', // Timeout
+      'pgrst102', // Service unavailable
+      '08', // PostgreSQL connection exception class
+      '53', // PostgreSQL insufficient resources
+      '57', // PostgreSQL operator intervention
+    ];
+
+    for (const codePattern of retryableCodes) {
+      if (code.includes(codePattern)) {
+        return true;
+      }
+    }
+
+    for (const pattern of retryablePatterns) {
+      if (message.includes(pattern)) {
+        return true;
+      }
+    }
+
+    // Default: Don't retry unknown errors (safer to fail fast)
+    return false;
+  }
+
   async getWallet(userId: string): Promise<WalletResponseDto> {
+    // ✅ TASK 3.2: Check cache first
+    const cacheKey = `wallet:${userId}`;
+    const cached = this.balanceCache.get(cacheKey);
+    
+    if (cached && Date.now() < cached.expiry) {
+      this.logger.debug(`Cache hit for wallet ${userId}`);
+      return cached.data;
+    }
+
+    // ✅ BUG FIX: Check if there's an in-flight request for this user
+    // This prevents multiple concurrent requests from all hitting the database
+    if (this.cacheLocks.has(cacheKey)) {
+      this.logger.debug(`Waiting for in-flight wallet fetch for user ${userId}`);
+      try {
+        return await this.cacheLocks.get(cacheKey)!;
+      } catch (error) {
+        // If the in-flight request failed, we'll retry below
+        this.logger.warn(`In-flight wallet fetch failed for user ${userId}, retrying...`);
+      }
+    }
+
+    // Create a promise for this fetch operation
+    const fetchPromise = this.fetchWalletFromDB(userId, cacheKey);
+    this.cacheLocks.set(cacheKey, fetchPromise);
+
+    try {
+      const result = await fetchPromise;
+      return result;
+    } finally {
+      // Always remove the lock when done (success or failure)
+      this.cacheLocks.delete(cacheKey);
+    }
+  }
+
+  /**
+   * Internal method to fetch wallet from database and update cache
+   * Separated to allow proper lock management
+   */
+  private async fetchWalletFromDB(userId: string, cacheKey: string): Promise<WalletResponseDto> {
     console.log('🔍 Getting wallet for user ID:', userId);
     
     const { data, error } = await this.supabase
@@ -77,12 +652,72 @@ export class WalletService {
     const walletDto = this.mapWalletToDto(data);
     
     // Add pending escrow data to response
-    return {
+    const walletResponse = {
       ...walletDto,
       pendingVendorEarnings: pendingEscrows.vendorAmount,
       pendingRiderEarnings: pendingEscrows.riderAmount,
       totalPendingEarnings: pendingEscrows.totalPending,
     };
+
+    // ✅ TASK 3.2: Cache the result
+    this.balanceCache.set(cacheKey, {
+      data: walletResponse,
+      expiry: Date.now() + this.BALANCE_CACHE_TTL,
+    });
+
+    return walletResponse;
+  }
+
+  /**
+   * Invalidate wallet balance cache for a user
+   * Called after any wallet transaction to ensure cache consistency
+   * ✅ BUG FIX: Made public so reconciliation service can call it
+   */
+  invalidateWalletCache(userId: string): void {
+    try {
+      const cacheKey = `wallet:${userId}`;
+      this.balanceCache.delete(cacheKey);
+      this.logger.debug(`Cache invalidated for wallet ${userId}`);
+    } catch (error: any) {
+      // ✅ BUG FIX: Add error handling for cache operations
+      this.logger.error(`Failed to invalidate cache for wallet ${userId}:`, error);
+      // Don't throw - cache invalidation failure shouldn't break the flow
+    }
+  }
+
+  /**
+   * Clean up expired cache entries to prevent memory leaks
+   * ✅ BUG FIX: Periodic cleanup prevents memory from growing unbounded
+   */
+  private cleanupExpiredCache(): void {
+    try {
+      const now = Date.now();
+      let cleanedCount = 0;
+      
+      for (const [key, value] of this.balanceCache.entries()) {
+        if (now >= value.expiry) {
+          this.balanceCache.delete(key);
+          cleanedCount++;
+        }
+      }
+
+      if (cleanedCount > 0) {
+        this.logger.debug(`Cleaned up ${cleanedCount} expired cache entries`);
+      }
+    } catch (error: any) {
+      this.logger.error('Error cleaning up expired cache:', error);
+    }
+  }
+
+  /**
+   * Scheduled job: Clean up expired cache entries every 5 minutes
+   * ✅ BUG FIX: Prevents memory leak from expired cache entries
+   */
+  @Cron('*/5 * * * *', {
+    name: 'wallet-cache-cleanup',
+  })
+  private scheduledCacheCleanup(): void {
+    this.cleanupExpiredCache();
   }
 
   private async createWalletForUser(userId: string): Promise<WalletResponseDto> {
@@ -447,7 +1082,7 @@ export class WalletService {
       p_user_id: userId,
       p_amount: dto.fretiAmount,
       p_limit_type: 'withdrawal',
-      p_transaction_type: 'withdrawal_burn'
+      p_transaction_type: WalletTransactionType.WITHDRAWAL_BURN
     });
 
     if (limitError) {
@@ -531,10 +1166,8 @@ export class WalletService {
     // Note: Balance validation happens atomically in createLedgerEntry via atomic_wallet_operation
     const userWallet = await this.getWallet(userId);
     
-    // Quick validation (final check happens atomically in database)
-    if (userWallet.availableBalance < dto.fretiAmount) {
-      throw new BadRequestException('Insufficient available balance');
-    }
+    // ✅ BUG FIX: Removed redundant balance check - atomic_wallet_operation validates atomically
+    // This prevents race conditions where balance could change between check and operation
 
     // Move funds from available to pending withdrawal (atomic operation with locking)
     // Note: createLedgerEntry now uses atomic_wallet_operation which handles locking and idempotency
@@ -947,6 +1580,9 @@ export class WalletService {
 
     // Success - balances updated atomically via trigger
     this.logger.log(`Ledger entry created atomically: ${result.ledger_entry_id}`);
+    
+    // ✅ BUG FIX: Invalidate cache after ledger entry creation (for deposits/withdrawals)
+    this.invalidateWalletCache(userId);
   }
 
   private async validateDailyDepositLimit(userId: string, amount: number): Promise<void> {
@@ -955,7 +1591,7 @@ export class WalletService {
       p_user_id: userId,
       p_amount: amount,
       p_limit_type: 'deposit',
-      p_transaction_type: 'deposit_mint'
+      p_transaction_type: WalletTransactionType.DEPOSIT_MINT
     });
 
     if (limitError) {
@@ -975,7 +1611,7 @@ export class WalletService {
       p_user_id: userId,
       p_amount: amount,
       p_limit_type: 'withdrawal',
-      p_transaction_type: 'withdrawal_burn'
+      p_transaction_type: WalletTransactionType.WITHDRAWAL_BURN
     });
 
     if (limitError) {

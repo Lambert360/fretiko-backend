@@ -4,6 +4,10 @@ import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared
 import { EscrowService } from '../escrow/escrow.service';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { RewardsService } from '../rewards/rewards.service';
+import { InvoiceService } from '../chat/invoice.service';
+import { WishlistService } from '../wishlist/wishlist.service';
+import { WalletService } from '../wallet/wallet.service';
+import { WalletTransactionType } from '../wallet/constants/transaction-types';
 
 @Injectable()
 export class CheckoutService {
@@ -16,6 +20,10 @@ export class CheckoutService {
     private notificationHelper: NotificationHelperService,
     @Inject(forwardRef(() => RewardsService))
     private rewardsService: RewardsService,
+    @Inject(forwardRef(() => InvoiceService))
+    private invoiceService: InvoiceService,
+    private wishlistService: WishlistService,
+    private walletService: WalletService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -113,6 +121,78 @@ export class CheckoutService {
         throw new HttpException('No selected items found in cart', HttpStatus.BAD_REQUEST);
       }
     }
+
+    const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    const shipping = this.calculateShipping(subtotal, items);
+    const tax = this.calculateTax(subtotal);
+    const escrowFee = this.calculateEscrowFee(subtotal + shipping + tax);
+    const total = subtotal + shipping + tax + escrowFee;
+
+    return {
+      items,
+      subtotal,
+      shipping,
+      tax,
+      escrowFee,
+      total,
+    };
+  }
+
+  // Get wishlist checkout summary
+  async getWishlistCheckoutSummary(userId: string, wishlistItemIds: string[], userToken?: string) {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+
+    if (!wishlistItemIds || wishlistItemIds.length === 0) {
+      throw new HttpException('Wishlist item IDs are required', HttpStatus.BAD_REQUEST);
+    }
+
+    // Fetch wishlist items with product details
+    const { data: wishlistItems, error: wishlistError } = await client
+      .from('wishlist')
+      .select(`
+        id,
+        product_id,
+        products (
+          id,
+          name,
+          price,
+          user_id,
+          status,
+          quantity
+        )
+      `)
+      .eq('user_id', userId)
+      .in('id', wishlistItemIds);
+
+    if (wishlistError) {
+      console.error('Error fetching wishlist items:', wishlistError);
+      throw new HttpException('Failed to fetch wishlist items', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    if (!wishlistItems || wishlistItems.length === 0) {
+      throw new HttpException('No wishlist items found', HttpStatus.NOT_FOUND);
+    }
+
+    // Filter out items with deleted or inactive products
+    const validItems = wishlistItems.filter(item => 
+      item.products && 
+      item.products.status === 'active' &&
+      item.products.quantity > 0
+    );
+
+    if (validItems.length === 0) {
+      throw new HttpException('No valid products found in wishlist items', HttpStatus.BAD_REQUEST);
+    }
+
+    // Build items array for checkout summary
+    const items = validItems.map(item => ({
+      id: item.products.id,
+      name: item.products.name,
+      price: item.products.price,
+      quantity: 1, // Wishlist items are always quantity 1
+      sellerId: item.products.user_id,
+      requiresEscrow: true, // Wishlist purchases always use escrow
+    }));
 
     const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
     const shipping = this.calculateShipping(subtotal, items);
@@ -570,6 +650,14 @@ export class CheckoutService {
         userToken,
       );
       isAuctionOrder = true;
+    } else if (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) {
+      // Wishlist checkout
+      console.log('💖 Backend createOrder - Wishlist checkout with itemIds:', orderData.wishlistItemIds);
+      summary = await this.getWishlistCheckoutSummary(
+        userId,
+        orderData.wishlistItemIds,
+        userToken,
+      );
     } else if (orderData.directCheckout) {
       // Direct product checkout
       summary = await this.getDirectCheckoutSummary(
@@ -638,8 +726,14 @@ export class CheckoutService {
     }
 
     // Determine order source
-    const orderSource = isAuctionOrder ? 'auction' : 
-                       orderData.directCheckout ? 'regular' : 'regular';
+    let orderSource = 'regular';
+    if (isAuctionOrder) {
+      orderSource = 'auction';
+    } else if (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) {
+      orderSource = 'wishlist';
+    } else if (orderData.directCheckout) {
+      orderSource = 'regular';
+    }
 
     // Log delivery type detection
     console.log('🚚 [DEBUG] Delivery type detection:', {
@@ -693,6 +787,10 @@ export class CheckoutService {
         // Add auction_id to metadata for easier querying
         ...(isAuctionOrder && orderData.auctionCheckout ? {
           auction_id: orderData.auctionCheckout.auctionId,
+        } : {}),
+        // Add wishlist_item_ids to metadata for cleanup
+        ...(orderSource === 'wishlist' && orderData.wishlistItemIds ? {
+          wishlist_item_ids: orderData.wishlistItemIds,
         } : {}),
       },
       created_at: new Date().toISOString(),
@@ -807,6 +905,32 @@ export class CheckoutService {
     // Process payment if wallet (use final amount after rewards discount)
     if (orderData.paymentMethodId === 'wallet') {
       await this.processWalletPayment(userId, order.id, finalPaymentAmount, vendorId, riderId, client);
+    }
+
+    // ✅ Mark invoice as paid if this order came from an invoice (after payment is processed)
+    if (order.source === 'invoice' && order.metadata?.invoiceId) {
+      try {
+        await this.invoiceService.markInvoiceAsPaid(order.metadata.invoiceId, order.id);
+        console.log(`✅ Invoice ${order.metadata.invoiceId} marked as paid after payment processing`);
+      } catch (error) {
+        console.error('Failed to mark invoice as paid:', error);
+        // Don't throw - invoice marking is not critical to payment processing
+      }
+    }
+
+    // ✅ Remove purchased items from wishlist if this order came from wishlist
+    if (order.source === 'wishlist' && order.metadata?.wishlist_item_ids) {
+      try {
+        await this.wishlistService.removePurchasedItems(
+          userId,
+          order.metadata.wishlist_item_ids,
+          userToken,
+        );
+        console.log(`✅ Removed ${order.metadata.wishlist_item_ids.length} items from wishlist after purchase`);
+      } catch (error) {
+        console.error('Failed to remove wishlist items:', error);
+        // Don't throw - wishlist cleanup is not critical to order creation
+      }
     }
 
     // Clear cart if not direct checkout
@@ -1038,39 +1162,31 @@ export class CheckoutService {
     riderId: string | null,
     client: any,
   ) {
-    // ✅ Use the process_wallet_transaction RPC function for proper escrow handling
+    // ✅ Use the process_wallet_transaction helper for proper escrow handling
     // This function automatically handles:
     // - Moving money from available_balance to escrow_balance
     // - Creating proper wallet_ledger entries
     // - Atomic transaction safety
-    const { data: result, error: rpcError } = await this.supabase.rpc(
-      'process_wallet_transaction',
-      {
-        p_user_id: userId,
-        p_transaction_type: 'purchase_hold',
-        p_amount: amount,
-        p_description: `Payment for order ${orderId}`,
-        p_reference_id: orderId, // orderId is already a UUID string
-        p_reference_type: 'order',
-      }
+    // - Validating both RPC error and return value success field
+    const result = await this.walletService.processWalletTransaction(
+      userId,
+      WalletTransactionType.PURCHASE_HOLD,
+      amount,
+      `Payment for order ${orderId}`,
+      orderId,
+      'order',
     );
-
-    if (rpcError) {
-      console.error('❌ Wallet transaction RPC error:', rpcError);
-      throw new HttpException('Payment processing failed', HttpStatus.INTERNAL_SERVER_ERROR);
-    }
 
     if (!result.success) {
       console.error('❌ Wallet transaction failed:', result.error);
-      throw new HttpException(result.error || 'Payment processing failed', HttpStatus.INTERNAL_SERVER_ERROR);
+      throw new HttpException(
+        result.error || 'Payment processing failed',
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
     }
 
     console.log(`✅ Wallet payment processed successfully:`, {
-      transactionId: result.transaction_id,
-      availableDelta: result.available_delta,
-      escrowDelta: result.escrow_delta,
-      newAvailable: result.new_available,
-      newEscrow: result.new_escrow,
+      transactionId: result.transactionId,
     });
 
     // ✅ Payment processed - money now in escrow
@@ -1167,19 +1283,48 @@ export class CheckoutService {
       console.log(`✅ Escrow created for order ${orderId}: ₣${amount}`);
       return escrow;
     } catch (escrowError) {
-      console.error('Failed to create escrow (non-critical):', escrowError);
-      // Don't throw - payment already processed, escrow can be created manually if needed
+      console.error('❌ CRITICAL: Failed to create escrow after payment:', escrowError);
+      // ⚠️ Payment is already processed (money in escrow balance), but escrow record doesn't exist
+      // This is a critical failure requiring manual intervention
+      throw new HttpException(
+        'Payment processed successfully but escrow creation failed. Payment is held in escrow but no escrow record exists. Manual intervention required.',
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
     }
   }
 
   // Calculate escrow breakdown (platform fee: 2%, delivery fee: 10% if rider)
+  // ✅ FIX: Round amounts to 6 decimal places (matching DECIMAL(18,6)) and validate sum
   private calculateEscrowBreakdown(
     totalAmount: number,
     riderId: string | null,
   ): { totalAmount: number; vendorAmount: number; riderAmount: number; platformAmount: number } {
-    const platformFee = totalAmount * 0.02; // 2% platform fee
-    const deliveryFee = riderId ? totalAmount * 0.10 : 0; // 10% delivery fee if rider assigned
-    const vendorAmount = totalAmount - platformFee - deliveryFee;
+    // Helper function to round to 6 decimal places (matching DECIMAL(18,6) precision)
+    const round6 = (value: number): number => Math.round(value * 1000000) / 1000000;
+
+    const platformFee = round6(totalAmount * 0.02); // 2% platform fee
+    const deliveryFee = riderId ? round6(totalAmount * 0.10) : 0; // 10% delivery fee if rider assigned
+    
+    // Calculate vendor amount (ensures sum equals totalAmount exactly)
+    const vendorAmount = round6(totalAmount - platformFee - deliveryFee);
+
+    // ✅ Validate sum equals totalAmount (within floating point tolerance)
+    const sum = round6(vendorAmount + deliveryFee + platformFee);
+    const difference = Math.abs(sum - totalAmount);
+    
+    if (difference > 0.000001) {
+      // If rounding caused discrepancy, adjust vendor amount to balance
+      // This ensures vendorAmount + riderAmount + platformAmount === totalAmount exactly
+      const adjustedVendorAmount = round6(totalAmount - platformFee - deliveryFee);
+      console.warn(`⚠️ Escrow breakdown rounding adjustment: ${difference} difference adjusted in vendorAmount`);
+      
+      return {
+        totalAmount,
+        vendorAmount: adjustedVendorAmount,
+        riderAmount: deliveryFee,
+        platformAmount: platformFee,
+      };
+    }
 
     return {
       totalAmount,
@@ -1248,12 +1393,18 @@ export class CheckoutService {
         multiStop: riderAssignment.vendorIds.length > 1,
         stopSequence: riderAssignment.vendorIds.indexOf(vendorGroup.vendorId) + 1,
       },
-      order_source: 'regular',
+      source: (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) ? 'wishlist' : 'regular',
       pickup_pin: this.generatePIN(),
       delivery_pin: this.generatePIN(),
       order_group_id: orderGroupId,
       is_grouped: true,
       group_sequence: sequence,
+      metadata: {
+        // Add wishlist_item_ids to metadata for cleanup (only for wishlist orders)
+        ...(orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0 ? {
+          wishlist_item_ids: orderData.wishlistItemIds,
+        } : {}),
+      },
     };
     
     const { data: order, error } = await client
@@ -1354,8 +1505,19 @@ export class CheckoutService {
     let totalAmount = 0; // Define outside try block for rollback access
     
     try {
-      // Get cart summary
-      const summary = await this.getCheckoutSummary(userId, userToken);
+      // Get cart summary OR wishlist summary
+      let summary;
+      if (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) {
+        // ✅ Handle wishlist source for grouped orders
+        console.log('💖 Backend createGroupedOrder - Wishlist checkout with itemIds:', orderData.wishlistItemIds);
+        summary = await this.getWishlistCheckoutSummary(
+          userId,
+          orderData.wishlistItemIds,
+          userToken,
+        );
+      } else {
+        summary = await this.getCheckoutSummary(userId, userToken);
+      }
       
       // Group items by vendor (sellerId)
       const vendorGroups = this.groupItemsByVendor(summary.items);
@@ -1458,6 +1620,21 @@ export class CheckoutService {
         console.warn('⚠️ Notification sending failed (non-critical):', notifError);
       }
       
+      // ✅ Remove purchased items from wishlist after grouped order creation
+      if (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) {
+        try {
+          await this.wishlistService.removePurchasedItems(
+            userId,
+            orderData.wishlistItemIds,
+            userToken,
+          );
+          console.log(`✅ Removed ${orderData.wishlistItemIds.length} items from wishlist after grouped order creation`);
+        } catch (error) {
+          console.error('Failed to remove wishlist items (non-critical):', error);
+          // Don't throw - wishlist cleanup is not critical to order creation
+        }
+      }
+      
       return {
         orderGroup: orderGroup,
         orders: orders,
@@ -1477,25 +1654,22 @@ export class CheckoutService {
         await client.from('order_groups').delete().eq('id', orderGroupId);
       }
       
-      // Rollback: Refund wallet if deducted using RPC function
+      // Rollback: Refund wallet if deducted using helper function
       if (walletDeducted) {
         try {
-          const { data: refundResult, error: refundError } = await this.supabase.rpc(
-            'process_wallet_transaction',
-            {
-              p_user_id: userId,
-              p_transaction_type: 'escrow_refund',
-              p_amount: totalAmount,
-              p_description: `Refund for failed order group creation`,
-              p_reference_id: orderGroupId || null,
-              p_reference_type: 'order_group',
-            }
+          const refundResult = await this.walletService.processWalletTransaction(
+            userId,
+            WalletTransactionType.ESCROW_REFUND,
+            totalAmount,
+            `Refund for failed order group creation`,
+            orderGroupId || undefined,
+            'order_group',
           );
 
-          if (refundError || !refundResult?.success) {
-            console.error('❌ Failed to refund wallet during rollback:', refundError || refundResult?.error);
+          if (!refundResult.success) {
+            console.error('❌ Failed to refund wallet during rollback:', refundResult.error);
           } else {
-            console.log('✅ Wallet refunded during rollback:', refundResult.transaction_id);
+            console.log('✅ Wallet refunded during rollback:', refundResult.transactionId);
           }
         } catch (refundError) {
           console.error('❌ Error during wallet refund rollback:', refundError);
