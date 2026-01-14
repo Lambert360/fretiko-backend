@@ -1,5 +1,7 @@
 import { Module, forwardRef } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { JwtModule } from '@nestjs/jwt';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import { AdminController } from './admin.controller';
 import { StaffAdminController } from './staff-admin.controller';
 import { ContentModerationController } from './content-moderation.controller';
@@ -11,6 +13,8 @@ import { DashboardController } from './dashboard.controller';
 import { OrdersController } from './orders.controller';
 import { DisputesController } from './disputes.controller';
 import { AdminService } from './admin.service';
+import { AdminNotificationsGateway } from './admin-notifications.gateway';
+import { AdminNotificationsService } from './admin-notifications.service';
 import { StaffModule } from '../staff/staff.module';
 import { AuditModule } from '../audit/audit.module';
 import { NotificationsModule } from '../notifications/notifications.module';
@@ -21,11 +25,20 @@ import { EmailService } from '../shared/email.service';
 
 @Module({
   imports: [
-    ConfigModule, 
-    StaffModule, 
-    AuditModule, 
-    NotificationsModule, 
-    WalletModule, 
+    ConfigModule,
+    EventEmitterModule.forRoot(), // For event-based notifications
+    JwtModule.registerAsync({
+      imports: [ConfigModule],
+      useFactory: async (configService: ConfigService) => ({
+        secret: configService.get<string>('JWT_SECRET') || 'your-secret-key',
+        signOptions: { expiresIn: '7d' },
+      }),
+      inject: [ConfigService],
+    }),
+    StaffModule,
+    AuditModule,
+    NotificationsModule,
+    WalletModule,
     forwardRef(() => ContentReportsModule),
     AuctionsModule, // For fraud detection and auctions service
   ],
@@ -41,11 +54,17 @@ import { EmailService } from '../shared/email.service';
     OrdersController, 
     DisputesController,
   ],
-  providers: [AdminService, EmailService],
-  exports: [AdminService],
+  providers: [
+    AdminService, 
+    EmailService, 
+    AdminNotificationsGateway, 
+    AdminNotificationsService,
+  ],
+  exports: [AdminService, AdminNotificationsService],
 })
 export class AdminModule {
   // WalletReconciliationService is imported via WalletModule and auto-injected into FinanceController
   // AuctionFraudDetectionService is imported via AuctionsModule for admin auction management
+  // AdminNotificationsGateway provides real-time WebSocket notifications for admin panel
 }
 

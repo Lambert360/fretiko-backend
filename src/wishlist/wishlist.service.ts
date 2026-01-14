@@ -1,27 +1,35 @@
 import { Injectable, NotFoundException, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { NotificationType, NotificationPriority } from '../notifications/dto/notification.dto';
 import { ChatService } from '../chat/chat.service';
 import { EscrowService } from '../escrow/escrow.service';
 import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 
 @Injectable()
 export class WishlistService {
   private supabase;
+  private readonly PLATFORM_COMMISSION_RATE: number;
 
   constructor(
     private configService: ConfigService,
     private notificationsService: NotificationsService,
+    private notificationHelper: NotificationHelperService,
     @Inject(forwardRef(() => ChatService))
     private chatService: ChatService,
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
     private walletService: WalletService,
+    private realtimeGateway: RealtimeGateway,
   ) {
     this.supabase = createSupabaseClient(this.configService);
+    this.PLATFORM_COMMISSION_RATE = parseFloat(
+      this.configService.get<string>('PLATFORM_COMMISSION_RATE', '0.1')
+    );
   }
 
   async getWishlistItems(userId: string, userToken?: string) {
@@ -397,6 +405,13 @@ export class WishlistService {
 
       const itemCount = selectedItemIds?.length || wishlistCount || 0;
 
+      // 🔥 NEW: Calculate purchase status for shared items
+      const purchaseStatus = await this.calculateWishlistPurchaseStatus(
+        ownerId,
+        selectedItemIds,
+        userToken
+      );
+
       // Find or create conversation between owner and friend
       const conversation = await this.chatService.findOrCreateConversation(
         ownerId,
@@ -416,8 +431,17 @@ export class WishlistService {
         recipientId: friendId,
         previewItems,
         canAddItems: data.share_type === 'view_and_add',
-        sharedAt: new Date(),
+        sharedAt: new Date().toISOString(), // 🔥 FIX: Convert to ISO string for proper serialization
+        purchaseStatus, // 🔥 NEW: Include purchase status
       };
+
+      console.log('✅ Wishlist data created with purchaseStatus:', {
+        itemCount,
+        purchaseStatus,
+        overallStatus: purchaseStatus?.overallStatus,
+        itemsPurchased: purchaseStatus?.itemsPurchased,
+        totalItems: purchaseStatus?.totalItems,
+      });
 
       const messageContent = `💖 ${ownerName} shared ${itemCount} item${itemCount > 1 ? 's' : ''} from their wishlist with you!`;
 
@@ -517,6 +541,108 @@ export class WishlistService {
   }
 
   /**
+   * Calculate purchase status for wishlist items
+   * Returns status including items purchased, processing, and completed
+   */
+  private async calculateWishlistPurchaseStatus(
+    ownerId: string,
+    selectedItemIds?: string[],
+    userToken?: string
+  ): Promise<{
+    itemsPurchased: number;
+    itemsProcessing: number;
+    itemsCompleted: number;
+    totalItems: number;
+    overallStatus: 'none' | 'processing' | 'completed';
+  }> {
+    const serviceClient = createServiceSupabaseClient(this.configService);
+
+    try {
+      // Get all wishlist items for this owner
+      let wishlistItemIds: string[] = [];
+      
+      if (selectedItemIds && selectedItemIds.length > 0) {
+        // Use selected items if provided (selective sharing)
+        wishlistItemIds = selectedItemIds;
+      } else {
+        // Get all wishlist items for the owner
+        const { data: allItems } = await serviceClient
+          .from('wishlist')
+          .select('id')
+          .eq('user_id', ownerId);
+        
+        wishlistItemIds = (allItems || []).map(item => item.id);
+      }
+
+      if (wishlistItemIds.length === 0) {
+        return {
+          itemsPurchased: 0,
+          itemsProcessing: 0,
+          itemsCompleted: 0,
+          totalItems: 0,
+          overallStatus: 'none',
+        };
+      }
+
+      // Get gift orders for these wishlist items
+      const { data: giftOrders } = await serviceClient
+        .from('gift_orders')
+        .select(`
+          wishlist_item_id,
+          orders!inner (
+            id,
+            status
+          )
+        `)
+        .in('wishlist_item_id', wishlistItemIds);
+
+      // Count items by status
+      let processingCount = 0;
+      let completedCount = 0;
+
+      if (giftOrders && giftOrders.length > 0) {
+        giftOrders.forEach((giftOrder: any) => {
+          const orderStatus = (giftOrder.orders as any)?.status;
+          if (orderStatus === 'completed' || orderStatus === 'delivered') {
+            completedCount++;
+          } else if (orderStatus && orderStatus !== 'cancelled') {
+            processingCount++;
+          }
+        });
+      }
+
+      const itemsPurchased = processingCount + completedCount;
+      const totalItems = wishlistItemIds.length;
+
+      // Determine overall status
+      let overallStatus: 'none' | 'processing' | 'completed' = 'none';
+      if (completedCount === totalItems && totalItems > 0) {
+        overallStatus = 'completed';
+      } else if (itemsPurchased > 0) {
+        overallStatus = 'processing';
+      }
+
+      return {
+        itemsPurchased,
+        itemsProcessing: processingCount,
+        itemsCompleted: completedCount,
+        totalItems,
+        overallStatus,
+      };
+    } catch (error) {
+      console.error('⚠️ Error calculating wishlist purchase status (non-critical):', error);
+      // Return default status on error
+      return {
+        itemsPurchased: 0,
+        itemsProcessing: 0,
+        itemsCompleted: 0,
+        totalItems: selectedItemIds?.length || 0,
+        overallStatus: 'none',
+      };
+    }
+  }
+
+  /**
    * Get wishlists shared with user
    */
   async getSharedWishlists(userId: string, userToken?: string) {
@@ -591,7 +717,21 @@ export class WishlistService {
       }
 
       console.log(`✅ Found ${selectiveData?.length || 0} selective items`);
-      data = selectiveData;
+      // Transform selective data to match the expected format structure
+      data = selectiveData?.map((item: any) => ({
+        wishlist_item_id: item.wishlist_item_id,
+        product_id: item.product_id,
+        product_name: item.product_name,
+        product_price: item.product_price,
+        product_image: item.product_image,
+        product_status: item.product_status,
+        seller_id: item.seller_id,
+        notes: item.notes,
+        priority: item.priority,
+        created_at: item.created_at,
+        added_by_friend_id: item.added_by_friend_id,
+        added_by_friend_name: item.added_by_friend_name || null,
+      })) || [];
     } else {
       // Full wishlist sharing: Get all wishlist items from owner
       const { data: fullData, error: fullError } = await client
@@ -670,6 +810,40 @@ export class WishlistService {
       }));
     }
 
+    // 🔥 NEW: Get gift order statuses for all wishlist items (use service client to bypass RLS)
+    const wishlistItemIds = data?.map(item => item.wishlist_item_id) || [];
+    let giftOrderMap = new Map();
+
+    if (wishlistItemIds.length > 0) {
+      const serviceClient = createServiceSupabaseClient(this.configService);
+      const { data: giftOrders, error: giftOrdersError } = await serviceClient
+        .from('gift_orders')
+        .select(`
+          wishlist_item_id,
+          status,
+          order_id,
+          orders!inner (
+            order_number,
+            status
+          )
+        `)
+        .in('wishlist_item_id', wishlistItemIds);
+
+      if (giftOrders && !giftOrdersError) {
+        giftOrders.forEach((go: any) => {
+          giftOrderMap.set(go.wishlist_item_id, {
+            status: go.status,
+            orderId: go.order_id,
+            orderNumber: go.orders?.order_number || null,
+            orderStatus: go.orders?.status || null,
+          });
+        });
+      } else if (giftOrdersError) {
+        console.error('⚠️ Error fetching gift orders for shared wishlist:', giftOrdersError);
+        // Continue without gift order status - non-critical
+      }
+    }
+
     // Transform to match frontend expectations
     const transformedData = data?.map(item => ({
       id: item.wishlist_item_id,
@@ -686,6 +860,7 @@ export class WishlistService {
       canAddItems: share.share_type === 'view_and_add',
       addedByFriend: item.added_by_friend_name || null,
       collaborationNote: item.notes || null, // Use notes as collaboration note
+      giftOrderStatus: giftOrderMap.get(item.wishlist_item_id) || null,
     })) || [];
     
     console.log('✅ Returning wishlist items:', transformedData?.length || 0, 'items');
@@ -952,10 +1127,30 @@ export class WishlistService {
     giftRecipientId: string,
     orderId: string | null,
     wishlistItemId: string,
+    deliveryAddress: {
+      fullName: string;
+      phone: string;
+      address: string;
+      city: string;
+      state: string;
+      postalCode: string;
+    },
     giftMessage?: string,
     isSurprise: boolean = false,
+    selectedRider?: {
+      riderId: string;
+      riderName?: string;
+      vehicleType?: string;
+      deliveryPrice?: number;
+      estimatedArrival?: number;
+    },
     userToken?: string
   ) {
+    // 🔥 FIX: Use service role client for initial lookup to bypass RLS
+    // This is a backend operation and we need to find the wishlist item regardless of RLS
+    const serviceClient = createServiceSupabaseClient(this.configService);
+    
+    // Use user client for user-specific operations (respects RLS for creating orders, etc.)
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     // Input validation
@@ -963,66 +1158,134 @@ export class WishlistService {
       throw new Error('Gift giver ID, recipient ID, and wishlist item ID are required');
     }
 
-    if (giftGiverId === giftRecipientId) {
-      throw new Error('Cannot create gift order for yourself');
+    // 🔥 SECURITY: Validate delivery address is provided by gift giver (for privacy reasons)
+    if (!deliveryAddress || !deliveryAddress.fullName || !deliveryAddress.address || !deliveryAddress.city || !deliveryAddress.phone) {
+      throw new Error('Delivery address is required. Please provide the recipient\'s delivery address including full name, phone, address, and city.');
     }
 
-    // Verify the wishlist item exists and belongs to the recipient
-    const { data: wishlistItem, error: wishlistError } = await client
+    console.log('🔍 Looking up wishlist item with service role client:', wishlistItemId);
+
+    // 🔥 FIX: First find the wishlist item using service role client to bypass RLS
+    // Query without nested relation first to ensure we get the wishlist item even if product has issues
+    const { data: wishlistItem, error: wishlistError } = await serviceClient
       .from('wishlist')
       .select(`
         id,
         user_id,
-        product_id,
-        products (
-          id,
-          name,
-          price,
-          status,
-          quantity,
-          stock_quantity,
-          primary_image_url,
-          images,
-          user_id as seller_id
-        )
+        product_id
       `)
       .eq('id', wishlistItemId)
-      .eq('user_id', giftRecipientId)
-      .single();
+      .maybeSingle(); // 🔥 FIX: Use maybeSingle() instead of single() for better error handling
 
-    if (wishlistError || !wishlistItem) {
-      throw new Error('Wishlist item not found or does not belong to recipient');
+    if (wishlistError) {
+      console.error('❌ Wishlist item query error:', wishlistError);
+      throw new Error(`Failed to query wishlist item: ${wishlistError.message}`);
     }
 
-    if (wishlistItem.products?.status !== 'active') {
+    if (!wishlistItem) {
+      console.error('❌ Wishlist item not found:', wishlistItemId);
+      throw new Error('Wishlist item not found');
+    }
+
+    // 🔥 FIX: Fetch product separately to avoid issues with nested relations
+    const { data: product, error: productError } = await serviceClient
+      .from('products')
+      .select(`
+        id,
+        name,
+        price,
+        status,
+        quantity,
+        primary_image_url,
+        images,
+        user_id
+      `)
+      .eq('id', wishlistItem.product_id)
+      .maybeSingle();
+
+    if (productError) {
+      console.error('❌ Product query error:', productError);
+      throw new Error(`Failed to query product: ${productError.message}`);
+    }
+
+    if (!product) {
+      throw new Error('The wishlist item product no longer exists');
+    }
+
+    // 🔥 FIX: Map user_id to seller_id for compatibility
+    const productWithSellerId = {
+      ...product,
+      seller_id: product.user_id
+    };
+
+    // Attach product to wishlist item for compatibility with existing code
+    (wishlistItem as any).products = productWithSellerId;
+
+    console.log('✅ Wishlist item found:', { 
+      id: wishlistItem.id, 
+      userId: wishlistItem.user_id, 
+      productId: wishlistItem.product_id,
+      productStatus: (wishlistItem as any).products?.status 
+    });
+
+    // 🔥 FIX: Use the actual owner from the wishlist item as the recipient
+    const actualRecipientId = wishlistItem.user_id;
+
+    // 🔥 FIX: Validate that the wishlist item doesn't belong to the giver
+    if (actualRecipientId === giftGiverId) {
+      throw new Error('Cannot purchase gifts for yourself');
+    }
+
+    // 🔥 FIX: Optional validation - warn if passed recipient ID doesn't match (but use actual recipient)
+    if (giftRecipientId !== actualRecipientId) {
+      console.warn(`⚠️ Recipient ID mismatch: Passed ${giftRecipientId}, but wishlist item belongs to ${actualRecipientId}. Using actual owner as recipient.`);
+    }
+
+    if ((wishlistItem as any).products?.status !== 'active') {
       throw new Error('The wishlist item product is no longer available');
     }
 
-    if (wishlistItem.products?.stock_quantity !== undefined && wishlistItem.products?.stock_quantity < 1) {
+    if ((wishlistItem as any).products?.quantity !== undefined && (wishlistItem as any).products?.quantity < 1) {
       throw new Error('The wishlist item product is out of stock');
     }
 
-    // Verify both users exist
-    const { data: giverUser, error: giverError } = await client
+    // Verify both users exist (use service client to bypass RLS for backend verification)
+    const { data: giverUser, error: giverError } = await serviceClient
       .from('user_profiles')
       .select('id, username')
       .eq('id', giftGiverId)
-      .single();
+      .maybeSingle();
 
-    const { data: recipientUser, error: recipientError } = await client
+    const { data: recipientUser, error: recipientError } = await serviceClient
       .from('user_profiles')
-      .select('id, username, delivery_address')
-      .eq('id', giftRecipientId)
-      .single();
+      .select('id, username')
+      .eq('id', actualRecipientId)
+      .maybeSingle();
 
-    if (giverError || !giverUser || recipientError || !recipientUser) {
-      throw new Error('Gift giver or recipient not found');
+    if (giverError) {
+      console.error('❌ Error looking up gift giver:', giverError);
+      throw new Error(`Failed to lookup gift giver: ${giverError.message}`);
     }
 
-    // 🔥 FIX: Check if gift order already exists for this wishlist item
+    if (!giverUser) {
+      console.error('❌ Gift giver not found:', giftGiverId);
+      throw new Error('Gift giver not found');
+    }
+
+    if (recipientError) {
+      console.error('❌ Error looking up recipient:', recipientError);
+      throw new Error(`Failed to lookup recipient: ${recipientError.message}`);
+    }
+
+    if (!recipientUser) {
+      console.error('❌ Recipient not found:', actualRecipientId);
+      throw new Error('Gift recipient not found');
+    }
+
+    // 🔥 FIX: Check if gift order already exists for this wishlist item (use service client to bypass RLS)
     // Note: This check happens early, but we'll also check right before creating gift_orders record
     // to prevent race conditions. The final check will use the order_id to ensure atomicity.
-    const { data: existingGift, error: existingGiftError } = await client
+    const { data: existingGift, error: existingGiftError } = await serviceClient
       .from('gift_orders')
       .select('id, status')
       .eq('wishlist_item_id', wishlistItemId)
@@ -1047,45 +1310,46 @@ export class WishlistService {
       throw new Error('Gift giver wallet not found');
     }
 
-    // 🔥 FIX: Gift purchases - buyer pays ONLY item price (no tax, no escrow fee, no platform fee)
+    // 🔥 FIX: Gift purchases - buyer pays item price + delivery fee (if rider selected)
     // Platform fee is deducted from vendor during escrow release, not from buyer
-    const total = wishlistItem.products.price; // ONLY item price
-    const platformFee = total * 0.02; // 2% platform commission (deducted from vendor during escrow release)
-    const deliveryFee = 0; // No delivery fee for buyer in gift purchases
+    const itemPrice = (wishlistItem as any).products.price;
+    const platformFee = itemPrice * 0.02; // 2% platform commission (deducted from vendor during escrow release)
+    
+    // Calculate delivery fee and rider info based on selected rider
+    let deliveryFee = 0;
+    let riderId: string | null = null;
+    let deliveryType: 'delivery' | 'pickup' = 'delivery';
+    
+    if (selectedRider) {
+      if (selectedRider.riderId === 'pickup') {
+        // Self pickup - no delivery fee, no rider
+        deliveryFee = 0;
+        riderId = null;
+        deliveryType = 'pickup';
+      } else if (selectedRider.deliveryPrice) {
+        // Rider selected - include delivery fee
+        deliveryFee = selectedRider.deliveryPrice;
+        riderId = selectedRider.riderId;
+        deliveryType = 'delivery';
+      }
+    }
+    
+    const total = itemPrice + deliveryFee;
 
     if (giverWallet.available_balance < total) {
       throw new Error(`Insufficient wallet balance. Need ₣${total.toFixed(2)}, available: ₣${giverWallet.available_balance.toFixed(2)}`);
     }
 
-    // 🔥 FIX: Get recipient's default delivery address with better error handling
-    const { data: deliveryAddress, error: addressError } = await client
-      .from('delivery_addresses')
-      .select('*')
-      .eq('user_id', giftRecipientId)
-      .eq('is_default', true)
-      .single();
-
-    if (addressError || !deliveryAddress) {
-      // Check if recipient has any addresses at all
-      const { data: anyAddress } = await client
-        .from('delivery_addresses')
-        .select('id')
-        .eq('user_id', giftRecipientId)
-        .limit(1)
-        .single();
-
-      if (!anyAddress) {
-        throw new Error(`${recipientUser.username} doesn't have a delivery address set. Please ask them to add an address before sending a gift.`);
-      } else {
-        throw new Error(`${recipientUser.username} doesn't have a default delivery address set. Please ask them to set a default address in their account settings.`);
-      }
-    }
+    // 🔥 SECURITY: Delivery address is provided by gift giver (not fetched from recipient for privacy)
+    // The address provided here will be used directly for order delivery
+    // Future enhancement: We could optionally verify server-side (using serviceClient) that the recipient
+    // has this address in their account, but this should not expose the address to the gift giver
 
     // Generate order number
     const orderNumber = `GIFT-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
 
     // Get vendor_id from product
-    const vendorId = wishlistItem.products.seller_id;
+    const vendorId = (wishlistItem as any).products.seller_id;
 
     // Create the order with correct schema
     const { data: createdOrder, error: orderError } = await client
@@ -1096,28 +1360,35 @@ export class WishlistService {
         order_number: orderNumber,
         status: 'pending', // 🔥 FIX: Start as pending (will be confirmed when vendor accepts)
         escrow_enabled: true, // Gifts always use escrow
-        total_amount: total, // Only item price (no tax, no fees for buyer)
-        delivery_fee: deliveryFee, // 0 for gift purchases
+        total_amount: total, // Item price + delivery fee (if rider selected)
+        delivery_fee: deliveryFee, // Delivery fee if rider selected, 0 for pickup
         platform_fee: platformFee, // 2% platform commission (deducted from vendor during escrow release)
-        rider_id: null, // Will be assigned later
-        delivery_type: 'delivery',
+        rider_id: riderId, // Rider ID if selected, null for pickup or if not selected
+        delivery_type: deliveryType, // 'delivery' if rider selected, 'pickup' for self-pickup
         delivery_address: {
-          fullName: deliveryAddress.full_name,
+          fullName: deliveryAddress.fullName,
           phone: deliveryAddress.phone,
           address: deliveryAddress.address,
           city: deliveryAddress.city,
           state: deliveryAddress.state,
-          postalCode: deliveryAddress.postal_code,
+          postalCode: deliveryAddress.postalCode,
         },
         delivery_instructions: giftMessage ? `Gift from ${giverUser.username}: ${giftMessage}` : `Gift from ${giverUser.username}`,
         estimated_delivery: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(), // 3 days
         source: 'wishlist', // Use 'wishlist' as source
         metadata: {
           gift_giver_id: giftGiverId,
-          gift_recipient_id: giftRecipientId,
+          gift_recipient_id: actualRecipientId,
           wishlist_item_id: wishlistItemId,
           gift_message: giftMessage,
           is_surprise: isSurprise,
+          rider_info: selectedRider ? {
+            riderId: selectedRider.riderId,
+            riderName: selectedRider.riderName,
+            vehicleType: selectedRider.vehicleType,
+            deliveryPrice: selectedRider.deliveryPrice,
+            estimatedArrival: selectedRider.estimatedArrival,
+          } : null,
         },
       })
       .select()
@@ -1128,16 +1399,31 @@ export class WishlistService {
       throw new Error(`Failed to create gift order: ${orderError?.message || 'Unknown error'}`);
     }
 
+    // 🔥 FIX: Validate order ID is a valid UUID before using it as reference_id
+    if (!createdOrder.id || typeof createdOrder.id !== 'string') {
+      console.error('Invalid order ID:', createdOrder);
+      throw new Error('Order was created but ID is missing or invalid');
+    }
+
+    // Validate UUID format (basic check)
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(createdOrder.id)) {
+      console.error('Order ID is not a valid UUID:', createdOrder.id);
+      throw new Error(`Order ID is not a valid UUID: ${createdOrder.id}`);
+    }
+
+    console.log('✅ Order created successfully:', { orderId: createdOrder.id, orderNumber: createdOrder.order_number });
+
     // Create order item
     const { error: orderItemError } = await client
       .from('order_items')
       .insert({
         order_id: createdOrder.id,
         product_id: wishlistItem.product_id,
-        product_name: wishlistItem.products.name,
+        product_name: (wishlistItem as any).products.name,
         quantity: 1,
-        unit_price: wishlistItem.products.price,
-        total_price: wishlistItem.products.price,
+        unit_price: (wishlistItem as any).products.price,
+        total_price: (wishlistItem as any).products.price,
         product_metadata: {
           gift_giver: giverUser.username,
           gift_recipient: recipientUser.username,
@@ -1155,19 +1441,17 @@ export class WishlistService {
 
     // 🔥 FIX: Update stock BEFORE payment to prevent race conditions and ensure rollback capability
     // If stock update fails, we can rollback before payment is processed
+    // Use service client for product queries to bypass RLS
     let stockUpdated = false;
     try {
-      const { data: currentProduct } = await client
+      const { data: currentProduct } = await serviceClient
         .from('products')
-        .select('quantity, stock_quantity')
+        .select('quantity')
         .eq('id', wishlistItem.product_id)
-        .single();
+        .maybeSingle();
 
       if (currentProduct) {
-        // Use stock_quantity if available, otherwise use quantity
-        const currentStock = currentProduct.stock_quantity !== null 
-          ? currentProduct.stock_quantity 
-          : currentProduct.quantity;
+        const currentStock = currentProduct.quantity;
 
         if (currentStock !== null && currentStock < 1) {
           // Rollback order and items
@@ -1179,30 +1463,15 @@ export class WishlistService {
         // Decrement stock atomically using database constraint
         const newStock = Math.max(0, currentStock - 1);
         
-        // Build update object conditionally
-        const updateData: any = {
-          quantity: newStock,
-          updated_at: new Date().toISOString(),
-        };
-        
-        // Only update stock_quantity if it exists
-        if (currentProduct.stock_quantity !== null) {
-          updateData.stock_quantity = newStock;
-        }
-
-        // Build query with conditional constraints
-        let updateQuery = client
+        // Update stock (use service client for product updates)
+        const { error: stockUpdateError } = await serviceClient
           .from('products')
-          .update(updateData)
+          .update({
+            quantity: newStock,
+            updated_at: new Date().toISOString(),
+          })
           .eq('id', wishlistItem.product_id)
           .gte('quantity', 1); // Ensure stock is at least 1 before decrementing (prevents negative)
-
-        // Only add stock_quantity constraint if it exists
-        if (currentProduct.stock_quantity !== null) {
-          updateQuery = updateQuery.gte('stock_quantity', 1);
-        }
-
-        const { error: stockUpdateError } = await updateQuery;
 
         if (stockUpdateError) {
           console.error('Stock update error:', stockUpdateError);
@@ -1223,12 +1492,20 @@ export class WishlistService {
     }
 
     // 🔥 FIX: Use process_wallet_transaction helper for proper escrow handling (consistent with other flows)
+    // Note: createdOrder.id is already validated as a valid UUID above, so we can use it directly
+    console.log('💳 Processing wallet transaction:', {
+      userId: giftGiverId,
+      amount: total,
+      orderId: createdOrder.id,
+      orderNumber: createdOrder.order_number,
+    });
+    
     const walletResult = await this.walletService.processWalletTransaction(
       giftGiverId,
       WalletTransactionType.PURCHASE_HOLD, // Moves money to escrow
       total,
-      `Gift purchase: ${wishlistItem.products.name} for ${recipientUser.username}`,
-      createdOrder.id,
+      `Gift purchase: ${(wishlistItem as any).products.name} for ${recipientUser.username}`,
+      createdOrder.id, // Already validated as valid UUID above
       'order',
     );
 
@@ -1238,25 +1515,22 @@ export class WishlistService {
       await client.from('order_items').delete().eq('order_id', createdOrder.id);
       await client.from('orders').delete().eq('id', createdOrder.id);
       
-      // 🔥 FIX: Rollback stock if it was updated
+      // 🔥 FIX: Rollback stock if it was updated (use service client)
       if (stockUpdated) {
         try {
-          const { data: currentProduct } = await client
+          const { data: currentProduct } = await serviceClient
             .from('products')
-            .select('quantity, stock_quantity')
+            .select('quantity')
             .eq('id', wishlistItem.product_id)
-            .single();
+            .maybeSingle();
           
           if (currentProduct) {
-            const currentStock = currentProduct.stock_quantity !== null 
-              ? currentProduct.stock_quantity 
-              : currentProduct.quantity;
+            const currentStock = currentProduct.quantity;
             
-            await client
+            await serviceClient
               .from('products')
               .update({
-                quantity: currentStock !== null ? currentStock + 1 : null,
-                stock_quantity: currentProduct.stock_quantity !== null ? currentStock + 1 : null,
+                quantity: currentStock !== null ? currentStock + 1 : 1,
                 updated_at: new Date().toISOString(),
               })
               .eq('id', wishlistItem.product_id);
@@ -1279,15 +1553,100 @@ export class WishlistService {
     // Make escrow creation critical - if it fails, we need to rollback payment
     let escrowCreated = false;
     try {
+      // Calculate rider commission (10% of rider earnings)
+      const riderCommission = riderId && deliveryFee > 0
+        ? deliveryFee * this.PLATFORM_COMMISSION_RATE
+        : 0;
+
       const escrowBreakdown = {
-        totalAmount: total, // Buyer paid only item price
-        vendorAmount: total - platformFee, // Vendor receives item price minus platform fee
-        riderAmount: deliveryFee, // 0 for gift purchases
-        platformAmount: platformFee, // Platform fee deducted from vendor during escrow release
+        totalAmount: total, // Buyer paid item price + delivery fee (if rider selected)
+        vendorAmount: itemPrice - platformFee, // Vendor receives item price minus platform fee
+        riderAmount: deliveryFee - riderCommission, // Rider gets delivery fee minus platform commission
+        platformAmount: platformFee + riderCommission, // Platform gets vendor commission + rider commission
       };
       await this.escrowService.createEscrow(createdOrder.id, escrowBreakdown);
       escrowCreated = true;
       console.log(`✅ Escrow created for wishlist gift order ${createdOrder.id}`);
+      
+      // ✅ GENERATE HANDOFF PINS (3-digit) for gift orders
+      // For self-pickup: only delivery PIN needed (buyer shows to vendor)
+      // For regular delivery: both PINs needed (pickup PIN for rider→vendor, delivery PIN for rider→buyer)
+      const pickupPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
+      const deliveryPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
+      
+      await client
+        .from('orders')
+        .update({
+          pickup_pin: pickupPin,
+          delivery_pin: deliveryPin,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', createdOrder.id);
+      
+      console.log(`✅ Generated handoff PINs for gift order ${createdOrder.id}`);
+      
+      // ✅ SEND PINs VIA NOTIFICATIONS
+      try {
+        // Get vendor name for notifications
+        const { data: vendorProfile } = await client
+          .from('user_profiles')
+          .select('username')
+          .eq('id', vendorId)
+          .single();
+        
+        // Handle PIN notifications based on delivery type
+        if (deliveryType === 'pickup') {
+          // Self-pickup: Send deliveryPin to BOTH vendor and recipient
+          // Recipient provides deliveryPin to vendor for handoff verification
+          
+          // Send deliveryPin to vendor (for verification)
+          await this.notificationHelper.notifyVendorSelfPickupPin(vendorId, {
+            id: createdOrder.id,
+            orderNumber: createdOrder.order_number,
+            deliveryPin: deliveryPin,
+            buyerName: recipientUser.username,
+          });
+          
+          // Send deliveryPin to recipient (they need it to pick up)
+          await this.notificationHelper.notifyBuyerSelfPickupPin(actualRecipientId, {
+            id: createdOrder.id,
+            orderNumber: createdOrder.order_number,
+            deliveryPin: deliveryPin,
+            vendorName: vendorProfile?.username || 'Vendor',
+          });
+          
+          console.log(`✅ Sent self-pickup PIN to vendor and recipient for gift order ${createdOrder.id}`);
+        } else if (riderId) {
+          // Regular delivery with rider: Send pickup PIN to rider, delivery PIN to recipient
+          
+          // Send pickup PIN to rider
+          await this.notificationHelper.notifyRiderPickupPin(riderId, {
+            id: createdOrder.id,
+            orderNumber: createdOrder.order_number,
+            pickupPin: pickupPin,
+            vendorName: vendorProfile?.username || 'Vendor',
+          });
+          
+          // Send delivery PIN to recipient
+          await this.notificationHelper.notifyBuyerDeliveryPin(actualRecipientId, {
+            id: createdOrder.id,
+            orderNumber: createdOrder.order_number,
+            deliveryPin: deliveryPin,
+          });
+          
+          console.log(`✅ Sent pickup PIN to rider and delivery PIN to recipient for gift order ${createdOrder.id}`);
+        } else {
+          // Delivery type but no rider (edge case) - send delivery PIN to recipient
+          await this.notificationHelper.notifyBuyerDeliveryPin(actualRecipientId, {
+            id: createdOrder.id,
+            orderNumber: createdOrder.order_number,
+            deliveryPin: deliveryPin,
+          });
+        }
+      } catch (pinNotifyError) {
+        console.error('Failed to send PIN notifications (non-critical):', pinNotifyError);
+        // Don't fail the order creation if PIN notifications fail
+      }
     } catch (escrowError) {
       console.error('Failed to create escrow for wishlist order:', escrowError);
       // 🔥 FIX: If escrow creation fails, we need to refund the payment
@@ -1338,25 +1697,22 @@ export class WishlistService {
       await client.from('order_items').delete().eq('order_id', createdOrder.id);
       await client.from('orders').delete().eq('id', createdOrder.id);
       
-      // Rollback stock
+      // Rollback stock (use service client)
       if (stockUpdated) {
         try {
-          const { data: currentProduct } = await client
+          const { data: currentProduct } = await serviceClient
             .from('products')
-            .select('quantity, stock_quantity')
+            .select('quantity')
             .eq('id', wishlistItem.product_id)
-            .single();
+            .maybeSingle();
           
           if (currentProduct) {
-            const currentStock = currentProduct.stock_quantity !== null 
-              ? currentProduct.stock_quantity 
-              : currentProduct.quantity;
+            const currentStock = currentProduct.quantity;
             
-            await client
+            await serviceClient
               .from('products')
               .update({
-                quantity: currentStock !== null ? currentStock + 1 : null,
-                stock_quantity: currentProduct.stock_quantity !== null ? currentStock + 1 : null,
+                quantity: currentStock !== null ? currentStock + 1 : 1,
                 updated_at: new Date().toISOString(),
               })
               .eq('id', wishlistItem.product_id);
@@ -1372,9 +1728,9 @@ export class WishlistService {
     // 🔥 FIX: Order status stays 'pending' (already set above) - no need to update here
     // Status will change to 'confirmed' when vendor accepts the order
 
-    // 🔥 FIX: Check for duplicate gift order again right before creating gift_orders record
+    // 🔥 FIX: Check for duplicate gift order again right before creating gift_orders record (use service client)
     // This prevents race conditions where two requests pass the initial check
-    const { data: duplicateCheck, error: duplicateCheckError } = await client
+    const { data: duplicateCheck, error: duplicateCheckError } = await serviceClient
       .from('gift_orders')
       .select('id')
       .eq('wishlist_item_id', wishlistItemId)
@@ -1433,25 +1789,22 @@ export class WishlistService {
       await client.from('order_items').delete().eq('order_id', createdOrder.id);
       await client.from('orders').delete().eq('id', createdOrder.id);
       
-      // Rollback stock
+      // Rollback stock (use service client)
       if (stockUpdated) {
         try {
-          const { data: currentProduct } = await client
+          const { data: currentProduct } = await serviceClient
             .from('products')
-            .select('quantity, stock_quantity')
+            .select('quantity')
             .eq('id', wishlistItem.product_id)
-            .single();
+            .maybeSingle();
           
           if (currentProduct) {
-            const currentStock = currentProduct.stock_quantity !== null 
-              ? currentProduct.stock_quantity 
-              : currentProduct.quantity;
+            const currentStock = currentProduct.quantity;
             
-            await client
+            await serviceClient
               .from('products')
               .update({
-                quantity: currentStock !== null ? currentStock + 1 : null,
-                stock_quantity: currentProduct.stock_quantity !== null ? currentStock + 1 : null,
+                quantity: currentStock !== null ? currentStock + 1 : 1,
                 updated_at: new Date().toISOString(),
               })
               .eq('id', wishlistItem.product_id);
@@ -1470,7 +1823,7 @@ export class WishlistService {
       .insert({
         order_id: createdOrder.id,
         gift_giver_id: giftGiverId,
-        gift_recipient_id: giftRecipientId,
+        gift_recipient_id: actualRecipientId,
         wishlist_item_id: wishlistItemId,
         gift_message: giftMessage,
         is_surprise: isSurprise,
@@ -1500,7 +1853,7 @@ export class WishlistService {
         const { data: notifPrefs } = await client
           .from('notification_settings')
           .select('order_notifications')
-          .eq('user_id', giftRecipientId)
+          .eq('user_id', actualRecipientId)
           .single();
 
         // Only send if user has order notifications enabled (default: true)
@@ -1508,17 +1861,17 @@ export class WishlistService {
 
         if (shouldSendNotification) {
           await this.notificationsService.createNotification({
-            user_id: giftRecipientId,
+            user_id: actualRecipientId,
             type: NotificationType.ORDER,
             title: '🎁 You Received a Gift!',
-            message: `${giverUser.username} sent you ${wishlistItem.products?.name} as a gift!`,
+            message: `${giverUser.username} sent you ${(wishlistItem as any).products?.name} as a gift!`,
             priority: NotificationPriority.HIGH,
             data: {
               gift_order_id: giftOrder?.id,
               gift_giver_id: giftGiverId,
               gift_giver_username: giverUser.username,
               product_id: wishlistItem.product_id,
-              product_name: wishlistItem.products?.name,
+              product_name: (wishlistItem as any).products?.name,
               wishlist_item_id: wishlistItemId,
               order_id: createdOrder.id,
               gift_message: giftMessage,
@@ -1526,9 +1879,9 @@ export class WishlistService {
             },
             badge: 'gift'
           });
-          console.log('💖 Gift notification sent to recipient:', giftRecipientId);
+          console.log('💖 Gift notification sent to recipient:', actualRecipientId);
         } else {
-          console.log('ℹ️ Gift notification skipped (user preference):', giftRecipientId);
+          console.log('ℹ️ Gift notification skipped (user preference):', actualRecipientId);
         }
       } catch (notifError) {
         console.error('Error sending gift notification:', notifError);
@@ -1540,7 +1893,7 @@ export class WishlistService {
     // This prevents orphaned orders (order exists but no gift_orders record)
     if (giftOrder && giftOrder.id) {
       try {
-        await this.removePurchasedItems(giftRecipientId, [wishlistItemId], userToken);
+        await this.removePurchasedItems(actualRecipientId, [wishlistItemId], userToken);
         console.log(`✅ Removed purchased wishlist item ${wishlistItemId} from recipient's wishlist`);
       } catch (cleanupError) {
         console.error('⚠️ Failed to remove wishlist item after gift purchase (non-critical):', cleanupError);
@@ -1550,13 +1903,32 @@ export class WishlistService {
       console.warn('⚠️ Skipping wishlist item cleanup - gift_orders record was not created');
     }
 
+    // 🔥 NEW: Emit WebSocket event for real-time wishlist updates
+    if (giftOrder && giftOrder.id && createdOrder) {
+      try {
+        await this.realtimeGateway.notifyWishlistGiftOrderCreated({
+          wishlistItemId: wishlistItemId,
+          wishlistOwnerId: actualRecipientId,
+          giftGiverId: giftGiverId,
+          orderId: createdOrder.id,
+          orderNumber: createdOrder.order_number,
+          orderStatus: createdOrder.status || 'pending',
+          productName: (wishlistItem as any).products?.name || 'Unknown Product',
+        });
+        console.log(`✅ WebSocket event emitted for wishlist gift order: ${createdOrder.order_number}`);
+      } catch (wsError) {
+        console.error('⚠️ Failed to emit WebSocket event for wishlist gift order (non-critical):', wsError);
+        // Don't fail the gift order if WebSocket emission fails
+      }
+    }
+
     return {
       message: 'Gift purchase successful!',
       giftOrderId: giftOrder?.id,
       orderId: createdOrder.id,
       orderNumber: createdOrder.order_number,
       recipientName: recipientUser.username,
-      productName: wishlistItem.products?.name,
+      productName: (wishlistItem as any).products?.name,
       totalAmount: total,
       isSurprise: isSurprise
     };
@@ -1939,20 +2311,20 @@ export class WishlistService {
 
         const { data: product } = await client
           .from('products')
-          .select('stock_quantity, price, primary_image_url, images')
+          .select('quantity, price, primary_image_url, images')
           .eq('id', canPurchase.productInfo.id)
-          .single();
+          .maybeSingle();
 
         // 🔥 FIX: Check cumulative quantity for same product across multiple wishlist items
         const requestedQuantity = item.quantity || 1;
         const productId = canPurchase.productInfo.id;
         const currentRequestedTotal = (productQuantities[productId] || 0) + requestedQuantity;
 
-        if (product && product.stock_quantity !== null && product.stock_quantity < currentRequestedTotal) {
+        if (product && product.quantity !== null && product.quantity < currentRequestedTotal) {
           validationResults.push({
             wishlistItemId: item.wishlistItemId,
             valid: false,
-            reason: `Only ${product.stock_quantity} available in stock, but ${currentRequestedTotal} requested across selected items! 📦 The seller doesn't have enough of this item.`
+            reason: `Only ${product.quantity} available in stock, but ${currentRequestedTotal} requested across selected items! 📦 The seller doesn't have enough of this item.`
           });
           continue;
         }

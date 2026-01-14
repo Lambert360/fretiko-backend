@@ -1,4 +1,4 @@
-import { Injectable, Logger, UnauthorizedException, BadRequestException, NotFoundException, ConflictException, Inject, forwardRef } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException, BadRequestException, NotFoundException, ConflictException, ForbiddenException, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -344,6 +344,73 @@ export class StaffService {
     }
 
     this.logger.log(`Staff updated: ${updatedStaff.staff_id}`);
+
+    return this.mapToResponseDto(updatedStaff);
+  }
+
+  /**
+   * Modify staff role or department (Super Admin Only)
+   * Allows promotion/demotion and department transfers
+   */
+  async modifyStaffRoleOrDepartment(
+    staffId: string,
+    modifyDto: { departmentId?: string; role?: string },
+    adminId: string,
+    adminRole: string,
+  ): Promise<StaffResponseDto> {
+    // Only super admins can modify staff roles and departments
+    if (adminRole !== 'super_admin') {
+      this.logger.warn(`Unauthorized attempt to modify staff by non-super admin: ${adminId}`);
+      throw new ForbiddenException('Only super admins can modify staff roles and departments');
+    }
+
+    // Prevent modifying own role/department
+    if (staffId === adminId) {
+      throw new BadRequestException('You cannot modify your own role or department');
+    }
+
+    // Get current staff details for audit logging
+    const currentStaff = await this.getStaffById(staffId);
+
+    // Build update data
+    const updateData: any = {
+      updated_at: new Date().toISOString(),
+    };
+
+    if (modifyDto.departmentId !== undefined) {
+      updateData.department_id = modifyDto.departmentId || null;
+    }
+
+    if (modifyDto.role) {
+      updateData.role = modifyDto.role;
+    }
+
+    // Update staff
+    const { data: updatedStaff, error } = await this.supabase
+      .from('staff_accounts')
+      .update(updateData)
+      .eq('id', staffId)
+      .select(`
+        *,
+        department:departments(id, name, slug, permissions)
+      `)
+      .single();
+
+    if (error) {
+      this.logger.error(`Failed to modify staff: ${error.message}`);
+      throw new BadRequestException('Failed to modify staff');
+    }
+
+    // Log audit trail
+    const changes: string[] = [];
+    if (modifyDto.departmentId !== undefined && modifyDto.departmentId !== currentStaff.departmentId) {
+      changes.push(`Department: ${currentStaff.departmentName || 'None'} → ${updatedStaff.department?.name || 'None'}`);
+    }
+    if (modifyDto.role && modifyDto.role !== currentStaff.role) {
+      changes.push(`Role: ${currentStaff.role} → ${modifyDto.role}`);
+    }
+
+    this.logger.log(`Staff modified by super admin ${adminId}: ${updatedStaff.staff_id} - ${changes.join(', ')}`);
 
     return this.mapToResponseDto(updatedStaff);
   }

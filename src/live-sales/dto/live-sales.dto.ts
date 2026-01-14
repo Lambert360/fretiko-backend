@@ -156,6 +156,10 @@ export class LiveProductPurchaseDto {
 
   @IsOptional()
   delivery_address?: any; // JSON object for delivery details
+
+  @IsOptional()
+  @IsUUID()
+  reservation_id?: string; // Optional: Reservation ID if user has an active reservation
 }
 
 // DTO for live service booking

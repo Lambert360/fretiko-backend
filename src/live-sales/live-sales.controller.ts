@@ -10,9 +10,12 @@ import {
   UseGuards,
   Request,
   BadRequestException,
+  ForbiddenException,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { LiveSalesService } from './live-sales.service';
+import { UsersService } from '../users/users.service';
 import {
   CreateLiveStreamDto,
   UpdateStreamStatusDto,
@@ -37,7 +40,10 @@ import {
 @Controller('live-sales')
 @UseGuards(JwtAuthGuard)
 export class LiveSalesController {
-  constructor(private readonly liveSalesService: LiveSalesService) {}
+  constructor(
+    private readonly liveSalesService: LiveSalesService,
+    private readonly usersService: UsersService,
+  ) {}
 
   // =====================
   // STREAM DISCOVERY
@@ -112,8 +118,10 @@ export class LiveSalesController {
   /**
    * POST /live-sales/streams
    * Create a new live stream (vendors only)
+   * Rate limit: 5 requests per hour per user
    */
   @Post('streams')
+  @Throttle({ default: { limit: 5, ttl: 3600000 } }) // 5 requests per hour
   async createStream(
     @Request() req: any,
     @Body() createStreamDto: CreateLiveStreamDto,
@@ -123,11 +131,19 @@ export class LiveSalesController {
       throw new BadRequestException('User not authenticated');
     }
 
-    // TODO: Add vendor role check
-    // const user = await this.usersService.getUserById(userId);
-    // if (!user.is_seller && !user.is_rider) {
-    //   throw new ForbiddenException('Only vendors can create live streams');
-    // }
+    // Verify user is a vendor (seller or rider)
+    try {
+      const userProfile = await this.usersService.getProfile(userId);
+      if (!userProfile.isSeller && !userProfile.isRider) {
+        throw new ForbiddenException('Only vendors (sellers or riders) can create live streams');
+      }
+    } catch (error) {
+      if (error instanceof ForbiddenException) {
+        throw error;
+      }
+      // If profile not found or other error, log but allow (profile might be incomplete)
+      this.liveSalesService['logger']?.warn(`Could not verify vendor role: ${error.message}`);
+    }
 
     const token = req.headers.authorization?.replace('Bearer ', '');
     return this.liveSalesService.createStream(userId, createStreamDto, token);
@@ -227,6 +243,23 @@ export class LiveSalesController {
     return { success: true, message: 'Left stream successfully' };
   }
 
+  /**
+   * GET /live-sales/streams/:id/hls-url
+   * Get HLS stream URL for viewers
+   */
+  @Get('streams/:id/hls-url')
+  async getHLSUrl(
+    @Param('id') streamId: string,
+    @Request() req: any,
+  ) {
+    const userId = req.user?.sub;
+    if (!userId) {
+      throw new BadRequestException('User not authenticated');
+    }
+
+    return this.liveSalesService.getHLSStreamUrl(streamId);
+  }
+
   // =====================
   // COMMENTS & REACTIONS
   // =====================
@@ -322,8 +355,10 @@ export class LiveSalesController {
   /**
    * POST /live-sales/purchase/product
    * Purchase a product during live stream
+   * Rate limit: 10 requests per minute per user
    */
   @Post('purchase/product')
+  @Throttle({ default: { limit: 10, ttl: 60000 } }) // 10 requests per minute
   async purchaseProduct(
     @Request() req: any,
     @Body() purchaseDto: LiveProductPurchaseDto,
@@ -339,8 +374,10 @@ export class LiveSalesController {
   /**
    * POST /live-sales/purchase/service
    * Book a service during live stream
+   * Rate limit: 10 requests per minute per user
    */
   @Post('purchase/service')
+  @Throttle({ default: { limit: 10, ttl: 60000 } }) // 10 requests per minute
   async bookService(
     @Request() req: any,
     @Body() bookingDto: LiveServiceBookingDto,
@@ -373,8 +410,9 @@ export class LiveSalesController {
       throw new BadRequestException('User not authenticated');
     }
 
-    // TODO: Implement vendor stream analytics
-    return { streams: [], message: 'Vendor streams retrieved' };
+    // Get vendor's streams with analytics
+    const streams = await this.liveSalesService.getVendorStreamsWithAnalytics(userId);
+    return { streams, message: 'Vendor streams with analytics retrieved' };
   }
 
   /**
@@ -391,7 +429,8 @@ export class LiveSalesController {
       throw new BadRequestException('User not authenticated');
     }
 
-    // TODO: Implement stream analytics
-    return { analytics: {}, message: 'Stream analytics retrieved' };
+    // Get detailed analytics for this stream
+    const analytics = await this.liveSalesService.getStreamAnalytics(streamId, userId);
+    return analytics;
   }
 }

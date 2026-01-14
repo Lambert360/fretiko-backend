@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Param, Query, UseGuards, Req, Body } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, UseGuards, Req, Body, BadRequestException } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
 import { PermissionsGuard } from '../staff/guards/permissions.guard';
@@ -19,6 +19,18 @@ export class FinanceController {
   ) {}
 
   /**
+   * Validate ISO date string format (YYYY-MM-DDTHH:mm:ss.sssZ)
+   */
+  private validateDateString(dateStr: string, fieldName: string): void {
+    if (!dateStr) return;
+
+    const date = new Date(dateStr);
+    if (isNaN(date.getTime())) {
+      throw new BadRequestException(`Invalid ${fieldName} date format. Expected ISO 8601 format (YYYY-MM-DDTHH:mm:ss.sssZ)`);
+    }
+  }
+
+  /**
    * Get platform revenue analytics
    * GET /admin/finance/revenue?start=2024-01-01&end=2024-12-31
    * Requires: view_revenue permission
@@ -31,6 +43,19 @@ export class FinanceController {
     @Query('start') start?: string,
     @Query('end') end?: string,
   ) {
+    // Validate date parameters if provided
+    if (start) this.validateDateString(start, 'start');
+    if (end) this.validateDateString(end, 'end');
+
+    // Validate date range if both dates are provided
+    if (start && end) {
+      const startDate = new Date(start);
+      const endDate = new Date(end);
+      if (startDate >= endDate) {
+        throw new BadRequestException('Start date must be before end date');
+      }
+    }
+
     const dateRange = start && end ? { start, end } : undefined;
     return this.adminService.getPlatformRevenueForStaff(req.user.sub, dateRange);
   }

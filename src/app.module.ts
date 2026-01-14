@@ -3,6 +3,8 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { ConnectionsModule } from './connections/connections.module';
@@ -46,6 +48,10 @@ import { AuditModule } from './audit/audit.module';
       envFilePath: '.env'
     }),
     ScheduleModule.forRoot(), // Enable scheduled tasks
+    ThrottlerModule.forRoot([{
+      ttl: 60000, // Time window: 60 seconds
+      limit: 100, // Maximum 100 requests per window (global default)
+    }]),
     AuthModule,
     UsersModule,
     ConnectionsModule,
@@ -81,6 +87,13 @@ import { AuditModule } from './audit/audit.module';
     AuditModule,
   ],
   controllers: [AppController, ExchangeRateController],
-  providers: [AppService, ExchangeRateService],
+  providers: [
+    AppService,
+    ExchangeRateService,
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard, // Apply rate limiting globally
+    },
+  ],
 })
 export class AppModule {}

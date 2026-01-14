@@ -122,78 +122,78 @@ export class EscrowService {
     try {
       this.logger.log(`Releasing escrow ${escrowId}: ${reason}`);
 
-      // Fetch escrow with order details
-      const { data: escrow, error: fetchError } = await this.supabase
-        .from('escrows')
-        .select(`
-          *,
-          orders!inner(
-            id,
-            order_number,
-            buyer_id,
-            vendor_id,
-            rider_id,
-            status,
-            delivered_at,
-            order_confirmed_at
-          )
-        `)
-        .eq('id', escrowId)
-        .eq('status', 'held')
-        .single();
+      // ✅ PHASE 1: Use atomic database function with row-level locking to prevent race conditions
+      // This function locks the escrow row, validates authorization/status, and atomically updates status
+      const { data: atomicResult, error: atomicError } = await this.supabase
+        .rpc('release_escrow_atomic', {
+          p_escrow_id: escrowId,
+          p_reason: reason,
+          p_user_id: userId || null,
+        });
 
-      if (fetchError || !escrow) {
-        throw new HttpException('Escrow not found or already released', HttpStatus.NOT_FOUND);
+      if (atomicError) {
+        this.logger.error('Atomic escrow release RPC error:', atomicError);
+        throw new HttpException(
+          `Failed to release escrow: ${atomicError.message}`,
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
       }
 
-      const order = escrow.orders;
-
-      // ✅ FIX Bug 16: Validate authorization if userId provided
-      if (userId) {
-        const isVendor = order.vendor_id === userId;
-        const isBuyer = order.buyer_id === userId;
-        const isRider = order.rider_id === userId;
+      if (!atomicResult || !atomicResult.success) {
+        const errorCode = atomicResult?.error_code || 'UNKNOWN';
+        const errorMessage = atomicResult?.error || 'Escrow release failed';
         
-        // TODO: Check if user is admin (implement admin check when admin system is added)
-        // const isAdmin = await this.isAdmin(userId);
+        this.logger.warn(`Escrow release failed: ${errorMessage} (code: ${errorCode})`);
         
-        if (!isVendor && !isBuyer && !isRider) {
-          throw new HttpException('Unauthorized - only vendor, buyer, or rider can release escrow', HttpStatus.FORBIDDEN);
+        // Map error codes to appropriate HTTP status codes
+        if (errorCode === 'ESCROW_NOT_FOUND') {
+          throw new HttpException(errorMessage, HttpStatus.NOT_FOUND);
+        } else if (errorCode === 'UNAUTHORIZED') {
+          throw new HttpException(errorMessage, HttpStatus.FORBIDDEN);
+        } else if (errorCode === 'ORDER_CANCELLED' || errorCode === 'ORDER_NOT_DELIVERED') {
+          throw new HttpException(errorMessage, HttpStatus.BAD_REQUEST);
+        } else if (errorCode === 'STATUS_CHANGED') {
+          throw new HttpException(errorMessage, HttpStatus.CONFLICT);
+        } else {
+          throw new HttpException(errorMessage, HttpStatus.INTERNAL_SERVER_ERROR);
         }
       }
 
-      // ✅ FIX Bug 19: Validate order status before release
-      if (order.status === 'cancelled') {
-        throw new HttpException('Cannot release escrow for cancelled order', HttpStatus.BAD_REQUEST);
-      }
+      // Extract escrow and order data from atomic function result
+      const escrowData = atomicResult.escrow;
+      const orderData = atomicResult.order;
 
-      // For manual releases (not auto-release), validate delivery/confirmation status
-      const isAutoRelease = reason.includes('Auto-released') || reason.includes('Auto-released after delivery confirmation period');
-      const isBuyerConfirmed = reason.includes('Buyer confirmed') || reason.includes('Buyer manually confirmed');
-      
-      if (!isAutoRelease && !isBuyerConfirmed) {
-        // Manual release - must verify order is delivered or confirmed
-        if (!order.delivered_at && !order.order_confirmed_at) {
-          throw new HttpException('Order must be delivered or confirmed before releasing escrow manually', HttpStatus.BAD_REQUEST);
-        }
-      }
+      this.logger.log(`✅ Escrow ${escrowId} locked and status updated atomically`);
+
+      // ✅ PHASE 2: Process wallet transactions (escrow is already released, preventing duplicate processing)
+      // Even if called concurrently, only one will succeed due to atomic lock, others will get ESCROW_NOT_FOUND
 
       // 1. Credit vendor wallet using RPC function (escrow release)
-      this.logger.log(`Crediting vendor ${order.vendor_id} with ₣${escrow.vendor_amount}`);
+      this.logger.log(`Crediting vendor ${orderData.vendor_id} with ₣${escrowData.vendor_amount}`);
       const vendorResult = await this.walletService.processWalletTransaction(
-        order.vendor_id,
+        orderData.vendor_id,
         WalletTransactionType.ESCROW_RELEASE,
-        parseFloat(escrow.vendor_amount),
-        `Escrow release for order ${order.order_number}`,
-        order.id,
+        parseFloat(escrowData.vendor_amount),
+        `Escrow release for order ${orderData.order_number}`,
+        orderData.id,
         'order',
       );
 
       if (!vendorResult.success) {
-        this.logger.error('Failed to credit vendor wallet:', vendorResult.error);
+        this.logger.error('❌ CRITICAL: Failed to credit vendor wallet after escrow status update:', vendorResult.error);
+        // ⚠️ Escrow status is already 'released', but vendor payment failed
+        // This requires manual reconciliation - log critical alert
+        this.logger.error(`🚨 CRITICAL RECONCILIATION REQUIRED: Escrow ${escrowId} status is 'released' but vendor payment failed. Manual intervention required.`);
         throw new HttpException(
-          `Failed to credit vendor wallet: ${vendorResult.error}`,
+          `Escrow released but vendor payment failed: ${vendorResult.error}. Manual reconciliation required.`,
           HttpStatus.INTERNAL_SERVER_ERROR
+        );
+      }
+
+      // ✅ PHASE 2: Log idempotent transaction detection (shouldn't happen with atomic lock, but log for monitoring)
+      if (vendorResult.idempotent) {
+        this.logger.warn(
+          `⚠️ IDEMPOTENT: Vendor payment for escrow ${escrowId} was idempotent (duplicate prevented). This suggests a concurrent release attempt was detected and prevented.`
         );
       }
 
@@ -201,77 +201,59 @@ export class EscrowService {
       // in the process_wallet_transaction RPC function (see add-sales-tracking.sql migration)
 
       // 2. Credit rider wallet (if applicable)
-      if (order.rider_id && escrow.rider_amount > 0) {
-        this.logger.log(`Crediting rider ${order.rider_id} with ₣${escrow.rider_amount}`);
+      if (orderData.rider_id && escrowData.rider_amount > 0) {
+        this.logger.log(`Crediting rider ${orderData.rider_id} with ₣${escrowData.rider_amount}`);
         const riderResult = await this.walletService.processWalletTransaction(
-          order.rider_id,
+          orderData.rider_id,
           WalletTransactionType.DELIVERY_PAYMENT,
-          parseFloat(escrow.rider_amount),
-          `Delivery fee for order ${order.order_number}`,
-          order.id,
+          parseFloat(escrowData.rider_amount),
+          `Delivery fee for order ${orderData.order_number}`,
+          orderData.id,
           'order',
         );
 
         if (!riderResult.success) {
-          this.logger.error('Failed to credit rider wallet:', riderResult.error);
-          // Don't throw - vendor already paid, log and continue
+          this.logger.error('⚠️ CRITICAL: Failed to credit rider wallet after escrow release:', riderResult.error);
+          // ⚠️ Vendor already paid, but rider payment failed - requires reconciliation
+          this.logger.error(`🚨 RECONCILIATION REQUIRED: Escrow ${escrowId} released and vendor paid, but rider payment failed. Manual intervention required.`);
+          // Don't throw - vendor already paid, but log critical alert for reconciliation
+        } else if (riderResult.idempotent) {
+          // ✅ PHASE 2: Log idempotent transaction detection
+          this.logger.warn(
+            `⚠️ IDEMPOTENT: Rider payment for escrow ${escrowId} was idempotent (duplicate prevented).`
+          );
         }
       }
 
       // 2b. Credit platform wallet with commission (if applicable)
       const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
-      if (escrow.platform_amount > 0) {
-        this.logger.log(`Crediting platform wallet with ₣${escrow.platform_amount}`);
+      if (escrowData.platform_amount > 0) {
+        this.logger.log(`Crediting platform wallet with ₣${escrowData.platform_amount}`);
         const platformResult = await this.walletService.processWalletTransaction(
           PLATFORM_USER_ID,
           WalletTransactionType.PLATFORM_COMMISSION,
-          parseFloat(escrow.platform_amount),
-          `Platform commission for order ${order.order_number}`,
-          order.id,
+          parseFloat(escrowData.platform_amount),
+          `Platform commission for order ${orderData.order_number}`,
+          orderData.id,
           'order',
         );
 
         if (!platformResult.success) {
-          this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet:', platformResult.error);
-          // ⚠️ Vendor/rider already paid, but platform commission failed
-          // Log as critical for reconciliation - escrow release continues
-          // TODO: Implement reconciliation process for failed platform commissions
-          this.logger.warn(`Platform commission ${escrow.platform_amount} for order ${order.order_number} failed - requires manual reconciliation`);
+          this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet after escrow release:', platformResult.error);
+          // ⚠️ Vendor/rider already paid, but platform commission failed - requires reconciliation
+          this.logger.error(`🚨 RECONCILIATION REQUIRED: Escrow ${escrowId} released and vendor/rider paid, but platform commission failed. Manual intervention required.`);
+          // Don't throw - vendor/rider already paid, but log critical alert
+        } else if (platformResult.idempotent) {
+          // ✅ PHASE 2: Log idempotent transaction detection
+          this.logger.warn(
+            `⚠️ IDEMPOTENT: Platform commission for escrow ${escrowId} was idempotent (duplicate prevented).`
+          );
         }
       }
 
-      // 3. Update escrow status (with status check to prevent race conditions)
-      const { error: updateError } = await this.supabase
-        .from('escrows')
-        .update({
-          status: 'released',
-          released_at: new Date().toISOString(),
-          release_reason: reason,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', escrowId)
-        .eq('status', 'held'); // ✅ Prevent double-release race condition
+      // ✅ Escrow status is already updated by atomic function, no need to update again
 
-      if (updateError) {
-        this.logger.error('Failed to update escrow status:', updateError);
-        // ⚠️ Wallet transactions already succeeded, but escrow status update failed
-        // This requires manual reconciliation - throw to alert monitoring systems
-        throw new HttpException('Escrow release partially completed - wallet transactions succeeded but status update failed. Manual intervention required.', HttpStatus.INTERNAL_SERVER_ERROR);
-      }
-
-      // Verify the update succeeded by checking the escrow status
-      const { data: verifyEscrow, error: verifyError } = await this.supabase
-        .from('escrows')
-        .select('status')
-        .eq('id', escrowId)
-        .single();
-
-      if (!verifyError && verifyEscrow && verifyEscrow.status !== 'released') {
-        this.logger.warn(`⚠️ Escrow ${escrowId} status update may have failed - status is still ${verifyEscrow.status} after update`);
-        // Don't throw - wallet transactions already succeeded, but log warning
-        // This could happen if another process changed status between our check and update
-      }
-
+      // ✅ PHASE 3: Update order status and handle post-release tasks
       // 4. Update order status to completed (only if not already cancelled) - ✅ FIX Bug 14
       const { error: orderUpdateError } = await this.supabase
         .from('orders')
@@ -279,7 +261,7 @@ export class EscrowService {
           status: 'completed',
           updated_at: new Date().toISOString(),
         })
-        .eq('id', order.id)
+        .eq('id', orderData.id)
         .neq('status', 'cancelled'); // Don't overwrite cancelled status
 
       if (orderUpdateError) {
@@ -288,13 +270,14 @@ export class EscrowService {
       }
 
       // 🔥 FIX: Update gift_orders status if this is a gift order
-      const { data: orderData } = await this.supabase
+      // Fetch order source from the order we already have data for
+      const { data: fullOrderData } = await this.supabase
         .from('orders')
         .select('source, metadata')
-        .eq('id', order.id)
+        .eq('id', orderData.id)
         .single();
 
-      if (orderData?.source === 'wishlist' && orderData.metadata?.wishlist_item_id) {
+      if (fullOrderData?.source === 'wishlist' && fullOrderData.metadata?.wishlist_item_id) {
         try {
           await this.supabase
             .from('gift_orders')
@@ -302,7 +285,7 @@ export class EscrowService {
               status: 'delivered',
               updated_at: new Date().toISOString(),
             })
-            .eq('order_id', order.id);
+            .eq('order_id', orderData.id);
           this.logger.log(`✅ Gift order status updated to delivered`);
         } catch (error) {
           this.logger.error('Failed to update gift_orders status (non-critical):', error);
@@ -312,21 +295,21 @@ export class EscrowService {
 
       // 5. Send notifications
       await this.notificationHelper.notifyVendorEscrowReleased(
-        order.vendor_id,
-        parseFloat(escrow.vendor_amount),
-        order.order_number,
+        orderData.vendor_id,
+        parseFloat(escrowData.vendor_amount),
+        orderData.order_number,
       );
 
-      if (order.rider_id) {
+      if (orderData.rider_id) {
         await this.notificationHelper.notifyRiderPaymentReleased(
-          order.rider_id,
-          parseFloat(escrow.rider_amount),
-          order.order_number,
+          orderData.rider_id,
+          parseFloat(escrowData.rider_amount),
+          orderData.order_number,
         );
       }
 
       // 6. Broadcast real-time wallet updates (balance will be fetched by client)
-      await this.realtimeGateway.notifyWalletBalanceUpdate(order.vendor_id, {
+      await this.realtimeGateway.notifyWalletBalanceUpdate(orderData.vendor_id, {
         availableBalance: 0, // Client will fetch actual balance
         escrowBalance: 0,
         pendingWithdrawal: 0,
@@ -334,8 +317,8 @@ export class EscrowService {
         transactionType: 'escrow_release',
       });
 
-      if (order.rider_id) {
-        await this.realtimeGateway.notifyWalletBalanceUpdate(order.rider_id, {
+      if (orderData.rider_id) {
+        await this.realtimeGateway.notifyWalletBalanceUpdate(orderData.rider_id, {
           availableBalance: 0,
           escrowBalance: 0,
           pendingWithdrawal: 0,
@@ -346,13 +329,13 @@ export class EscrowService {
 
       // 7. Update client relationship
       try {
-        await this.connectionsService.createClientRelationship(order.vendor_id, {
-          clientId: order.buyer_id,
+        await this.connectionsService.createClientRelationship(orderData.vendor_id, {
+          clientId: orderData.buyer_id,
           relationshipType: 'customer',
           totalOrders: 1,
-          totalSpent: parseFloat(escrow.total_amount),
+          totalSpent: parseFloat(escrowData.total_amount),
         });
-        this.logger.log(`✅ Updated client relationship for vendor ${order.vendor_id}`);
+        this.logger.log(`✅ Updated client relationship for vendor ${orderData.vendor_id}`);
       } catch (error) {
         this.logger.warn('⚠️ Failed to update client relationship (non-critical):', error.message);
         // This is non-critical - escrow release still succeeded

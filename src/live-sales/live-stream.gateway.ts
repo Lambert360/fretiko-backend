@@ -10,9 +10,11 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { Logger, UseGuards } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { LiveSalesService } from './live-sales.service';
 import { AnalyticsService } from '../analytics/analytics.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { createSupabaseClient } from '../shared/supabase.client';
 
 /**
  * Live Stream WebSocket Gateway
@@ -42,11 +44,15 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
 
   private readonly logger = new Logger(LiveStreamGateway.name);
   private connectedUsers = new Map<string, { userId: string; streamId?: string; role: string }>();
+  private supabase;
 
   constructor(
     private readonly liveSalesService: LiveSalesService,
     private readonly analyticsService: AnalyticsService,
-  ) {}
+    private readonly configService: ConfigService,
+  ) {
+    this.supabase = createSupabaseClient(this.configService);
+  }
 
   // =====================
   // GATEWAY LIFECYCLE
@@ -60,14 +66,49 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
     try {
       this.logger.log(`Client connected: ${client.id}`);
       
-      // TODO: Implement JWT authentication for WebSocket
-      // For now, we'll accept all connections
-      // In production, verify JWT token from handshake auth
+      // Extract JWT token from handshake auth or query parameters
+      const token = client.handshake.auth?.token || 
+                   client.handshake.query?.token as string || 
+                   client.handshake.headers?.authorization?.replace('Bearer ', '');
       
-      this.connectedUsers.set(client.id, {
-        userId: 'anonymous', // Will be set during authentication
-        role: 'viewer',
-      });
+      // Attempt to authenticate on connection if token is provided
+      if (token) {
+        try {
+          const { data: { user }, error } = await this.supabase.auth.getUser(token);
+          
+          if (error || !user) {
+            this.logger.warn(`Invalid token on connection: ${client.id}`, error?.message);
+            this.connectedUsers.set(client.id, {
+              userId: 'anonymous',
+              role: 'viewer',
+            });
+          } else {
+            this.logger.log(`Authenticated user on connection: ${user.id}`);
+            this.connectedUsers.set(client.id, {
+              userId: user.id,
+              role: 'viewer',
+            });
+            // Join vendor room if user is a vendor
+            if (user.user_metadata?.is_seller || user.user_metadata?.is_vendor) {
+              client.join(`vendor:${user.id}`);
+              this.connectedUsers.get(client.id)!.role = 'vendor';
+            }
+          }
+        } catch (authError) {
+          this.logger.warn(`Auth error on connection: ${client.id}`, authError.message);
+          this.connectedUsers.set(client.id, {
+            userId: 'anonymous',
+            role: 'viewer',
+          });
+        }
+      } else {
+        // No token provided - set as anonymous (can authenticate later)
+        this.connectedUsers.set(client.id, {
+          userId: 'anonymous',
+          role: 'viewer',
+        });
+        this.logger.log(`Anonymous connection: ${client.id} - authentication required`);
+      }
 
     } catch (error) {
       this.logger.error(`Connection error: ${error.message}`);
@@ -98,22 +139,74 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
   @SubscribeMessage('authenticate')
   async handleAuthenticate(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { token: string; userId: string },
+    @MessageBody() data: { token: string; userId?: string },
   ) {
     try {
-      // TODO: Verify JWT token
-      // For now, just accept the userId
-      
-      const userInfo = this.connectedUsers.get(client.id);
-      if (userInfo) {
-        userInfo.userId = data.userId;
-        this.connectedUsers.set(client.id, userInfo);
+      if (!data.token) {
+        client.emit('authentication_error', { message: 'Token is required' });
+        return;
       }
 
-      client.emit('authenticated', { success: true });
-      this.logger.log(`User authenticated: ${data.userId}`);
+      // Verify JWT token using Supabase Auth
+      const { data: { user }, error } = await this.supabase.auth.getUser(data.token);
+      
+      if (error || !user) {
+        this.logger.warn(`Authentication failed: ${client.id}`, error?.message);
+        client.emit('authentication_error', { 
+          message: error?.message || 'Invalid token' 
+        });
+        return;
+      }
+
+      // Verify userId matches token payload (if provided)
+      if (data.userId && data.userId !== user.id) {
+        this.logger.warn(`User ID mismatch: ${client.id}`, {
+          provided: data.userId,
+          token: user.id
+        });
+        client.emit('authentication_error', { 
+          message: 'User ID does not match token' 
+        });
+        return;
+      }
+
+      // Update user info with authenticated user
+      const userInfo = this.connectedUsers.get(client.id);
+      if (userInfo) {
+        userInfo.userId = user.id;
+        userInfo.role = user.user_metadata?.is_seller || user.user_metadata?.is_vendor 
+          ? 'vendor' 
+          : 'viewer';
+        this.connectedUsers.set(client.id, userInfo);
+        
+        // Join vendor room if user is a vendor
+        if (userInfo.role === 'vendor') {
+          client.join(`vendor:${user.id}`);
+        }
+      } else {
+        // Create new entry if doesn't exist
+        this.connectedUsers.set(client.id, {
+          userId: user.id,
+          role: user.user_metadata?.is_seller || user.user_metadata?.is_vendor 
+            ? 'vendor' 
+            : 'viewer',
+        });
+        if (this.connectedUsers.get(client.id)!.role === 'vendor') {
+          client.join(`vendor:${user.id}`);
+        }
+      }
+
+      client.emit('authenticated', { 
+        success: true,
+        userId: user.id,
+        role: this.connectedUsers.get(client.id)?.role || 'viewer'
+      });
+      this.logger.log(`User authenticated: ${user.id} (role: ${this.connectedUsers.get(client.id)?.role})`);
     } catch (error) {
-      client.emit('authentication_error', { message: error.message });
+      this.logger.error(`Authentication error: ${client.id}`, error);
+      client.emit('authentication_error', { 
+        message: error instanceof Error ? error.message : 'Authentication failed' 
+      });
     }
   }
 
@@ -560,7 +653,28 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         return;
       }
 
-      // TODO: Verify user is the vendor of this stream
+      // Verify user is the vendor of this stream
+      const { data: stream, error: streamError } = await this.supabase
+        .from('live_streams')
+        .select('vendor_id, status')
+        .eq('id', data.streamId)
+        .single();
+
+      if (streamError || !stream) {
+        client.emit('error', { message: 'Stream not found' });
+        return;
+      }
+
+      if (stream.vendor_id !== userInfo.userId) {
+        client.emit('error', { message: 'Unauthorized: Only stream vendor can send vendor messages' });
+        this.logger.warn(`Unauthorized vendor message attempt: User ${userInfo.userId} tried to send message for stream ${data.streamId} owned by ${stream.vendor_id}`);
+        return;
+      }
+
+      if (stream.status !== 'live') {
+        client.emit('error', { message: 'Cannot send vendor messages for inactive streams' });
+        return;
+      }
 
       // Broadcast vendor message to all viewers
       this.server.to(`stream:${data.streamId}`).emit('vendor_message', {
@@ -585,17 +699,41 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
     @MessageBody() data: { streamId: string; productId: string },
   ) {
     try {
-      // TODO: Implement get current inventory logic
-      // For now, send mock inventory data
+      const userInfo = this.connectedUsers.get(client.id);
+      if (!userInfo || userInfo.userId === 'anonymous') {
+        client.emit('error', { message: 'User not authenticated' });
+        return;
+      }
+
+      // Get real inventory data from database
+      const inventory = await this.liveSalesService.getProductInventory(
+        data.streamId,
+        data.productId
+      );
+
+      // Broadcast inventory update to all viewers
+      this.server.to(`stream:${data.streamId}`).emit('inventory_update', {
+        streamId: data.streamId,
+        productId: data.productId,
+        currentStock: inventory.currentStock,
+        reservedStock: inventory.reservedStock,
+        availableStock: inventory.availableStock,
+        soldCount: inventory.soldCount,
+        lastUpdated: new Date().toISOString(),
+      });
+
+      // Also send to requesting client
       client.emit('inventory_update', {
         streamId: data.streamId,
         productId: data.productId,
-        currentStock: 10,
-        reservedStock: 2,
-        soldCount: 5,
+        currentStock: inventory.currentStock,
+        reservedStock: inventory.reservedStock,
+        availableStock: inventory.availableStock,
+        soldCount: inventory.soldCount,
         lastUpdated: new Date().toISOString(),
       });
     } catch (error) {
+      this.logger.error(`Error getting inventory: ${error.message}`);
       client.emit('error', { message: error.message });
     }
   }
@@ -607,7 +745,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       streamId: string; 
       productId: string; 
       quantity: number; 
-      reservationId: string; 
+      reservationId?: string; 
     },
   ) {
     try {
@@ -617,25 +755,57 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         return;
       }
 
-      // TODO: Implement actual stock reservation logic in database
+      // Get live product ID using service method
+      const liveProductId = await this.liveSalesService.getLiveProductId(data.streamId, data.productId);
+
+      if (!liveProductId) {
+        client.emit('error', { message: 'Product not found in stream' });
+        return;
+      }
+
+      // Reserve stock using service method
+      const reservationResult = await this.liveSalesService.reserveStock(
+        data.streamId,
+        data.productId,
+        liveProductId,
+        userInfo.userId,
+        data.quantity,
+      );
+
+      if (!reservationResult.success) {
+        client.emit('stock_reservation_failed', {
+          error: reservationResult.error,
+          availableStock: reservationResult.availableStock,
+        });
+        return;
+      }
+
+      // Get updated inventory
+      const inventory = await this.liveSalesService.getProductInventory(
+        data.streamId,
+        data.productId
+      );
       
       // Broadcast inventory update to all viewers
       this.server.to(`stream:${data.streamId}`).emit('inventory_update', {
         streamId: data.streamId,
         productId: data.productId,
-        currentStock: 8, // Mock data - should come from database
-        reservedStock: 4, // Mock data - should come from database
-        soldCount: 5,
+        currentStock: inventory.currentStock,
+        reservedStock: inventory.reservedStock,
+        availableStock: inventory.availableStock,
+        soldCount: inventory.soldCount,
         lastUpdated: new Date().toISOString(),
       });
 
       client.emit('stock_reserved', { 
         success: true, 
-        reservationId: data.reservationId 
+        reservationId: reservationResult.reservationId,
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(), // 5 minutes from now
       });
 
-      this.logger.log(`Stock reserved by ${userInfo.userId} for product ${data.productId}`);
+      this.logger.log(`Stock reserved by ${userInfo.userId} for product ${data.productId}: ${reservationResult.reservationId}`);
     } catch (error) {
+      this.logger.error(`Error reserving stock: ${error.message}`);
       client.emit('error', { message: error.message });
     }
   }
@@ -652,7 +822,47 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         return;
       }
 
-      // TODO: Implement reservation confirmation logic
+      // Verify reservation belongs to user
+      const { data: reservation, error: reservationError } = await this.liveSalesService['supabase']
+        .from('live_stream_stock_reservations')
+        .select('user_id, stream_id, product_id')
+        .eq('id', data.reservationId)
+        .single();
+
+      if (reservationError || !reservation) {
+        client.emit('error', { message: 'Reservation not found' });
+        return;
+      }
+
+      if (reservation.user_id !== userInfo.userId) {
+        client.emit('error', { message: 'Unauthorized' });
+        return;
+      }
+
+      // Confirm reservation using service method
+      const success = await this.liveSalesService.confirmReservation(data.reservationId);
+
+      if (!success) {
+        client.emit('error', { message: 'Failed to confirm reservation' });
+        return;
+      }
+
+      // Get updated inventory
+      const inventory = await this.liveSalesService.getProductInventory(
+        reservation.stream_id,
+        reservation.product_id
+      );
+
+      // Broadcast inventory update
+      this.server.to(`stream:${reservation.stream_id}`).emit('inventory_update', {
+        streamId: reservation.stream_id,
+        productId: reservation.product_id,
+        currentStock: inventory.currentStock,
+        reservedStock: inventory.reservedStock,
+        availableStock: inventory.availableStock,
+        soldCount: inventory.soldCount,
+        lastUpdated: new Date().toISOString(),
+      });
       
       client.emit('reservation_confirmed', { 
         success: true, 
@@ -661,6 +871,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
 
       this.logger.log(`Reservation confirmed by ${userInfo.userId}: ${data.reservationId}`);
     } catch (error) {
+      this.logger.error(`Error confirming reservation: ${error.message}`);
       client.emit('error', { message: error.message });
     }
   }
@@ -677,7 +888,47 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         return;
       }
 
-      // TODO: Implement reservation cancellation logic
+      // Verify reservation belongs to user
+      const { data: reservation, error: reservationError } = await this.liveSalesService['supabase']
+        .from('live_stream_stock_reservations')
+        .select('user_id, stream_id, product_id')
+        .eq('id', data.reservationId)
+        .single();
+
+      if (reservationError || !reservation) {
+        client.emit('error', { message: 'Reservation not found' });
+        return;
+      }
+
+      if (reservation.user_id !== userInfo.userId) {
+        client.emit('error', { message: 'Unauthorized' });
+        return;
+      }
+
+      // Cancel reservation using service method
+      const success = await this.liveSalesService.cancelReservation(data.reservationId);
+
+      if (!success) {
+        client.emit('error', { message: 'Failed to cancel reservation' });
+        return;
+      }
+
+      // Get updated inventory
+      const inventory = await this.liveSalesService.getProductInventory(
+        reservation.stream_id,
+        reservation.product_id
+      );
+
+      // Broadcast inventory update
+      this.server.to(`stream:${reservation.stream_id}`).emit('inventory_update', {
+        streamId: reservation.stream_id,
+        productId: reservation.product_id,
+        currentStock: inventory.currentStock,
+        reservedStock: inventory.reservedStock,
+        availableStock: inventory.availableStock,
+        soldCount: inventory.soldCount,
+        lastUpdated: new Date().toISOString(),
+      });
       
       client.emit('reservation_cancelled', { 
         success: true, 
@@ -686,6 +937,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
 
       this.logger.log(`Reservation cancelled by ${userInfo.userId}: ${data.reservationId}`);
     } catch (error) {
+      this.logger.error(`Error cancelling reservation: ${error.message}`);
       client.emit('error', { message: error.message });
     }
   }

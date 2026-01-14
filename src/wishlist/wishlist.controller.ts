@@ -181,19 +181,44 @@ export class WishlistController {
   @Post('gift')
   async createGiftOrder(@Request() req, @Body() giftData: {
     giftRecipientId: string;
-    orderId: string;
+    orderId: string | null;
     wishlistItemId: string;
     giftMessage?: string;
     isSurprise?: boolean;
+    deliveryAddress: {
+      fullName: string;
+      phone: string;
+      address: string;
+      city: string;
+      state: string;
+      postalCode: string;
+    };
+    selectedRider?: {
+      riderId: string;
+      riderName?: string;
+      vehicleType?: string;
+      deliveryPrice?: number;
+      estimatedArrival?: number;
+    };
   }) {
-    console.log('💖 Creating gift order:', giftData);
+    console.log('💖 Creating gift order:', { 
+      giftRecipientId: giftData.giftRecipientId,
+      orderId: giftData.orderId,
+      wishlistItemId: giftData.wishlistItemId,
+      isSurprise: giftData.isSurprise,
+      deliveryAddress: giftData.deliveryAddress ? 'provided' : 'missing',
+      hasSelectedRider: !!giftData.selectedRider,
+      riderId: giftData.selectedRider?.riderId,
+    });
     return this.wishlistService.createGiftOrder(
       req.user.sub,
       giftData.giftRecipientId,
       giftData.orderId,
       giftData.wishlistItemId,
+      giftData.deliveryAddress,
       giftData.giftMessage,
       giftData.isSurprise,
+      giftData.selectedRider,
       req.supabaseToken
     );
   }

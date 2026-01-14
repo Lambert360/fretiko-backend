@@ -162,15 +162,28 @@ export class BankAccountService {
       const existingAccounts = await this.getUserBankAccounts(userId);
       const isFirstAccount = existingAccounts.length === 0;
 
-      // Infer country from currency if not provided
+      // Platform user can choose any country/currency combination
+      const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
       let country = dto.country;
-      if (!country && dto.currency) {
-        const currencyToCountry: Record<string, string> = {
-          'NGN': 'NG', 'GHS': 'GH', 'KES': 'KE', 'ZAR': 'ZA', 'UGX': 'UG',
-          'TZS': 'TZ', 'RWF': 'RW', 'XAF': 'CM', 'XOF': 'SN', 'USD': 'US',
-          'EUR': 'EU', 'GBP': 'GB', 'CAD': 'CA', 'AUD': 'AU',
-        };
-        country = currencyToCountry[dto.currency.toUpperCase()];
+
+      if (userId === PLATFORM_USER_ID) {
+        // For platform user, use provided country or default to US
+        country = dto.country || 'US';
+      } else {
+        // For regular users, infer country from currency if not provided
+        if (!country && dto.currency) {
+          const currencyToCountry: Record<string, string> = {
+            'NGN': 'NG', 'GHS': 'GH', 'KES': 'KE', 'ZAR': 'ZA', 'UGX': 'UG',
+            'TZS': 'TZ', 'RWF': 'RW', 'XAF': 'CM', 'XOF': 'SN', 'USD': 'US',
+            'EUR': 'EU', 'GBP': 'GB', 'CAD': 'CA', 'AUD': 'AU',
+          };
+          country = currencyToCountry[dto.currency.toUpperCase()];
+        }
+
+        // For regular users, ensure we have a valid country
+        if (!country) {
+          country = 'NG'; // Default fallback for regular users
+        }
       }
 
       const { data, error } = await this.supabase
@@ -182,7 +195,7 @@ export class BankAccountService {
           bank_code: dto.bankCode,
           account_number: dto.accountNumber,
           account_type: dto.accountType || 'savings',
-          currency: dto.currency || 'NGN',
+          currency: userId === PLATFORM_USER_ID ? (dto.currency || 'USD') : (dto.currency || 'NGN'),
           country: country,
           swift_code: dto.swiftCode,
           iban: dto.iban,

@@ -41,6 +41,8 @@ export class WorkspaceService {
           updated_at,
           buyer_id,
           delivery_address,
+          delivery_type,
+          rider_id,
           source,
           metadata,
           order_items(
@@ -88,7 +90,7 @@ export class WorkspaceService {
         console.log(`⏱️ [WORKSPACE] Profiles fetch took ${Date.now() - profileStart}ms (${buyerIds.length} buyers)`);
       }
 
-      // ✅ Transform orders - use the source field from database!
+      // ✅ Transform orders - include deliveryType and riderId!
       const transformStart = Date.now();
         const transformedOrders = orders.map(order => ({
           id: order.id,
@@ -100,6 +102,8 @@ export class WorkspaceService {
         total: order.total_amount,
           deliveryAddress: order.delivery_address,
           deliveryFee: order.delivery_fee,
+          deliveryType: order.delivery_type || 'delivery', // ✅ Add deliveryType
+          riderId: order.rider_id || null, // ✅ Add riderId
           createdAt: order.created_at,
           updatedAt: order.updated_at,
         estimatedPreparationTime: order.metadata?.estimated_preparation_time || 15,
@@ -988,7 +992,7 @@ export class WorkspaceService {
       // ✅ Verify vendor owns order and it's in processing status
       const { data: order, error: fetchError } = await supabaseClient
         .from('orders')
-        .select('id, order_number, delivery_type, delivery_pin, buyer_id, vendor_id')
+        .select('id, order_number, delivery_type, delivery_pin, buyer_id, vendor_id, rider_id, status')
         .eq('id', orderId)
         .eq('vendor_id', userId)
         .eq('status', 'processing')
@@ -1010,7 +1014,8 @@ export class WorkspaceService {
       if (order.delivery_type !== 'pickup') {
         console.error('❌ [DEBUG] Delivery type mismatch:', {
           expected: 'pickup',
-          actual: order.delivery_type
+          actual: order.delivery_type,
+          rider_id: order.rider_id
         });
         throw new Error('This action is only for self-pickup orders');
       }

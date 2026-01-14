@@ -8,6 +8,7 @@ import { ConnectionsModule } from '../connections/connections.module';
 import { EscrowModule } from '../escrow/escrow.module';
 import { RewardsModule } from '../rewards/rewards.module';
 import { WalletModule } from '../wallet/wallet.module';
+import { RealtimeModule } from '../realtime/realtime.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { WalletModule } from '../wallet/wallet.module';
     forwardRef(() => EscrowModule),
     forwardRef(() => RewardsModule),
     WalletModule,
+    RealtimeModule, // For WebSocket real-time order status updates
   ],
   controllers: [OrdersController],
   providers: [OrdersService],

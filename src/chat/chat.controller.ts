@@ -1104,31 +1104,6 @@ export class ChatController {
     }
   }
 
-  @Post('invoices/:invoiceId/checkout')
-  async createOrderFromInvoice(
-    @Param('invoiceId') invoiceId: string,
-    @Headers('authorization') authHeader: string,
-  ) {
-    this.logger.log(`POST /chat/invoices/${invoiceId}/checkout`);
-
-    const userId = this.getUserIdFromToken(authHeader);
-    const token = authHeader.split(' ')[1];
-
-    try {
-      const result = await this.invoiceService.createOrderFromInvoice(userId, invoiceId, token);
-
-      this.logger.log(`Order created from invoice: ${invoiceId}, Order ID: ${result.orderId}`);
-      return {
-        success: true,
-        data: result,
-        message: 'Order created successfully',
-      };
-    } catch (error) {
-      this.logger.error('Error creating order from invoice:', error);
-      throw error;
-    }
-  }
-
   // =============================================================================
   // HEALTH CHECK ENDPOINT
   // =============================================================================

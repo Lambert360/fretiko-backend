@@ -51,11 +51,13 @@ export class StaffAnalyticsController {
     @Query('start') start?: string,
     @Query('end') end?: string,
     @Query('period') period?: 'daily' | 'weekly' | 'monthly',
+    @Query('timezoneOffset') timezoneOffset?: string,
   ) {
     return this.adminService.getTimeSeriesForStaff(
       req.user.sub,
       { start, end },
       period || 'daily',
+      timezoneOffset ? parseInt(timezoneOffset) : undefined,
     );
   }
 }

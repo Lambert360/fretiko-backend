@@ -11,7 +11,7 @@ import {
 import { Logger, OnModuleDestroy } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { RealtimeService } from './realtime.service';
-import { createUserSupabaseClient } from '../shared/supabase.client';
+import { createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { ConfigService } from '@nestjs/config';
 
 @WebSocketGateway({
@@ -604,6 +604,111 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
   }
 
+  @SubscribeMessage('join_wishlist')
+  async handleJoinWishlist(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { ownerId: string }
+  ) {
+    try {
+      this.logger.log(`🎁 JOIN WISHLIST REQUEST: Socket ${client.id} wants to view wishlist for owner: ${data.ownerId}`);
+
+      const userId = await this.realtimeService.getUserBySocketId(client.id);
+
+      if (!userId) {
+        this.logger.warn(`❌ JOIN WISHLIST FAILED: Unauthorized socket ${client.id}`);
+        client.emit('error', { message: 'Unauthorized' });
+        return;
+      }
+
+      // Verify user has access to view this shared wishlist
+      // Allow access if user is the owner or if there's an active share
+      // For simplicity, we'll allow joining if user is authenticated (share verification can be done on data fetch)
+      // The frontend already checks share access when loading wishlist items
+      // This is just for real-time updates, so we'll allow authenticated users to join
+      if (userId !== data.ownerId) {
+        // For viewers, check if there's an active share (use service client for quick check)
+        const supabase = createServiceSupabaseClient(this.configService);
+        const { data: share } = await supabase
+          .from('wishlist_shares')
+          .select('id')
+          .eq('owner_id', data.ownerId)
+          .eq('shared_with_id', userId)
+          .eq('is_active', true)
+          .maybeSingle();
+
+        if (!share) {
+          this.logger.warn(`❌ JOIN WISHLIST FAILED: User ${userId} denied access to wishlist for owner ${data.ownerId} - no active share`);
+          client.emit('joined_wishlist', {
+            ownerId: data.ownerId,
+            success: false,
+            reason: 'Access denied - no active wishlist share found',
+            timestamp: new Date().toISOString()
+          });
+          return;
+        }
+      }
+
+      // Join the wishlist room
+      const roomName = `wishlist_${data.ownerId}`;
+      this.logger.log(`🚀 ATTEMPTING JOIN WISHLIST: ${client.id} -> ${roomName}`);
+
+      try {
+        client.join(roomName);
+        this.logger.log(`✅ JOIN WISHLIST COMPLETED: Socket ${client.id} joined ${roomName}`);
+      } catch (joinError) {
+        this.logger.error(`💥 JOIN WISHLIST FAILED:`, joinError);
+        client.emit('joined_wishlist', { success: false, reason: 'Join operation failed' });
+        return;
+      }
+
+      // Get room size
+      let roomSize = 0;
+      try {
+        if (client.nsp && client.nsp.adapter && client.nsp.adapter.rooms) {
+          roomSize = client.nsp.adapter.rooms.get(roomName)?.size || 0;
+        }
+      } catch (roomSizeError) {
+        this.logger.error(`💥 Error getting wishlist room size:`, roomSizeError);
+      }
+
+      this.logger.log(`✅ JOIN WISHLIST SUCCESS: User ${userId} (socket ${client.id}) joined wishlist room for owner ${data.ownerId} - Room size: ${roomSize}`);
+
+      client.emit('joined_wishlist', {
+        ownerId: data.ownerId,
+        success: true,
+        roomSize: roomSize,
+        message: 'Successfully joined wishlist room',
+        timestamp: new Date().toISOString()
+      });
+
+    } catch (error) {
+      this.logger.error(`💥 JOIN WISHLIST ERROR for socket ${client.id}:`, error);
+      if (client && client.emit) {
+        client.emit('error', { message: 'Failed to join wishlist room' });
+      }
+    }
+  }
+
+  @SubscribeMessage('leave_wishlist')
+  async handleLeaveWishlist(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { ownerId: string }
+  ) {
+    try {
+      const roomName = `wishlist_${data.ownerId}`;
+      client.leave(roomName);
+      this.logger.log(`👋 LEAVE WISHLIST: Socket ${client.id} left ${roomName}`);
+      
+      client.emit('left_wishlist', {
+        ownerId: data.ownerId,
+        success: true,
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      this.logger.error(`💥 LEAVE WISHLIST ERROR for socket ${client.id}:`, error);
+    }
+  }
+
   @SubscribeMessage('leave_dispute')
   async handleLeaveDispute(
     @ConnectedSocket() client: Socket,
@@ -1132,6 +1237,92 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       this.logger.debug(`🏍️ RIDER LOCATION: Broadcasted location for rider ${location.riderId} on order ${orderId}`);
     } catch (error) {
       this.logger.error(`💥 RIDER LOCATION ERROR for order ${orderId}:`, error.stack || error.message);
+    }
+  }
+
+  /**
+   * Notify wishlist owners/viewers when a gift order is created for a wishlist item
+   */
+  async notifyWishlistGiftOrderCreated(data: {
+    wishlistItemId: string;
+    wishlistOwnerId: string;
+    giftGiverId: string;
+    orderId: string;
+    orderNumber: string;
+    orderStatus: string;
+    productName: string;
+  }) {
+    try {
+      if (!this.server) {
+        this.logger.error(`💥 WISHLIST UPDATE ERROR: Server not available for wishlist item ${data.wishlistItemId}`);
+        return;
+      }
+
+      const payload = {
+        wishlistItemId: data.wishlistItemId,
+        orderId: data.orderId,
+        orderNumber: data.orderNumber,
+        orderStatus: data.orderStatus,
+        giftOrderStatus: {
+          status: data.orderStatus,
+          orderId: data.orderId,
+          orderNumber: data.orderNumber,
+          orderStatus: data.orderStatus,
+        },
+        timestamp: new Date().toISOString(),
+      };
+
+      // Notify the wishlist owner (recipient) - they're always in their user room
+      this.server.to(`user_${data.wishlistOwnerId}`).emit('wishlist_item_gift_ordered', payload);
+      
+      // Also notify any users viewing this shared wishlist (viewers join the wishlist room)
+      this.server.to(`wishlist_${data.wishlistOwnerId}`).emit('wishlist_item_gift_ordered', payload);
+
+      this.logger.log(`🎁 WISHLIST GIFT ORDER: Notified wishlist owner ${data.wishlistOwnerId} of gift order for item ${data.wishlistItemId}`);
+    } catch (error) {
+      this.logger.error(`💥 WISHLIST GIFT ORDER ERROR for item ${data.wishlistItemId}:`, error.stack || error.message);
+    }
+  }
+
+  /**
+   * Notify wishlist owners/viewers when gift order status changes
+   */
+  async notifyWishlistGiftOrderStatusUpdate(data: {
+    wishlistItemId: string;
+    wishlistOwnerId: string;
+    orderId: string;
+    orderNumber: string;
+    orderStatus: string;
+  }) {
+    try {
+      if (!this.server) {
+        this.logger.error(`💥 WISHLIST STATUS UPDATE ERROR: Server not available for wishlist item ${data.wishlistItemId}`);
+        return;
+      }
+
+      const payload = {
+        wishlistItemId: data.wishlistItemId,
+        orderId: data.orderId,
+        orderNumber: data.orderNumber,
+        orderStatus: data.orderStatus,
+        giftOrderStatus: {
+          status: data.orderStatus,
+          orderId: data.orderId,
+          orderNumber: data.orderNumber,
+          orderStatus: data.orderStatus,
+        },
+        timestamp: new Date().toISOString(),
+      };
+
+      // Notify the wishlist owner (recipient) - they're always in their user room
+      this.server.to(`user_${data.wishlistOwnerId}`).emit('gift_order_status_update', payload);
+      
+      // Also notify any users viewing this shared wishlist (viewers join the wishlist room)
+      this.server.to(`wishlist_${data.wishlistOwnerId}`).emit('gift_order_status_update', payload);
+
+      this.logger.log(`📦 WISHLIST GIFT ORDER STATUS: Notified wishlist owner ${data.wishlistOwnerId} of status update '${data.orderStatus}' for order ${data.orderId}`);
+    } catch (error) {
+      this.logger.error(`💥 WISHLIST STATUS UPDATE ERROR for item ${data.wishlistItemId}:`, error.stack || error.message);
     }
   }
 

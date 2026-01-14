@@ -56,6 +56,16 @@ export class UpdateStaffDto {
   isActive?: boolean;
 }
 
+export class ModifyStaffDto {
+  @IsOptional()
+  @IsUUID()
+  departmentId?: string;
+
+  @IsOptional()
+  @IsEnum(StaffRole)
+  role?: StaffRole;
+}
+
 export class UpdateMyProfileDto {
   @IsOptional()
   @IsString()

@@ -157,7 +157,7 @@ export class WalletService {
     referenceId?: string,
     referenceType?: string,
     maxRetries: number = 3
-  ): Promise<{ success: boolean; transactionId?: string; error?: string }> {
+  ): Promise<{ success: boolean; transactionId?: string; error?: string; idempotent?: boolean }> {
     // ✅ BUG FIX: Validate transaction type before processing
     if (!isValidTransactionType(transactionType)) {
       const error = `Invalid transaction type: ${transactionType}. Valid types: ${getAllTransactionTypes().join(', ')}`;
@@ -223,13 +223,21 @@ export class WalletService {
       }
 
       try {
+        // 🔥 FIX: Ensure reference_id is either a valid UUID string or null (not empty string, not undefined)
+        const normalizedReferenceId = (referenceId && typeof referenceId === 'string' && referenceId.trim() !== '') 
+          ? referenceId.trim() 
+          : null;
+        const normalizedReferenceType = (referenceType && typeof referenceType === 'string' && referenceType.trim() !== '') 
+          ? referenceType.trim() 
+          : null;
+        
         const { data, error } = await this.supabase.rpc('process_wallet_transaction', {
           p_user_id: userId,
           p_transaction_type: transactionType,
           p_amount: amount,
           p_description: description,
-          p_reference_id: referenceId || null,
-          p_reference_type: referenceType || null,
+          p_reference_id: normalizedReferenceId,
+          p_reference_type: normalizedReferenceType,
         });
 
         // Check for Supabase RPC call error
@@ -282,6 +290,9 @@ export class WalletService {
         if (!data || !data.success) {
           const errorMsg = data?.error || 'Transaction failed without error message';
           lastError = errorMsg;
+          
+          // ✅ PHASE 2: Log idempotent transaction detection (duplicate prevented)
+          // The RPC function now checks for duplicates and returns existing transaction
 
           // ✅ TASK 3.1: Log negative balance attempts for security monitoring
           if (errorMsg.toLowerCase().includes('insufficient')) {
@@ -327,7 +338,36 @@ export class WalletService {
         }
 
         // Success - return transaction details
-        if (attempt > 0) {
+        // ✅ PHASE 2: Log idempotent transaction detection (duplicate prevented)
+        if (data.idempotent) {
+          this.logger.warn(
+            `⚠️ IDEMPOTENT: Duplicate transaction prevented for ${transactionType} (user: ${userId}, reference: ${normalizedReferenceId}, referenceType: ${normalizedReferenceType}). Returning existing transaction ${data.transaction_id}`
+          );
+          // Log to reconciliation_alerts for monitoring
+          try {
+            await this.supabase
+              .from('reconciliation_alerts')
+              .insert({
+                user_id: userId,
+                alert_type: 'duplicate_transaction_prevented',
+                alert_severity: 'low',
+                alert_reason: `Idempotent check prevented duplicate ${transactionType} transaction with reference ${normalizedReferenceId}`,
+                status: 'resolved', // Already handled by idempotency check
+                local_amount: amount,
+                local_currency: 'USD',
+                metadata: {
+                  transaction_type: transactionType,
+                  reference_id: normalizedReferenceId,
+                  reference_type: normalizedReferenceType,
+                  existing_transaction_id: data.transaction_id,
+                  timestamp: new Date().toISOString(),
+                },
+              });
+          } catch (alertError) {
+            // Don't throw - alerting failure shouldn't block transaction processing
+            this.logger.warn('Failed to log duplicate transaction alert:', alertError);
+          }
+        } else if (attempt > 0) {
           this.logger.log(
             `✅ Wallet transaction successful after ${attempt} retries: ${transactionType} for user ${userId}, amount: ${amount}`
           );
@@ -340,7 +380,8 @@ export class WalletService {
 
         return { 
           success: true, 
-          transactionId: data.transaction_id 
+          transactionId: data.transaction_id,
+          idempotent: data.idempotent || false
         };
       } catch (error: any) {
         lastException = error;

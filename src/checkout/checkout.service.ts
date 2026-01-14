@@ -12,6 +12,7 @@ import { WalletTransactionType } from '../wallet/constants/transaction-types';
 @Injectable()
 export class CheckoutService {
   private supabase;
+  private readonly PLATFORM_COMMISSION_RATE: number;
 
   constructor(
     private configService: ConfigService,
@@ -26,6 +27,9 @@ export class CheckoutService {
     private walletService: WalletService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
+    this.PLATFORM_COMMISSION_RATE = parseFloat(
+      this.configService.get<string>('PLATFORM_COMMISSION_RATE', '0.1')
+    );
   }
 
   /**
@@ -650,6 +654,26 @@ export class CheckoutService {
         userToken,
       );
       isAuctionOrder = true;
+    } else if (orderData.invoiceCheckout) {
+      // Invoice checkout - use items from invoice
+      console.log('📄 Backend createOrder - Invoice checkout with invoiceId:', orderData.invoiceCheckout.invoiceId);
+      summary = {
+        items: orderData.invoiceCheckout.items.map(item => ({
+          id: item.id,
+          name: item.name,
+          price: item.price,
+          quantity: item.quantity,
+          sellerId: orderData.invoiceCheckout.vendorId,
+          image: item.image,
+          itemType: item.type || 'product',
+        })),
+        subtotal: orderData.invoiceCheckout.totalAmount,
+        shipping: 0, // Will be set when rider is selected
+        tax: 0,
+        escrowFee: 0,
+        total: orderData.invoiceCheckout.totalAmount,
+        sellerId: orderData.invoiceCheckout.vendorId,
+      };
     } else if (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) {
       // Wishlist checkout
       console.log('💖 Backend createOrder - Wishlist checkout with itemIds:', orderData.wishlistItemIds);
@@ -729,6 +753,8 @@ export class CheckoutService {
     let orderSource = 'regular';
     if (isAuctionOrder) {
       orderSource = 'auction';
+    } else if (orderData.invoiceCheckout) {
+      orderSource = 'invoice';
     } else if (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) {
       orderSource = 'wishlist';
     } else if (orderData.directCheckout) {
@@ -787,6 +813,11 @@ export class CheckoutService {
         // Add auction_id to metadata for easier querying
         ...(isAuctionOrder && orderData.auctionCheckout ? {
           auction_id: orderData.auctionCheckout.auctionId,
+        } : {}),
+        // Add invoice_id to metadata for invoice tracking
+        ...(orderSource === 'invoice' && orderData.invoiceCheckout ? {
+          invoiceId: orderData.invoiceCheckout.invoiceId,
+          invoiceNumber: orderData.invoiceCheckout.invoiceNumber,
         } : {}),
         // Add wishlist_item_ids to metadata for cleanup
         ...(orderSource === 'wishlist' && orderData.wishlistItemIds ? {
@@ -907,14 +938,43 @@ export class CheckoutService {
       await this.processWalletPayment(userId, order.id, finalPaymentAmount, vendorId, riderId, client);
     }
 
-    // ✅ Mark invoice as paid if this order came from an invoice (after payment is processed)
+    // ✅ Link invoice to order if this order came from an invoice (after payment is processed)
     if (order.source === 'invoice' && order.metadata?.invoiceId) {
       try {
-        await this.invoiceService.markInvoiceAsPaid(order.metadata.invoiceId, order.id);
-        console.log(`✅ Invoice ${order.metadata.invoiceId} marked as paid after payment processing`);
+        // Fetch invoice to get invoice number
+        const { data: invoice } = await client
+          .from('chat_invoices')
+          .select('invoice_number')
+          .eq('id', order.metadata.invoiceId)
+          .single();
+        
+        // Link order to invoice and update metadata with actual invoice number
+        const { error: linkError } = await client
+          .from('chat_invoices')
+          .update({ order_id: order.id })
+          .eq('id', order.metadata.invoiceId);
+        
+        if (linkError) {
+          console.error('Failed to link invoice to order:', linkError);
+        } else {
+          console.log(`✅ Invoice ${order.metadata.invoiceId} linked to order ${order.id}`);
+          
+          // Update order metadata with actual invoice number if we have it
+          if (invoice?.invoice_number && invoice.invoice_number !== order.metadata.invoiceNumber) {
+            await client
+              .from('orders')
+              .update({
+                metadata: {
+                  ...order.metadata,
+                  invoiceNumber: invoice.invoice_number,
+                },
+              })
+              .eq('id', order.id);
+          }
+        }
       } catch (error) {
-        console.error('Failed to mark invoice as paid:', error);
-        // Don't throw - invoice marking is not critical to payment processing
+        console.error('Failed to link invoice to order:', error);
+        // Don't throw - invoice linking is not critical to order creation
       }
     }
 
@@ -1590,11 +1650,16 @@ export class CheckoutService {
       // 7. Create escrows per vendor if enabled
       if (orderData.useEscrow) {
         for (const order of orders) {
+          // Calculate rider commission (10% of rider earnings)
+          const riderCommission = order.rider_id && order.delivery_fee > 0
+            ? order.delivery_fee * this.PLATFORM_COMMISSION_RATE
+            : 0;
+
           const breakdown = {
             totalAmount: order.total_amount,
             vendorAmount: order.total_amount - order.delivery_fee - order.platform_fee,
-            riderAmount: order.delivery_fee,
-            platformAmount: order.platform_fee,
+            riderAmount: order.delivery_fee - riderCommission, // Rider gets delivery fee minus platform commission
+            platformAmount: order.platform_fee + riderCommission, // Platform gets vendor commission + rider commission
           };
           await this.escrowService.createEscrow(order.id, breakdown);
         }

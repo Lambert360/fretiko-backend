@@ -8,6 +8,7 @@ import {
   StaffLoginDto,
   CreateStaffDto,
   UpdateStaffDto,
+  ModifyStaffDto,
   UpdateMyProfileDto,
   ChangePasswordDto,
   SuspendStaffDto,
@@ -118,6 +119,22 @@ export class StaffController {
   @Permissions('edit_staff')
   async updateStaff(@Param('id') id: string, @Body() updateDto: UpdateStaffDto) {
     return this.staffService.updateStaff(id, updateDto);
+  }
+
+  /**
+   * Modify staff role or department (Super Admin Only)
+   * PATCH /staff/:id/modify
+   * Allows promotion/demotion and department transfers
+   * IMPORTANT: Only super admins can use this endpoint
+   */
+  @Patch(':id/modify')
+  @UseGuards(StaffJwtAuthGuard)
+  async modifyStaffRoleOrDepartment(
+    @Param('id') id: string,
+    @Body() modifyDto: ModifyStaffDto,
+    @Req() req,
+  ) {
+    return this.staffService.modifyStaffRoleOrDepartment(id, modifyDto, req.user.sub, req.user.role);
   }
 
   /**

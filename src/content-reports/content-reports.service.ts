@@ -1,10 +1,13 @@
 import { Injectable, Logger, HttpException, HttpStatus, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { NotificationType, NotificationPriority, ActionButtonType } from '../notifications/dto/notification.dto';
 import { AdminService } from '../admin/admin.service';
+import { AdminNotificationsService, AdminNotificationType } from '../admin/admin-notifications.service';
+import { AdminNotificationEventType, ContentReportCreatedEvent } from '../admin/events/admin-notification.events';
 
 export interface CreateContentReportDto {
   reportCategory: 'product' | 'service' | 'chat' | 'user';
@@ -62,6 +65,7 @@ export class ContentReportsService {
     private configService: ConfigService,
     private notificationHelper: NotificationHelperService,
     private notificationsService: NotificationsService,
+    private eventEmitter: EventEmitter2, // For event-based notifications
     @Inject(forwardRef(() => AdminService))
     private adminService: AdminService,
   ) {
@@ -171,6 +175,21 @@ export class ContentReportsService {
         );
       } catch (notifError) {
         this.logger.warn('Failed to send notification to reporter', notifError);
+      }
+
+      // 🔔 Emit content report created event for notifications
+      try {
+        const event: ContentReportCreatedEvent = {
+          reportId: report.id,
+          category: createDto.reportCategory,
+          reportType: createDto.reportType,
+          reporterId: userId,
+        };
+
+        this.eventEmitter.emit(AdminNotificationEventType.CONTENT_REPORT_CREATED, event);
+        this.logger.log(`📢 Emitted content report created event for report ${report.id}`);
+      } catch (eventError) {
+        this.logger.warn('Failed to emit content report created event', eventError);
       }
 
       // Notify moderators about the new content report

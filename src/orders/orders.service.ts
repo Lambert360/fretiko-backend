@@ -8,6 +8,7 @@ import { EscrowService } from '../escrow/escrow.service';
 import { RewardsService } from '../rewards/rewards.service';
 import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 
 @Injectable()
 export class OrdersService {
@@ -23,69 +24,143 @@ export class OrdersService {
     @Inject(forwardRef(() => RewardsService))
     private rewardsService: RewardsService,
     private walletService: WalletService,
+    private realtimeGateway: RealtimeGateway,
   ) {}
 
   async getMyOrders(userId: string, filters?: any) {
     const supabase = createServiceSupabaseClient(this.configService);
     
-    let query = supabase
-      .from('orders')
-      .select(`
-        id,
-        order_number,
-        status,
-        total_amount,
-        delivery_fee,
-        platform_fee,
-        estimated_delivery,
-        delivery_address,
-        metadata,
-        created_at,
-        buyer_id,
-        vendor_id,
-        rider_id,
-        escrow_enabled,
-        delivery_type,
-        rider_info,
-        source,
-        order_items (
+    // ✅ Query orders where user is buyer OR gift recipient
+    // Use two queries and combine for reliability with JSONB filtering
+    const [buyerOrdersResult, giftOrdersResult] = await Promise.all([
+      // Orders where user is the buyer
+      supabase
+        .from('orders')
+        .select(`
           id,
-          product_id,
-          product_name,
-          unit_price,
-          quantity,
-          total_price,
-          product_metadata
-        )
-      `)
-      .eq('buyer_id', userId)
-      .order('created_at', { ascending: false });
+          order_number,
+          status,
+          total_amount,
+          delivery_fee,
+          platform_fee,
+          estimated_delivery,
+          delivery_address,
+          delivery_instructions,
+          metadata,
+          created_at,
+          buyer_id,
+          vendor_id,
+          rider_id,
+          escrow_enabled,
+          delivery_type,
+          rider_info,
+          source,
+          order_items (
+            id,
+            product_id,
+            product_name,
+            unit_price,
+            quantity,
+            total_price,
+            product_metadata
+          )
+        `)
+        .eq('buyer_id', userId)
+        .order('created_at', { ascending: false }),
+      
+      // Orders where user is gift recipient (wishlist gift orders)
+      supabase
+        .from('orders')
+        .select(`
+          id,
+          order_number,
+          status,
+          total_amount,
+          delivery_fee,
+          platform_fee,
+          estimated_delivery,
+          delivery_address,
+          delivery_instructions,
+          metadata,
+          created_at,
+          buyer_id,
+          vendor_id,
+          rider_id,
+          escrow_enabled,
+          delivery_type,
+          rider_info,
+          source,
+          order_items (
+            id,
+            product_id,
+            product_name,
+            unit_price,
+            quantity,
+            total_price,
+            product_metadata
+          )
+        `)
+        .eq('source', 'wishlist')
+        .eq('metadata->>gift_recipient_id', userId)
+        .order('created_at', { ascending: false })
+    ]);
+
+    if (buyerOrdersResult.error) {
+      throw new Error(`Failed to fetch buyer orders: ${buyerOrdersResult.error.message}`);
+    }
+
+    if (giftOrdersResult.error) {
+      throw new Error(`Failed to fetch gift orders: ${giftOrdersResult.error.message}`);
+    }
+
+    // Combine results and deduplicate by order ID
+    const allOrdersMap = new Map();
+    
+    buyerOrdersResult.data?.forEach(order => {
+      allOrdersMap.set(order.id, order);
+    });
+    
+    giftOrdersResult.data?.forEach(order => {
+      allOrdersMap.set(order.id, order);
+    });
+
+    let orders = Array.from(allOrdersMap.values());
+
+    // ✅ Filter out vendor orders (unless vendor is also the gift recipient)
+    orders = orders.filter(order => {
+      // If user is vendor, exclude from "My Orders" unless they're also the gift recipient
+      if (order.vendor_id === userId) {
+        // Only include if user is also the gift recipient
+        return order.source === 'wishlist' && order.metadata?.gift_recipient_id === userId;
+      }
+      return true;
+    });
 
     // Apply filters
     if (filters?.status?.length) {
-      query = query.in('status', filters.status.split(','));
+      const statusList = filters.status.split(',');
+      orders = orders.filter(order => statusList.includes(order.status));
     }
     if (filters?.startDate) {
-      query = query.gte('created_at', filters.startDate);
+      orders = orders.filter(order => order.created_at >= filters.startDate);
     }
     if (filters?.endDate) {
-      query = query.lte('created_at', filters.endDate);
+      orders = orders.filter(order => order.created_at <= filters.endDate);
     }
     if (filters?.minAmount) {
-      query = query.gte('total_amount', parseInt(filters.minAmount));
+      const minAmount = parseInt(filters.minAmount);
+      orders = orders.filter(order => order.total_amount >= minAmount);
     }
     if (filters?.maxAmount) {
-      query = query.lte('total_amount', parseInt(filters.maxAmount));
+      const maxAmount = parseInt(filters.maxAmount);
+      orders = orders.filter(order => order.total_amount <= maxAmount);
     }
 
-    const { data, error } = await query;
-
-    if (error) {
-      throw new Error(`Failed to fetch orders: ${error.message}`);
-    }
+    // Sort by created_at descending
+    orders.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
     // Transform data to match frontend interface
-    return data.map(order => ({
+    return orders.map(order => ({
       id: order.id,
       orderNumber: order.order_number,
       status: order.status,
@@ -99,6 +174,7 @@ export class OrdersService {
       orderDate: order.created_at,
       estimatedDelivery: order.estimated_delivery,
       deliveryAddress: order.delivery_address,
+      deliveryInstructions: order.delivery_instructions, // ✅ Include delivery instructions
       escrowEnabled: order.escrow_enabled,
       deliveryType: order.delivery_type,
       riderInfo: order.rider_info,
@@ -106,7 +182,7 @@ export class OrdersService {
       buyerId: order.buyer_id,
       vendorId: order.vendor_id,
       riderId: order.rider_id,
-      metadata: order.metadata, // ✅ Include metadata for auction_id and other data
+      metadata: order.metadata,
       items: order.order_items.map(item => ({
         id: item.id,
         productId: item.product_id,
@@ -122,6 +198,34 @@ export class OrdersService {
   async getOrderDetails(userId: string, orderId: string) {
     const supabase = createServiceSupabaseClient(this.configService);
     
+    // ✅ First, fetch order without buyer_id restriction to check access permissions
+    const { data: orderData, error: fetchError } = await supabase
+      .from('orders')
+      .select('id, buyer_id, vendor_id, rider_id, metadata, source')
+      .eq('id', orderId)
+      .single();
+
+    if (fetchError || !orderData) {
+      throw new Error(`Order not found: ${fetchError?.message || 'Unknown error'}`);
+    }
+
+    // ✅ Check if user has access: buyer, gift recipient, OR vendor (only if vendor is also recipient)
+    const isBuyer = orderData.buyer_id === userId;
+    const isVendor = orderData.vendor_id === userId;
+    const isGiftRecipient = orderData.source === 'wishlist' && 
+                           orderData.metadata?.gift_recipient_id === userId;
+    
+    // ✅ Vendors should NOT see orders in OrderDetails (only in Workspace)
+    // Exception: Vendor can see if they're also the gift recipient
+    if (isVendor && !isGiftRecipient) {
+      throw new Error('Vendors can only view orders in Workspace');
+    }
+
+    if (!isBuyer && !isGiftRecipient) {
+      throw new Error('Order not found or access denied');
+    }
+
+    // ✅ Now fetch full order details
     const { data, error } = await supabase
       .from('orders')
       .select(`
@@ -137,7 +241,6 @@ export class OrdersService {
         )
       `)
       .eq('id', orderId)
-      .eq('buyer_id', userId)
       .single();
 
     if (error) {
@@ -707,7 +810,7 @@ export class OrdersService {
     // Verify user can update this order
     const { data: order, error: fetchError } = await supabase
       .from('orders')
-      .select('buyer_id, seller_id, rider_id, status as current_status')
+      .select('buyer_id, seller_id, rider_id, status, order_number')
       .eq('id', orderId)
       .single();
 
@@ -716,7 +819,7 @@ export class OrdersService {
     }
 
     // Check permissions based on status transition
-    const canUpdate = this.canUserUpdateStatus(userId, order, status);
+    const canUpdate = this.canUserUpdateStatus(userId, { ...order, current_status: order.status }, status);
     if (!canUpdate) {
       throw new Error('Unauthorized to update this order status');
     }
@@ -755,6 +858,42 @@ export class OrdersService {
 
     // Send notifications based on status change
     await this.sendOrderStatusNotifications(orderId, status, order);
+
+    // 🔥 NEW: Check if this is a gift order and emit wishlist-specific event
+    try {
+      const { data: giftOrder } = await supabase
+        .from('gift_orders')
+        .select('wishlist_item_id, gift_recipient_id')
+        .eq('order_id', orderId)
+        .maybeSingle();
+
+      if (giftOrder && giftOrder.wishlist_item_id) {
+        // This is a gift order - emit wishlist-specific status update
+        await this.realtimeGateway.notifyWishlistGiftOrderStatusUpdate({
+          wishlistItemId: giftOrder.wishlist_item_id,
+          wishlistOwnerId: giftOrder.gift_recipient_id,
+          orderId: orderId,
+          orderNumber: order.order_number || '',
+          orderStatus: status,
+        });
+        console.log(`✅ Emitted wishlist gift order status update for item ${giftOrder.wishlist_item_id}`);
+      }
+    } catch (giftOrderError) {
+      console.error('⚠️ Failed to check/emit gift order status update (non-critical):', giftOrderError);
+      // Don't throw - gift order check is not critical to order status update
+    }
+
+    // 🔥 NEW: Emit general order_status_update event (for OrderTrackingScreen and other components)
+    try {
+      await this.realtimeGateway.notifyOrderStatusUpdate(orderId, status, {
+        buyerId: order.buyer_id,
+        vendorId: order.seller_id,
+        riderId: order.rider_id || undefined,
+      });
+    } catch (wsError) {
+      console.error('⚠️ Failed to emit order_status_update event (non-critical):', wsError);
+      // Don't throw - WebSocket emission failure shouldn't break order update
+    }
 
     return { success: true };
   }

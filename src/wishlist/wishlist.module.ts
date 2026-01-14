@@ -5,6 +5,7 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { ChatModule } from '../chat/chat.module';
 import { EscrowModule } from '../escrow/escrow.module';
 import { WalletModule } from '../wallet/wallet.module';
+import { RealtimeModule } from '../realtime/realtime.module';
 
 @Module({
   imports: [
@@ -12,6 +13,7 @@ import { WalletModule } from '../wallet/wallet.module';
     forwardRef(() => ChatModule), // Use forwardRef to avoid circular dependency
     forwardRef(() => EscrowModule), // EscrowService needed for wishlist orders
     WalletModule,
+    RealtimeModule, // For WebSocket real-time updates
   ],
   controllers: [WishlistController],
   providers: [WishlistService],

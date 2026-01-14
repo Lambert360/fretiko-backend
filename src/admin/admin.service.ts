@@ -1,9 +1,12 @@
 import { Injectable, Logger, UnauthorizedException, NotFoundException, Inject, forwardRef, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction, AuditEntityType, AuditStatus } from '../audit/dto/audit.dto';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
+import { AdminNotificationsService, AdminNotificationType } from './admin-notifications.service';
+import { AdminNotificationEventType, DisputeEscalatedEvent } from './events/admin-notification.events';
 import { WalletService } from '../wallet/wallet.service';
 import { EmailService } from '../shared/email.service';
 import { BankAccountService, CreateBankAccountDto, UpdateBankAccountDto } from '../wallet/bank-account.service';
@@ -23,6 +26,7 @@ export class AdminService {
     @Inject(forwardRef(() => AuditService))
     private auditService: AuditService,
     private notificationHelper: NotificationHelperService,
+    private eventEmitter: EventEmitter2, // For event-based notifications
     @Inject(forwardRef(() => WalletService))
     private walletService: WalletService,
     private emailService: EmailService,
@@ -35,9 +39,25 @@ export class AdminService {
   private readonly PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
 
   /**
-   * Verify user is an admin (check user_profiles.role)
+   * Verify user is an admin or super admin
+   * Checks both user_profiles (regular admins) and staff_accounts (super admins)
    */
   async verifyAdmin(userId: string): Promise<boolean> {
+    // First check if user is a super admin staff account
+    const { data: staffAccount } = await this.supabase
+      .from('staff_accounts')
+      .select('role, is_active')
+      .eq('id', userId)
+      .eq('is_active', true)
+      .single();
+
+    // Super admins have unrestricted access
+    if (staffAccount?.role === 'super_admin') {
+      this.logger.log(`Super admin access granted to staff user ${userId}`);
+      return true;
+    }
+
+    // Fall back to regular admin check
     const { data: profile } = await this.supabase
       .from('user_profiles')
       .select('role, preferences')
@@ -46,7 +66,7 @@ export class AdminService {
 
     // Check if user has admin role
     const isAdmin = profile?.role === 'admin' || profile?.preferences?.isAdmin === true;
-    
+
     if (!isAdmin) {
       this.logger.warn(`Unauthorized admin access attempt by user ${userId}`);
       throw new UnauthorizedException('Admin access required');
@@ -72,6 +92,7 @@ export class AdminService {
       .select(`
         id,
         platform_amount,
+        rider_amount,
         status,
         created_at,
         released_at,
@@ -80,7 +101,8 @@ export class AdminService {
           order_number,
           source,
           vendor_id,
-          buyer_id
+          buyer_id,
+          delivery_fee
         )
       `)
       .gte('created_at', startDate)
@@ -90,6 +112,13 @@ export class AdminService {
     const releasedEscrows = escrows?.filter(e => e.status === 'released') || [];
     const heldEscrows = escrows?.filter(e => e.status === 'held') || [];
     const refundedEscrows = escrows?.filter(e => e.status === 'refunded') || [];
+
+    // Calculate rider commission (10% of delivery fees for released escrows)
+    const riderCommissionRate = 0.1; // 10%
+    const totalRiderCommission = releasedEscrows.reduce((sum, e) => {
+      const deliveryFee = parseFloat(e.orders?.delivery_fee || '0');
+      return sum + (deliveryFee * riderCommissionRate);
+    }, 0);
 
     const totalPlatformFees = escrows?.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0) || 0;
     const realizedRevenue = releasedEscrows.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0);
@@ -103,6 +132,8 @@ export class AdminService {
       auction: 0,
       service_booking: 0,
       invoice: 0,
+      wishlist: 0,
+      logistics: totalRiderCommission, // Rider commission revenue
     };
 
     escrows?.forEach(e => {
@@ -211,6 +242,7 @@ export class AdminService {
       .select(`
         id,
         platform_amount,
+        rider_amount,
         status,
         created_at,
         released_at,
@@ -219,7 +251,8 @@ export class AdminService {
           order_number,
           source,
           vendor_id,
-          buyer_id
+          buyer_id,
+          delivery_fee
         )
       `)
       .not('released_at', 'is', null) // Only include escrows that have been released
@@ -228,6 +261,16 @@ export class AdminService {
 
     // Calculate revenue by status
     // Since we filtered by released_at, all escrows should be released
+    // Calculate rider commission (10% of delivery fees for released escrows)
+    const riderCommissionRate = 0.1; // 10%
+    const totalRiderCommission = escrows?.reduce((sum, e) => {
+      if (e.status === 'released') {
+        const deliveryFee = parseFloat(e.orders?.delivery_fee || '0');
+        return sum + (deliveryFee * riderCommissionRate);
+      }
+      return sum;
+    }, 0) || 0;
+
     const realizedRevenue = escrows?.reduce((sum, e) => {
       if (e.status === 'released') {
         return sum + parseFloat(e.platform_amount || '0');
@@ -243,7 +286,7 @@ export class AdminService {
       .eq('status', 'held')
       .gte('created_at', startDate)
       .lte('created_at', endDate);
-    
+
     const { data: refundedEscrowsInRange } = await this.supabase
       .from('escrows')
       .select('platform_amount')
@@ -262,12 +305,22 @@ export class AdminService {
       auction: 0,
       service_booking: 0,
       invoice: 0,
+      wishlist: 0,
+      logistics: totalRiderCommission, // Rider commission revenue
     };
 
     escrows?.forEach(e => {
       const source = e.orders?.source || 'regular';
-      const amount = parseFloat(e.platform_amount || '0');
+      let amount = parseFloat(e.platform_amount || '0');
+
+      // Separate rider commission from vendor commission
       if (e.status === 'released') {
+        const deliveryFee = parseFloat(e.orders?.delivery_fee || '0');
+        const riderCommission = deliveryFee * riderCommissionRate;
+
+        // Subtract rider commission from order source revenue (vendor commission only)
+        amount = amount - riderCommission;
+
         revenueBySource[source] = (revenueBySource[source] || 0) + amount;
       }
     });
@@ -419,10 +472,7 @@ export class AdminService {
         updated_at,
         user:user_profiles!payout_requests_user_id_fkey(
           id,
-          username,
-          email,
-          first_name,
-          last_name
+          username
         )
       `)
       .order('created_at', { ascending: false });
@@ -445,11 +495,44 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to fetch payouts: ${error.message}`);
-      throw new Error(`Failed to fetch payouts: ${error.message}`);
+      throw new BadRequestException(`Failed to fetch payouts: ${error.message}`);
+    }
+
+    // Fetch emails separately from auth.users (system architecture pattern)
+    const processedPayouts = payouts || [];
+    if (processedPayouts.length > 0) {
+      const userIds: string[] = Array.from(new Set(
+        processedPayouts
+          .map(p => p.user_id)
+          .filter((id): id is string => id !== null && id !== undefined)
+      ));
+      const emailsMap: Record<string, string> = {};
+
+      // Fetch emails from auth.users using admin API
+      for (const userId of userIds) {
+        try {
+          const { data: authUser, error: authError } = await this.supabase.auth.admin.getUserById(userId);
+          if (authUser?.user?.email && !authError) {
+            emailsMap[userId] = authUser.user.email;
+          } else {
+            emailsMap[userId] = ''; // No email available
+          }
+        } catch (error) {
+          this.logger.warn(`Could not fetch email for user ${userId}:`, error);
+          emailsMap[userId] = ''; // Default to empty on error
+        }
+      }
+
+      // Add emails to payout user objects
+      processedPayouts.forEach(payout => {
+        if (payout.user) {
+          payout.user.email = emailsMap[payout.user_id] || '';
+        }
+      });
     }
 
     return {
-      payouts: payouts || [],
+      payouts: processedPayouts,
       total: count || 0,
       page,
       limit,
@@ -667,7 +750,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to fetch reconciliation alerts: ${error.message}`);
-      throw new Error(`Failed to fetch reconciliation alerts: ${error.message}`);
+      throw new BadRequestException(`Failed to fetch reconciliation alerts: ${error.message}`);
     }
 
     // Get user data for all alerts
@@ -792,7 +875,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to update reconciliation alert: ${error.message}`);
-      throw new Error(`Failed to update reconciliation alert: ${error.message}`);
+      throw new BadRequestException(`Failed to update reconciliation alert: ${error.message}`);
     }
 
     return {
@@ -854,7 +937,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to fetch deposits: ${error.message}`);
-      throw new Error(`Failed to fetch deposits: ${error.message}`);
+      throw new BadRequestException(`Failed to fetch deposits: ${error.message}`);
     }
 
     // Get user data for all deposits
@@ -941,7 +1024,7 @@ export class AdminService {
 
     if (walletsError) {
       this.logger.error(`Failed to fetch wallets: ${walletsError.message}`);
-      throw new Error(`Failed to fetch wallets: ${walletsError.message}`);
+      throw new BadRequestException(`Failed to fetch wallets: ${walletsError.message}`);
     }
 
     const totalAvailable = wallets?.reduce(
@@ -1020,7 +1103,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to fetch wallets: ${error.message}`);
-      throw new Error(`Failed to fetch wallets: ${error.message}`);
+      throw new BadRequestException(`Failed to fetch wallets: ${error.message}`);
     }
 
     // Transform and filter wallets
@@ -1177,10 +1260,12 @@ export class AdminService {
 
     // Get top categories from order_items
     // Query order_items directly to get category revenue
+    // NOTE: This queries all order_items for category aggregation.
+    // Consider adding date filtering if this becomes a performance bottleneck.
     const { data: orderItems } = await this.supabase
       .from('order_items')
       .select('order_id, category, total_price')
-      .limit(10000); // Reasonable limit for category aggregation
+      .limit(5000); // Reduced limit for better performance
 
     const categoryRevenue: Record<string, { orderCount: number; revenue: number }> = {};
     const processedOrders = new Set<string>();
@@ -1268,44 +1353,83 @@ export class AdminService {
     staffId: string,
     dateRange?: { start?: string; end?: string },
     period: 'daily' | 'weekly' | 'monthly' = 'daily',
+    timezoneOffset?: number,
   ) {
     // Verify staff has permission
     await this.verifyContentModerator(staffId);
 
-    const startDate = dateRange?.start || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const endDate = dateRange?.end || new Date().toISOString().split('T')[0];
+    // Handle timezone-aware date range
+    let startDate: string;
+    let endDate: string;
 
-    this.logger.log(`Staff ${staffId} fetching time series from ${startDate} to ${endDate} with period: ${period}`);
+    if (dateRange?.start && dateRange?.end && timezoneOffset !== undefined) {
+      // Convert local dates to UTC for database querying
+      // timezoneOffset is minutes to add to local time to get UTC
+      const startLocal = new Date(dateRange.start + 'T00:00:00');
+      const endLocal = new Date(dateRange.end + 'T23:59:59.999');
+
+      // Adjust for timezone offset (convert to UTC)
+      startLocal.setMinutes(startLocal.getMinutes() + timezoneOffset);
+      endLocal.setMinutes(endLocal.getMinutes() + timezoneOffset);
+
+      startDate = startLocal.toISOString();
+      endDate = endLocal.toISOString();
+    } else {
+      // Fallback to UTC dates
+      startDate = dateRange?.start || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0] + 'T00:00:00.000Z';
+      endDate = dateRange?.end || new Date().toISOString().split('T')[0] + 'T23:59:59.999Z';
+    }
+
+    this.logger.log(`Staff ${staffId} fetching time series from ${startDate} to ${endDate} with period: ${period}, timezoneOffset: ${timezoneOffset}`);
 
     // Get orders in date range
-    const { data: orders } = await this.supabase
+    const { data: orders, error: ordersError } = await this.supabase
       .from('orders')
-      .select('id, total, created_at')
+      .select('id, total_amount, created_at')
       .gte('created_at', startDate)
       .lte('created_at', endDate);
 
+    if (ordersError) {
+      this.logger.error(`Failed to fetch orders for time series: ${ordersError.message}`);
+    }
+    
+    this.logger.log(`Fetched ${orders?.length || 0} orders for time series`);
+
     // Get released escrows for revenue
-    const { data: escrows } = await this.supabase
+    const { data: escrows, error: escrowsError } = await this.supabase
       .from('escrows')
       .select('platform_amount, released_at')
       .eq('status', 'released')
       .gte('released_at', startDate)
       .lte('released_at', endDate);
 
+    if (escrowsError) {
+      this.logger.error(`Failed to fetch escrows for time series: ${escrowsError.message}`);
+    }
+
     // Get new users
-    const { data: users } = await this.supabase
+    const { data: users, error: usersError } = await this.supabase
       .from('user_profiles')
       .select('id, created_at')
       .gte('created_at', startDate)
       .lte('created_at', endDate);
 
+    if (usersError) {
+      this.logger.error(`Failed to fetch users for time series: ${usersError.message}`);
+    }
+
     // Helper function to get period key based on period type
     const getPeriodKey = (dateString: string): string => {
       const date = new Date(dateString);
       
+      // Convert UTC timestamp to local timezone for grouping
+      if (timezoneOffset !== undefined) {
+        date.setMinutes(date.getMinutes() - timezoneOffset);
+      }
+      
       switch (period) {
         case 'daily':
-          return date.toISOString().split('T')[0]; // YYYY-MM-DD
+          return date.toISOString().split('T')[0]; // YYYY-MM-DD (now in local timezone)
           
         case 'weekly':
           // Get Monday of the week
@@ -1373,13 +1497,40 @@ export class AdminService {
       periodData[key].users += 1;
     });
 
-    // Convert to array and sort by date
-    const timeSeries = Object.entries(periodData)
-      .map(([key, data]) => ({
+    // Generate all period keys between start and end dates
+    const generateAllPeriodKeys = (start: string, end: string): string[] => {
+      const keys: string[] = [];
+      const current = new Date(start);
+      const endDate = new Date(end);
+
+      while (current <= endDate) {
+        keys.push(getPeriodKey(current.toISOString()));
+
+        // Increment based on period
+        switch (period) {
+          case 'daily':
+            current.setDate(current.getDate() + 1);
+            break;
+          case 'weekly':
+            current.setDate(current.getDate() + 7);
+            break;
+          case 'monthly':
+            current.setMonth(current.getMonth() + 1);
+            break;
+        }
+      }
+
+      return keys;
+    };
+
+    // Generate continuous data for all periods
+    const allKeys = generateAllPeriodKeys(startDate, endDate);
+    const timeSeries = allKeys
+      .map(key => ({
         date: formatPeriodDate(key),
-        orders: data.orders,
-        revenue: data.revenue,
-        users: data.users,
+        orders: periodData[key]?.orders || 0,
+        revenue: periodData[key]?.revenue || 0,
+        users: periodData[key]?.users || 0,
       }))
       .sort((a, b) => a.date.localeCompare(b.date));
 
@@ -1523,7 +1674,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to fetch riders: ${error.message}`);
-      throw new Error(`Failed to fetch riders: ${error.message}`);
+      throw new BadRequestException(`Failed to fetch riders: ${error.message}`);
     }
 
     // Get rider profiles and trust scores
@@ -1753,7 +1904,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to fetch deliveries: ${error.message}`);
-      throw new Error(`Failed to fetch deliveries: ${error.message}`);
+      throw new BadRequestException(`Failed to fetch deliveries: ${error.message}`);
     }
 
     // Transform to delivery format
@@ -1922,7 +2073,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to assign rider: ${error.message}`);
-      throw new Error(`Failed to assign rider: ${error.message}`);
+      throw new BadRequestException(`Failed to assign rider: ${error.message}`);
     }
 
     return { message: 'Rider assigned successfully' };
@@ -1967,7 +2118,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to update delivery status: ${error.message}. Attempted to set status: "${orderStatus}"`);
-      throw new Error(`Failed to update delivery status: ${error.message}`);
+      throw new BadRequestException(`Failed to update delivery status: ${error.message}`);
     }
 
     return { message: 'Delivery status updated successfully' };
@@ -2121,7 +2272,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to fetch disputes: ${error.message}`);
-      throw new Error(`Failed to fetch disputes: ${error.message}`);
+      throw new BadRequestException(`Failed to fetch disputes: ${error.message}`);
     }
 
     // Fetch user profiles separately
@@ -2415,11 +2566,11 @@ export class AdminService {
         
         if (retryResult.error) {
           this.logger.error(`Failed to resolve dispute: ${retryResult.error.message}`);
-          throw new Error(`Failed to resolve dispute: ${retryResult.error.message}`);
+          throw new BadRequestException(`Failed to resolve dispute: ${retryResult.error.message}`);
         }
       } else {
         this.logger.error(`Failed to resolve dispute: ${error.message}`);
-        throw new Error(`Failed to resolve dispute: ${error.message}`);
+        throw new BadRequestException(`Failed to resolve dispute: ${error.message}`);
       }
     }
 
@@ -2470,7 +2621,7 @@ export class AdminService {
 
     if (error) {
       this.logger.error(`Failed to escalate dispute: ${error.message}`);
-      throw new Error(`Failed to escalate dispute: ${error.message}`);
+      throw new BadRequestException(`Failed to escalate dispute: ${error.message}`);
     }
 
     // If createReport is true and departmentId is provided, create a report
@@ -2568,6 +2719,23 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       }
     }
 
+    // 🔔 Emit dispute escalation event for notifications
+    try {
+      const event: DisputeEscalatedEvent = {
+        disputeId,
+        escalatedBy: staffId,
+        departmentId,
+        reportCreated,
+        reportNumber: reportNumber || undefined,
+      };
+
+      this.eventEmitter.emit(AdminNotificationEventType.DISPUTE_ESCALATED, event);
+      this.logger.log(`📢 Emitted dispute escalation event for dispute ${disputeId}`);
+    } catch (eventError) {
+      this.logger.warn(`Failed to emit dispute escalation event: ${eventError.message}`);
+      // Don't fail the escalation if event emission fails
+    }
+
     return { 
       message: 'Dispute escalated successfully',
       reportCreated,
@@ -2609,7 +2777,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
 
     if (error) {
       this.logger.error(`Failed to add admin note: ${error.message}`);
-      throw new Error(`Failed to add admin note: ${error.message}`);
+      throw new BadRequestException(`Failed to add admin note: ${error.message}`);
     }
 
     return { message: 'Admin note added successfully' };
@@ -3007,7 +3175,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
 
     if (error) {
       this.logger.error(`Failed to fetch users: ${error.message}`);
-      throw new Error(`Failed to fetch users: ${error.message}`);
+      throw new BadRequestException(`Failed to fetch users: ${error.message}`);
     }
 
     // Filter users in JavaScript if needed (for complex AND conditions that Supabase might not handle well)
@@ -5622,6 +5790,165 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     
     // Use wallet service to create withdrawal request for platform user
     return this.walletService.createWithdrawRequest(this.PLATFORM_USER_ID, dto);
+  }
+
+  /**
+   * Get platform withdrawal requests with pagination
+   * Admin-only endpoint to view withdrawal history
+   */
+  async getPlatformWithdrawals(adminId: string, page: number = 1, limit: number = 50) {
+    await this.verifyAdmin(adminId);
+    
+    this.logger.log(`Admin ${adminId} fetching platform withdrawal requests (page ${page}, limit ${limit})`);
+    
+    const offset = (page - 1) * limit;
+    
+    // Fetch payout requests for platform user with pagination
+    const { data: withdrawals, error, count } = await this.supabase
+      .from('payout_requests')
+      .select(`
+        id,
+        freti_amount,
+        estimated_local_amount,
+        local_currency,
+        status,
+        external_payout_id,
+        requested_at,
+        processed_at,
+        paid_at,
+        failure_reason,
+        retry_count,
+        created_at,
+        metadata
+      `, { count: 'exact' }) // Get total count for pagination
+      .eq('user_id', this.PLATFORM_USER_ID)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1); // Pagination range
+
+    if (error) {
+      this.logger.error(`Failed to fetch platform withdrawals: ${error.message}`);
+      throw new BadRequestException('Failed to fetch platform withdrawal requests');
+    }
+
+    // Fetch bank account details for each withdrawal
+    const withdrawalsWithBankInfo = await Promise.all(
+      (withdrawals || []).map(async (withdrawal) => {
+        // Extract bank_account_id from metadata
+        const bankAccountId = withdrawal.metadata?.bank_account_id;
+        
+        if (bankAccountId) {
+          try {
+            const bankAccount = await this.bankAccountService.getBankAccount(
+              this.PLATFORM_USER_ID,
+              bankAccountId
+            );
+            return {
+              ...withdrawal,
+              bank_account_id: bankAccountId, // Add it to the response for frontend compatibility
+              bankAccount: {
+                accountName: bankAccount.accountName,
+                bankName: bankAccount.bankName,
+                accountNumber: bankAccount.accountNumber,
+                currency: bankAccount.currency,
+              },
+            };
+          } catch (err) {
+            // If bank account is deleted or inaccessible, return without it
+            return {
+              ...withdrawal,
+              bank_account_id: bankAccountId,
+              bankAccount: null,
+            };
+          }
+        }
+        return {
+          ...withdrawal,
+          bank_account_id: null,
+          bankAccount: null,
+        };
+      })
+    );
+
+    // Return with pagination metadata
+    return {
+      data: withdrawalsWithBankInfo,
+      pagination: {
+        page,
+        limit,
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit),
+        hasMore: offset + limit < (count || 0),
+      },
+    };
+  }
+
+  /**
+   * Get navigation badge counts for staff member
+   * Returns unread counts for various admin sections
+   */
+  async getNavBadges(staffId: string) {
+    await this.verifyAdmin(staffId);
+
+    this.logger.log(`Fetching nav badges for staff ${staffId}`);
+
+    try {
+      // Fetch counts in parallel
+      const [
+        disputesCount,
+        reportsCount,
+        memosCount,
+        notificationsCount
+      ] = await Promise.all([
+        // Unresolved disputes count
+        this.supabase
+          .from('disputes')
+          .select('id', { count: 'exact', head: true })
+          .in('status', ['open', 'in_progress'])
+          .then(res => res.count || 0),
+
+        // Pending reports count
+        this.supabase
+          .from('content_reports')
+          .select('id', { count: 'exact', head: true })
+          .eq('status', 'pending')
+          .then(res => res.count || 0),
+
+        // Unread memos count for this staff
+        this.supabase
+          .from('memos')
+          .select('id', { count: 'exact', head: true })
+          .eq('recipient_id', staffId)
+          .eq('is_read', false)
+          .then(res => res.count || 0),
+
+        // Unread admin notifications
+        this.supabase
+          .from('admin_notifications')
+          .select('id', { count: 'exact', head: true })
+          .eq('staff_id', staffId)
+          .eq('is_read', false)
+          .eq('is_deleted', false)
+          .then(res => res.count || 0),
+      ]);
+
+      return {
+        disputes: disputesCount,
+        reports: reportsCount,
+        memos: memosCount,
+        orders: 0, // TODO: Add new orders count if needed
+        notifications: notificationsCount,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to fetch nav badges for staff ${staffId}:`, error);
+      // Return zeros on error
+      return {
+        disputes: 0,
+        reports: 0,
+        memos: 0,
+        orders: 0,
+        notifications: 0,
+      };
+    }
   }
 }
 

@@ -1,6 +1,9 @@
-import { Injectable, Logger, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException, NotFoundException, ForbiddenException, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { AdminNotificationsService, AdminNotificationType } from '../admin/admin-notifications.service';
+import { AdminNotificationEventType, MemoSentEvent } from '../admin/events/admin-notification.events';
 import {
   SendMemoDto,
   MemoResponseDto,
@@ -19,7 +22,10 @@ export class MemosService {
   private readonly logger = new Logger(MemosService.name);
   private supabase;
 
-  constructor(private configService: ConfigService) {
+  constructor(
+    private configService: ConfigService,
+    private eventEmitter: EventEmitter2, // For event-based notifications
+  ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
 
@@ -93,6 +99,24 @@ export class MemosService {
     }
 
     this.logger.log(`Memo sent by ${sender.full_name} (${senderId})`);
+
+    // 🔔 Emit memo sent event for notifications
+    try {
+      const event: MemoSentEvent = {
+        memoId: memo.id,
+        senderId: senderId,
+        senderName: sender.full_name,
+        recipientType: memoDto.recipientType.toLowerCase(),
+        recipientId: memoDto.recipientId,
+        priority: memoDto.priority || 'normal',
+      };
+
+      this.eventEmitter.emit(AdminNotificationEventType.MEMO_SENT, event);
+      this.logger.log(`📢 Emitted memo sent event for memo ${memo.id}`);
+    } catch (eventError) {
+      this.logger.warn(`Failed to emit memo sent event: ${eventError.message}`);
+      // Don't fail the memo send if event emission fails
+    }
 
     return this.mapToResponseDto(memo);
   }
