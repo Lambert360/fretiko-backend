@@ -9,7 +9,7 @@ import {
   OnGatewayInit,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { Logger, UseGuards } from '@nestjs/common';
+import { Logger, UseGuards, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { LiveSalesService } from './live-sales.service';
 import { AnalyticsService } from '../analytics/analytics.service';
@@ -43,7 +43,8 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
   server: Server;
 
   private readonly logger = new Logger(LiveStreamGateway.name);
-  private connectedUsers = new Map<string, { userId: string; streamId?: string; role: string }>();
+  private connectedUsers = new Map<string, { userId: string; streamId?: string; role: string; accessToken?: string }>();
+  private streamViewerCounts = new Map<string, Set<string>>(); // Fallback viewer tracking: streamId -> Set of userIds
   private supabase;
 
   constructor(
@@ -59,7 +60,9 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
   // =====================
 
   afterInit(server: Server) {
+    this.server = server;
     this.logger.log('Live Stream WebSocket Gateway initialized');
+    this.logger.log(`Socket.IO adapter type: ${this.server?.sockets?.adapter?.constructor?.name || 'unknown'}`);
   }
 
   async handleConnection(client: Socket) {
@@ -81,18 +84,31 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
             this.connectedUsers.set(client.id, {
               userId: 'anonymous',
               role: 'viewer',
+              accessToken: undefined,
             });
           } else {
             this.logger.log(`Authenticated user on connection: ${user.id}`);
             this.connectedUsers.set(client.id, {
               userId: user.id,
               role: 'viewer',
+              accessToken: token,  // Store token for user-authenticated operations
             });
             // Join vendor room if user is a vendor
             if (user.user_metadata?.is_seller || user.user_metadata?.is_vendor) {
               client.join(`vendor:${user.id}`);
               this.connectedUsers.get(client.id)!.role = 'vendor';
             }
+
+            // Emit authentication confirmation to client (industry standard)
+            const authData = {
+              success: true,
+              userId: user.id,
+              role: this.connectedUsers.get(client.id)?.role || 'viewer',
+              timestamp: new Date().toISOString()
+            };
+
+            client.emit('authenticated', authData);
+            this.logger.log(`✅ Authentication event emitted to client ${client.id} for user: ${user.id} (role: ${authData.role})`);
           }
         } catch (authError) {
           this.logger.warn(`Auth error on connection: ${client.id}`, authError.message);
@@ -121,8 +137,61 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       const userInfo = this.connectedUsers.get(client.id);
       
       if (userInfo?.streamId) {
-        // Leave stream when disconnecting
-        await this.handleLeaveStream(client, { streamId: userInfo.streamId });
+        // Remove from fallback viewer tracking
+        if (this.streamViewerCounts.has(userInfo.streamId)) {
+          this.streamViewerCounts.get(userInfo.streamId)!.delete(userInfo.userId);
+          // Clean up empty sets
+          if (this.streamViewerCounts.get(userInfo.streamId)!.size === 0) {
+            this.streamViewerCounts.delete(userInfo.streamId);
+          }
+        }
+
+        // Check if disconnecting user is the vendor
+        const isVendor = userInfo.role === 'vendor';
+
+        if (isVendor) {
+          // Vendor disconnected - end their stream
+          this.logger.log(`🏁 Vendor ${userInfo.userId} disconnected from their stream ${userInfo.streamId} - ending stream`);
+
+          try {
+            if (userInfo.accessToken) {
+              await this.liveSalesService.endStream(userInfo.streamId, userInfo.userId, userInfo.accessToken);
+            } else {
+              this.logger.warn(`No access token available for vendor ${userInfo.userId} - cannot end stream properly`);
+            }
+
+            // Notify all viewers that stream ended due to disconnect
+            this.server.to(`stream:${userInfo.streamId}`).emit('stream_ended', {
+              streamId: userInfo.streamId,
+              reason: 'vendor_disconnected',
+              timestamp: new Date().toISOString(),
+            });
+          } catch (endError) {
+            this.logger.error(`Failed to end stream on vendor disconnect: ${endError.message}`);
+          }
+        } else {
+          // Regular viewer disconnecting
+          await this.liveSalesService.leaveStream(userInfo.streamId, userInfo.userId);
+          
+          // Send updated viewer count after disconnect
+          let roomSize = this.streamViewerCounts.get(userInfo.streamId)?.size || 0;
+          
+          // Try to use adapter if available (more accurate)
+          if (this.server?.sockets?.adapter?.rooms) {
+            const adapterRoomSize = this.server.sockets.adapter.rooms.get(`stream:${userInfo.streamId}`)?.size || 0;
+            roomSize = adapterRoomSize;
+          }
+
+          // Emit to both stream viewers AND vendor/broadcaster
+          this.server.to(`stream:${userInfo.streamId}`).emit('viewer_count_update', {
+            streamId: userInfo.streamId,
+            count: roomSize,
+          });
+          this.server.to(`vendor:${userInfo.streamId}`).emit('viewer_count_update', {
+            streamId: userInfo.streamId,
+            count: roomSize,
+          });
+        }
       }
 
       this.connectedUsers.delete(client.id);
@@ -196,12 +265,16 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         }
       }
 
-      client.emit('authenticated', { 
+      // Emit authentication confirmation to client (industry standard)
+      const authData = {
         success: true,
         userId: user.id,
-        role: this.connectedUsers.get(client.id)?.role || 'viewer'
-      });
-      this.logger.log(`User authenticated: ${user.id} (role: ${this.connectedUsers.get(client.id)?.role})`);
+        role: this.connectedUsers.get(client.id)?.role || 'viewer',
+        timestamp: new Date().toISOString()
+      };
+
+      client.emit('authenticated', authData);
+      this.logger.log(`✅ Authentication event emitted to client ${client.id} for user: ${user.id} (role: ${authData.role})`);
     } catch (error) {
       this.logger.error(`Authentication error: ${client.id}`, error);
       client.emit('authentication_error', { 
@@ -226,6 +299,18 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         return;
       }
 
+      // Check if user is the stream owner
+      try {
+        const stream = await this.liveSalesService.getStreamById(data.streamId);
+        if (stream && stream.vendor_id === userInfo.userId) {
+          userInfo.role = 'vendor';
+          client.join(`vendor:${data.streamId}`);
+          this.logger.log(`✅ User ${userInfo.userId} is the stream owner - joined as vendor`);
+        }
+      } catch (err) {
+        this.logger.warn(`Could not check stream ownership: ${err.message}`);
+      }
+
       // Join the stream room
       client.join(`stream:${data.streamId}`);
       
@@ -233,8 +318,14 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       userInfo.streamId = data.streamId;
       this.connectedUsers.set(client.id, userInfo);
 
+      // Add to fallback viewer tracking
+      if (!this.streamViewerCounts.has(data.streamId)) {
+        this.streamViewerCounts.set(data.streamId, new Set());
+      }
+      this.streamViewerCounts.get(data.streamId)!.add(userInfo.userId);
+
       // Update database
-      await this.liveSalesService.joinStream(data.streamId, userInfo.userId);
+      await this.liveSalesService.joinStream(data.streamId, userInfo.userId, userInfo.accessToken);
 
       // Track analytics event
       await this.analyticsService.recordAnalyticsEvent({
@@ -250,9 +341,24 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         timestamp: new Date().toISOString(),
       });
 
-      // Send current viewer count to all in stream
-      const roomSize = this.server.sockets.adapter.rooms.get(`stream:${data.streamId}`)?.size || 0;
+      // Calculate viewer count using fallback Map
+      let roomSize = this.streamViewerCounts.get(data.streamId)?.size || 0;
+      
+      // Try to use adapter if available (more accurate)
+      if (this.server?.sockets?.adapter?.rooms) {
+        const adapterRoomSize = this.server.sockets.adapter.rooms.get(`stream:${data.streamId}`)?.size || 0;
+        this.logger.log(`📊 Room size - Adapter: ${adapterRoomSize}, Fallback: ${roomSize}`);
+        roomSize = adapterRoomSize; // Prefer adapter if available
+      } else {
+        this.logger.log(`📊 Using fallback viewer count: ${roomSize}`);
+      }
+
+      // Emit to both stream viewers AND vendor/broadcaster
       this.server.to(`stream:${data.streamId}`).emit('viewer_count_update', {
+        streamId: data.streamId,
+        count: roomSize,
+      });
+      this.server.to(`vendor:${data.streamId}`).emit('viewer_count_update', {
         streamId: data.streamId,
         count: roomSize,
       });
@@ -267,7 +373,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         viewerCount: roomSize,
       });
 
-      this.logger.log(`User ${userInfo.userId} joined stream ${data.streamId}`);
+      this.logger.log(`User ${userInfo.userId} joined stream ${data.streamId} as ${userInfo.role}`);
     } catch (error) {
       client.emit('error', { message: error.message });
     }
@@ -282,6 +388,9 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       const userInfo = this.connectedUsers.get(client.id);
       if (!userInfo) return;
 
+      // Check if this user is the stream owner/vendor
+      const isVendor = userInfo.role === 'vendor';
+
       // Leave the stream room
       client.leave(`stream:${data.streamId}`);
       
@@ -289,8 +398,41 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       userInfo.streamId = undefined;
       this.connectedUsers.set(client.id, userInfo);
 
+      // Remove from fallback viewer tracking
+      if (this.streamViewerCounts.has(data.streamId)) {
+        this.streamViewerCounts.get(data.streamId)!.delete(userInfo.userId);
+        // Clean up empty sets
+        if (this.streamViewerCounts.get(data.streamId)!.size === 0) {
+          this.streamViewerCounts.delete(data.streamId);
+        }
+      }
+
       if (userInfo.userId !== 'anonymous') {
-        // Update database
+        // If vendor is leaving their own stream, end it automatically
+        if (isVendor) {
+          this.logger.log(`🏁 Vendor ${userInfo.userId} leaving their stream ${data.streamId} - ending stream`);
+          if (userInfo.accessToken) {
+            await this.liveSalesService.endStream(data.streamId, userInfo.userId, userInfo.accessToken);
+          } else {
+            this.logger.warn(`No access token available for vendor ${userInfo.userId} - cannot end stream properly`);
+          }
+
+          // Notify all viewers that stream ended
+          this.server.to(`stream:${data.streamId}`).emit('stream_ended', {
+            streamId: data.streamId,
+            reason: 'vendor_left',
+            timestamp: new Date().toISOString(),
+          });
+
+          // Track analytics event
+          await this.analyticsService.recordAnalyticsEvent({
+            streamId: data.streamId,
+            userId: userInfo.userId,
+            eventType: 'stream_end',
+            metadata: { reason: 'vendor_left', timestamp: new Date().toISOString() },
+          });
+        } else {
+          // Regular viewer leaving
         await this.liveSalesService.leaveStream(data.streamId, userInfo.userId);
 
         // Track analytics event
@@ -310,11 +452,27 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         // Broadcast real-time analytics update to vendor
         const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(data.streamId);
         this.server.to(`vendor:${data.streamId}`).emit('analytics_update', realtimeAnalytics);
+        }
       }
 
-      // Send updated viewer count
-      const roomSize = this.server.sockets.adapter.rooms.get(`stream:${data.streamId}`)?.size || 0;
+      // Calculate viewer count using fallback Map
+      let roomSize = this.streamViewerCounts.get(data.streamId)?.size || 0;
+      
+      // Try to use adapter if available (more accurate)
+      if (this.server?.sockets?.adapter?.rooms) {
+        const adapterRoomSize = this.server.sockets.adapter.rooms.get(`stream:${data.streamId}`)?.size || 0;
+        this.logger.log(`📊 Room size after leave - Adapter: ${adapterRoomSize}, Fallback: ${roomSize}`);
+        roomSize = adapterRoomSize; // Prefer adapter if available
+      } else {
+        this.logger.log(`📊 Using fallback viewer count after leave: ${roomSize}`);
+      }
+
+      // Emit to both stream viewers AND vendor/broadcaster
       this.server.to(`stream:${data.streamId}`).emit('viewer_count_update', {
+        streamId: data.streamId,
+        count: roomSize,
+      });
+      this.server.to(`vendor:${data.streamId}`).emit('viewer_count_update', {
         streamId: data.streamId,
         count: roomSize,
       });
@@ -401,9 +559,16 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       }
 
       // Save reaction to database
+      // Handle both reactionType and reaction_type for backward compatibility
+      const reactionType = data.reactionType || (data as any).reaction_type;
+      if (!reactionType) {
+        client.emit('error', { message: 'reaction_type is required' });
+        return;
+      }
+      
       await this.liveSalesService.sendReaction(userInfo.userId, {
         stream_id: data.streamId,
-        reaction_type: data.reactionType as any,
+        reaction_type: reactionType as any,
       });
 
       // Track analytics event
@@ -417,12 +582,15 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         },
       });
 
-      // Broadcast reaction animation to all viewers
-      this.server.to(`stream:${data.streamId}`).emit('new_reaction', {
+      // Broadcast reaction animation to all viewers AND vendor
+      const reactionData = {
         userId: userInfo.userId,
         reactionType: data.reactionType,
         timestamp: new Date().toISOString(),
-      });
+      };
+      
+      this.server.to(`stream:${data.streamId}`).emit('new_reaction', reactionData);
+      this.server.to(`vendor:${data.streamId}`).emit('new_reaction', reactionData);
 
       // Broadcast real-time analytics update to vendor
       const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(data.streamId);
@@ -500,6 +668,60 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       
       this.logger.log(`Gift ${data.giftType} x${data.quantity} sent by ${userInfo.userId} in stream ${data.streamId}`);
     } catch (error) {
+      client.emit('error', { message: error.message });
+    }
+  }
+
+  @SubscribeMessage('showcase_item')
+  async handleShowcaseItem(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { 
+      streamId: string;
+      item: any;
+      showcasedBy?: string;
+      type?: string;
+    },
+  ) {
+    try {
+      const userInfo = this.connectedUsers.get(client.id);
+      if (!userInfo || userInfo.userId === 'anonymous') {
+        client.emit('error', { message: 'User not authenticated' });
+        return;
+      }
+
+      // Verify user is the stream owner (vendor) and stream is live
+      try {
+        const stream = await this.liveSalesService.getStreamById(data.streamId);
+
+        if (stream.vendor_id !== userInfo.userId) {
+          client.emit('error', { message: 'Only stream owner can showcase items' });
+          return;
+        }
+
+        if (stream.status !== 'live') {
+          client.emit('error', { message: 'Can only showcase items during live streams' });
+          return;
+        }
+      } catch (error) {
+        if (error instanceof NotFoundException) {
+          client.emit('error', { message: 'Stream not found' });
+        } else {
+          client.emit('error', { message: 'Failed to verify stream' });
+        }
+        return;
+      }
+
+      // Broadcast showcase item to all viewers
+      this.server.to(`stream:${data.streamId}`).emit('showcase_item', {
+        item: data.item,
+        showcasedBy: data.showcasedBy || userInfo.userId,
+        type: data.type,
+        timestamp: new Date().toISOString(),
+      });
+
+      this.logger.log(`Item showcased by ${userInfo.userId} in stream ${data.streamId}`);
+    } catch (error) {
+      this.logger.error(`Error showcasing item: ${error.message}`);
       client.emit('error', { message: error.message });
     }
   }
@@ -1051,7 +1273,12 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
    * Get current viewer count for a stream
    */
   getStreamViewerCount(streamId: string): number {
+    if (this.server && this.server.sockets && this.server.sockets.adapter && this.server.sockets.adapter.rooms) {
     return this.server.sockets.adapter.rooms.get(`stream:${streamId}`)?.size || 0;
+    } else {
+      this.logger.warn(`⚠️ Cannot access rooms in getStreamViewerCount - adapter not available`);
+      return 0;
+    }
   }
 
   /**

@@ -76,60 +76,90 @@ export class WalletService {
   /**
    * Ensure platform wallet exists (called on service startup)
    * Platform wallet is used to receive platform commissions
-   * ✅ BUG FIX: Added race condition handling using ON CONFLICT
+   * ✅ BUG FIX: Preserves existing balances when wallet already exists
+   * ✅ BUG FIX: Only creates wallet if it doesn't exist, never resets balances
    */
   private async ensurePlatformWallet(): Promise<void> {
     const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
     
     try {
-      // ✅ BUG FIX: Use INSERT ... ON CONFLICT to handle race conditions
-      // This ensures only one instance creates the wallet, even if multiple start simultaneously
-      const { data: wallet, error: upsertError } = await this.supabase
+      // First, check if wallet already exists
+      const { data: existingWallet, error: fetchError } = await this.supabase
         .from('wallets')
-        .upsert({
-          user_id: PLATFORM_USER_ID,
-          available_balance: 0.0,
-          escrow_balance: 0.0,
-          pending_withdrawal: 0.0,
-          preferred_currency: 'USD',
-          kyc_status: 'approved',
-          daily_deposit_limit: 999999999.0,
-          daily_withdrawal_limit: 999999999.0,
-          updated_at: new Date().toISOString(),
-        }, {
-          onConflict: 'user_id',
-          ignoreDuplicates: false, // Update existing record
-        })
-        .select()
+        .select('id, kyc_status, daily_deposit_limit, daily_withdrawal_limit')
+        .eq('user_id', PLATFORM_USER_ID)
         .single();
 
-      if (upsertError) {
-        // If upsert fails, try to fetch existing wallet
-        const { data: existingWallet, error: fetchError } = await this.supabase
+      if (fetchError && fetchError.code !== 'PGRST116') {
+        // PGRST116 = not found, which is expected if wallet doesn't exist
+        // Any other error is a real problem
+        this.logger.error('Failed to check platform wallet existence:', fetchError);
+        return;
+      }
+
+      if (existingWallet) {
+        // Wallet exists - only update non-balance fields if needed
+        const updates: any = {};
+        let needsUpdate = false;
+
+        if (existingWallet.kyc_status !== 'approved') {
+          updates.kyc_status = 'approved';
+          needsUpdate = true;
+        }
+
+        if (existingWallet.daily_deposit_limit !== 999999999.0) {
+          updates.daily_deposit_limit = 999999999.0;
+          needsUpdate = true;
+        }
+
+        if (existingWallet.daily_withdrawal_limit !== 999999999.0) {
+          updates.daily_withdrawal_limit = 999999999.0;
+          needsUpdate = true;
+        }
+
+        if (needsUpdate) {
+          updates.updated_at = new Date().toISOString();
+          const { error: updateError } = await this.supabase
+            .from('wallets')
+            .update(updates)
+            .eq('id', existingWallet.id);
+
+          if (updateError) {
+            this.logger.error('Failed to update platform wallet settings:', updateError);
+          } else {
+            this.logger.log(`✅ Platform wallet settings updated (preserved balances): ${existingWallet.id}`);
+          }
+        } else {
+          this.logger.debug('Platform wallet already exists with correct settings (balances preserved)');
+        }
+      } else {
+        // Wallet doesn't exist - create it with default values
+        const { data: newWallet, error: insertError } = await this.supabase
           .from('wallets')
-          .select('id, kyc_status')
-          .eq('user_id', PLATFORM_USER_ID)
+          .insert({
+            user_id: PLATFORM_USER_ID,
+            available_balance: 0.0,
+            escrow_balance: 0.0,
+            pending_withdrawal: 0.0,
+            preferred_currency: 'USD',
+            kyc_status: 'approved',
+            daily_deposit_limit: 999999999.0,
+            daily_withdrawal_limit: 999999999.0,
+          })
+          .select()
           .single();
 
-        if (fetchError || !existingWallet) {
-          this.logger.error('Failed to ensure platform wallet exists:', upsertError);
-          // Don't throw - this is a non-critical initialization check
-          return;
+        if (insertError) {
+          // If insert fails due to race condition (another instance created it), that's okay
+          if (insertError.code === '23505') {
+            // Unique constraint violation - wallet was created by another instance
+            this.logger.debug('Platform wallet was created by another instance (race condition handled)');
+          } else {
+            this.logger.error('Failed to create platform wallet:', insertError);
+          }
+        } else if (newWallet) {
+          this.logger.log(`✅ Platform wallet created: ${newWallet.id}`);
         }
-
-        // Ensure KYC status is approved
-        if (existingWallet.kyc_status !== 'approved') {
-          await this.supabase
-            .from('wallets')
-            .update({ kyc_status: 'approved', updated_at: new Date().toISOString() })
-            .eq('id', existingWallet.id);
-          
-          this.logger.log(`✅ Platform wallet KYC status updated to approved`);
-        } else {
-          this.logger.debug('Platform wallet already exists and is approved');
-        }
-      } else if (wallet) {
-        this.logger.log(`✅ Platform wallet ensured: ${wallet.id}`);
       }
     } catch (error: any) {
       this.logger.error('Error ensuring platform wallet exists:', error);
@@ -1354,19 +1384,40 @@ export class WalletService {
         // Get wallet for refund (no need to lock as RPC handles it)
         const walletForRefund = await this.getWallet(userId);
         
-        await this.createLedgerEntry({
-          walletId: walletForRefund.id,
-          transactionType: 'withdrawal_burn',
-          availableDelta: dto.fretiAmount, // Refund
-          escrowDelta: 0,
-          pendingWithdrawalDelta: -dto.fretiAmount, // Remove from pending
-          referenceType: 'payout_request',
-          referenceId: payoutId,
-          idempotencyKey: `${idempotencyKey}_refund`,
-          description: 'Withdrawal failed - funds refunded to available balance'
-        }, userId);
+        // Check if refund already exists (idempotency check)
+        // Use different reference_type to avoid unique constraint violation
+        // The unique constraint is on (user_id, transaction_type, reference_type, reference_id)
+        // So we use 'payout_request_refund' as reference_type instead of 'payout_request'
+        const { data: existingRefund } = await this.supabase
+          .from('wallet_ledger')
+          .select('id')
+          .eq('user_id', userId)
+          .eq('transaction_type', 'withdrawal_burn')
+          .eq('reference_type', 'payout_request_refund')
+          .eq('reference_id', payoutId)
+          .single();
+        
+        if (!existingRefund) {
+          // Use different reference_type ('payout_request_refund') to avoid unique constraint violation
+          // The initial withdrawal uses 'payout_request', refund uses 'payout_request_refund'
+          // This allows us to use the same payoutId as reference_id (which is a UUID)
+          await this.createLedgerEntry({
+            walletId: walletForRefund.id,
+            transactionType: 'withdrawal_burn',
+            availableDelta: dto.fretiAmount, // Refund
+            escrowDelta: 0,
+            pendingWithdrawalDelta: -dto.fretiAmount, // Remove from pending
+            referenceType: 'payout_request_refund', // Different reference_type to avoid constraint violation
+            referenceId: payoutId, // Same payoutId (valid UUID)
+            idempotencyKey: `${idempotencyKey}_refund`,
+            description: 'Withdrawal failed - funds refunded to available balance'
+          }, userId);
+          this.logger.log(`✅ Funds refunded for failed withdrawal: ${payoutId}`);
+        } else {
+          this.logger.log(`Refund already processed for withdrawal ${payoutId} (idempotent)`);
+        }
 
-        // Update payout status to failed
+        // Update payout status to failed (idempotent - safe to call multiple times)
         await this.supabase
           .from('payout_requests')
           .update({
@@ -1387,10 +1438,48 @@ export class WalletService {
           `Your withdrawal of ₣${dto.fretiAmount} FRETI could not be processed. Funds have been refunded to your available balance. Error: ${error.message?.includes('URL') || error.message?.includes('parse') ? 'Payment gateway configuration issue' : error.message || 'Unknown error'}`,
           { payoutId, amount: dto.fretiAmount, type: 'wallet_withdrawal_failed' }
         );
-
-        this.logger.log(`✅ Funds refunded for failed withdrawal: ${payoutId}`);
       } catch (refundError: any) {
-        // CRITICAL: If refund fails, funds are stuck in pending_withdrawal
+        // Check if this is an idempotency error (refund already processed)
+        const isIdempotencyError = refundError.message?.includes('idempotency') || 
+                                   refundError.message?.includes('duplicate key') ||
+                                   refundError.message?.includes('already exists');
+        
+        if (isIdempotencyError) {
+          // Refund was already processed - this is OK, just log and continue
+          this.logger.log(`Refund already processed for withdrawal ${payoutId} (idempotent operation detected)`);
+          
+          // Update payout status to failed (if not already updated)
+          await this.supabase
+            .from('payout_requests')
+            .update({
+              status: 'failed',
+              failure_reason: error.message || 'Failed to initiate transfer',
+              metadata: {
+                ...payoutData.metadata,
+                error_details: error.message,
+                refunded_at: new Date().toISOString(),
+                refund_idempotent: true,
+              }
+            })
+            .eq('id', payoutId);
+
+          // Send notification about failure (funds already refunded)
+          await this.notificationHelper.notifySystemUpdate(
+            userId,
+            'Withdrawal Failed',
+            `Your withdrawal of ₣${dto.fretiAmount} FRETI could not be processed. Funds have been refunded to your available balance. Error: ${error.message?.includes('URL') || error.message?.includes('parse') ? 'Payment gateway configuration issue' : error.message || 'Unknown error'}`,
+            { payoutId, amount: dto.fretiAmount, type: 'wallet_withdrawal_failed' }
+          );
+
+          // Provide user-friendly error message
+          const errorMessage = error.message?.includes('URL') || error.message?.includes('parse')
+            ? 'Payment gateway configuration error. Please contact support or check your Flutterwave API keys in the .env file.'
+            : error.message || 'Failed to initiate withdrawal';
+          
+          throw new BadRequestException(errorMessage);
+        }
+        
+        // CRITICAL: If refund fails for other reasons, funds are stuck in pending_withdrawal
         this.logger.error(`❌ CRITICAL: Failed to refund withdrawal ${payoutId}. Funds may be stuck in pending_withdrawal!`, {
           payoutId,
           userId,

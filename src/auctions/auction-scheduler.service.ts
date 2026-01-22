@@ -78,11 +78,13 @@ export class AuctionSchedulerService {
     try {
       const now = new Date();
 
-      // Find auctions that should end
+      // Find TIMED auctions that should end
+      // Exclude live auctions - they end when auctioneer closes the stream
       const { data: auctionsToEnd, error } = await this.supabase
         .from('auctions')
-        .select('id, title, seller_id, winner_id, winning_bid, current_bid, reserve_price, unique_bidders')
+        .select('id, title, seller_id, winner_id, winning_bid, current_bid, reserve_price, unique_bidders, auction_type')
         .eq('status', 'active')
+        .eq('auction_type', 'timed') // Only auto-end timed auctions
         .lte('end_time', now.toISOString());
 
       if (error) {
@@ -91,6 +93,7 @@ export class AuctionSchedulerService {
       }
 
       for (const auction of auctionsToEnd || []) {
+        console.log(`[Auction ${auction.id}] End time reached for timed auction. Ending...`);
         await this.endAuction(auction);
       }
 
@@ -367,6 +370,37 @@ export class AuctionSchedulerService {
               total_amount: auction.current_bid,
               payment_status: 'pending',
             });
+
+          // Save win to user_auction_wins (for timed auctions, no item_id)
+          if (auction.winner_id) {
+            try {
+              // Check if win already exists (prevent duplicates)
+              const { data: existingWin } = await this.supabase
+                .from('user_auction_wins')
+                .select('id')
+                .eq('user_id', auction.winner_id)
+                .eq('auction_id', auction.id)
+                .is('item_id', null)
+                .maybeSingle();
+
+              if (!existingWin) {
+                // Insert new win (unique indexes will prevent duplicates)
+                await this.supabase
+                  .from('user_auction_wins')
+                  .insert({
+                    user_id: auction.winner_id,
+                    auction_id: auction.id,
+                    item_id: null, // Timed auctions have no item_id
+                    winning_bid: auction.current_bid,
+                    status: 'pending_checkout',
+                    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), // 7 days
+                  });
+              }
+            } catch (error) {
+              console.error(`Failed to save auction win for auction ${auction.id}:`, error);
+              // Don't throw - win saving failure shouldn't block the auction end
+            }
+          }
         } else {
           if (!reserveMet) {
           eventMessage = `Auction ended. Reserve price not met.`;

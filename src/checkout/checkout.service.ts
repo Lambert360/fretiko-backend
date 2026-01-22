@@ -8,6 +8,7 @@ import { InvoiceService } from '../chat/invoice.service';
 import { WishlistService } from '../wishlist/wishlist.service';
 import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
+import { AuctionsService } from '../auctions/auctions.service';
 
 @Injectable()
 export class CheckoutService {
@@ -25,6 +26,8 @@ export class CheckoutService {
     private invoiceService: InvoiceService,
     private wishlistService: WishlistService,
     private walletService: WalletService,
+    @Inject(forwardRef(() => AuctionsService))
+    private auctionsService: AuctionsService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
     this.PLATFORM_COMMISSION_RATE = parseFloat(
@@ -272,6 +275,7 @@ export class CheckoutService {
         winner_id,
         seller_id,
         status,
+        auction_type,
         start_time,
         end_time,
         commission_rate,
@@ -286,15 +290,52 @@ export class CheckoutService {
     }
 
     // ✅ CRITICAL: Verify user is the winner (authorization check)
-    if (auction.winner_id !== userId) {
+    // For multi-item auctions, check auction_items; for single-item, check auction.winner_id
+    let isWinner = false;
+    
+    if (auction.winner_id === userId) {
+      isWinner = true;
+    } else {
+      // Check if user won any items in this auction (for multi-item auctions)
+      const { data: wonItems } = await this.supabase
+        .from('auction_items')
+        .select('id')
+        .eq('auction_id', auctionId)
+        .eq('winner_id', userId)
+        .in('bidding_status', ['ended', 'sold'])
+        .limit(1);
+      
+      if (wonItems && wonItems.length > 0) {
+        isWinner = true;
+      } else {
+        // Also check user_auction_wins view (most reliable source)
+        const { data: win } = await this.supabase
+          .from('user_auction_wins')
+          .select('id')
+          .eq('auction_id', auctionId)
+          .eq('user_id', userId)
+          .eq('status', 'pending_checkout')
+          .limit(1);
+        
+        if (win && win.length > 0) {
+          isWinner = true;
+        }
+      }
+    }
+    
+    if (!isWinner) {
       throw new HttpException('You are not the winner of this auction', HttpStatus.FORBIDDEN);
     }
 
-    // Verify auction is ended (check end_time instead of time_status which is a computed field)
-    const now = new Date();
-    const endTime = new Date(auction.end_time);
-    if (endTime > now) {
-      throw new HttpException('Auction has not ended yet', HttpStatus.BAD_REQUEST);
+    // Verify auction is ended for TIMED auctions only.
+    // For LIVE auctions we allow checkout while the event is still running,
+    // as long as the user has already been recorded as the winner.
+    if (auction.auction_type !== 'live') {
+      const now = new Date();
+      const endTime = new Date(auction.end_time);
+      if (endTime > now) {
+        throw new HttpException('Auction has not ended yet', HttpStatus.BAD_REQUEST);
+      }
     }
 
     // Check if sale record exists and its status (use service role client)
@@ -325,21 +366,125 @@ export class CheckoutService {
       }
     }
 
+    // Get winning bid - check multiple sources
+    // For multi-item auctions, winning_bid is stored in auction_items
+    // For single-item auctions, it's in auctions table
+    let winningBid = auction.winning_bid;
+    let itemTitle = auction.title;
+    let itemThumbnail = auction.thumbnail_url;
+    
+    console.log(`🔍 Getting winning bid for auction ${auctionId}, user ${userId}`);
+    console.log(`  - Auction winning_bid: ${auction.winning_bid}`);
+    console.log(`  - Auction winner_id: ${auction.winner_id}`);
+    
+    if (!winningBid) {
+      // Try to get from user_auction_wins (this is the most reliable source)
+      const { data: wins, error: winsError } = await this.supabase
+        .from('user_auction_wins')
+        .select('winning_bid, item_id, auction_id')
+        .eq('auction_id', auctionId)
+        .eq('user_id', userId)
+        .eq('status', 'pending_checkout');
+      
+      console.log(`  - Found ${wins?.length || 0} wins in user_auction_wins`);
+      if (winsError) {
+        console.error(`  - Error querying user_auction_wins:`, winsError);
+      }
+      
+      if (wins && wins.length > 0) {
+        const win = wins[0];
+        winningBid = win.winning_bid;
+        console.log(`  - Using win winning_bid: ${winningBid}`);
+        
+        // If there's an item_id, get item details
+        if (win.item_id) {
+          const { data: item } = await this.supabase
+            .from('auction_items')
+            .select('title, images')
+            .eq('id', win.item_id)
+            .single();
+          
+          if (item) {
+            itemTitle = item.title || auction.title;
+            itemThumbnail = item.images?.[0] || auction.thumbnail_url;
+          }
+        }
+      } else {
+        // For multi-item auctions, check auction_items for items won by this user
+        const { data: wonItems, error: itemsError } = await this.supabase
+          .from('auction_items')
+          .select('id, title, winning_bid, current_bid, images')
+          .eq('auction_id', auctionId)
+          .eq('winner_id', userId)
+          .in('bidding_status', ['ended', 'sold']);
+        
+        console.log(`  - Found ${wonItems?.length || 0} won items in auction_items`);
+        if (itemsError) {
+          console.error(`  - Error querying auction_items:`, itemsError);
+        }
+        
+        if (wonItems && wonItems.length > 0) {
+          // Use the first won item (for now - in future we might need to handle multiple items)
+          const wonItem = wonItems[0];
+          winningBid = wonItem.winning_bid || wonItem.current_bid;
+          itemTitle = wonItem.title || auction.title;
+          itemThumbnail = wonItem.images?.[0] || auction.thumbnail_url;
+          console.log(`  - Using item winning_bid: ${winningBid}`);
+        } else {
+          // Last resort: get highest bid from auction_bids
+          const { data: highestBid, error: bidError } = await this.supabase
+            .from('auction_bids')
+            .select('amount')
+            .eq('auction_id', auctionId)
+            .eq('bidder_id', userId)
+            .order('amount', { ascending: false })
+            .limit(1)
+            .single();
+          
+          console.log(`  - Highest bid from auction_bids: ${highestBid?.amount || 'not found'}`);
+          if (bidError && bidError.code !== 'PGRST116') {
+            console.error(`  - Error querying auction_bids:`, bidError);
+          }
+          
+          if (highestBid?.amount) {
+            winningBid = highestBid.amount;
+            console.log(`  - Using highest bid amount: ${winningBid}`);
+          }
+        }
+      }
+    }
+
+    // If still no winning bid, throw error with more details
+    if (!winningBid || winningBid <= 0) {
+      console.error(`❌ Could not find winning bid for auction ${auctionId}, user ${userId}`);
+      console.error(`  - Auction type: ${auction.auction_type}`);
+      console.error(`  - Auction status: ${auction.status}`);
+      console.error(`  - Auction winner_id: ${auction.winner_id}`);
+      throw new HttpException(
+        `Winning bid not found for this auction. Please ensure the auction has ended and you are the winner.`,
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    
+    console.log(`✅ Found winning bid: ${winningBid} for auction ${auctionId}`);
+
     const items = [{
       id: auction.id,
-      name: auction.title,
-      price: auction.winning_bid,
+      name: itemTitle,
+      price: winningBid,
       quantity: 1,
       sellerId: auction.seller_id,
       requiresEscrow: true, // Auctions always use escrow
-      imageUrl: auction.thumbnail_url,
+      imageUrl: itemThumbnail,
       itemType: 'auction',
     }];
 
-    const subtotal = auction.winning_bid;
+    const subtotal = winningBid;
     const shipping = this.calculateShipping(subtotal, items);
     const tax = this.calculateTax(subtotal);
-    const commissionFee = Math.round(subtotal * (auction.commission_rate / 100));
+    // ✅ FIX: All auction orders use 10% platform commission (not the auction.commission_rate from DB)
+    const AUCTION_COMMISSION_RATE = 10; // 10% for all auction orders
+    const commissionFee = Math.round(subtotal * (AUCTION_COMMISSION_RATE / 100));
     const escrowFee = this.calculateEscrowFee(subtotal + shipping + tax);
     const total = subtotal + shipping + tax + escrowFee;
 
@@ -350,7 +495,7 @@ export class CheckoutService {
       tax,
       escrowFee,
       commissionFee,
-      commissionRate: auction.commission_rate,
+      commissionRate: AUCTION_COMMISSION_RATE, // Always 10% for auctions
       total,
       auctionId: auction.id,
       sellerId: auction.seller_id,
@@ -753,6 +898,7 @@ export class CheckoutService {
     let orderSource = 'regular';
     if (isAuctionOrder) {
       orderSource = 'auction';
+      console.log(`🎯 Order source set to 'auction' for auction checkout (auctionId: ${orderData.auctionCheckout?.auctionId})`);
     } else if (orderData.invoiceCheckout) {
       orderSource = 'invoice';
     } else if (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) {
@@ -760,6 +906,8 @@ export class CheckoutService {
     } else if (orderData.directCheckout) {
       orderSource = 'regular';
     }
+    
+    console.log(`📦 Order source determined: ${orderSource} (isAuctionOrder: ${isAuctionOrder})`);
 
     // Log delivery type detection
     console.log('🚚 [DEBUG] Delivery type detection:', {
@@ -780,7 +928,9 @@ export class CheckoutService {
       escrow_enabled: orderData.useEscrow || false,  // ✅ Correct column name
       total_amount: actualTotal,
       delivery_fee: actualDeliveryFee,  // ✅ Correct column name
-      platform_fee: actualTotal * 0.02, // 2% platform fee
+      platform_fee: isAuctionOrder && summary.commissionFee 
+        ? summary.commissionFee 
+        : actualTotal * 0.02, // 2% for regular orders, auction commission rate for auction orders
       rider_id: riderId,
       delivery_type: orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery',
       delivery_address: {
@@ -838,11 +988,23 @@ export class CheckoutService {
       console.error('Order creation error:', orderError);
       throw new HttpException('Failed to create order', HttpStatus.INTERNAL_SERVER_ERROR);
     }
+    
+    // ✅ Verify order source was saved correctly
+    console.log(`✅ Order created: ${order.order_number}, source: ${order.source}, isAuctionOrder: ${isAuctionOrder}`);
+    if (isAuctionOrder && order.source !== 'auction') {
+      console.error(`❌ WARNING: Order ${order.order_number} was created as auction but source is '${order.source}' instead of 'auction'!`);
+    }
 
     // Create order items - handle BOTH products AND services AND auctions
     const orderItems = summary.items.map(item => {
       const isService = item.itemType === 'service';
       const isAuction = item.itemType === 'auction';
+      
+      // Ensure unit_price is never null - use 0 as fallback if price is missing
+      const unitPrice = item.price || 0;
+      if (!item.price || item.price <= 0) {
+        console.warn(`⚠️ Warning: Item "${item.name}" has invalid price: ${item.price}. Using 0 as fallback.`);
+      }
       
       return {
         order_id: order.id,
@@ -851,13 +1013,14 @@ export class CheckoutService {
         product_name: item.name,
         category: item.category || 'General',  // ✅ Store category for countdown calculation
         quantity: item.quantity,
-        unit_price: item.price,
-        total_price: item.price * item.quantity,
+        unit_price: unitPrice,
+        total_price: unitPrice * item.quantity,
         scheduled_date: isService ? item.serviceDate : null,
         scheduled_time: isService ? item.serviceTime : null,
         service_notes: isService ? item.serviceNotes : null,
         product_metadata: isAuction ? {
           auction_id: orderData.auctionCheckout?.auctionId,
+          auction_item_id: orderData.auctionCheckout?.itemId || item.product_metadata?.auction_item_id || null,
           auction_lot: item.product_metadata?.auction_lot,
           description: item.product_metadata?.description,
         } : null,
@@ -1042,6 +1205,41 @@ export class CheckoutService {
 
     // Handle auction-specific logic
     if (isAuctionOrder && orderData.auctionCheckout) {
+      // Mark auction win as checked out (for both live and timed auctions)
+      try {
+        // Get user's wins for this auction
+        const wins = await this.auctionsService.getUserAuctionWins(
+          userId,
+          'pending_checkout',
+          userToken,
+        );
+
+        // Find the win that matches this auction (and item if multi-item)
+        const auctionId = orderData.auctionCheckout.auctionId;
+        const itemId = orderData.auctionCheckout.itemId || null; // For multi-item auctions
+        
+        const matchingWin = wins.find(
+          (win: any) =>
+            win.auction_id === auctionId &&
+            (win.item_id === itemId || (win.item_id === null && itemId === null))
+        );
+
+        if (matchingWin) {
+          await this.auctionsService.markWinCheckedOut(
+            matchingWin.id,
+            order.id,
+            userId,
+            userToken,
+          );
+          console.log(`✅ Marked auction win ${matchingWin.id} as checked out`);
+        } else {
+          console.warn(`⚠️ No matching win found for auction ${auctionId}, item ${itemId}`);
+        }
+      } catch (error) {
+        console.error('Failed to mark auction win as checked out:', error);
+        // Don't throw - marking win as checked out is not critical to order creation
+      }
+
       // Update auction sale record to link to order and mark as completed
       // The sale record was created as 'pending' when auction ended
       await client
@@ -1078,14 +1276,20 @@ export class CheckoutService {
     // ✅ NOTIFY VENDOR OF PAYMENT IN ESCROW (if wallet payment)
     if (orderData.paymentMethodId === 'wallet') {
       try {
-        const escrowBreakdown = this.calculateEscrowBreakdown(actualTotal, riderId);
+        // Calculate commission rate from order's platform_fee (already set correctly for all order types)
+        // Auction orders: 10%, Live sales: 5%, Regular orders: 2%
+        const orderCommissionRate = order.platform_fee && actualTotal > 0
+          ? order.platform_fee / actualTotal
+          : undefined; // undefined = use default 2%
+        
+        const escrowBreakdown = this.calculateEscrowBreakdown(actualTotal, riderId, orderCommissionRate);
         await this.notificationHelper.notifyVendorOrderPaid(vendorId, {
           orderId: order.id,
           orderNumber: order.order_number,
           vendorAmount: escrowBreakdown.vendorAmount,
           escrowId: order.id, // Escrow uses order_id as reference
         });
-        console.log(`✅ Vendor ${vendorId} notified of payment in escrow`);
+        console.log(`✅ Vendor ${vendorId} notified of payment in escrow (commission rate: ${orderCommissionRate ? (orderCommissionRate * 100).toFixed(1) + '%' : 'default 2%'})`);
       } catch (notifyError) {
         console.error('Failed to notify vendor of payment (non-critical):', notifyError);
       }
@@ -1338,7 +1542,23 @@ export class CheckoutService {
 
     // ✅ CREATE ESCROW RECORD
     try {
-      const escrowBreakdown = this.calculateEscrowBreakdown(amount, riderId);
+      // Get order to get commission rate from platform_fee (already set correctly for all order types)
+      // Auction orders: 10%, Live sales: 5%, Regular orders: 2%
+      const { data: orderData } = await client
+        .from('orders')
+        .select('source, metadata, platform_fee, total_amount')
+        .eq('id', orderId)
+        .single();
+      
+      // Calculate commission rate from platform_fee for ALL order types
+      // This ensures correct commission rates: 10% (auctions), 5% (live sales), 2% (regular)
+      const orderCommissionRate = orderData?.platform_fee && orderData?.total_amount && orderData.total_amount > 0
+        ? orderData.platform_fee / orderData.total_amount
+        : undefined; // undefined = use default 2%
+      
+      console.log(`💰 Escrow commission rate for order ${orderId}: ${orderCommissionRate ? (orderCommissionRate * 100).toFixed(1) + '%' : 'default 2%'} (source: ${orderData?.source || 'unknown'})`);
+      
+      const escrowBreakdown = this.calculateEscrowBreakdown(amount, riderId, orderCommissionRate);
       const escrow = await this.escrowService.createEscrow(orderId, escrowBreakdown);
       console.log(`✅ Escrow created for order ${orderId}: ₣${amount}`);
       return escrow;
@@ -1353,16 +1573,21 @@ export class CheckoutService {
     }
   }
 
-  // Calculate escrow breakdown (platform fee: 2%, delivery fee: 10% if rider)
+  // Calculate escrow breakdown (platform fee: varies by order type - 10% auctions, 5% live sales, 2% regular, delivery fee: 10% if rider)
   // ✅ FIX: Round amounts to 6 decimal places (matching DECIMAL(18,6)) and validate sum
+  // ✅ FIX: Use actual commission rate from order for ALL order types, not just auctions
   private calculateEscrowBreakdown(
     totalAmount: number,
     riderId: string | null,
+    platformCommissionRate?: number, // Optional: Commission rate from order (0.10 for 10%, 0.05 for 5%, 0.02 for 2%)
   ): { totalAmount: number; vendorAmount: number; riderAmount: number; platformAmount: number } {
     // Helper function to round to 6 decimal places (matching DECIMAL(18,6) precision)
     const round6 = (value: number): number => Math.round(value * 1000000) / 1000000;
 
-    const platformFee = round6(totalAmount * 0.02); // 2% platform fee
+    // Use provided commission rate (from order's platform_fee) or default to 2% for regular orders
+    // This ensures correct rates: 10% (auctions), 5% (live sales), 2% (regular)
+    const commissionRate = platformCommissionRate !== undefined ? platformCommissionRate : 0.02;
+    const platformFee = round6(totalAmount * commissionRate);
     const deliveryFee = riderId ? round6(totalAmount * 0.10) : 0; // 10% delivery fee if rider assigned
     
     // Calculate vendor amount (ensures sum equals totalAmount exactly)

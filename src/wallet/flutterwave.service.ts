@@ -140,28 +140,44 @@ export class FlutterwaveService {
   }>();
 
   constructor(private configService: ConfigService) {
-    const publicKey = this.configService.get<string>('FLW_PUBLIC_KEY');
-    const secretKey = this.configService.get<string>('FLW_SECRET_KEY');
-    const encryptionKey = this.configService.get<string>('FLW_ENCRYPTION_KEY');
+    // Use process.env as fallback if configService doesn't have it (for compatibility)
+    const publicKey = this.configService.get<string>('FLW_PUBLIC_KEY') || process.env.FLW_PUBLIC_KEY;
+    const secretKey = this.configService.get<string>('FLW_SECRET_KEY') || process.env.FLW_SECRET_KEY;
+    const encryptionKey = this.configService.get<string>('FLW_ENCRYPTION_KEY') || process.env.FLW_ENCRYPTION_KEY;
 
-    if (!publicKey || !secretKey) {
+    // Enhanced diagnostics
+    const publicKeyTrimmed = publicKey?.trim();
+    const secretKeyTrimmed = secretKey?.trim();
+    const encryptionKeyTrimmed = encryptionKey?.trim();
+
+    // Log diagnostic information
+    this.logger.log('🔍 Flutterwave configuration check:', {
+      publicKeyPresent: !!publicKey,
+      publicKeyLength: publicKey?.length || 0,
+      publicKeyTrimmedLength: publicKeyTrimmed?.length || 0,
+      publicKeyStartsWith: publicKeyTrimmed?.substring(0, 10) || 'N/A',
+      secretKeyPresent: !!secretKey,
+      secretKeyLength: secretKey?.length || 0,
+      secretKeyTrimmedLength: secretKeyTrimmed?.length || 0,
+      secretKeyStartsWith: secretKeyTrimmed?.substring(0, 10) || 'N/A',
+      encryptionKeyPresent: !!encryptionKey,
+    });
+
+    if (!publicKey || !secretKey || !publicKeyTrimmed || !secretKeyTrimmed || 
+        publicKeyTrimmed.length === 0 || secretKeyTrimmed.length === 0) {
       this.logger.warn('⚠️ Flutterwave keys not configured. Payment features will not work.');
       this.logger.warn('⚠️ Add FLW_PUBLIC_KEY, FLW_SECRET_KEY, and FLW_ENCRYPTION_KEY to your .env file');
+      this.logger.warn('⚠️ Make sure the keys are not empty and do not have extra whitespace');
       // Initialize with empty strings to allow app to start, but methods will fail gracefully
       this.flw = null as any;
     } else {
       try {
-        // Validate keys are not empty and properly formatted
-        if (publicKey.trim().length === 0 || secretKey.trim().length === 0) {
-          throw new Error('Flutterwave keys cannot be empty');
-        }
-        
         // Flutterwave SDK expects: new Flutterwave(publicKey, secretKey, encryptionKey)
         // Make sure we're passing strings, not undefined
         this.flw = new Flutterwave(
-          publicKey.trim(), 
-          secretKey.trim(), 
-          encryptionKey?.trim() || ''
+          publicKeyTrimmed, 
+          secretKeyTrimmed, 
+          encryptionKeyTrimmed || ''
         );
         this.logger.log('✅ Flutterwave service initialized successfully');
       } catch (error: any) {
@@ -172,6 +188,7 @@ export class FlutterwaveService {
           encryptionKeyPresent: !!encryptionKey,
           publicKeyLength: publicKey?.length || 0,
           secretKeyLength: secretKey?.length || 0,
+          errorMessage: error.message,
         });
         this.flw = null as any;
       }
@@ -183,15 +200,73 @@ export class FlutterwaveService {
    * Uses Flutterwave Payment Links API to create a hosted payment page
    */
   async initializePayment(dto: InitializePaymentDto): Promise<PaymentResponse> {
-    if (!this.flw) {
-      throw new BadRequestException('Flutterwave is not configured. Please add FLW_PUBLIC_KEY and FLW_SECRET_KEY to your .env file');
+    // Re-check keys at runtime in case they were added after service initialization
+    // Use process.env as fallback if configService doesn't have it (for compatibility)
+    const publicKey = this.configService.get<string>('FLW_PUBLIC_KEY') || process.env.FLW_PUBLIC_KEY;
+    const secretKey = this.configService.get<string>('FLW_SECRET_KEY') || process.env.FLW_SECRET_KEY;
+    const encryptionKey = this.configService.get<string>('FLW_ENCRYPTION_KEY') || process.env.FLW_ENCRYPTION_KEY;
+    
+    // Enhanced diagnostics for deposits (to compare with withdrawals)
+    this.logger.debug('🔍 Deposit: Flutterwave env vars check:', {
+      configService_FLW_SECRET_KEY: secretKey ? `${secretKey.substring(0, 10)}... (length: ${secretKey.length})` : 'NOT SET',
+      processEnv_FLW_SECRET_KEY: process.env.FLW_SECRET_KEY ? `${process.env.FLW_SECRET_KEY.substring(0, 10)}... (length: ${process.env.FLW_SECRET_KEY.length})` : 'NOT SET',
+      rawSecretKeyType: typeof secretKey,
+      rawSecretKeyIsUndefined: secretKey === undefined,
+      rawSecretKeyIsNull: secretKey === null,
+      rawSecretKeyIsEmptyString: secretKey === '',
+    });
+    
+    const publicKeyTrimmed = publicKey?.trim();
+    let secretKeyTrimmed = secretKey?.trim();
+    const encryptionKeyTrimmed = encryptionKey?.trim();
+    
+    // 🔍 DIAGNOSTIC: Check if secret key is accidentally in encryption key variable
+    if (!secretKeyTrimmed && encryptionKeyTrimmed && encryptionKeyTrimmed.startsWith('FLWSECK')) {
+      this.logger.warn('⚠️ DETECTED: Secret key appears to be in FLW_ENCRYPTION_KEY instead of FLW_SECRET_KEY!');
+      this.logger.warn('⚠️ Your FLW_ENCRYPTION_KEY contains: FLWSECK... (this is a SECRET KEY format)');
+      this.logger.warn('⚠️ FIX: Move the value from FLW_ENCRYPTION_KEY to FLW_SECRET_KEY in your .env file');
+      this.logger.warn('⚠️ FLW_ENCRYPTION_KEY should be a different, longer key (usually 32+ characters)');
+      // Use encryption key as fallback if it looks like a secret key
+      secretKeyTrimmed = encryptionKeyTrimmed;
+      this.logger.warn('⚠️ Using FLW_ENCRYPTION_KEY value as secret key (temporary workaround)');
+    }
+    
+    // Try to re-initialize if keys are present but service wasn't initialized
+    if (!this.flw && publicKeyTrimmed && secretKeyTrimmed && 
+        publicKeyTrimmed.length > 0 && secretKeyTrimmed.length > 0) {
+      try {
+        this.logger.log('🔄 Attempting to initialize Flutterwave service with runtime keys...');
+        this.flw = new Flutterwave(
+          publicKeyTrimmed,
+          secretKeyTrimmed,
+          encryptionKey?.trim() || ''
+        );
+        this.logger.log('✅ Flutterwave service initialized successfully at runtime');
+      } catch (error: any) {
+        this.logger.error('❌ Failed to initialize Flutterwave service at runtime:', error.message);
+        this.flw = null as any;
+      }
+    }
+    
+    // For deposits, we can use keys directly even if SDK isn't initialized
+    // But we still need to validate keys are present
+    if (!publicKeyTrimmed || !secretKeyTrimmed) {
+      this.logger.error('❌ Flutterwave configuration check failed for deposit:', {
+        flwInitialized: !!this.flw,
+        publicKeyPresent: !!publicKey,
+        publicKeyLength: publicKey?.length || 0,
+        secretKeyPresent: !!secretKey,
+        secretKeyLength: secretKey?.length || 0,
+      });
+      throw new BadRequestException(
+        'Flutterwave is not configured. Please add FLW_PUBLIC_KEY and FLW_SECRET_KEY to your .env file. ' +
+        'Make sure the keys are not empty, do not have extra whitespace, and restart the server after adding them.'
+      );
     }
 
     try {
       this.logger.log(`Initializing payment: ${dto.amount} ${dto.currency} for ${dto.customerEmail}`);
 
-      const publicKey = this.configService.get<string>('FLW_PUBLIC_KEY');
-      const secretKey = this.configService.get<string>('FLW_SECRET_KEY');
       const baseUrl = this.configService.get<string>('FLW_BASE_URL') || 'https://api.flutterwave.com/v3';
 
       // Use Flutterwave Payment Links API directly via HTTP
@@ -227,7 +302,7 @@ export class FlutterwaveService {
         payload,
         {
           headers: {
-            'Authorization': `Bearer ${secretKey}`,
+            'Authorization': `Bearer ${secretKeyTrimmed}`,
             'Content-Type': 'application/json',
           },
           timeout: 30000, // 30 second timeout
@@ -367,8 +442,133 @@ export class FlutterwaveService {
    * Initiate bank transfer for withdrawals
    */
   async initiateTransfer(dto: InitiateTransferDto): Promise<TransferResponse> {
-    if (!this.flw) {
-      throw new BadRequestException('Flutterwave is not configured. Please add FLW_PUBLIC_KEY and FLW_SECRET_KEY to your .env file');
+    // Re-check keys at runtime in case they were added after service initialization
+    // Use process.env as fallback if configService doesn't have it (for compatibility)
+    const publicKey = this.configService.get<string>('FLW_PUBLIC_KEY') || process.env.FLW_PUBLIC_KEY;
+    const secretKey = this.configService.get<string>('FLW_SECRET_KEY') || process.env.FLW_SECRET_KEY;
+    const encryptionKey = this.configService.get<string>('FLW_ENCRYPTION_KEY') || process.env.FLW_ENCRYPTION_KEY;
+    
+    // Enhanced diagnostics: Check all possible variations
+    const allEnvVars = {
+      'FLW_PUBLIC_KEY': this.configService.get<string>('FLW_PUBLIC_KEY'),
+      'FLW_SECRET_KEY': this.configService.get<string>('FLW_SECRET_KEY'),
+      'FLW_ENCRYPTION_KEY': this.configService.get<string>('FLW_ENCRYPTION_KEY'),
+      // Check alternative names
+      'FLUTTERWAVE_PUBLIC_KEY': this.configService.get<string>('FLUTTERWAVE_PUBLIC_KEY'),
+      'FLUTTERWAVE_SECRET_KEY': this.configService.get<string>('FLUTTERWAVE_SECRET_KEY'),
+      'FLUTTERWAVE_ENCRYPTION_KEY': this.configService.get<string>('FLUTTERWAVE_ENCRYPTION_KEY'),
+    };
+    
+    this.logger.debug('🔍 Withdrawal: All Flutterwave env vars check:', {
+      ...Object.fromEntries(
+        Object.entries(allEnvVars).map(([key, value]) => [
+          key,
+          value ? `${value.substring(0, 10)}... (length: ${value.length})` : 'NOT SET'
+        ])
+      ),
+      processEnv_FLW_SECRET_KEY: process.env.FLW_SECRET_KEY ? `${process.env.FLW_SECRET_KEY.substring(0, 10)}... (length: ${process.env.FLW_SECRET_KEY.length})` : 'NOT SET',
+      rawSecretKeyType: typeof secretKey,
+      rawSecretKeyIsUndefined: secretKey === undefined,
+      rawSecretKeyIsNull: secretKey === null,
+      rawSecretKeyIsEmptyString: secretKey === '',
+      configServiceVsProcessEnv: {
+        configService: secretKey ? 'HAS VALUE' : 'NO VALUE',
+        processEnv: process.env.FLW_SECRET_KEY ? 'HAS VALUE' : 'NO VALUE',
+        match: (secretKey || '') === (process.env.FLW_SECRET_KEY || ''),
+      },
+    });
+    
+    const publicKeyTrimmed = publicKey?.trim();
+    let secretKeyTrimmed = secretKey?.trim();
+    const encryptionKeyTrimmed = encryptionKey?.trim();
+    
+    // 🔍 DIAGNOSTIC: Check if secret key is accidentally in encryption key variable
+    if (!secretKeyTrimmed && encryptionKeyTrimmed && encryptionKeyTrimmed.startsWith('FLWSECK')) {
+      this.logger.warn('⚠️ DETECTED: Secret key appears to be in FLW_ENCRYPTION_KEY instead of FLW_SECRET_KEY!');
+      this.logger.warn(`⚠️ Your FLW_ENCRYPTION_KEY contains: ${encryptionKeyTrimmed.substring(0, 15)}... (length: ${encryptionKeyTrimmed.length})`);
+      
+      const isTestKey = encryptionKeyTrimmed.includes('TEST');
+      const minLength = isTestKey ? 20 : 35; // Test keys can be shorter
+      
+      // Validate secret key length (test keys may be shorter)
+      if (encryptionKeyTrimmed.length < minLength) {
+        this.logger.warn(`⚠️ SECRET KEY LENGTH WARNING: Got ${encryptionKeyTrimmed.length} chars (minimum: ${minLength})`);
+        this.logger.warn('⚠️ This may work in test mode, but verify the key is complete in your .env file');
+      }
+      
+      this.logger.warn('⚠️ FIX: Move the value from FLW_ENCRYPTION_KEY to FLW_SECRET_KEY in your .env file');
+      this.logger.warn('⚠️ FLW_ENCRYPTION_KEY should be a different, longer key (usually 32+ characters)');
+      // Use encryption key as fallback if it looks like a secret key
+      secretKeyTrimmed = encryptionKeyTrimmed;
+      this.logger.warn('⚠️ Using FLW_ENCRYPTION_KEY value as secret key (temporary workaround)');
+    }
+    
+    // Validate secret key format and length before using (more lenient for test mode)
+    if (secretKeyTrimmed) {
+      const isTestKey = secretKeyTrimmed.includes('TEST');
+      const expectedMinLength = isTestKey ? 20 : 35; // Test keys can be shorter (20+), live keys need 35+
+      
+      if (secretKeyTrimmed.length < expectedMinLength) {
+        this.logger.warn(`⚠️ SECRET KEY LENGTH WARNING: Key is ${secretKeyTrimmed.length} chars (minimum: ${expectedMinLength})`);
+        this.logger.warn(`⚠️ Key prefix: ${secretKeyTrimmed.substring(0, 20)}...`);
+        if (!isTestKey) {
+          // Only throw error for live keys that are too short
+          this.logger.error('❌ Please verify your FLW_SECRET_KEY in .env file is complete and not truncated');
+          throw new BadRequestException(
+            `Invalid Flutterwave secret key: Key appears incomplete (${secretKeyTrimmed.length} characters). ` +
+            `Expected ${expectedMinLength}+ characters. Please check your .env file and ensure the key is not truncated.`
+          );
+        } else {
+          // For test keys, just warn but allow it
+          this.logger.warn('⚠️ Test mode key detected - proceeding with shorter key (may work in test mode)');
+        }
+      }
+      
+      // Validate format
+      if (!secretKeyTrimmed.startsWith('FLWSECK')) {
+        this.logger.error(`❌ SECRET KEY FORMAT INVALID: Should start with FLWSECK, got: ${secretKeyTrimmed.substring(0, 10)}...`);
+        throw new BadRequestException(
+          'Invalid Flutterwave secret key format. Secret keys should start with "FLWSECK" (test) or "FLWSECK" (live).'
+        );
+      }
+    }
+    
+    // Try to re-initialize if keys are present but service wasn't initialized
+    if (!this.flw && publicKeyTrimmed && secretKeyTrimmed && 
+        publicKeyTrimmed.length > 0 && secretKeyTrimmed.length > 0) {
+      try {
+        this.logger.log('🔄 Attempting to initialize Flutterwave service with runtime keys...');
+        this.flw = new Flutterwave(
+          publicKeyTrimmed,
+          secretKeyTrimmed,
+          encryptionKeyTrimmed || ''
+        );
+        this.logger.log('✅ Flutterwave service initialized successfully at runtime');
+      } catch (error: any) {
+        this.logger.error('❌ Failed to initialize Flutterwave service at runtime:', error.message);
+        this.flw = null as any;
+      }
+    }
+    
+    // For transfers, we use axios directly (like deposits), so we only need keys, not SDK initialization
+    if (!publicKeyTrimmed || !secretKeyTrimmed) {
+      this.logger.error('❌ Flutterwave configuration check failed:', {
+        flwInitialized: !!this.flw,
+        publicKeyPresent: !!publicKey,
+        publicKeyLength: publicKey?.length || 0,
+        publicKeyTrimmedLength: publicKeyTrimmed?.length || 0,
+        secretKeyPresent: !!secretKey,
+        secretKeyLength: secretKey?.length || 0,
+        secretKeyTrimmedLength: secretKeyTrimmed?.length || 0,
+        envKeys: {
+          FLW_PUBLIC_KEY: publicKey ? `${publicKey.substring(0, 10)}...` : 'NOT SET',
+          FLW_SECRET_KEY: secretKey ? `${secretKey.substring(0, 10)}...` : 'NOT SET',
+        }
+      });
+      throw new BadRequestException(
+        'Flutterwave is not configured. Please add FLW_PUBLIC_KEY and FLW_SECRET_KEY to your .env file. ' +
+        'Make sure the keys are not empty, do not have extra whitespace, and restart the server after adding them.'
+      );
     }
 
     try {
@@ -413,22 +613,39 @@ export class FlutterwaveService {
       }
 
       // Use direct API call instead of SDK to avoid URL construction bugs
-      const secretKey = this.configService.get<string>('FLW_SECRET_KEY');
-      if (!secretKey) {
-        throw new BadRequestException('Flutterwave secret key is not configured');
-      }
+      // Use the already-trimmed secretKeyTrimmed from above
 
-      this.logger.log(`Using direct API call for transfer initiation to avoid SDK URL parsing issues`);
+      // Detect test vs live mode from key prefix
+      const isTestMode = secretKeyTrimmed.includes('TEST') || publicKeyTrimmed.includes('TEST');
+      const baseUrl = this.configService.get<string>('FLW_BASE_URL') || 'https://api.flutterwave.com/v3';
+      
+      this.logger.log(`Using direct API call for transfer initiation (${isTestMode ? 'TEST' : 'LIVE'} mode)`);
+      this.logger.debug(`Transfer API details:`, {
+        baseUrl,
+        isTestMode,
+        secretKeyPrefix: secretKeyTrimmed.substring(0, 15),
+        publicKeyPrefix: publicKeyTrimmed.substring(0, 15),
+      });
+      
+      // Prepare headers
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${secretKeyTrimmed}`,
+        'Content-Type': 'application/json',
+      };
+      
+      // Add test scenario header for test mode (helps with testing)
+      if (isTestMode) {
+        // Optional: Add scenario header for test mode transfers
+        // This helps simulate successful transfers in test mode
+        // headers['X-Scenario-Key'] = 'scenario:successful'; // Uncomment if needed
+      }
       
       // Make direct HTTP call to Flutterwave API
       const response = await axios.post(
-        'https://api.flutterwave.com/v3/transfers',
+        `${baseUrl}/transfers`,
         payload,
         {
-          headers: {
-            Authorization: `Bearer ${secretKey}`,
-            'Content-Type': 'application/json',
-          },
+          headers,
           timeout: 30000, // 30 second timeout
         }
       );
@@ -468,6 +685,29 @@ export class FlutterwaveService {
       if (error.response) {
         const errorData = error.response.data || {};
         const errorMessage = errorData.message || errorData.data?.message || error.message || 'Failed to initiate transfer';
+        
+        // Provide specific guidance for common Flutterwave errors
+        if (errorMessage.includes('IP Whitelisting') || errorMessage.includes('IP whitelist')) {
+          this.logger.error('❌ Flutterwave IP Whitelisting Error:');
+          this.logger.error('❌ This is a Flutterwave account configuration issue, not a code problem.');
+          this.logger.error('❌ To fix this:');
+          this.logger.error('   1. Log into your Flutterwave Dashboard');
+          this.logger.error('   2. Go to Settings → API Keys & Webhooks');
+          this.logger.error('   3. Find "IP Whitelisting" or "IP Restrictions" section');
+          this.logger.error('   4. Either:');
+          this.logger.error('      - Add your server IP address to the whitelist, OR');
+          this.logger.error('      - Disable IP whitelisting (for test mode only)');
+          this.logger.error('   5. Note: In test mode, you may need to disable IP whitelisting for transfers');
+          this.logger.error('   6. Deposits may work without whitelisting, but transfers require it to be configured');
+          
+          throw new BadRequestException(
+            `Flutterwave API error: ${errorMessage}. ` +
+            `Please configure IP Whitelisting in your Flutterwave Dashboard. ` +
+            `Go to Settings → API Keys & Webhooks → IP Whitelisting. ` +
+            `For test mode, you may need to disable IP restrictions or add your server IP address.`
+          );
+        }
+        
         throw new BadRequestException(`Flutterwave API error: ${errorMessage}`);
       }
       

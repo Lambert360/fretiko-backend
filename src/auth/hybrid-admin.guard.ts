@@ -45,6 +45,24 @@ export class HybridAdminGuard implements CanActivate {
           .single();
 
         if (!error && staff) {
+          // For staff users, check if they have view_revenue permission (required for gift management)
+          if (staff.role !== 'super_admin') {
+            const { data: department, error: deptError } = await this.serviceSupabase
+              .from('departments')
+              .select('permissions')
+              .eq('id', staff.department_id)
+              .single();
+
+            if (deptError || !department) {
+              throw new UnauthorizedException('Staff department not found');
+            }
+
+            const permissions: string[] = department.permissions || [];
+            if (!permissions.includes('view_revenue')) {
+              throw new UnauthorizedException('Staff user requires view_revenue permission for gift management');
+            }
+          }
+
           // Attach staff info to request
           request.user = {
             sub: staff.id,

@@ -1,8 +1,8 @@
 import { Injectable, NotFoundException, BadRequestException, ForbiddenException, forwardRef, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
-import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto, WatchlistDto } from './dto';
-import { Auction, AuctionWithDetails, AuctionBid, AuctionCategory, AuctionCategoryWithStats, PublicBidHistoryItem } from './entities';
+import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto, WatchlistDto, CreateAuctionItemDto } from './dto';
+import { Auction, AuctionWithDetails, AuctionBid, AuctionCategory, AuctionCategoryWithStats, PublicBidHistoryItem, AuctionItem, AuctionItemWithDetails } from './entities';
 import { WalletService } from '../wallet/wallet.service';
 import { AuctionGateway } from './auction.gateway';
 import ffmpeg from 'fluent-ffmpeg';
@@ -509,6 +509,43 @@ export class AuctionsService {
 
     if (error) {
       throw new BadRequestException(`Failed to create auction: ${error.message}`);
+    }
+
+    // For live auctions, create initial auction item from auction data
+    if (data.auction_type === 'live') {
+      const initialItemData = {
+        auction_id: data.id,
+        title: data.title,
+        description: data.description,
+        lot_number: data.lot_number,
+        starting_price: data.starting_price,
+        reserve_price: data.reserve_price,
+        current_bid: 0,
+        bid_increment: data.bid_increment || 1.0,
+        bidding_status: 'waiting',
+        order_in_auction: 1,
+        bidding_duration: 120, // Default 2 minutes
+        images: imageUrls.length > 0 ? imageUrls : (createAuctionDto.images || []),
+        video_url: videoUrl,
+      };
+
+      const { data: initialItem, error: itemError } = await client
+        .from('auction_items')
+        .insert(initialItemData)
+        .select()
+        .single();
+
+      if (itemError) {
+        console.error('⚠️ Failed to create initial auction item:', itemError);
+        // Don't fail the auction creation if item creation fails
+      } else {
+        // Set this as the current item
+        await client
+          .from('auctions')
+          .update({ current_item_id: initialItem.id })
+          .eq('id', data.id);
+        console.log('✅ Initial auction item created for live auction');
+      }
     }
 
     // Broadcast auction creation event for scheduled auctions (so discovery screen can update)
@@ -1427,5 +1464,873 @@ export class AuctionsService {
       is_watched_by_user: watchedIds.has(auction.id),
       user_has_bid: bidIds.has(auction.id),
     }));
+  }
+
+  /**
+   * Generate Agora RTC token for auction live streaming
+   * Similar to liveSalesService.generateAgoraToken but for auctions
+   */
+  async generateAgoraToken(auctionId: string, sellerId: string, role: 'host' | 'audience'): Promise<{
+    token: string;
+    channel: string;
+    uid: number;
+    appId: string;
+  }> {
+    try {
+      const appId = this.configService.get<string>('AGORA_APP_ID');
+      const appCertificate = this.configService.get<string>('AGORA_APP_CERTIFICATE');
+
+      if (!appId || !appCertificate) {
+        throw new BadRequestException('Agora credentials not configured');
+      }
+
+      // Verify auction exists and is live type
+      const { data: auction, error } = await this.serviceSupabase
+        .from('auctions')
+        .select('seller_id, auction_type')
+        .eq('id', auctionId)
+        .single();
+
+      if (error || !auction) {
+        throw new NotFoundException('Auction not found');
+      }
+
+      if (auction.auction_type !== 'live') {
+        throw new BadRequestException('This auction is not a live auction');
+      }
+
+      if (auction.seller_id !== sellerId && role === 'host') {
+        throw new ForbiddenException('Only auction owner can host the stream');
+      }
+
+      // Use auction ID as channel name
+      const channelName = `auction_${auctionId}`;
+      
+      // Generate unique UID (use numeric part of seller ID hash)
+      const uid = Math.abs(this.hashCode(sellerId || auctionId)) % 1000000;
+      
+      // Token expires in 24 hours
+      const expirationTimeInSeconds = 86400;
+      const currentTimestamp = Math.floor(Date.now() / 1000);
+      const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+      // Generate actual Agora token
+      const { RtcTokenBuilder, RtcRole } = require('agora-token');
+      const agoraRole = role === 'host' ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+      
+      const token = RtcTokenBuilder.buildTokenWithUid(
+        appId,
+        appCertificate,
+        channelName,
+        uid,
+        agoraRole,
+        privilegeExpiredTs
+      );
+
+      return {
+        token,
+        channel: channelName,
+        uid,
+        appId,
+      };
+    } catch (error) {
+      if (error instanceof NotFoundException || error instanceof ForbiddenException || error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to generate streaming token');
+    }
+  }
+
+  /**
+   * Start broadcasting for a live auction
+   * Updates stream_url to indicate broadcast has started
+   */
+  async startBroadcast(auctionId: string, sellerId: string): Promise<any> {
+    try {
+      // Verify auction exists and user is seller
+      const auction = await this.findById(auctionId);
+      
+      if (auction.auction_type !== 'live') {
+        throw new BadRequestException('This is not a live auction');
+      }
+      
+      if (auction.seller_id !== sellerId) {
+        throw new ForbiddenException('Only auction owner can start broadcast');
+      }
+
+      // Update auction with stream_url (using Agora channel name as identifier)
+      const streamUrl = `agora://auction_${auctionId}`;
+      const { data, error } = await this.serviceSupabase
+        .from('auctions')
+        .update({
+          stream_url: streamUrl,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', auctionId)
+        .select()
+        .single();
+
+      if (error) {
+        throw new BadRequestException(`Failed to start broadcast: ${error.message}`);
+      }
+
+      // Broadcast stream URL update to all viewers
+      await this.auctionGateway.broadcastStreamUrlUpdate(auctionId, streamUrl);
+
+      return { message: 'Broadcast started successfully', stream_url: streamUrl };
+    } catch (error) {
+      if (error instanceof BadRequestException || error instanceof ForbiddenException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to start broadcast');
+    }
+  }
+
+  /**
+   * Stop broadcasting for a live auction
+   * Removes stream_url to indicate broadcast has ended
+   */
+  async stopBroadcast(auctionId: string, sellerId: string): Promise<any> {
+    try {
+      // Verify auction exists and user is seller
+      const auction = await this.findById(auctionId);
+      
+      if (auction.seller_id !== sellerId) {
+        throw new ForbiddenException('Only auction owner can stop broadcast');
+      }
+
+      // Remove stream_url
+      const { data, error } = await this.serviceSupabase
+        .from('auctions')
+        .update({
+          stream_url: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', auctionId)
+        .select()
+        .single();
+
+      if (error) {
+        throw new BadRequestException(`Failed to stop broadcast: ${error.message}`);
+      }
+
+      // Broadcast stream ended
+      await this.auctionGateway.broadcastStreamUrlUpdate(auctionId, null);
+
+      return { message: 'Broadcast stopped successfully' };
+    } catch (error) {
+      if (error instanceof BadRequestException || error instanceof ForbiddenException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to stop broadcast');
+    }
+  }
+
+  /**
+   * Helper method to generate hash code from string
+   */
+  private hashCode(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return hash;
+  }
+
+  // ==================== AUCTION ITEMS MANAGEMENT ====================
+
+  /**
+   * Get auction item by ID
+   */
+  async getAuctionItem(itemId: string): Promise<AuctionItem | null> {
+    const { data, error } = await this.serviceSupabase
+      .from('auction_items')
+      .select('*')
+      .eq('id', itemId)
+      .single();
+
+    if (error || !data) {
+      return null;
+    }
+
+    return data as AuctionItem;
+  }
+
+  /**
+   * Get current auction item
+   */
+  async getCurrentAuctionItem(auctionId: string): Promise<AuctionItem | null> {
+    const auction = await this.findById(auctionId);
+    if (!auction || !(auction as any).current_item_id) {
+      return null;
+    }
+
+    return this.getAuctionItem((auction as any).current_item_id);
+  }
+
+  /**
+   * Get next waiting item in auction
+   */
+  async getNextWaitingItem(auctionId: string): Promise<AuctionItem | null> {
+    const { data, error } = await this.serviceSupabase
+      .rpc('get_next_waiting_auction_item', { p_auction_id: auctionId });
+
+    if (error || !data) {
+      // Fallback to manual query
+      const { data: items, error: itemsError } = await this.serviceSupabase
+        .from('auction_items')
+        .select('*')
+        .eq('auction_id', auctionId)
+        .eq('bidding_status', 'waiting')
+        .order('order_in_auction', { ascending: true })
+        .limit(1);
+
+      if (itemsError || !items || items.length === 0) {
+        return null;
+      }
+
+      return items[0] as AuctionItem;
+    }
+
+    if (!data) {
+      return null;
+    }
+
+    return this.getAuctionItem(data);
+  }
+
+  /**
+   * Get all auction items for an auction
+   */
+  async getAuctionItems(auctionId: string): Promise<AuctionItem[]> {
+    const { data, error } = await this.serviceSupabase
+      .from('auction_items')
+      .select('*')
+      .eq('auction_id', auctionId)
+      .order('order_in_auction', { ascending: true });
+
+    if (error || !data) {
+      return [];
+    }
+
+    return data as AuctionItem[];
+  }
+
+  /**
+   * Create a new auction item during live auction
+   * Allows hosts to add items on-the-fly
+   */
+  async createAuctionItem(
+    auctionId: string,
+    userId: string,
+    createAuctionItemDto: CreateAuctionItemDto,
+    userToken?: string,
+    images?: Express.Multer.File[],
+  ): Promise<AuctionItem> {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.serviceSupabase;
+
+    // Verify auction exists and user owns it
+    const auction = await this.findById(auctionId);
+    if (!auction) {
+      throw new BadRequestException('Auction not found');
+    }
+
+    if (auction.seller_id !== userId) {
+      throw new ForbiddenException('Only the auction seller can add items');
+    }
+
+    // Verify auction is active or scheduled
+    if (auction.status !== 'active' && auction.status !== 'scheduled') {
+      throw new BadRequestException('Can only add items to active or scheduled auctions');
+    }
+
+    // Get max order_in_auction to assign next order
+    const { data: existingItems, error: itemsError } = await this.serviceSupabase
+      .from('auction_items')
+      .select('order_in_auction')
+      .eq('auction_id', auctionId)
+      .order('order_in_auction', { ascending: false })
+      .limit(1);
+
+    const nextOrder = existingItems && existingItems.length > 0
+      ? (existingItems[0].order_in_auction || 0) + 1
+      : 1;
+
+    // Upload images to Supabase Storage if provided
+    const imageUrls: string[] = [];
+    if (images && images.length > 0) {
+      console.log(`📤 Uploading ${images.length} images for auction item...`);
+
+      for (const image of images) {
+        const fileName = `${userId}/${Date.now()}-${Math.random().toString(36).substring(7)}.${image.originalname.split('.').pop()}`;
+
+        const { data: uploadData, error: uploadError } = await client.storage
+          .from('media')
+          .upload(fileName, image.buffer, {
+            contentType: image.mimetype,
+            cacheControl: '3600',
+          });
+
+        if (uploadError) {
+          console.error('❌ Image upload failed:', uploadError);
+          throw new BadRequestException(`Failed to upload image: ${uploadError.message}`);
+        }
+
+        // Get public URL
+        const { data: publicUrlData } = client.storage
+          .from('media')
+          .getPublicUrl(fileName);
+
+        imageUrls.push(publicUrlData.publicUrl);
+        console.log(`✅ Image uploaded: ${publicUrlData.publicUrl}`);
+      }
+    }
+
+    // Get auction defaults for item if not provided
+    const bidIncrement = createAuctionItemDto.bid_increment || auction.bid_increment || 1.0;
+    const biddingDuration = createAuctionItemDto.bidding_duration || 120; // Default 2 minutes
+
+    // Create auction item
+    const itemData = {
+      auction_id: auctionId,
+      title: createAuctionItemDto.title,
+      description: createAuctionItemDto.description || null,
+      lot_number: createAuctionItemDto.lot_number || null,
+      starting_price: createAuctionItemDto.starting_price,
+      reserve_price: createAuctionItemDto.reserve_price || null,
+      current_bid: createAuctionItemDto.starting_price,
+      bid_increment: bidIncrement,
+      bidding_status: 'waiting' as const,
+      order_in_auction: nextOrder,
+      bidding_duration: biddingDuration,
+      images: imageUrls.length > 0 ? imageUrls : (createAuctionItemDto.images || []),
+    };
+
+    const { data: newItem, error: insertError } = await this.serviceSupabase
+      .from('auction_items')
+      .insert(itemData)
+      .select()
+      .single();
+
+    if (insertError || !newItem) {
+      console.error('❌ Failed to create auction item:', insertError);
+      throw new BadRequestException('Failed to create auction item');
+    }
+
+    console.log(`✅ Auction item created: ${newItem.id} (order: ${nextOrder})`);
+
+    // Broadcast new item added event (optional notification for viewers)
+    await this.auctionGateway.broadcastItemEvent(auctionId, null, 'item_added', {
+      item_id: newItem.id,
+      item_title: newItem.title,
+      item_number: nextOrder,
+      starting_price: newItem.starting_price,
+      timestamp: new Date().toISOString(),
+    });
+
+    return newItem as AuctionItem;
+  }
+
+  /**
+   * Start countdown for auction item (3-2-1 countdown)
+   */
+  async startItemCountdown(auctionId: string, itemId: string, sellerId: string): Promise<void> {
+    // Verify auction ownership
+    const auction = await this.findById(auctionId);
+    if (!auction || auction.seller_id !== sellerId) {
+      throw new ForbiddenException('Only the auction seller can control items');
+    }
+
+    const item = await this.getAuctionItem(itemId);
+    if (!item || item.auction_id !== auctionId) {
+      throw new NotFoundException('Auction item not found');
+    }
+
+    if (item.bidding_status !== 'waiting') {
+      throw new BadRequestException('Item is not in waiting status');
+    }
+
+    // Update item status to countdown
+    const { error } = await this.serviceSupabase
+      .from('auction_items')
+      .update({
+        bidding_status: 'countdown',
+        countdown_started_at: new Date().toISOString(),
+      })
+      .eq('id', itemId);
+
+    if (error) {
+      throw new BadRequestException('Failed to start countdown');
+    }
+
+    // Broadcast countdown start
+    await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'start_countdown', {
+      item_id: itemId,
+      item_title: item.title,
+      countdown_duration: 3,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Schedule automatic bidding start after 3 seconds
+    setTimeout(() => {
+      this.openItemBidding(auctionId, itemId, sellerId).catch(err => {
+        console.error('Error opening bidding after countdown:', err);
+      });
+    }, 3000);
+  }
+
+  /**
+   * Open bidding for auction item
+   */
+  async openItemBidding(auctionId: string, itemId: string, sellerId: string): Promise<void> {
+    // Verify auction ownership
+    const auction = await this.findById(auctionId);
+    if (!auction || auction.seller_id !== sellerId) {
+      throw new ForbiddenException('Only the auction seller can control items');
+    }
+
+    const item = await this.getAuctionItem(itemId);
+    if (!item || item.auction_id !== auctionId) {
+      throw new NotFoundException('Auction item not found');
+    }
+
+    // Update item status to active
+    const { error } = await this.serviceSupabase
+      .from('auction_items')
+      .update({
+        bidding_status: 'active',
+        bidding_started_at: new Date().toISOString(),
+        current_bid: item.starting_price, // Reset to starting price
+      })
+      .eq('id', itemId);
+
+    if (error) {
+      throw new BadRequestException('Failed to open bidding');
+    }
+
+    // Broadcast bidding open
+    await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'bidding_open', {
+      item_id: itemId,
+      item_title: item.title,
+      starting_price: item.starting_price,
+      minimum_bid: item.starting_price + item.bid_increment,
+      bid_increment: item.bid_increment,
+      duration: item.bidding_duration,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Schedule bidding end after duration
+    setTimeout(() => {
+      this.endItemBidding(auctionId, itemId, sellerId).catch(err => {
+        console.error('Error ending bidding:', err);
+      });
+    }, item.bidding_duration * 1000);
+  }
+
+  /**
+   * End bidding for auction item (manual or automatic)
+   */
+  async endItemBidding(auctionId: string, itemId: string, sellerId: string): Promise<void> {
+    // Verify auction ownership
+    const auction = await this.findById(auctionId);
+    if (!auction || auction.seller_id !== sellerId) {
+      throw new ForbiddenException('Only the auction seller can control items');
+    }
+
+    const item = await this.getAuctionItem(itemId);
+    if (!item || item.auction_id !== auctionId) {
+      throw new NotFoundException('Auction item not found');
+    }
+
+    if (item.bidding_status !== 'active') {
+      return; // Already ended
+    }
+
+    // Get highest bidder for this item
+    const { data: highestBid, error: bidError } = await this.serviceSupabase
+      .from('auction_bids')
+      .select('bidder_id, amount, bidder_display_id')
+      .eq('auction_id', auctionId)
+      .order('amount', { ascending: false })
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    const hasValidBid = highestBid && highestBid.amount >= item.starting_price;
+    const winner = hasValidBid ? {
+      bidder_id: highestBid.bidder_id,
+      amount: highestBid.amount,
+      bidder_display_id: highestBid.bidder_display_id,
+    } : null;
+
+    // Update item status
+    const updateData: any = {
+      bidding_status: winner ? 'ended' : 'passed',
+      bidding_ended_at: new Date().toISOString(),
+    };
+
+    if (winner) {
+      updateData.winner_id = winner.bidder_id;
+      updateData.winning_bid = winner.amount;
+      updateData.current_bid = winner.amount;
+    }
+
+    const { error } = await this.serviceSupabase
+      .from('auction_items')
+      .update(updateData)
+      .eq('id', itemId);
+
+    if (error) {
+      throw new BadRequestException('Failed to end bidding');
+    }
+
+    // Broadcast bidding ended
+    await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'bidding_ended', {
+      item_id: itemId,
+      item_title: item.title,
+      winner: winner,
+      final_bid: winner?.amount || item.starting_price,
+      item_sold: !!winner,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Mark item as sold (auctioneer strikes gavel)
+   */
+  async markItemSold(auctionId: string, itemId: string, sellerId: string): Promise<void> {
+    // Verify auction ownership
+    const auction = await this.findById(auctionId);
+    if (!auction || auction.seller_id !== sellerId) {
+      throw new ForbiddenException('Only the auction seller can control items');
+    }
+
+    const item = await this.getAuctionItem(itemId);
+    if (!item || item.auction_id !== auctionId) {
+      throw new NotFoundException('Auction item not found');
+    }
+
+    if (item.bidding_status !== 'ended') {
+      throw new BadRequestException('Item bidding must be ended before marking as sold');
+    }
+
+    // Update item status to sold
+    const { error } = await this.serviceSupabase
+      .from('auction_items')
+      .update({
+        bidding_status: 'sold',
+      })
+      .eq('id', itemId);
+
+    if (error) {
+      throw new BadRequestException('Failed to mark item as sold');
+    }
+
+    // Save win to database if there's a winner
+    if (item.winner_id && item.winning_bid) {
+      try {
+        await this.saveAuctionWin(
+          item.winner_id,
+          auctionId,
+          item.winning_bid,
+          itemId,
+        );
+      } catch (error) {
+        console.error('Failed to save auction win:', error);
+        // Don't throw - win saving failure shouldn't block the sale
+      }
+    }
+
+    // Broadcast item sold
+    await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'item_sold', {
+      item_id: itemId,
+      item_title: item.title,
+      winner: item.winner_id ? {
+        bidder_id: item.winner_id,
+        amount: item.winning_bid,
+      } : null,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Load next item
+    await this.loadNextItem(auctionId, sellerId);
+  }
+
+  /**
+   * Skip/Pass item (no bids or reserve not met)
+   */
+  async skipItem(auctionId: string, itemId: string, sellerId: string): Promise<void> {
+    // Verify auction ownership
+    const auction = await this.findById(auctionId);
+    if (!auction || auction.seller_id !== sellerId) {
+      throw new ForbiddenException('Only the auction seller can control items');
+    }
+
+    const item = await this.getAuctionItem(itemId);
+    if (!item || item.auction_id !== auctionId) {
+      throw new NotFoundException('Auction item not found');
+    }
+
+    // Update item status to passed
+    const { error } = await this.serviceSupabase
+      .from('auction_items')
+      .update({
+        bidding_status: 'passed',
+        bidding_ended_at: new Date().toISOString(),
+      })
+      .eq('id', itemId);
+
+    if (error) {
+      throw new BadRequestException('Failed to skip item');
+    }
+
+    // Load next item
+    await this.loadNextItem(auctionId, sellerId);
+  }
+
+  /**
+   * Load next item in auction
+   */
+  async loadNextItem(auctionId: string, sellerId: string): Promise<void> {
+    const nextItem = await this.getNextWaitingItem(auctionId);
+
+    if (nextItem) {
+      // Update auction to set current item
+      const { error } = await this.serviceSupabase
+        .from('auctions')
+        .update({
+          current_item_id: nextItem.id,
+        })
+        .eq('id', auctionId);
+
+      if (error) {
+        throw new BadRequestException('Failed to load next item');
+      }
+
+      // Get total items count
+      const { count } = await this.serviceSupabase
+        .from('auction_items')
+        .select('*', { count: 'exact', head: true })
+        .eq('auction_id', auctionId);
+
+      // Broadcast next item ready
+      await this.auctionGateway.broadcastItemEvent(auctionId, null, 'item_ready', {
+        item_id: nextItem.id,
+        item_title: nextItem.title,
+        item_number: nextItem.order_in_auction,
+        total_items: count || 0,
+        starting_price: nextItem.starting_price,
+        bid_increment: nextItem.bid_increment,
+        images: nextItem.images,
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      // No more items - end auction
+      await this.endAuction(auctionId);
+    }
+  }
+
+  /**
+   * End entire auction
+   */
+  private async endAuction(auctionId: string): Promise<void> {
+    const { error } = await this.serviceSupabase
+      .from('auctions')
+      .update({
+        status: 'ended',
+        end_time: new Date().toISOString(),
+      })
+      .eq('id', auctionId);
+
+    if (error) {
+      console.error('Error ending auction:', error);
+    }
+
+    // Broadcast auction ended
+    await this.auctionGateway.broadcastAuctionStatusChange(auctionId, 'ended', {
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Save auction win to database (for both live and timed auctions)
+   */
+  async saveAuctionWin(
+    userId: string,
+    auctionId: string,
+    winningBid: number,
+    itemId?: string,
+  ): Promise<any> {
+    try {
+      // Check if win already exists (prevent duplicates)
+      const existingWin = await this.serviceSupabase
+        .from('user_auction_wins')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('auction_id', auctionId)
+        .eq('item_id', itemId || null)
+        .in('status', ['pending_checkout', 'checked_out'])
+        .maybeSingle();
+
+      if (existingWin?.data) {
+        // Win already exists, return it
+        return existingWin.data;
+      }
+
+      // Create new win record
+      const { data, error } = await this.serviceSupabase
+        .from('user_auction_wins')
+        .insert({
+          user_id: userId,
+          auction_id: auctionId,
+          item_id: itemId || null,
+          winning_bid: winningBid,
+          status: 'pending_checkout',
+          expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), // 7 days
+        })
+        .select()
+        .single();
+
+      if (error) {
+        console.error('Error saving auction win:', error);
+        throw new BadRequestException(`Failed to save auction win: ${error.message}`);
+      }
+
+      return data;
+    } catch (error) {
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      console.error('Unexpected error saving auction win:', error);
+      throw new BadRequestException('Failed to save auction win');
+    }
+  }
+
+  /**
+   * Get user's auction wins
+   */
+  async getUserAuctionWins(
+    userId: string,
+    status?: 'pending_checkout' | 'checked_out' | 'expired',
+    userToken?: string,
+  ): Promise<any[]> {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.serviceSupabase;
+
+    let query = client
+      .from('user_auction_wins')
+      .select(`
+        *,
+        auction:auctions (
+          id,
+          title,
+          images,
+          thumbnail_url,
+          status,
+          auction_type
+        ),
+        item:auction_items (
+          id,
+          title,
+          images,
+          lot_number,
+          order_in_auction
+        )
+      `)
+      .eq('user_id', userId)
+      .order('won_at', { ascending: false });
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      throw new BadRequestException(`Failed to fetch auction wins: ${error.message}`);
+    }
+
+    return data || [];
+  }
+
+  /**
+   * Send a reaction to an auction
+   * Allows viewers to provide feedback to auctioneers
+   */
+  async sendReaction(userId: string, auctionId: string, reactionType: 'heart' | 'thumbs_up' | 'applause' | 'fire', userToken?: string): Promise<void> {
+    try {
+      const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.serviceSupabase;
+
+      // Verify auction exists and is active
+      const auction = await this.findById(auctionId);
+      if (!auction || auction.status !== 'active') {
+        throw new BadRequestException('Auction not found or not active');
+      }
+
+      // Save reaction to database
+      const { error } = await client
+        .from('auction_reactions')
+        .insert({
+          auction_id: auctionId,
+          user_id: userId,
+          reaction_type: reactionType,
+        });
+
+      if (error) {
+        // Handle unique constraint violation (user already sent this reaction type)
+        // For auctions, we allow multiple reactions, so this shouldn't happen with our schema
+        // But we'll handle it gracefully
+        if (error.code === '23505') {
+          // User already sent this reaction - that's okay, we allow multiple
+          // Just log and continue
+          console.log(`User ${userId} already sent ${reactionType} reaction to auction ${auctionId}`);
+        } else {
+          throw new BadRequestException(`Failed to save reaction: ${error.message}`);
+        }
+      }
+    } catch (error) {
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      console.error('Error sending auction reaction:', error);
+      throw new BadRequestException('Failed to send reaction');
+    }
+  }
+
+  /**
+   * Mark auction win as checked out (after order is created)
+   */
+  async markWinCheckedOut(winId: string, orderId: string, userId: string, userToken?: string): Promise<void> {
+    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.serviceSupabase;
+
+    // Verify win belongs to user
+    const { data: win, error: fetchError } = await client
+      .from('user_auction_wins')
+      .select('user_id')
+      .eq('id', winId)
+      .single();
+
+    if (fetchError || !win) {
+      throw new NotFoundException('Auction win not found');
+    }
+
+    if (win.user_id !== userId) {
+      throw new ForbiddenException('You do not have permission to update this win');
+    }
+
+    // Update win status
+    const { error } = await client
+      .from('user_auction_wins')
+      .update({
+        status: 'checked_out',
+        order_id: orderId,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', winId);
+
+    if (error) {
+      throw new BadRequestException(`Failed to mark win as checked out: ${error.message}`);
+    }
   }
 }

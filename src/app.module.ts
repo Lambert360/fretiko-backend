@@ -40,6 +40,7 @@ import { DepartmentsModule } from './departments/departments.module';
 import { MemosModule } from './memos/memos.module';
 import { ReportsModule } from './reports/reports.module';
 import { AuditModule } from './audit/audit.module';
+import { GiftModule } from './gifts/gift.module';
 
 @Module({
   imports: [
@@ -85,6 +86,7 @@ import { AuditModule } from './audit/audit.module';
     MemosModule,
     ReportsModule,
     AuditModule,
+    GiftModule,
   ],
   controllers: [AppController, ExchangeRateController],
   providers: [

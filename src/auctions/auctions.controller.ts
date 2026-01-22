@@ -19,7 +19,7 @@ import {
 } from '@nestjs/common';
 import { FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 import { AuctionsService } from './auctions.service';
-import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto, WatchlistDto } from './dto';
+import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto, WatchlistDto, CreateAuctionItemDto } from './dto';
 import { AuctionOwnerGuard, AuctionActiveGuard } from './guards';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../auth/optional-jwt-auth.guard';
@@ -262,31 +262,40 @@ export class AuctionsController {
     @Query('role') role: 'host' | 'audience' = 'audience',
     @Request() req: any,
   ) {
-    // Verify auction exists and is a live auction
-    const auction = await this.auctionsService.findById(auctionId, req.user.sub);
-    
-    if (auction.auction_type !== 'live') {
-      throw new BadRequestException('This auction is not a live auction');
+    const userId = req.user?.sub;
+    if (!userId) {
+      throw new BadRequestException('User not authenticated');
     }
-    
-    // For hosts, verify they own the auction
-    if (role === 'host' && auction.seller_id !== req.user.sub) {
-      throw new UnauthorizedException('Only the auction owner can host the stream');
-    }
-    
-    // Generate channel name for this auction
-    const channelName = `auction_${auctionId}`;
-    
-    return {
-      auctionId,
-      channelName,
-      role,
-      auctionTitle: auction.title,
-      currentBid: auction.current_bid,
-      // Note: Actual Agora token generation would be integrated here
-      // using the liveSalesService.generateAgoraToken() method
-      message: 'Endpoint ready - integrate with Agora token service',
-    };
+
+    return this.auctionsService.generateAgoraToken(auctionId, userId, role);
+  }
+
+  /**
+   * Start broadcasting for a live auction
+   * Called when auctioneer successfully joins Agora channel
+   */
+  @Post(':id/start-broadcast')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async startBroadcast(
+    @Param('id') auctionId: string,
+    @Request() req: any,
+  ) {
+    return this.auctionsService.startBroadcast(auctionId, req.user.sub);
+  }
+
+  /**
+   * Stop broadcasting for a live auction
+   * Called when auctioneer leaves Agora channel
+   */
+  @Post(':id/stop-broadcast')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async stopBroadcast(
+    @Param('id') auctionId: string,
+    @Request() req: any,
+  ) {
+    return this.auctionsService.stopBroadcast(auctionId, req.user.sub);
   }
 
   /**
@@ -333,6 +342,199 @@ export class AuctionsController {
   @HttpCode(HttpStatus.NO_CONTENT)
   async deleteAuction(@Param('id') id: string, @Request() req: any) {
     return this.auctionsService.cancelAuction(id, req.user.sub);
+  }
+
+  // ==================== AUCTION ITEM CONTROLS (Auctioneer) ====================
+
+  /**
+   * Create a new auction item during live auction
+   * Allows host to add items on-the-fly
+   * Only auction seller can add items
+   */
+  @Post(':auctionId/items')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @UseInterceptors(
+    FileFieldsInterceptor([
+      { name: 'images', maxCount: 10 },
+    ]),
+  )
+  @HttpCode(HttpStatus.CREATED)
+  async createAuctionItem(
+    @Param('auctionId') auctionId: string,
+    @Body() body: any, // Use any for FormData parsing
+    @UploadedFiles() files: { images?: Express.Multer.File[] },
+    @Request() req: any,
+  ) {
+    console.log('📸 Received', files?.images?.length || 0, 'images for auction item creation');
+    console.log('📝 Raw FormData body:', body);
+
+    // Parse FormData fields manually (FormData sends everything as strings)
+    const createAuctionItemDto: CreateAuctionItemDto = {
+      title: body.title,
+      description: body.description || undefined,
+      lot_number: body.lot_number || undefined,
+      starting_price: parseFloat(body.starting_price),
+      reserve_price: body.reserve_price ? parseFloat(body.reserve_price) : undefined,
+      bid_increment: body.bid_increment ? parseFloat(body.bid_increment) : undefined,
+      bidding_duration: body.bidding_duration ? parseInt(body.bidding_duration) : undefined,
+      images: [], // Will be populated by the service from uploaded files
+    };
+
+    console.log('📦 Parsed item data:', createAuctionItemDto);
+
+    return this.auctionsService.createAuctionItem(
+      auctionId,
+      req.user.sub,
+      createAuctionItemDto,
+      req.supabaseToken,
+      files?.images || [],
+    );
+  }
+
+  /**
+   * Get current auction item
+   */
+  @Get(':auctionId/current-item')
+  @UseGuards(JwtAuthGuard)
+  async getCurrentItem(@Param('auctionId') auctionId: string) {
+    return this.auctionsService.getCurrentAuctionItem(auctionId);
+  }
+
+  /**
+   * Get all auction items for an auction
+   */
+  @Get(':auctionId/items')
+  @UseGuards(JwtAuthGuard)
+  async getAuctionItems(@Param('auctionId') auctionId: string) {
+    return this.auctionsService.getAuctionItems(auctionId);
+  }
+
+  /**
+   * Start countdown for auction item (3-2-1 countdown)
+   * Only auction seller can control
+   */
+  @Post(':auctionId/items/:itemId/start-countdown')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async startItemCountdown(
+    @Param('auctionId') auctionId: string,
+    @Param('itemId') itemId: string,
+    @Request() req: any,
+  ) {
+    await this.auctionsService.startItemCountdown(auctionId, itemId, req.user.sub);
+    return { message: 'Countdown started', item_id: itemId };
+  }
+
+  /**
+   * Open bidding for auction item
+   * Only auction seller can control
+   */
+  @Post(':auctionId/items/:itemId/open-bidding')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async openItemBidding(
+    @Param('auctionId') auctionId: string,
+    @Param('itemId') itemId: string,
+    @Request() req: any,
+  ) {
+    await this.auctionsService.openItemBidding(auctionId, itemId, req.user.sub);
+    return { message: 'Bidding opened', item_id: itemId };
+  }
+
+  /**
+   * End bidding for auction item (manual)
+   * Only auction seller can control
+   */
+  @Post(':auctionId/items/:itemId/end-bidding')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async endItemBidding(
+    @Param('auctionId') auctionId: string,
+    @Param('itemId') itemId: string,
+    @Request() req: any,
+  ) {
+    await this.auctionsService.endItemBidding(auctionId, itemId, req.user.sub);
+    return { message: 'Bidding ended', item_id: itemId };
+  }
+
+  /**
+   * Mark item as sold (auctioneer strikes gavel)
+   * Only auction seller can control
+   */
+  @Post(':auctionId/items/:itemId/mark-sold')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async markItemSold(
+    @Param('auctionId') auctionId: string,
+    @Param('itemId') itemId: string,
+    @Request() req: any,
+  ) {
+    await this.auctionsService.markItemSold(auctionId, itemId, req.user.sub);
+    return { message: 'Item marked as sold', item_id: itemId };
+  }
+
+  /**
+   * Skip/Pass item (no bids or reserve not met)
+   * Only auction seller can control
+   */
+  @Post(':auctionId/items/:itemId/skip')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async skipItem(
+    @Param('auctionId') auctionId: string,
+    @Param('itemId') itemId: string,
+    @Request() req: any,
+  ) {
+    await this.auctionsService.skipItem(auctionId, itemId, req.user.sub);
+    return { message: 'Item skipped', item_id: itemId };
+  }
+
+  /**
+   * Load next item in auction
+   * Only auction seller can control
+   */
+  @Post(':auctionId/load-next-item')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async loadNextItem(
+    @Param('auctionId') auctionId: string,
+    @Request() req: any,
+  ) {
+    await this.auctionsService.loadNextItem(auctionId, req.user.sub);
+    return { message: 'Next item loaded' };
+  }
+
+  /**
+   * Get user's auction wins
+   * Returns all won auction items (pending checkout, checked out, expired)
+   */
+  @Get('user/my-wins')
+  @UseGuards(JwtAuthGuard)
+  async getUserAuctionWins(
+    @Request() req: any,
+    @Query('status') status?: 'pending_checkout' | 'checked_out' | 'expired',
+  ) {
+    return this.auctionsService.getUserAuctionWins(req.user.sub, status, req.headers.authorization?.replace('Bearer ', ''));
+  }
+
+  /**
+   * Mark auction win as checked out (after order is created)
+   */
+  @Put('wins/:winId/checkout')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async markWinCheckedOut(
+    @Param('winId') winId: string,
+    @Body() body: { orderId: string },
+    @Request() req: any,
+  ) {
+    await this.auctionsService.markWinCheckedOut(
+      winId,
+      body.orderId,
+      req.user.sub,
+      req.headers.authorization?.replace('Bearer ', ''),
+    );
+    return { message: 'Win marked as checked out', win_id: winId };
   }
 
 }

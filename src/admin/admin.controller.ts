@@ -95,6 +95,33 @@ export class AdminController {
   }
 
   /**
+   * Get auction analytics summary
+   * GET /admin/analytics/auctions/summary?start=...&end=...
+   */
+  @Get('analytics/auctions/summary')
+  async getAuctionAnalyticsSummary(
+    @Request() req,
+    @Query('start') start?: string,
+    @Query('end') end?: string,
+  ) {
+    // Validate date parameters if provided
+    if (start) this.validateDateString(start, 'start');
+    if (end) this.validateDateString(end, 'end');
+
+    // Validate date range if both dates are provided
+    if (start && end) {
+      const startDate = new Date(start);
+      const endDate = new Date(end);
+      if (startDate >= endDate) {
+        throw new BadRequestException('Start date must be before end date');
+      }
+    }
+
+    const dateRange = start && end ? { start, end } : undefined;
+    return this.adminService.getAuctionAnalyticsSummary(req.user.sub, dateRange);
+  }
+
+  /**
    * Get platform wallet balance
    * GET /admin/platform/wallet
    * Restricted to staff users only

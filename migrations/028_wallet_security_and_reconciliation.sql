@@ -177,7 +177,7 @@ BEGIN
             NULL::DECIMAL as escrow_balance_after,
             NULL::DECIMAL as pending_withdrawal_after,
             NULL::UUID as ledger_entry_id,
-            format('Insufficient balance. Available: %, Required: %', 
+            format('Insufficient balance. Available: %s, Required: %s', 
                 v_current_available, ABS(p_available_delta))::TEXT as error_message;
         RETURN;
     END IF;
@@ -304,7 +304,7 @@ BEGIN
             NULL::DECIMAL as daily_limit,
             NULL::DECIMAL as daily_used,
             NULL::DECIMAL as remaining,
-            format('Invalid limit type: %', p_limit_type)::TEXT as error_message;
+            format('Invalid limit type: %s', p_limit_type)::TEXT as error_message;
         RETURN;
     END IF;
     
@@ -325,7 +325,7 @@ BEGIN
             v_wallet_limit as daily_limit,
             v_daily_used as daily_used,
             GREATEST(0, v_wallet_limit - v_daily_used) as remaining,
-            format('Daily % limit exceeded. Limit: %, Used: %, Requested: %, Remaining: %',
+            format('Daily %s limit exceeded. Limit: %s, Used: %s, Requested: %s, Remaining: %s',
                 p_limit_type, v_wallet_limit, v_daily_used, p_amount,
                 GREATEST(0, v_wallet_limit - v_daily_used))::TEXT as error_message;
         RETURN;

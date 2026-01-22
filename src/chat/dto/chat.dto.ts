@@ -588,6 +588,13 @@ export class CallSessionResponseDto {
     avatarUrl?: string;
   };
   metadata?: any;
+  agoraConfig?: {
+    appId: string;
+    channel: string;
+    token: string;
+    uid: number;
+  };
+  rtcConfiguration?: any; // Backward compatibility
 }
 
 export class CallParticipantResponseDto {

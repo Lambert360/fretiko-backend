@@ -1,7 +1,7 @@
 import { Injectable, BadRequestException, NotFoundException, ForbiddenException, HttpException, HttpStatus, Inject, forwardRef, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { EscrowService } from '../escrow/escrow.service';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { WalletService } from '../wallet/wallet.service';
@@ -16,6 +16,7 @@ import {
   LiveServiceBookingDto,
   JoinStreamDto,
   LeaveStreamDto,
+  LiveStreamProductDto,
   LiveStreamResponse,
   LiveStreamStatsResponse,
   CommentResponse,
@@ -60,7 +61,9 @@ export class LiveSalesService {
     private notificationHelper: NotificationHelperService,
     private walletService: WalletService,
   ) {
-    this.supabase = createSupabaseClient(this.configService);
+    // CRITICAL: Use service role client to bypass RLS for system operations
+    // like updating agora_resource_id, agora_sid, and other system fields
+    this.supabase = createServiceSupabaseClient(this.configService);
     this.PLATFORM_COMMISSION_RATE = parseFloat(
       this.configService.get<string>('PLATFORM_COMMISSION_RATE', '0.1')
     );
@@ -326,7 +329,7 @@ export class LiveSalesService {
 
       // Track viewer join if userId provided
       if (userId && stream.status === StreamStatus.LIVE) {
-        await this.joinStream(streamId, userId);
+        await this.joinStream(streamId, userId, undefined); // No accessToken available in this context
       }
 
       return {
@@ -410,7 +413,9 @@ export class LiveSalesService {
           productsToInsert,
         });
 
-        const { error: productError } = await supabaseClient
+        // Use service role client to bypass RLS policies during stream creation
+        // This ensures products are always added successfully without timing/transaction issues
+        const { error: productError } = await this.supabase
           .from('live_stream_products')
           .insert(productsToInsert);
 
@@ -446,6 +451,7 @@ export class LiveSalesService {
     streamId: string,
     vendorId: string,
     updateStatusDto: UpdateStreamStatusDto,
+    accessToken?: string,
   ): Promise<LiveStreamResponse> {
     try {
       // Verify ownership
@@ -472,18 +478,60 @@ export class LiveSalesService {
       if (updateStatusDto.status === StreamStatus.LIVE) {
         updateData.started_at = new Date().toISOString();
         updateData.stream_url = updateStatusDto.stream_url;
+        
+        // 🚀 Start HLS Cloud Recording with S3
+        // Run in background to not block status update
+        this.startHLSConversion(streamId).catch(err => {
+          this.logger.warn(`⚠️ HLS conversion start failed for stream ${streamId}: ${err.message}`);
+          // Don't throw - HLS is optional, stream can continue without it
+        });
       } else if (updateStatusDto.status === StreamStatus.ENDED) {
         updateData.ended_at = new Date().toISOString();
+        
+        // Stop recording and get HLS URL from S3
+        // Give a small delay to ensure any in-flight recording updates are committed
+        setTimeout(() => {
+          this.stopHLSRecording(streamId).catch(err => {
+            this.logger.warn(`⚠️ Failed to stop recording for stream ${streamId}: ${err.message}`);
+          });
+        }, 2000); // 2 second delay
       }
 
-      const { error: updateError } = await this.supabase
+      this.logger.log(`🔄 Updating stream ${streamId} status to ${updateStatusDto.status}`);
+
+      // CRITICAL: Use service role client for updates to preserve agora_resource_id and agora_sid
+      // User clients may have RLS restrictions that prevent reading/writing these system fields
+      // This ensures Cloud Recording IDs are never accidentally cleared
+      const clientForUpdate = this.supabase; // Always use service role
+
+      this.logger.log(`📝 Updating stream with data: ${JSON.stringify(updateData)}`);
+
+      const { data: updateResult, error: updateError } = await clientForUpdate
         .from('live_streams')
         .update(updateData)
-        .eq('id', streamId);
+        .eq('id', streamId)
+        .select('id, status'); // Verify the update
 
-      if (updateError) throw updateError;
+      if (updateError) {
+        this.logger.error(`❌ Stream status update failed: ${updateError.message}`);
+        this.logger.error(`   Full error: ${JSON.stringify(updateError)}`);
+        throw updateError;
+      }
 
-      return await this.getStreamById(streamId);
+      if (!updateResult || updateResult.length === 0) {
+        this.logger.error(`❌ Stream status update returned no rows. Stream ${streamId} may not exist.`);
+        throw new Error(`Stream ${streamId} not found for update`);
+      }
+
+      this.logger.log(`✅ Stream status update completed for ${streamId}. Updated status: ${updateResult[0]?.status}`);
+
+      // Small delay to ensure database commit
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      const updatedStream = await this.getStreamById(streamId);
+      this.logger.log(`📊 Verified stream status in DB: ${updatedStream.status}`);
+
+      return updatedStream;
     } catch (error) {
       this.logEvent('error', 'stream_status_update_exception', {
         streamId,
@@ -499,8 +547,116 @@ export class LiveSalesService {
   /**
    * End a live stream
    */
-  async endStream(streamId: string, vendorId: string): Promise<void> {
-    await this.updateStreamStatus(streamId, vendorId, { status: StreamStatus.ENDED });
+  async endStream(streamId: string, vendorId: string, accessToken?: string): Promise<void> {
+    await this.updateStreamStatus(streamId, vendorId, { status: StreamStatus.ENDED }, accessToken);
+  }
+
+  /**
+   * Add product to existing live stream
+   */
+  async addProductToStream(
+    streamId: string,
+    vendorId: string,
+    productDto: LiveStreamProductDto,
+    userToken?: string,
+  ): Promise<any> {
+    try {
+      // Verify stream ownership and status
+      const { data: stream, error: streamError } = await this.supabase
+        .from('live_streams')
+        .select('vendor_id, status, stream_type')
+        .eq('id', streamId)
+        .single();
+
+      if (streamError || !stream) {
+        throw new NotFoundException('Live stream not found');
+      }
+
+      if (stream.vendor_id !== vendorId) {
+        throw new ForbiddenException('Only stream owner can add products');
+      }
+
+      if (stream.status !== 'live' && stream.status !== 'setup') {
+        throw new BadRequestException('Can only add products to live or setup streams');
+      }
+
+      if (stream.stream_type !== 'products') {
+        throw new BadRequestException('Can only add products to product streams');
+      }
+
+      // Check if product already exists in stream
+      const { data: existingProduct } = await this.supabase
+        .from('live_stream_products')
+        .select('id')
+        .eq('stream_id', streamId)
+        .eq('product_id', productDto.product_id)
+        .single();
+
+      if (existingProduct) {
+        throw new BadRequestException('Product already exists in this stream');
+      }
+
+      // Get current max display_order
+      const { data: existingProducts } = await this.supabase
+        .from('live_stream_products')
+        .select('display_order')
+        .eq('stream_id', streamId)
+        .order('display_order', { ascending: false })
+        .limit(1);
+
+      const displayOrder = productDto.display_order || ((existingProducts?.[0]?.display_order || -1) + 1);
+
+      // Use service role client to bypass RLS policies
+      // This ensures products are always added successfully without timing/transaction issues
+      // We've already verified ownership above, so this is safe
+      const { data: newProduct, error: insertError } = await this.supabase
+        .from('live_stream_products')
+        .insert({
+          stream_id: streamId,
+          product_id: productDto.product_id,
+          live_price: productDto.live_price,
+          live_stock: productDto.live_stock,
+          original_stock: productDto.live_stock,
+          display_order: displayOrder,
+          is_featured: productDto.is_featured || false,
+        })
+        .select(`
+          id,
+          product_id,
+          live_price,
+          live_stock,
+          original_stock,
+          sold_count,
+          display_order,
+          is_featured,
+          product:products!product_id (
+            id,
+            name,
+            primary_image_url,
+            category:product_categories!category_id (
+              name
+            )
+          )
+        `)
+        .single();
+
+      if (insertError || !newProduct) {
+        throw new BadRequestException(`Failed to add product: ${insertError?.message}`);
+      }
+
+      this.logEvent('log', 'product_added_to_stream', {
+        streamId,
+        vendorId,
+        productId: productDto.product_id,
+      });
+
+      return newProduct;
+    } catch (error) {
+      this.logEvent('error', 'add_product_to_stream_error', { streamId, vendorId }, error instanceof Error ? error : new Error(String(error)));
+      throw error instanceof BadRequestException || error instanceof ForbiddenException || error instanceof NotFoundException
+        ? error
+        : new BadRequestException('Failed to add product to stream');
+    }
   }
 
   // =====================
@@ -510,9 +666,11 @@ export class LiveSalesService {
   /**
    * Join a live stream as a viewer
    */
-  async joinStream(streamId: string, userId: string): Promise<void> {
+  async joinStream(streamId: string, userId: string, accessToken?: string, retryCount = 0): Promise<void> {
     try {
       // Check if stream exists and is live
+      this.logger.log(`🔍 Checking stream ${streamId} status for join (retry: ${retryCount})`);
+
       const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
         .select('status')
@@ -523,12 +681,26 @@ export class LiveSalesService {
         throw new NotFoundException('Live stream not found');
       }
 
+      this.logger.log(`📊 Stream ${streamId} status from DB: ${stream.status}`);
+
+      // ✅ RETRY LOGIC: Handle race condition between updateStreamStatus and joinStream
+      if (stream.status !== StreamStatus.LIVE && retryCount < 3) {
+        this.logger.log(`Stream ${streamId} not live yet, retrying... (${retryCount + 1}/3)`);
+        await new Promise(resolve => setTimeout(resolve, 100 * (retryCount + 1))); // Progressive delay: 100ms, 200ms, 300ms
+        return this.joinStream(streamId, userId, accessToken, retryCount + 1);
+      }
+
       if (stream.status !== StreamStatus.LIVE) {
         throw new BadRequestException('Stream is not currently live');
       }
 
       // Insert or update viewer record
-      const { error: viewerError } = await this.supabase
+      // ✅ Use user client for viewer operations (respects RLS policies)
+      const clientForViewerOps = accessToken
+        ? createUserSupabaseClient(this.configService, accessToken)
+        : this.supabase;
+
+      const { error: viewerError } = await clientForViewerOps
         .from('live_stream_viewers')
         .upsert({
           stream_id: streamId,
@@ -697,7 +869,11 @@ export class LiveSalesService {
           onConflict: 'stream_id,user_id,reaction_type',
         });
 
-      if (error) throw error;
+      if (error) {
+        // Properly serialize Supabase error before throwing
+        const errorMessage = error.message || JSON.stringify(error);
+        throw new Error(`Failed to save reaction: ${errorMessage}`);
+      }
 
       // Log analytics
       await this.logAnalytics(sendReactionDto.stream_id, 'reaction', 1, {
@@ -705,11 +881,29 @@ export class LiveSalesService {
         reaction_type: sendReactionDto.reaction_type,
       });
     } catch (error) {
+      // Properly extract error message
+      let errorMessage = 'Failed to send reaction';
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      } else if (typeof error === 'string') {
+        errorMessage = error;
+      } else if (error && typeof error === 'object') {
+        errorMessage = (error as any).message || JSON.stringify(error);
+      }
+      
       this.logEvent('error', 'send_reaction_exception', {
         streamId: sendReactionDto.stream_id,
         userId,
-      }, error instanceof Error ? error : new Error(String(error)));
-      throw new BadRequestException('Failed to send reaction');
+        error: errorMessage,
+      }, error instanceof Error ? error : new Error(errorMessage));
+      
+      throw new BadRequestException(
+        errorMessage.includes('not found')
+          ? 'Stream not found or not live'
+          : errorMessage.includes('violates row-level security')
+          ? 'Unable to send reaction. Please try again.'
+          : `Failed to send reaction: ${errorMessage}`
+      );
     }
   }
 
@@ -977,16 +1171,31 @@ export class LiveSalesService {
       };
 
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorDetails = error instanceof Error ? error.stack : JSON.stringify(error);
+      
       this.logEvent('error', 'send_gift_exception', {
         streamId: sendGiftDto.stream_id,
         userId,
         giftType: sendGiftDto.gift_type,
         quantity: sendGiftDto.quantity,
+        error: errorMessage,
+        errorDetails,
       }, error instanceof Error ? error : new Error(String(error)));
+      
+      // Re-throw specific exceptions as-is
       if (error instanceof NotFoundException || error instanceof BadRequestException) {
         throw error;
       }
-      throw new BadRequestException('Failed to send gift');
+      
+      // Provide more descriptive error message
+      throw new BadRequestException(
+        errorMessage.includes('balance') 
+          ? 'Insufficient wallet balance for gift'
+          : errorMessage.includes('not found')
+          ? 'Gift type or stream not found'
+          : `Failed to send gift: ${errorMessage}`
+      );
     }
   }
 
@@ -1057,6 +1266,8 @@ export class LiveSalesService {
       }
 
       // 2. Get live stream product details
+      this.logger.debug(`🔍 Querying live_stream_products for stream_id: ${purchaseDto.stream_id}, product_id: ${purchaseDto.product_id}`);
+      
       const { data: liveProduct, error: productError } = await this.supabase
         .from('live_stream_products')
         .select(`
@@ -1069,16 +1280,52 @@ export class LiveSalesService {
             id,
             name,
             description,
-            vendor_id
+            user_id
           )
         `)
         .eq('stream_id', purchaseDto.stream_id)
         .eq('product_id', purchaseDto.product_id)
         .single();
 
-      if (productError || !liveProduct) {
+      if (productError) {
+        this.logger.error(`❌ Error querying live_stream_products:`, {
+          error: productError,
+          code: productError.code,
+          message: productError.message,
+          details: productError.details,
+          hint: productError.hint,
+          stream_id: purchaseDto.stream_id,
+          product_id: purchaseDto.product_id,
+        });
+        
+        // Check if it's a "not found" error (PGRST116) or something else
+        if (productError.code === 'PGRST116') {
+          // Try to see if product exists at all in the stream
+          const { data: allProducts, error: checkError } = await this.supabase
+            .from('live_stream_products')
+            .select('id, product_id, stream_id')
+            .eq('stream_id', purchaseDto.stream_id);
+          
+          this.logger.debug(`📦 Products in stream ${purchaseDto.stream_id}:`, {
+            count: allProducts?.length || 0,
+            products: allProducts,
+            checkError,
+          });
+        }
+        
         throw new NotFoundException('Product not found in this stream');
       }
+
+      if (!liveProduct) {
+        this.logger.error(`❌ No product returned (but no error) for stream_id: ${purchaseDto.stream_id}, product_id: ${purchaseDto.product_id}`);
+        throw new NotFoundException('Product not found in this stream');
+      }
+
+      this.logger.debug(`✅ Found live product:`, {
+        id: liveProduct.id,
+        product_id: liveProduct.product_id,
+        stream_id: purchaseDto.stream_id,
+      });
 
       // 3. Check for duplicate purchase (idempotency) - BEFORE stock deduction
       // Prevent duplicate purchases within last 30 seconds for same product and quantity
@@ -1086,12 +1333,17 @@ export class LiveSalesService {
       const duplicateCheckWindowMs = this.configService.get<number>('LIVE_SALES_DUPLICATE_WINDOW_MS') || 30000; // Default 30 seconds
       const duplicateCheckWindow = new Date(Date.now() - duplicateCheckWindowMs).toISOString();
 
+      // Get product vendor ID for duplicate check and order creation
+      // Note: We'll get this from liveProduct.product.user_id after fetching the product
+      // For now, use stream.vendor_id in duplicate check (will be updated after product fetch)
+      
       // Check for recent orders with same product and quantity
+      // Note: This check happens before we fetch the product, so we use stream.vendor_id as approximation
+      // The actual vendor_id will be set correctly when creating the order
       const { data: recentOrders, error: duplicateError } = await this.supabase
         .from('orders')
         .select('id, order_number, status, created_at, metadata')
         .eq('buyer_id', userId)
-        .eq('vendor_id', stream.vendor_id)
         .eq('source', 'live_stream')
         .in('status', ['pending', 'paid', 'processing']) // Check active orders
         .gte('created_at', duplicateCheckWindow) // Within configured window
@@ -1291,12 +1543,17 @@ export class LiveSalesService {
       const orderNumber = `LIVE-${Date.now()}-${Math.random().toString(36).substring(7).toUpperCase()}`;
 
       // 8. Create order record for live stream purchase
+      // Use product owner (product.user_id) as vendor_id, not stream owner
+      // This ensures the product owner receives payment, even if products from different vendors are in the same stream
+      const productVendorId = liveProduct.product.user_id;
+      
       // Validate required data before attempting order creation
-      if (!userId || !stream.vendor_id || !totalAmount) {
+      if (!userId || !productVendorId || !totalAmount) {
         this.logEvent('error', 'invalid_purchase_order_data', {
           purchaseId,
           userId,
-          vendorId: stream.vendor_id,
+          productVendorId,
+          streamVendorId: stream.vendor_id,
           totalAmount,
         });
         throw new BadRequestException('Invalid order data: missing required fields');
@@ -1309,7 +1566,7 @@ export class LiveSalesService {
           .insert({
             order_number: orderNumber,
             buyer_id: userId,
-            vendor_id: stream.vendor_id,
+            vendor_id: productVendorId, // Use product owner, not stream owner
             total_amount: totalAmount,
             delivery_fee: deliveryFee,
             platform_fee: platformFee,
@@ -1322,6 +1579,7 @@ export class LiveSalesService {
             metadata: {
               stream_id: purchaseDto.stream_id,
               stream_title: stream.title,
+              booking_type: 'product', // Distinguish product purchases within live_stream
               transaction_id: transactionId,
               subtotal: subtotal,
               unit_price: unitPrice,
@@ -1335,7 +1593,8 @@ export class LiveSalesService {
           this.logEvent('error', 'order_creation_failed', {
             purchaseId,
             userId,
-            vendorId: stream.vendor_id,
+            productVendorId,
+            streamVendorId: stream.vendor_id,
             totalAmount,
             orderNumber,
             errorCode: orderError.code,
@@ -1436,7 +1695,8 @@ export class LiveSalesService {
         orderId: order.id,
         orderNumber: order.order_number,
         userId,
-        vendorId: stream.vendor_id,
+        productVendorId,
+        streamVendorId: stream.vendor_id,
       });
 
       // 9. Create order item
@@ -1552,11 +1812,106 @@ export class LiveSalesService {
           amount: totalAmount,
         });
 
-        // Update order status to paid
+        // Generate handoff PINs (3-digit) for order verification
+        // For self-pickup: only delivery PIN needed (buyer shows to vendor)
+        // For regular delivery: both PINs needed (pickup PIN for rider→vendor, delivery PIN for rider→buyer)
+        const pickupPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
+        const deliveryPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
+        
+        // Update order with PINs and keep status as 'pending' so vendor can accept it
+        // Status will change to 'processing' when vendor accepts, then 'paid' when completed
         await this.supabase
           .from('orders')
-          .update({ status: 'paid' })
+          .update({ 
+            pickup_pin: pickupPin,
+            delivery_pin: deliveryPin,
+            status: 'pending', // Keep as 'pending' so vendor can accept the order
+            updated_at: new Date().toISOString(),
+          })
           .eq('id', order.id);
+        
+        this.logEvent('log', 'pins_generated', {
+          purchaseId,
+          orderId: order.id,
+          orderNumber: order.order_number,
+          pickupPin,
+          deliveryPin,
+          deliveryType: purchaseDto.rider_id ? 'delivery' : 'pickup',
+        });
+
+        // Send PIN notifications to relevant parties
+        try {
+          // Get vendor profile for notifications (use product owner, not stream owner)
+          const { data: vendorProfile } = await this.supabase
+            .from('user_profiles')
+            .select('username')
+            .eq('id', productVendorId)
+            .single();
+
+          const deliveryType = purchaseDto.rider_id ? 'delivery' : 'pickup';
+          
+          if (deliveryType === 'pickup') {
+            // Self-pickup: Send deliveryPin to BOTH vendor and buyer
+            // Buyer provides deliveryPin to vendor for handoff verification
+            
+            // Send deliveryPin to vendor (for verification) - use product owner
+            await this.notificationHelper.notifyVendorSelfPickupPin(productVendorId, {
+              id: order.id,
+              orderNumber: order.order_number,
+              deliveryPin: deliveryPin,
+              buyerName: 'Live Stream Customer', // Could fetch buyer username if needed
+            });
+            this.logEvent('log', 'pickup_pin_sent_to_vendor', {
+              orderId: order.id,
+              productVendorId,
+            });
+
+            // Send deliveryPin to buyer (to provide to vendor)
+            await this.notificationHelper.notifyBuyerSelfPickupPin(userId, {
+              id: order.id,
+              orderNumber: order.order_number,
+              deliveryPin: deliveryPin,
+              vendorName: vendorProfile?.username,
+            });
+            this.logEvent('log', 'pickup_pin_sent_to_buyer', {
+              orderId: order.id,
+              buyerId: userId,
+            });
+          } else {
+            // Regular delivery: Send pickupPin to rider, deliveryPin to buyer
+            
+            // Send pickup PIN to rider
+            if (purchaseDto.rider_id) {
+              await this.notificationHelper.notifyRiderPickupPin(purchaseDto.rider_id, {
+                id: order.id,
+                orderNumber: order.order_number,
+                pickupPin: pickupPin,
+                vendorName: vendorProfile?.username,
+              });
+              this.logEvent('log', 'pickup_pin_sent_to_rider', {
+                orderId: order.id,
+                riderId: purchaseDto.rider_id,
+              });
+            }
+
+            // Send delivery PIN to buyer
+            await this.notificationHelper.notifyBuyerDeliveryPin(userId, {
+              id: order.id,
+              orderNumber: order.order_number,
+              deliveryPin: deliveryPin,
+            });
+            this.logEvent('log', 'delivery_pin_sent_to_buyer', {
+              orderId: order.id,
+              buyerId: userId,
+            });
+          }
+        } catch (pinNotifyError) {
+          this.logEvent('warn', 'pin_notification_failed', {
+            orderId: order.id,
+            error: pinNotifyError instanceof Error ? pinNotifyError.message : String(pinNotifyError),
+          });
+          // Don't throw - PIN notification failure is non-critical
+        }
 
       } catch (escrowError) {
         this.logEvent('error', 'escrow_creation_failed', {
@@ -1597,9 +1952,9 @@ export class LiveSalesService {
         );
       }
 
-      // 12. Notify vendor of new order
+      // 12. Notify vendor of new order (notify product owner, not stream owner)
       try {
-        await this.notificationHelper.notifyVendorNewOrder(stream.vendor_id, {
+        await this.notificationHelper.notifyVendorNewOrder(productVendorId, {
           id: order.id,
           orderNumber: order.order_number,
           totalAmount: totalAmount,
@@ -1608,7 +1963,7 @@ export class LiveSalesService {
         });
 
         // Notify vendor payment is in escrow
-        await this.notificationHelper.notifyVendorOrderPaid(stream.vendor_id, {
+        await this.notificationHelper.notifyVendorOrderPaid(productVendorId, {
           orderId: order.id,
           orderNumber: order.order_number,
           vendorAmount: vendorAmount,
@@ -1616,12 +1971,14 @@ export class LiveSalesService {
         });
 
         this.logEvent('debug', 'vendor_notified', {
-          vendorId: stream.vendor_id,
+          productVendorId,
+          streamVendorId: stream.vendor_id,
           orderId: order.id,
         });
       } catch (notifyError) {
         this.logEvent('warn', 'vendor_notification_failed', {
-          vendorId: stream.vendor_id,
+          productVendorId,
+          streamVendorId: stream.vendor_id,
           orderId: order.id,
         }, notifyError instanceof Error ? notifyError : new Error(String(notifyError)));
       }
@@ -1985,7 +2342,8 @@ export class LiveSalesService {
         .select('id, order_number, status, created_at, metadata')
         .eq('buyer_id', userId)
         .eq('vendor_id', stream.vendor_id)
-        .eq('source', 'service_booking')
+        .eq('source', 'live_stream')
+        .eq('metadata->>booking_type', 'service')
         .in('status', ['pending', 'paid', 'processing'])
         .gte('created_at', duplicateCheckWindow)
         .order('created_at', { ascending: false })
@@ -2151,9 +2509,10 @@ export class LiveSalesService {
             platform_fee: platformFee,
             status: 'pending',
             escrow_enabled: true,
-            source: 'service_booking',
+            source: 'live_stream',
             metadata: {
               stream_id: bookingDto.stream_id,
+              booking_type: 'service', // Distinguish service bookings within live_stream
               service_id: liveService.service_id,
               service_name: liveService.service.name,
               booking_date: bookingDto.service_date,
@@ -2690,6 +3049,459 @@ export class LiveSalesService {
   }
 
   /**
+   * Start HLS Cloud Recording for a live stream
+   *
+   * Uses Agora's Cloud Recording API (3-step process):
+   * 1. Acquire - Get a resource ID
+   * 2. Start - Begin recording with HLS configuration + S3 storage
+   * 3. Store resourceId/sid for later Query/Stop
+   * 
+   * Note: This starts 10 seconds after stream goes live to ensure video is publishing
+   */
+  async startHLSConversion(streamId: string): Promise<void> {
+    try {
+      const appId = this.configService.get<string>('AGORA_APP_ID');
+      
+      // Cloud Recording API requires Customer ID & Customer Secret (NOT App ID & Certificate)
+      // These are generated in Agora Console → Developer Toolkit → RESTful API
+      const customerId = this.configService.get<string>('AGORA_CUSTOMER_ID');
+      const customerSecret = this.configService.get<string>('AGORA_CUSTOMER_SECRET');
+      
+      const channelName = `fretiko_${streamId}`;
+
+      // AWS S3 Configuration
+      const s3Bucket = this.configService.get<string>('AWS_S3_BUCKET') || this.configService.get<string>('CLOUD_STORAGE_BUCKET');
+      const s3Region = this.configService.get<string>('AWS_S3_REGION') || 'us-east-1';
+      const awsAccessKey = this.configService.get<string>('AWS_ACCESS_KEY_ID') || this.configService.get<string>('CLOUD_STORAGE_ACCESS_KEY');
+      const awsSecretKey = this.configService.get<string>('AWS_SECRET_ACCESS_KEY') || this.configService.get<string>('CLOUD_STORAGE_SECRET_KEY');
+
+      if (!appId) {
+        throw new BadRequestException('Agora App ID not configured');
+      }
+
+      if (!customerId || !customerSecret) {
+        this.logger.warn(`⚠️ Agora Customer ID/Secret not configured for stream ${streamId}, skipping HLS recording`);
+        this.logger.warn(`Generate these in: Agora Console → Developer Toolkit → RESTful API → Add a secret`);
+        return; // Don't throw - allow stream to continue without HLS
+      }
+
+      if (!s3Bucket || !awsAccessKey || !awsSecretKey) {
+        this.logger.warn(`⚠️ AWS S3 credentials not configured for stream ${streamId}, skipping HLS recording`);
+        return; // Don't throw - allow stream to continue without HLS
+      }
+
+      // Generate Agora REST API authentication using Customer credentials
+      const plainCredentials = `${customerId}:${customerSecret}`;
+      const encodedCredentials = Buffer.from(plainCredentials).toString('base64');
+
+      // Map AWS region to Agora region code
+      // Common mappings: us-east-1 -> 0, us-west-1 -> 1, eu-west-1 -> 2, etc.
+      const regionMap: Record<string, number> = {
+        'us-east-1': 0,
+        'us-west-1': 1,
+        'eu-west-1': 2,
+        'ap-southeast-1': 3,
+        'ap-northeast-1': 4,
+        'ap-southeast-2': 5,
+        'eu-central-1': 6,
+        'us-west-2': 7,
+        'ap-south-1': 8,
+        'sa-east-1': 9,
+        'ca-central-1': 10,
+        'eu-west-2': 11,
+        'eu-west-3': 12,
+        'ap-northeast-2': 13,
+        'ap-east-1': 14,
+        'eu-north-1': 15, // Stockholm, Sweden
+      };
+      const agoraRegion = regionMap[s3Region] ?? 0;
+
+      // Wait 10 seconds to ensure video is publishing
+      await new Promise(resolve => setTimeout(resolve, 10000));
+
+      this.logEvent('log', 'starting_cloud_recording_acquisition', {
+        streamId,
+        channelName,
+        appId,
+        s3Bucket,
+        s3Region,
+      });
+
+      // Step 1: Acquire - Get a resource ID
+      const acquireUrl = `https://api.agora.io/v1/apps/${appId}/cloud_recording/acquire`;
+      const acquireResponse = await fetch(acquireUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${encodedCredentials}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          cname: channelName,
+          uid: '0', // Use string UID for cloud recording
+          clientRequest: {
+            resourceExpiredHour: 24,
+          },
+        }),
+      });
+
+      if (!acquireResponse.ok) {
+        const errorData = await acquireResponse.json();
+        this.logEvent('warn', 'cloud_recording_acquire_failed', {
+          streamId,
+          status: acquireResponse.status,
+          error: JSON.stringify(errorData),
+        });
+        throw new Error(`Cloud Recording acquire failed: ${acquireResponse.statusText}`);
+      }
+
+      const acquireData = await acquireResponse.json();
+      const resourceId = acquireData.resourceId;
+
+      this.logEvent('log', 'cloud_recording_acquired', {
+        streamId,
+        resourceId,
+      });
+
+      // Step 2: Start - Begin HLS recording with S3 storage
+      const startUrl = `https://api.agora.io/v1/apps/${appId}/cloud_recording/resourceid/${resourceId}/mode/mix/start`;
+      const startResponse = await fetch(startUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${encodedCredentials}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          cname: channelName,
+          uid: '0',
+          clientRequest: {
+            recordingConfig: {
+              maxIdleTime: 300, // Stop after 5 mins of no activity
+              streamTypes: 2, // 0=audio only, 1=video only, 2=audio+video ✅
+              channelType: 1, // 0=communication, 1=live broadcast ✅
+              videoStreamType: 0, // 0=high stream, 1=low stream
+              subscribeVideoUids: ['#allstream#'], // Subscribe to all video streams
+              subscribeAudioUids: ['#allstream#'], // Subscribe to all audio streams
+            },
+            recordingFileConfig: {
+              avFileType: ['hls'], // ✅ CRITICAL: Enable HLS output (.m3u8 + .ts)
+            },
+            storageConfig: {
+              vendor: 1, // 1 = Amazon S3 ✅
+              region: agoraRegion, // Mapped from AWS region
+              bucket: s3Bucket,
+              accessKey: awsAccessKey,
+              secretKey: awsSecretKey,
+              fileNamePrefix: ['streams', streamId], // S3 path: streams/streamId/
+            },
+          },
+        }),
+      });
+
+      if (!startResponse.ok) {
+        const errorData = await startResponse.json();
+        this.logEvent('warn', 'cloud_recording_start_failed', {
+          streamId,
+          resourceId,
+          status: startResponse.status,
+          error: JSON.stringify(errorData),
+        });
+        throw new Error(`Cloud Recording start failed: ${startResponse.statusText}`);
+      }
+
+      const startData = await startResponse.json();
+      const sid = startData.sid;
+
+      // First verify the stream exists
+      const { data: streamCheck, error: checkError } = await this.supabase
+        .from('live_streams')
+        .select('id, status')
+        .eq('id', streamId)
+        .single();
+
+      if (checkError || !streamCheck) {
+        this.logger.error(`❌ Stream ${streamId} not found in database: ${checkError?.message || 'No data returned'}`);
+        throw new Error(`Stream not found: ${streamId}`);
+      }
+
+      // Store resourceId and sid in database for later use (query/stop)
+      // IMPORTANT: Use service role client (this.supabase) to bypass RLS
+      // User clients may not have permission to update these system fields
+      const { data: updateResult, error: dbError } = await this.supabase
+        .from('live_streams')
+        .update({
+          agora_resource_id: resourceId,
+          agora_sid: sid,
+        })
+        .eq('id', streamId)
+        .select('agora_resource_id, agora_sid'); // ✅ Verify the update worked
+
+      if (dbError) {
+        this.logger.error(`❌ Failed to save Cloud Recording IDs to database: ${dbError.message}`);
+        this.logger.error(`   Full error: ${JSON.stringify(dbError)}`);
+        throw new Error(`Database update failed: ${dbError.message}`);
+      }
+
+      // Double-check the values were actually saved
+      if (!updateResult || updateResult.length === 0 || !updateResult[0].agora_resource_id) {
+        this.logger.error(`❌ Database update returned no data or null resourceId. Update result: ${JSON.stringify(updateResult)}`);
+        this.logger.error(`   Stream exists: ${!!streamCheck}, Stream status: ${streamCheck?.status}`);
+        // Try a direct query to see what's in the DB
+        const { data: verifyData } = await this.supabase
+          .from('live_streams')
+          .select('id, agora_resource_id, agora_sid')
+          .eq('id', streamId)
+          .single();
+        this.logger.error(`   Direct query result: ${JSON.stringify(verifyData)}`);
+        throw new Error('Database update verification failed - IDs not saved');
+      }
+
+      this.logger.log(`✅ Verified Cloud Recording IDs saved: resourceId=${resourceId.substring(0, 20)}..., sid=${sid}`);
+      
+      // 🚀 Start polling for HLS URL (available while live, not just at end)
+      // HLS URL becomes available 10-30 seconds after recording starts
+      this.pollForHLSURL(streamId, resourceId, sid).catch(err => {
+        this.logger.warn(`⚠️ HLS URL polling failed for stream ${streamId}: ${err.message}`);
+      });
+    
+
+      this.logEvent('log', 'cloud_recording_started', {
+        streamId,
+        resourceId,
+        sid,
+        s3Bucket,
+      });
+
+      this.logger.log(`✅ Cloud Recording (HLS) started for stream ${streamId}, storing to S3: ${s3Bucket}`);
+    } catch (error) {
+      this.logEvent('error', 'cloud_recording_exception', {
+        streamId,
+      }, error instanceof Error ? error : new Error(String(error)));
+      // Don't throw - let stream continue without HLS
+      this.logger.warn(`⚠️ HLS conversion failed for stream ${streamId}, continuing without HLS`);
+    }
+  }
+
+  /**
+   * Poll Agora Cloud Recording API to get HLS URL while stream is live
+   * HLS URL becomes available 10-30 seconds after recording starts
+   */
+  private async pollForHLSURL(streamId: string, resourceId: string, sid: string, maxAttempts: number = 20): Promise<void> {
+    const appId = this.configService.get<string>('AGORA_APP_ID');
+    const customerId = this.configService.get<string>('AGORA_CUSTOMER_ID');
+    const customerSecret = this.configService.get<string>('AGORA_CUSTOMER_SECRET');
+    const s3Bucket = this.configService.get<string>('AWS_S3_BUCKET') || this.configService.get<string>('CLOUD_STORAGE_BUCKET');
+    const s3Region = this.configService.get<string>('AWS_S3_REGION') || 'us-east-1';
+
+    if (!appId || !customerId || !customerSecret || !s3Bucket) {
+      this.logger.warn(`⚠️ Missing Agora/S3 config for HLS polling on stream ${streamId}`);
+      return;
+    }
+
+    const channelName = `fretiko_${streamId}`;
+    const plainCredentials = `${customerId}:${customerSecret}`;
+    const encodedCredentials = Buffer.from(plainCredentials).toString('base64');
+
+    let attempts = 0;
+    const pollInterval = 5000; // Poll every 5 seconds
+
+    const poll = async (): Promise<void> => {
+      attempts++;
+
+      // Check if stream is still live
+      const { data: stream } = await this.supabase
+        .from('live_streams')
+        .select('status, stream_url')
+        .eq('id', streamId)
+        .single();
+
+      if (!stream || stream.status !== 'live') {
+        this.logger.log(`🛑 Stream ${streamId} is no longer live, stopping HLS polling`);
+        return;
+      }
+
+      // If HLS URL already exists, we're done
+      if (stream.stream_url) {
+        this.logger.log(`✅ HLS URL already available for stream ${streamId}`);
+        return;
+      }
+
+      try {
+        // Query Agora Cloud Recording status
+        const queryUrl = `https://api.agora.io/v1/apps/${appId}/cloud_recording/resourceid/${resourceId}/sid/${sid}/mode/mix/query`;
+        const queryResponse = await fetch(queryUrl, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Basic ${encodedCredentials}`,
+            'Content-Type': 'application/json',
+          },
+        });
+
+        if (!queryResponse.ok) {
+          if (attempts < maxAttempts) {
+            this.logger.log(`⏳ HLS not ready yet for stream ${streamId} (attempt ${attempts}/${maxAttempts}), retrying...`);
+            setTimeout(poll, pollInterval);
+          } else {
+            this.logger.warn(`⚠️ HLS URL polling timed out for stream ${streamId} after ${maxAttempts} attempts`);
+          }
+          return;
+        }
+
+        const queryData = await queryResponse.json();
+        const serverResponse = queryData.serverResponse;
+
+        // Check if recording has uploaded files
+        if (serverResponse?.fileList && serverResponse.fileList.length > 0) {
+          // Find HLS file (usually ends with .m3u8)
+          const hlsFile = serverResponse.fileList.find((file: any) => 
+            file.fileName?.endsWith('.m3u8') || file.fileName?.includes('index.m3u8')
+          );
+
+          if (hlsFile && hlsFile.fileName) {
+            // Construct S3 HLS URL
+            // Format: https://{bucket}.s3.{region}.amazonaws.com/streams/{streamId}/{fileName}
+            const hlsUrl = `https://${s3Bucket}.s3.${s3Region}.amazonaws.com/streams/${streamId}/${hlsFile.fileName}`;
+
+            // Update stream_url in database
+        const { error: updateError } = await this.supabase
+          .from('live_streams')
+          .update({ stream_url: hlsUrl })
+          .eq('id', streamId);
+
+        if (updateError) {
+              this.logger.error(`❌ Failed to update HLS URL in database: ${updateError.message}`);
+        } else {
+              this.logger.log(`✅ HLS URL available and saved for stream ${streamId}: ${hlsUrl.substring(0, 80)}...`);
+              return; // Success!
+            }
+          }
+        }
+
+        // If no HLS file yet, continue polling
+        if (attempts < maxAttempts) {
+          this.logger.log(`⏳ HLS file not uploaded yet for stream ${streamId} (attempt ${attempts}/${maxAttempts}), retrying in ${pollInterval/1000}s...`);
+          setTimeout(poll, pollInterval);
+        } else {
+          this.logger.warn(`⚠️ HLS URL polling timed out for stream ${streamId} after ${maxAttempts} attempts`);
+        }
+      } catch (error) {
+        this.logger.error(`❌ Error polling HLS URL for stream ${streamId}: ${error instanceof Error ? error.message : String(error)}`);
+        if (attempts < maxAttempts) {
+          setTimeout(poll, pollInterval);
+        }
+      }
+    };
+
+    // Start polling after initial delay (HLS takes 10-30 seconds to be available)
+    setTimeout(poll, 15000); // Wait 15 seconds before first poll
+  }
+
+  /**
+   * Stop Cloud Recording and get HLS URL from S3
+   */
+  async stopHLSRecording(streamId: string): Promise<{ hlsUrl: string } | null> {
+    try {
+      this.logger.log(`🛑 Attempting to stop Cloud Recording for stream ${streamId}`);
+      
+      // Query with explicit field selection and logging
+      const { data: stream, error: dbError } = await this.supabase
+        .from('live_streams')
+        .select('agora_resource_id, agora_sid, status, vendor_id')
+        .eq('id', streamId)
+        .single();
+
+      if (dbError) {
+        this.logger.error(`❌ Database error fetching recording for stream ${streamId}: ${dbError.message}`);
+        this.logger.error(`   Full error: ${JSON.stringify(dbError)}`);
+        return null;
+      }
+
+      this.logger.log(`📊 Stream data from DB: ${JSON.stringify({
+            streamId,
+        hasResourceId: !!stream?.agora_resource_id,
+        hasSid: !!stream?.agora_sid,
+        resourceIdLength: stream?.agora_resource_id?.length || 0,
+        sidLength: stream?.agora_sid?.length || 0,
+        status: stream?.status
+      })}`);
+
+      if (!stream?.agora_resource_id || !stream?.agora_sid) {
+        this.logger.warn(`⚠️ No Cloud Recording found for stream ${streamId}. Found in DB: resourceId=${stream?.agora_resource_id || 'null'}, sid=${stream?.agora_sid || 'null'}`);
+        this.logger.warn(`   This means either: 1) Recording never started, 2) Database update failed, 3) IDs were cleared by another operation`);
+        return null;
+      }
+
+      const appId = this.configService.get<string>('AGORA_APP_ID');
+      
+      // Cloud Recording API requires Customer ID & Customer Secret
+      const customerId = this.configService.get<string>('AGORA_CUSTOMER_ID');
+      const customerSecret = this.configService.get<string>('AGORA_CUSTOMER_SECRET');
+      
+      const channelName = `fretiko_${streamId}`;
+      const s3Bucket = this.configService.get<string>('AWS_S3_BUCKET') || this.configService.get<string>('CLOUD_STORAGE_BUCKET');
+      const s3Region = this.configService.get<string>('AWS_S3_REGION') || 'us-east-1';
+
+      if (!s3Bucket || !s3Region) {
+        this.logger.warn(`S3 configuration missing for stream ${streamId}`);
+        return null;
+      }
+
+      if (!customerId || !customerSecret) {
+        this.logger.warn(`Agora Customer credentials missing for stream ${streamId}`);
+        return null;
+      }
+
+      const plainCredentials = `${customerId}:${customerSecret}`;
+      const encodedCredentials = Buffer.from(plainCredentials).toString('base64');
+
+      // Step 3: Stop recording
+      const stopUrl = `https://api.agora.io/v1/apps/${appId}/cloud_recording/resourceid/${stream.agora_resource_id}/sid/${stream.agora_sid}/mode/mix/stop`;
+      const stopResponse = await fetch(stopUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${encodedCredentials}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          cname: channelName,
+          uid: '0',
+          clientRequest: {
+            async_stop: false, // Wait for upload to complete
+          },
+        }),
+      });
+
+      if (!stopResponse.ok) {
+        const errorData = await stopResponse.json();
+        this.logger.error(`Stop recording failed: ${JSON.stringify(errorData)}`);
+        return null;
+      }
+
+      const stopData = await stopResponse.json();
+      
+      // Wait for upload status to be "uploaded"
+      if (stopData.serverResponse?.fileList?.[0]?.uploadingStatus === 'uploaded') {
+        const fileName = stopData.serverResponse.fileList[0].fileName;
+        const hlsUrl = `https://${s3Bucket}.s3.${s3Region}.amazonaws.com/${fileName}`;
+        
+        // Update stream with HLS URL
+        await this.supabase
+          .from('live_streams')
+          .update({ stream_url: hlsUrl })
+          .eq('id', streamId);
+
+        this.logger.log(`✅ HLS recording uploaded to S3: ${hlsUrl}`);
+        return { hlsUrl };
+      }
+
+      this.logger.warn(`Recording upload not complete yet for stream ${streamId}`);
+      return null;
+    } catch (error) {
+      this.logger.error(`Error stopping recording: ${error}`);
+      return null;
+    }
+  }
+
+  /**
    * Get HLS stream URL for viewers
    *
    * Queries Agora's REST API to get the actual HLS URL from their CDN
@@ -2697,10 +3509,10 @@ export class LiveSalesService {
    */
   async getHLSStreamUrl(streamId: string): Promise<{ hlsUrl: string; status: string }> {
     try {
-      // Verify stream exists and is live
+      // Verify stream exists and check status
       const { data: stream, error } = await this.supabase
         .from('live_streams')
-        .select('status, stream_url')
+        .select('status, stream_url, agora_resource_id')
         .eq('id', streamId)
         .single();
 
@@ -2708,118 +3520,35 @@ export class LiveSalesService {
         throw new NotFoundException('Stream not found');
       }
 
-      if (stream.status !== 'live') {
+      // ✅ INDUSTRY STANDARD: LIVE streams use RTC, not HLS!
+      // HLS is ONLY for VOD replays after stream ends
+      if (stream.status === 'live') {
         return {
           hlsUrl: '',
-          status: 'Stream is not live yet'
+          status: 'Stream is LIVE - viewers should use Agora RTC for real-time viewing. HLS is for VOD replays only.'
         };
       }
 
-      // If stream_url is already set (HLS is available), return it
-      if (stream.stream_url) {
+      // ✅ ENDED streams: HLS URL from Cloud Recording (S3)
+      if (stream.status === 'ended' && stream.stream_url) {
         return {
           hlsUrl: stream.stream_url,
-          status: 'live'
+          status: 'VOD replay available from Cloud Recording'
         };
       }
 
-      // Query Agora REST API for HLS URL
-      const appId = this.configService.get<string>('AGORA_APP_ID');
-      const appCertificate = this.configService.get<string>('AGORA_APP_CERTIFICATE');
-      const channelName = `fretiko_${streamId}`;
-
-      if (!appId || !appCertificate) {
-        throw new BadRequestException('Agora credentials not configured');
-      }
-
-      // Generate Agora REST API authentication signature
-      const timestamp = Math.floor(Date.now() / 1000);
-      const expiredTs = timestamp + 3600; // 1 hour validity
-
-      const signature = this.generateAgoraRestSignature(appId, appCertificate, channelName, timestamp, expiredTs);
-
-      // Query Agora REST API for HLS status and URL
-      const agoraApiUrl = `https://api.agora.io/dev/v1/channel/${appId}/agora-hls/${channelName}`;
-
-      this.logEvent('log', 'querying_agora_hls_api', {
-        streamId,
-        channelName,
-        apiUrl: agoraApiUrl,
-      });
-
-      const response = await fetch(agoraApiUrl, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Agora ${appId}:${signature}`,
-          'Content-Type': 'application/json'
-        }
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        this.logEvent('warn', 'agora_hls_api_error', {
-          streamId,
-          channelName,
-          status: response.status,
-          statusText: response.statusText,
-          error: errorText,
-        });
-
-        // If HLS transcoding hasn't started yet
-        if (response.status === 404) {
-          return {
-            hlsUrl: '',
-            status: 'HLS transcoding not started yet'
-          };
-        }
-
-        return {
-          hlsUrl: '',
-          status: 'HLS not ready yet'
-        };
-      }
-
-      const agoraData = await response.json();
-
-      this.logEvent('log', 'agora_hls_api_response', {
-        streamId,
-        channelName,
-        hasHlsUrl: !!agoraData?.data?.hlsUrl,
-        responseKeys: Object.keys(agoraData?.data || {}),
-      });
-
-      if (agoraData?.data?.hlsUrl) {
-        const hlsUrl = agoraData.data.hlsUrl;
-
-        // Update stream with HLS URL for future requests
-        const { error: updateError } = await this.supabase
-          .from('live_streams')
-          .update({ stream_url: hlsUrl })
-          .eq('id', streamId);
-
-        if (updateError) {
-          this.logEvent('warn', 'stream_url_update_failed', {
-            streamId,
-            hlsUrl,
-            error: updateError.message,
-          });
-          // Continue anyway - HLS URL is still valid
-        } else {
-          this.logEvent('log', 'stream_url_updated', {
-            streamId,
-            hlsUrl,
-          });
-        }
-
-        return {
-          hlsUrl,
-          status: 'live'
-        };
-      }
-
+      // ✅ ENDED but HLS not ready yet
+      if (stream.status === 'ended' && stream.agora_resource_id) {
       return {
         hlsUrl: '',
-        status: 'HLS transcoding in progress'
+          status: 'Cloud Recording is finalizing... HLS replay will be available shortly'
+        };
+      }
+
+      // ✅ Stream not started or no recording
+      return {
+        hlsUrl: '',
+        status: `Stream is ${stream.status}. No HLS replay available.`
       };
 
     } catch (error) {
@@ -3202,7 +3931,7 @@ export class LiveSalesService {
       // Use RPC function to properly identify orders without escrow records
       const { data: orphanedOrders, error: findError } = await this.supabase
         .rpc('get_orphaned_orders', {
-          source_filter: ['live_stream', 'service_booking'],
+          source_filter: ['live_stream'],
           orphan_threshold: orphanThreshold
         });
 
@@ -3268,6 +3997,63 @@ export class LiveSalesService {
       });
     } catch (error) {
       this.logEvent('error', 'cleanup_orphaned_orders_cron_error', {},
+        error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  /**
+   * Cleanup abandoned live streams
+   * Ends live streams that have been running for more than 8 hours or
+   * have no vendor connected for more than 30 minutes
+   * Runs every 30 minutes
+   */
+  @Cron('*/30 * * * *') // Every 30 minutes
+  async cleanupAbandonedStreams(): Promise<void> {
+    try {
+      const now = new Date();
+      const eightHoursAgo = new Date(now.getTime() - 8 * 60 * 60 * 1000);
+      const thirtyMinutesAgo = new Date(now.getTime() - 30 * 60 * 1000);
+
+      this.logger.log('🧹 Starting cleanup of abandoned live streams');
+
+      // Find live streams that have been running for more than 8 hours
+      const { data: oldStreams, error: oldStreamsError } = await this.supabase
+        .from('live_streams')
+        .select('id, vendor_id, title, started_at')
+        .eq('status', 'live')
+        .lt('started_at', eightHoursAgo.toISOString());
+
+      if (oldStreamsError) {
+        this.logger.error('Failed to find old live streams:', oldStreamsError.message);
+      } else if (oldStreams && oldStreams.length > 0) {
+        this.logger.log(`Found ${oldStreams.length} streams running for >8 hours`);
+
+        for (const stream of oldStreams) {
+          try {
+            // End the stream automatically
+            await this.endStream(stream.id, stream.vendor_id, undefined); // No access token available in cron
+            this.logger.log(`🏁 Auto-ended old stream: ${stream.title} (${stream.id})`);
+
+            this.logEvent('log', 'stream_auto_ended_old', {
+              streamId: stream.id,
+              vendorId: stream.vendor_id,
+              reason: 'running_too_long',
+              durationHours: Math.floor((now.getTime() - new Date(stream.started_at).getTime()) / (1000 * 60 * 60)),
+            });
+          } catch (endError) {
+            this.logger.error(`Failed to end old stream ${stream.id}:`, endError);
+          }
+        }
+      }
+
+      // Find live streams with no recent vendor activity
+      // This is harder to detect since we don't track vendor connection times
+      // For now, we'll rely on the disconnect handling to end streams when vendors leave
+
+      this.logger.log('✅ Abandoned streams cleanup completed');
+    } catch (error) {
+      this.logger.error('Error in abandoned streams cleanup:', error);
+      this.logEvent('error', 'cleanup_abandoned_streams_error', {},
         error instanceof Error ? error : new Error(String(error)));
     }
   }
@@ -3632,5 +4418,857 @@ export class LiveSalesService {
       average_session_duration: 0,
       engagement_rate: 0,
     };
+  }
+
+  // =====================
+  // PORTFOLIO SERVICES
+  // =====================
+
+  /**
+   * Get portfolio services for a stream
+   */
+  async getPortfolioServices(streamId: string): Promise<any[]> {
+    try {
+      // Get portfolio services with their images
+      const { data: portfolioServices, error: portfolioError } = await this.supabase
+        .from('live_portfolio_services')
+        .select(`
+          id,
+          stream_id,
+          title,
+          description,
+          price,
+          category,
+          impressions,
+          add_to_cart_clicks,
+          bookings,
+          revenue,
+          display_order,
+          created_at,
+          images:live_portfolio_images!portfolio_id (
+            id,
+            image_url,
+            caption,
+            display_order,
+            is_primary
+          )
+        `)
+        .eq('stream_id', streamId)
+        .eq('is_active', true)
+        .is('deleted_at', null)
+        .order('display_order', { ascending: true })
+        .order('created_at', { ascending: false });
+
+      if (portfolioError) {
+        this.logEvent('error', 'get_portfolio_services_failed', { streamId }, portfolioError);
+        throw new BadRequestException('Failed to fetch portfolio services');
+      }
+
+      // Transform data to match frontend expectations
+      const transformed = (portfolioServices || []).map((service: any) => ({
+        id: service.id,
+        stream_id: service.stream_id,
+        title: service.title,
+        description: service.description,
+        price: parseFloat(service.price) || 0,
+        category: service.category,
+        display_order: service.display_order || 0,
+        created_at: service.created_at,
+        images: (service.images || []).map((img: any) => ({
+          id: img.id,
+          url: img.image_url,
+          caption: img.caption,
+          display_order: img.display_order || 0,
+          is_primary: img.is_primary || false,
+        })),
+        // Analytics
+        impressions: service.impressions || 0,
+        add_to_cart_clicks: service.add_to_cart_clicks || 0,
+        bookings: service.bookings || 0,
+        revenue: parseFloat(service.revenue) || 0,
+      }));
+
+      return transformed;
+    } catch (error) {
+      this.logEvent('error', 'get_portfolio_services_error', { streamId }, error instanceof Error ? error : new Error(String(error)));
+      throw new BadRequestException('Failed to fetch portfolio services');
+    }
+  }
+
+  /**
+   * Book a portfolio service during live stream
+   */
+  async bookPortfolioService(
+    userId: string,
+    bookingDto: {
+      stream_id: string;
+      portfolio_id: string;
+      service_date: string;
+      service_time: string;
+      service_notes?: string;
+    },
+  ): Promise<TransactionResponse> {
+    const startTime = Date.now();
+    const bookingId = `portfolio_booking_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Input validation
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new BadRequestException('Invalid user ID');
+    }
+
+    if (!bookingDto.stream_id || typeof bookingDto.stream_id !== 'string') {
+      throw new BadRequestException('Invalid stream ID');
+    }
+
+    if (!bookingDto.portfolio_id || typeof bookingDto.portfolio_id !== 'string') {
+      throw new BadRequestException('Invalid portfolio ID');
+    }
+
+    if (!bookingDto.service_date || typeof bookingDto.service_date !== 'string') {
+      throw new BadRequestException('Invalid service date');
+    }
+
+    if (!bookingDto.service_time || typeof bookingDto.service_time !== 'string') {
+      throw new BadRequestException('Invalid service time');
+    }
+
+    // Validate date format (YYYY-MM-DD)
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(bookingDto.service_date)) {
+      throw new BadRequestException('Service date must be in YYYY-MM-DD format');
+    }
+
+    // Validate time format (HH:MM)
+    const timeRegex = /^\d{2}:\d{2}$/;
+    if (!timeRegex.test(bookingDto.service_time)) {
+      throw new BadRequestException('Service time must be in HH:MM format');
+    }
+
+    // Validate date is not in the past
+    const requestedDateTime = new Date(`${bookingDto.service_date}T${bookingDto.service_time}`);
+    const now = new Date();
+    if (requestedDateTime <= now) {
+      throw new BadRequestException('Service booking must be scheduled for a future date and time');
+    }
+
+    if (bookingDto.service_notes && typeof bookingDto.service_notes !== 'string') {
+      throw new BadRequestException('Service notes must be a string');
+    }
+
+    this.logEvent('log', 'portfolio_booking_initiated', {
+      bookingId,
+      userId,
+      streamId: bookingDto.stream_id,
+      portfolioId: bookingDto.portfolio_id,
+      serviceDate: bookingDto.service_date,
+      serviceTime: bookingDto.service_time,
+    });
+
+    try {
+      // 1. Get stream details and verify it's live
+      const { data: stream, error: streamError } = await this.supabase
+        .from('live_streams')
+        .select('vendor_id, status, title')
+        .eq('id', bookingDto.stream_id)
+        .single();
+
+      if (streamError || !stream) {
+        throw new NotFoundException('Live stream not found');
+      }
+
+      if (stream.status !== 'live') {
+        throw new BadRequestException('Cannot book portfolio services from inactive streams');
+      }
+
+      if (stream.vendor_id === userId) {
+        throw new BadRequestException('Cannot book portfolio services from your own stream');
+      }
+
+      // 2. Get portfolio service details
+      const { data: portfolioService, error: portfolioError } = await this.supabase
+        .from('live_portfolio_services')
+        .select(`
+          id,
+          stream_id,
+          title,
+          description,
+          price,
+          category
+        `)
+        .eq('id', bookingDto.portfolio_id)
+        .eq('stream_id', bookingDto.stream_id)
+        .eq('is_active', true)
+        .is('deleted_at', null)
+        .single();
+
+      if (portfolioError || !portfolioService) {
+        throw new NotFoundException('Portfolio service not found in this stream');
+      }
+
+      // 3. Check for duplicate booking (idempotency)
+      const duplicateCheckWindowMs = this.configService.get<number>('LIVE_SALES_DUPLICATE_WINDOW_MS') || 30000;
+      const duplicateCheckWindow = new Date(Date.now() - duplicateCheckWindowMs).toISOString();
+      const { data: recentBooking, error: duplicateError } = await this.supabase
+        .from('orders')
+        .select('id, order_number, status, created_at, metadata')
+        .eq('buyer_id', userId)
+        .eq('vendor_id', stream.vendor_id)
+        .eq('source', 'live_stream')
+        .eq('metadata->>booking_type', 'portfolio')
+        .in('status', ['pending', 'paid', 'processing'])
+        .gte('created_at', duplicateCheckWindow)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (duplicateError) {
+        this.logEvent('warn', 'portfolio_duplicate_check_failed', {
+          bookingId,
+          userId,
+          streamId: bookingDto.stream_id,
+          error: duplicateError.message,
+        });
+      }
+
+      if (recentBooking) {
+        const recentMetadata = recentBooking.metadata as any;
+        if (recentMetadata?.portfolio_id === bookingDto.portfolio_id &&
+            recentMetadata?.booking_date === bookingDto.service_date &&
+            recentMetadata?.booking_time === bookingDto.service_time) {
+          const timeSinceBooking = Date.now() - new Date(recentBooking.created_at).getTime();
+          this.logEvent('log', 'duplicate_portfolio_booking_detected', {
+            bookingId,
+            userId,
+            streamId: bookingDto.stream_id,
+            portfolioId: bookingDto.portfolio_id,
+            recentOrderId: recentBooking.id,
+            timeSinceBooking,
+          });
+
+          return {
+            id: recentBooking.metadata?.transaction_id || `dup_${recentBooking.id}`,
+            stream_id: bookingDto.stream_id,
+            transaction_type: TransactionType.SERVICE,
+            total_amount: recentBooking.total_amount,
+            status: TransactionStatus.PENDING,
+            service: {
+              date: bookingDto.service_date,
+              time: bookingDto.service_time,
+              notes: recentMetadata?.service_notes,
+            },
+            created_at: recentBooking.created_at,
+          };
+        }
+      }
+
+      // 4. Calculate pricing
+      const servicePrice = parseFloat(portfolioService.price) || 0;
+      if (servicePrice <= 0) {
+        throw new BadRequestException('Portfolio service price must be greater than zero');
+      }
+
+      const platformFeeRate = 0.05; // 5% platform fee
+      const platformFee = servicePrice * platformFeeRate;
+      const vendorAmount = servicePrice - platformFee;
+
+      this.logEvent('log', 'portfolio_booking_calculation', {
+        bookingId,
+        userId,
+        servicePrice,
+        platformFee,
+        vendorAmount,
+        totalAmount: servicePrice,
+      });
+
+      // 5. Get customer's wallet
+      const { data: customerWallet, error: walletError } = await this.supabase
+        .from('wallets')
+        .select('id, available_balance')
+        .eq('user_id', userId)
+        .single();
+
+      if (walletError || !customerWallet) {
+        throw new NotFoundException('Customer wallet not found');
+      }
+
+      // 6. Check sufficient balance
+      if (customerWallet.available_balance < servicePrice) {
+        throw new BadRequestException('Insufficient wallet balance for portfolio service booking');
+      }
+
+      // 7. Start transaction processing
+      const transactionId = `portfolio_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const orderNumber = `PORT-${Date.now()}-${Math.random().toString(36).substring(7).toUpperCase()}`;
+
+      // 8. Create order record for portfolio booking
+      if (!userId || !stream.vendor_id || !servicePrice) {
+        this.logEvent('error', 'invalid_portfolio_booking_data', {
+          bookingId,
+          userId,
+          vendorId: stream.vendor_id,
+          servicePrice,
+        });
+        throw new BadRequestException('Invalid booking data: missing required fields');
+      }
+
+      let order;
+      try {
+        const { data: orderData, error: orderError } = await this.supabase
+          .from('orders')
+          .insert({
+            order_number: orderNumber,
+            buyer_id: userId,
+            vendor_id: stream.vendor_id,
+            total_amount: servicePrice,
+            delivery_fee: 0, // Portfolio services don't have delivery
+            platform_fee: platformFee,
+            status: 'pending',
+            escrow_enabled: true,
+            source: 'live_stream',
+            metadata: {
+              stream_id: bookingDto.stream_id,
+              booking_type: 'portfolio', // Distinguish portfolio bookings within live_stream
+              portfolio_id: bookingDto.portfolio_id,
+              portfolio_title: portfolioService.title,
+              booking_date: bookingDto.service_date,
+              booking_time: bookingDto.service_time,
+              transaction_id: transactionId,
+              service_notes: bookingDto.service_notes,
+            }
+          })
+          .select()
+          .single();
+
+        if (orderError) {
+          this.logEvent('error', 'portfolio_booking_order_creation_failed', {
+            bookingId,
+            userId,
+            vendorId: stream.vendor_id,
+            servicePrice,
+            orderNumber,
+            errorCode: orderError.code,
+            errorMessage: orderError.message,
+          });
+
+          if (orderError.code === '23505') {
+            throw new BadRequestException('Order number already exists. Please try again.');
+          } else if (orderError.code === '23503') {
+            throw new BadRequestException('Invalid reference data. Please verify portfolio and vendor information.');
+          } else {
+            throw new BadRequestException(`Failed to create booking order: ${orderError.message || 'Unknown error'}`);
+          }
+        }
+
+        if (!orderData) {
+          throw new BadRequestException('Order creation returned no data');
+        }
+
+        order = orderData;
+      } catch (error) {
+        this.logEvent('error', 'portfolio_booking_order_creation_failed', {
+          bookingId,
+          userId,
+          streamId: bookingDto.stream_id,
+          portfolioId: bookingDto.portfolio_id,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+
+        if (error instanceof BadRequestException) {
+          throw error;
+        }
+        throw new BadRequestException(`Failed to create booking order: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+
+      this.logEvent('log', 'portfolio_order_created', {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        userId,
+        vendorId: stream.vendor_id,
+      });
+
+      // 9. Create order item for portfolio service
+      const { error: orderItemError } = await this.supabase
+        .from('order_items')
+        .insert({
+          order_id: order.id,
+          product_id: null, // Portfolio services don't have product IDs
+          product_name: portfolioService.title,
+          unit_price: servicePrice,
+          quantity: 1,
+          total_price: servicePrice,
+          product_metadata: {
+            portfolio_id: bookingDto.portfolio_id,
+            portfolio_title: portfolioService.title,
+            portfolio_category: portfolioService.category,
+            booking_date: bookingDto.service_date,
+            booking_time: bookingDto.service_time,
+            description: portfolioService.description,
+            special_notes: bookingDto.service_notes,
+          }
+        });
+
+      if (orderItemError) {
+        this.logEvent('error', 'portfolio_order_item_creation_failed', {
+          bookingId,
+          orderId: order.id,
+          error: orderItemError.message,
+        });
+        throw new BadRequestException('Failed to create order item. Please try again.');
+      }
+
+      // 10. Deduct from customer wallet (move to escrow)
+      const deductResult = await this.walletService.processWalletTransaction(
+        userId,
+        WalletTransactionType.PURCHASE_HOLD,
+        servicePrice,
+        `Portfolio booking: ${portfolioService.title} on ${bookingDto.service_date} ${bookingDto.service_time}`,
+        order.id,
+        'order',
+      );
+
+      if (!deductResult.success) {
+        this.logEvent('error', 'portfolio_booking_wallet_deduction_failed', {
+          bookingId,
+          orderId: order.id,
+          userId,
+          amount: servicePrice,
+          error: deductResult.error,
+        });
+        throw new BadRequestException(`Failed to process booking payment: ${deductResult.error}`);
+      }
+
+      // 11. Create escrow for buyer protection
+      try {
+        const escrowBreakdown = {
+          totalAmount: servicePrice,
+          vendorAmount: vendorAmount,
+          riderAmount: 0, // Portfolio services don't have delivery
+          platformAmount: platformFee,
+        };
+
+        await this.escrowService.createEscrow(order.id, escrowBreakdown);
+        this.logEvent('log', 'portfolio_escrow_created', {
+          orderId: order.id,
+          orderNumber: order.order_number,
+          amount: servicePrice,
+        });
+
+        // Generate handoff PINs (3-digit) for service verification
+        // Portfolio services are in-person, so use self-pickup style PINs
+        const pickupPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
+        const deliveryPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
+        
+        // Update order with PINs and keep status as 'pending' so vendor can accept it
+        await this.supabase
+          .from('orders')
+          .update({ 
+            pickup_pin: pickupPin,
+            delivery_pin: deliveryPin,
+            status: 'pending', // Keep as 'pending' so vendor can accept the order
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', order.id);
+        
+        this.logEvent('log', 'pins_generated', {
+          bookingId,
+          orderId: order.id,
+          orderNumber: order.order_number,
+          pickupPin,
+          deliveryPin,
+          deliveryType: 'pickup', // Portfolio services are in-person
+        });
+
+        // Send PIN notifications to vendor and buyer
+        try {
+          // Get vendor and buyer profiles for notifications
+          const { data: vendorProfile } = await this.supabase
+            .from('user_profiles')
+            .select('username')
+            .eq('id', stream.vendor_id)
+            .single();
+
+          const { data: buyerProfile } = await this.supabase
+            .from('user_profiles')
+            .select('username')
+            .eq('id', userId)
+            .single();
+
+          // Portfolio services are in-person, so send deliveryPin to both vendor and buyer
+          // Buyer provides deliveryPin to vendor for service verification
+          
+          // Send deliveryPin to vendor (for verification)
+          await this.notificationHelper.notifyVendorSelfPickupPin(stream.vendor_id, {
+            id: order.id,
+            orderNumber: order.order_number,
+            deliveryPin: deliveryPin,
+            buyerName: buyerProfile?.username || 'Portfolio Customer',
+          });
+          this.logEvent('log', 'pickup_pin_sent_to_vendor', {
+            orderId: order.id,
+            vendorId: stream.vendor_id,
+          });
+
+          // Send deliveryPin to buyer (to provide to vendor)
+          await this.notificationHelper.notifyBuyerSelfPickupPin(userId, {
+            id: order.id,
+            orderNumber: order.order_number,
+            deliveryPin: deliveryPin,
+            vendorName: vendorProfile?.username,
+          });
+          this.logEvent('log', 'pickup_pin_sent_to_buyer', {
+            orderId: order.id,
+            buyerId: userId,
+          });
+        } catch (pinNotifyError) {
+          this.logEvent('warn', 'portfolio_pin_notification_failed', {
+            orderId: order.id,
+            error: pinNotifyError instanceof Error ? pinNotifyError.message : String(pinNotifyError),
+          });
+          // Don't throw - PIN notification failure is non-critical
+        }
+
+      } catch (escrowError) {
+        this.logEvent('error', 'portfolio_escrow_creation_failed', {
+          userId,
+          orderId: order.id,
+          amount: servicePrice,
+        }, escrowError instanceof Error ? escrowError : new Error(String(escrowError)));
+        
+        // Rollback transaction
+        const rollbackReason = `Escrow creation failed: ${escrowError instanceof Error ? escrowError.message : 'Unknown error'}`;
+        const rollbackResult = await this.rollbackPurchaseTransaction(
+          userId,
+          order.id,
+          servicePrice,
+          rollbackReason,
+        );
+
+        if (!rollbackResult.success) {
+          this.logEvent('error', 'portfolio_rollback_failed_after_escrow_failure', {
+            userId,
+            orderId: order.id,
+            rollbackError: rollbackResult.error,
+          });
+          throw new HttpException(
+            `Payment processed but escrow creation failed. Rollback also failed: ${rollbackResult.error}. Manual intervention required. Order ID: ${order.id}`,
+            HttpStatus.INTERNAL_SERVER_ERROR
+          );
+        }
+
+        throw new BadRequestException(
+          'Payment was processed but escrow creation failed. Payment has been refunded to your wallet. Please try again.'
+        );
+      }
+
+      // 12. Notify vendor of new booking
+      try {
+        await this.notificationHelper.notifyVendorNewOrder(stream.vendor_id, {
+          id: order.id,
+          orderNumber: order.order_number,
+          totalAmount: servicePrice,
+          itemCount: 1,
+          buyerName: 'Portfolio Customer',
+        });
+
+        // Don't notify as paid - order is pending vendor acceptance
+        // notifyVendorOrderPaid will be called when vendor accepts the order
+      } catch (notifyError) {
+        this.logEvent('warn', 'portfolio_vendor_notification_failed', {
+          vendorId: stream.vendor_id,
+          orderId: order.id,
+        }, notifyError instanceof Error ? notifyError : new Error(String(notifyError)));
+      }
+
+      // 13. Log analytics
+      await this.logAnalytics(bookingDto.stream_id, 'portfolio_booking', servicePrice, {
+        customer_id: userId,
+        portfolio_id: bookingDto.portfolio_id,
+        booking_date: bookingDto.service_date,
+        booking_time: bookingDto.service_time,
+        service_price: servicePrice,
+      });
+
+      const duration = Date.now() - startTime;
+      this.logEvent('log', 'portfolio_booking_completed', {
+        bookingId,
+        transactionId,
+        userId,
+        vendorId: stream.vendor_id,
+        portfolioId: bookingDto.portfolio_id,
+        portfolioTitle: portfolioService.title,
+        bookingDate: bookingDto.service_date,
+        bookingTime: bookingDto.service_time,
+        amount: servicePrice,
+        orderId: order.id,
+        orderNumber: order.order_number,
+        duration,
+      });
+
+      // Return transaction details
+      return {
+        id: transactionId,
+        stream_id: bookingDto.stream_id,
+        transaction_type: TransactionType.SERVICE,
+        total_amount: servicePrice,
+        status: TransactionStatus.ESCROW,
+        service: {
+          date: bookingDto.service_date,
+          time: bookingDto.service_time,
+          notes: bookingDto.service_notes,
+        },
+        created_at: new Date().toISOString(),
+      };
+
+    } catch (error) {
+      this.logEvent('error', 'portfolio_booking_exception', {
+        streamId: bookingDto.stream_id,
+        userId,
+        portfolioId: bookingDto.portfolio_id,
+        serviceDate: bookingDto.service_date,
+        serviceTime: bookingDto.service_time,
+      }, error instanceof Error ? error : new Error(String(error)));
+      if (error instanceof NotFoundException || error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to process portfolio service booking');
+    }
+  }
+
+  /**
+   * Create/upload portfolio service for a stream
+   */
+  async createPortfolioService(
+    vendorId: string,
+    streamId: string,
+    portfolioData: {
+      title: string;
+      description?: string;
+      price: number;
+      category: 'work_sample' | 'consultation' | 'service_package' | 'testimonial';
+      display_order?: number;
+    },
+    images?: Express.Multer.File[],
+    imageCaptions?: string[],
+    imageIsPrimary?: boolean[],
+    userToken?: string,
+  ): Promise<any> {
+    try {
+      // Verify stream ownership
+      const { data: stream, error: streamError } = await this.supabase
+        .from('live_streams')
+        .select('vendor_id, status')
+        .eq('id', streamId)
+        .single();
+
+      if (streamError || !stream) {
+        throw new NotFoundException('Stream not found');
+      }
+
+      if (stream.vendor_id !== vendorId) {
+        throw new ForbiddenException('Only stream owner can add portfolio services');
+      }
+
+      // Use user-authenticated client if token provided
+      const client = userToken
+        ? createUserSupabaseClient(this.configService, userToken)
+        : this.supabase;
+
+      // Upload images to Supabase Storage
+      const imageUrls: Array<{ url: string; caption?: string; is_primary: boolean }> = [];
+      if (images && images.length > 0) {
+        for (let i = 0; i < images.length; i++) {
+          const image = images[i];
+          const fileExtension = image.originalname.split('.').pop() || 'jpg';
+          const fileName = `${vendorId}/portfolio/${Date.now()}-${i}-${Math.random().toString(36).substring(7)}.${fileExtension}`;
+
+          const { data: uploadData, error: uploadError } = await client.storage
+            .from('media')
+            .upload(fileName, image.buffer, {
+              contentType: image.mimetype,
+              cacheControl: '3600',
+            });
+
+          if (uploadError) {
+            throw new BadRequestException(`Failed to upload image: ${uploadError.message}`);
+          }
+
+          const { data: publicUrlData } = client.storage
+            .from('media')
+            .getPublicUrl(fileName);
+
+          imageUrls.push({
+            url: publicUrlData.publicUrl,
+            caption: imageCaptions?.[i] || undefined,
+            is_primary: imageIsPrimary?.[i] || false,
+          });
+        }
+      }
+
+      // Get next display order if not provided
+      const { data: existingPortfolios } = await this.supabase
+        .from('live_portfolio_services')
+        .select('display_order')
+        .eq('stream_id', streamId)
+        .order('display_order', { ascending: false })
+        .limit(1);
+
+      const displayOrder = portfolioData.display_order || ((existingPortfolios?.[0]?.display_order || 0) + 1);
+
+      // Create portfolio service
+      // Use service role client to bypass RLS policies
+      // This ensures portfolio services are always added successfully without timing/transaction issues
+      // We've already verified ownership above, so this is safe
+      const { data: portfolio, error: portfolioError } = await this.supabase
+        .from('live_portfolio_services')
+        .insert({
+          stream_id: streamId,
+          title: portfolioData.title,
+          description: portfolioData.description || null,
+          price: portfolioData.price,
+          category: portfolioData.category,
+          display_order: displayOrder,
+        })
+        .select()
+        .single();
+
+      if (portfolioError || !portfolio) {
+        throw new BadRequestException(`Failed to create portfolio service: ${portfolioError?.message}`);
+      }
+
+      // Insert portfolio images
+      // Use service role client to bypass RLS policies for consistent behavior
+      if (imageUrls.length > 0) {
+        const imageRecords = imageUrls.map((img, index) => ({
+          portfolio_id: portfolio.id,
+          image_url: img.url,
+          caption: img.caption || null,
+          display_order: index,
+          is_primary: img.is_primary || index === 0, // First image is primary by default
+        }));
+
+        const { error: imagesError } = await this.supabase
+          .from('live_portfolio_images')
+          .insert(imageRecords);
+
+        if (imagesError) {
+          this.logger.warn(`Failed to insert portfolio images: ${imagesError.message}`);
+          // Don't fail the entire operation if images fail
+        }
+      }
+
+      // Return portfolio with images
+      return await this.getPortfolioServices(streamId).then(services => 
+        services.find(s => s.id === portfolio.id)
+      ) || portfolio;
+    } catch (error) {
+      this.logEvent('error', 'create_portfolio_service_error', { streamId, vendorId }, error instanceof Error ? error : new Error(String(error)));
+      throw error instanceof BadRequestException || error instanceof ForbiddenException || error instanceof NotFoundException
+        ? error
+        : new BadRequestException('Failed to create portfolio service');
+    }
+  }
+
+  /**
+   * Delete portfolio service
+   */
+  async deletePortfolioService(portfolioId: string, vendorId: string, userToken?: string): Promise<void> {
+    try {
+      // Verify portfolio exists and belongs to vendor's stream
+      const { data: portfolio, error: portfolioError } = await this.supabase
+        .from('live_portfolio_services')
+        .select(`
+          id,
+          stream_id,
+          stream:live_streams!stream_id (vendor_id)
+        `)
+        .eq('id', portfolioId)
+        .single();
+
+      if (portfolioError || !portfolio) {
+        throw new NotFoundException('Portfolio service not found');
+      }
+
+      if ((portfolio.stream as any)?.vendor_id !== vendorId) {
+        throw new ForbiddenException('Only stream owner can delete portfolio services');
+      }
+
+      const client = userToken
+        ? createUserSupabaseClient(this.configService, userToken)
+        : this.supabase;
+
+      // Soft delete portfolio service
+      const { error: deleteError } = await client
+        .from('live_portfolio_services')
+        .update({
+          is_active: false,
+          deleted_at: new Date().toISOString(),
+        })
+        .eq('id', portfolioId);
+
+      if (deleteError) {
+        throw new BadRequestException(`Failed to delete portfolio service: ${deleteError.message}`);
+      }
+    } catch (error) {
+      this.logEvent('error', 'delete_portfolio_service_error', { portfolioId, vendorId }, error instanceof Error ? error : new Error(String(error)));
+      throw error instanceof BadRequestException || error instanceof ForbiddenException || error instanceof NotFoundException
+        ? error
+        : new BadRequestException('Failed to delete portfolio service');
+    }
+  }
+
+  /**
+   * Track portfolio impression
+   */
+  async trackPortfolioImpression(portfolioId: string): Promise<void> {
+    try {
+      const { error } = await this.supabase.rpc('track_portfolio_impression', {
+        p_portfolio_id: portfolioId,
+      });
+
+      if (error) {
+        this.logger.warn(`Failed to track portfolio impression: ${error.message}`);
+        // Don't throw - analytics failures shouldn't break UX
+      }
+    } catch (error) {
+      this.logger.warn('Error tracking portfolio impression:', error);
+      // Silently fail - analytics shouldn't break functionality
+    }
+  }
+
+  /**
+   * Track portfolio add to cart
+   */
+  async trackPortfolioAddToCart(portfolioId: string): Promise<void> {
+    try {
+      const { error } = await this.supabase.rpc('track_portfolio_add_to_cart', {
+        p_portfolio_id: portfolioId,
+      });
+
+      if (error) {
+        this.logger.warn(`Failed to track add to cart: ${error.message}`);
+      }
+    } catch (error) {
+      this.logger.warn('Error tracking add to cart:', error);
+    }
+  }
+
+  /**
+   * Get portfolio analytics for a stream
+   */
+  async getPortfolioAnalytics(streamId: string): Promise<any[]> {
+    try {
+      const { data, error } = await this.supabase.rpc('get_portfolio_analytics', {
+        p_stream_id: streamId,
+      });
+
+      if (error) {
+        throw new BadRequestException(`Failed to fetch portfolio analytics: ${error.message}`);
+      }
+
+      return data || [];
+    } catch (error) {
+      this.logEvent('error', 'get_portfolio_analytics_error', { streamId }, error instanceof Error ? error : new Error(String(error)));
+      throw new BadRequestException('Failed to fetch portfolio analytics');
+    }
   }
 }

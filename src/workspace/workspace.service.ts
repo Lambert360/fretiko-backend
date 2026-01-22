@@ -299,9 +299,13 @@ export class WorkspaceService {
       const auctionRevenue = todayOrders?.filter(o => o.source === 'auction')
         .reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
         
-      const serviceOrdersCount = todayOrders?.filter(o => o.source === 'service_booking').length || 0;
-      const serviceRevenue = todayOrders?.filter(o => o.source === 'service_booking')
-        .reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
+      // Service bookings are now part of live_stream orders, identified by metadata.booking_type
+      const serviceOrdersCount = todayOrders?.filter(o => 
+        o.source === 'live_stream' && o.metadata?.booking_type === 'service'
+      ).length || 0;
+      const serviceRevenue = todayOrders?.filter(o => 
+        o.source === 'live_stream' && o.metadata?.booking_type === 'service'
+      ).reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
 
       console.log(`⏱️ [WORKSPACE] Stats calculated from ${todayOrdersCount} orders`);
 
@@ -1518,7 +1522,8 @@ export class WorkspaceService {
         .select('id, order_number, status, vendor_id, buyer_id, source, metadata')
         .eq('id', orderId)
         .eq('vendor_id', userId)
-        .eq('source', 'service_booking')
+        .eq('source', 'live_stream')
+        .eq('metadata->>booking_type', 'service')
         .single();
 
       if (orderError || !order) {
@@ -1659,10 +1664,11 @@ export class WorkspaceService {
         };
       }
 
-      // 5. Release escrow
+      // 5. Release escrow (pass userId for authorization check)
       await this.escrowService.releaseEscrow(
         escrow.id,
         reason || 'Vendor requested release after dispute window',
+        userId
       );
 
       return {
@@ -1747,6 +1753,7 @@ export class WorkspaceService {
 
   /**
    * Get orders filtered by source (regular, live_stream, auction, service_booking)
+   * ✅ NOTE: service_booking and portfolio bookings are now part of live_stream orders
    * ✅ BUG FIX: Missing endpoint implementation
    */
   async getOrdersBySource(userId: string, source: 'regular' | 'live_stream' | 'auction' | 'service_booking', userToken?: string) {
@@ -1755,7 +1762,7 @@ export class WorkspaceService {
       : this.supabase;
 
     try {
-      const { data: orders, error } = await supabaseClient
+      let query = supabaseClient
         .from('orders')
         .select(`
           id,
@@ -1767,6 +1774,7 @@ export class WorkspaceService {
           buyer_id,
           delivery_address,
           source,
+          metadata,
           order_items(
             id,
             product_name,
@@ -1775,8 +1783,18 @@ export class WorkspaceService {
             product_metadata
           )
         `)
-        .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
-        .eq('source', source)
+        .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`);
+
+      // Handle service_booking as a special case (it's now live_stream with metadata.booking_type='service')
+      if (source === 'service_booking') {
+        query = query
+          .eq('source', 'live_stream')
+          .eq('metadata->>booking_type', 'service');
+      } else {
+        query = query.eq('source', source);
+      }
+
+      const { data: orders, error } = await query
         .order('created_at', { ascending: false })
         .limit(100); // Limit to prevent large queries
 

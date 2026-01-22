@@ -1034,7 +1034,7 @@ export class OrdersService {
     } else if (escrow.status === 'held') {
       // ✅ USE ESCROW SERVICE TO PROPERLY RELEASE FUNDS
       try {
-        await this.escrowService.releaseEscrow(escrow.id, 'Buyer confirmed order receipt');
+        await this.escrowService.releaseEscrow(escrow.id, 'Buyer confirmed order receipt', userId);
         console.log(`✅ Escrow ${escrow.id} released successfully via EscrowService`);
       } catch (releaseError) {
         console.error('❌ Failed to release escrow:', releaseError);
@@ -1145,22 +1145,56 @@ export class OrdersService {
         throw new Error('Order must be delivered before releasing funds');
       }
 
-      // Get escrow details
+      // Get escrow details (check both 'held' and 'released' status)
       const { data: escrow, error: escrowFetchError } = await supabase
         .from('escrows')
-        .select('id, status')
+        .select('id, status, released_at')
         .eq('order_id', orderId)
-        .eq('status', 'held')
+        .in('status', ['held', 'released'])
         .single();
 
       if (escrowFetchError || !escrow) {
-        throw new Error('Escrow not found or already released');
+        throw new Error('Escrow not found for this order');
       }
 
-      // Release escrow immediately
+      // If escrow is already released, check if vendor was actually paid
+      if (escrow.status === 'released') {
+        console.log(`⚠️ Escrow ${escrow.id} is already released. Checking if vendor was paid...`);
+        
+        // Check if vendor payment was successful by looking for wallet_ledger entry
+        const { data: vendorPayment } = await supabase
+          .from('wallet_ledger')
+          .select('id')
+          .eq('reference_type', 'escrow')
+          .eq('reference_id', escrow.id)
+          .eq('transaction_type', 'escrow_release')
+          .eq('user_id', order.vendor_id)
+          .limit(1)
+          .single();
+
+        if (vendorPayment) {
+          // Vendor was paid - escrow release was successful
+          console.log(`✅ Escrow already released and vendor was paid. Returning success.`);
+          return {
+            success: true,
+            message: 'Funds were already released successfully! Vendor and rider have been paid.',
+          };
+        } else {
+          // Escrow is released but vendor wasn't paid - reconciliation required
+          console.error(`❌ CRITICAL: Escrow ${escrow.id} is released but vendor payment is missing!`);
+          throw new Error(
+            'Escrow was released but vendor payment failed. This requires manual reconciliation. ' +
+            'Please contact support with order number: ' + order.order_number
+          );
+        }
+      }
+
+      // Escrow is still 'held' - proceed with release
+      // Release escrow immediately (pass userId for authorization check)
       await this.escrowService.releaseEscrow(
         escrow.id,
-        'Buyer manually confirmed and released funds'
+        'Buyer manually confirmed and released funds',
+        userId
       );
 
       console.log(`✅ Buyer ${userId} manually released escrow for order ${orderId}`);

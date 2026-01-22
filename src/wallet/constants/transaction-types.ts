@@ -19,10 +19,12 @@ export enum WalletTransactionType {
   ADMIN_ADJUSTMENT = 'admin_adjustment',
   DELIVERY_PAYMENT = 'delivery_payment',
   PLATFORM_COMMISSION = 'platform_commission',
+  GIFT_CONVERSION = 'gift_conversion',
 
   // Debits from available balance
   WITHDRAWAL_BURN = 'withdrawal_burn',
   FEE_DEDUCTION = 'fee_deduction',
+  GIFT_PURCHASE = 'gift_purchase',
 
   // Transfers between balance types
   PURCHASE_HOLD = 'purchase_hold', // available → escrow
@@ -58,8 +60,10 @@ export const TRANSACTION_TYPE_DESCRIPTIONS: Record<WalletTransactionType, string
   [WalletTransactionType.REWARD_CREDIT]: 'Reward credited to available balance',
   [WalletTransactionType.DELIVERY_PAYMENT]: 'Delivery fee paid to rider',
   [WalletTransactionType.PLATFORM_COMMISSION]: 'Platform commission credited',
+  [WalletTransactionType.GIFT_CONVERSION]: 'Gift converted to credits (80% to user)',
   [WalletTransactionType.WITHDRAWAL_REQUEST]: 'Funds moved to pending withdrawal',
   [WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM]: 'Escrow released to platform',
+  [WalletTransactionType.GIFT_PURCHASE]: 'Gift purchase (debit from user wallet)',
 };
 
 /**

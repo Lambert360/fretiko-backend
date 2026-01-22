@@ -1,6 +1,6 @@
 import { Injectable, HttpException, HttpStatus, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -33,6 +33,7 @@ class AnalyticsError extends HttpException {
 @Injectable()
 export class AnalyticsService implements OnModuleDestroy {
   private supabase;
+  private serviceSupabase; // Service role client for inserts (bypasses RLS)
   
   // ✅ PERFORMANCE FIX: Configuration constants
   private readonly MAX_HISTORICAL_DAYS = 90; // Limit historical queries to 90 days
@@ -61,6 +62,7 @@ export class AnalyticsService implements OnModuleDestroy {
 
   constructor(private configService: ConfigService) {
     this.supabase = createSupabaseClient(this.configService);
+    this.serviceSupabase = createServiceSupabaseClient(this.configService);
     
     // ✅ PHASE 5 FIX: Load configurable values from environment
     this.PLATFORM_COMMISSION_RATE = parseFloat(
@@ -2953,7 +2955,8 @@ export class AnalyticsService implements OnModuleDestroy {
       }
 
       // Critical events (gift_sent, product_purchased) are processed immediately
-      const { error } = await this.supabase
+      // Use service role client to bypass RLS for system events
+      const { error } = await this.serviceSupabase
         .from('analytics_events')
         .insert({
           stream_id: eventData.streamId,
@@ -3152,7 +3155,8 @@ export class AnalyticsService implements OnModuleDestroy {
         created_at: new Date(event.timestamp).toISOString(),
       }));
 
-      const { error: batchInsertError } = await this.supabase
+      // Use service role client to bypass RLS for batch inserts
+      const { error: batchInsertError } = await this.serviceSupabase
         .from('analytics_events')
         .insert(eventsToInsert);
 

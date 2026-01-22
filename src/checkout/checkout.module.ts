@@ -10,6 +10,7 @@ import { RidersModule } from '../riders/riders.module';
 import { ChatModule } from '../chat/chat.module';
 import { WishlistModule } from '../wishlist/wishlist.module';
 import { WalletModule } from '../wallet/wallet.module';
+import { AuctionsModule } from '../auctions/auctions.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { WalletModule } from '../wallet/wallet.module';
     forwardRef(() => ChatModule),
     WishlistModule,
     WalletModule,
+    forwardRef(() => AuctionsModule), // For marking auction wins as checked out
   ],
   controllers: [CheckoutController],
   providers: [CheckoutService],

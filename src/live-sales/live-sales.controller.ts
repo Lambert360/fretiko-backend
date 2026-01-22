@@ -8,10 +8,15 @@ import {
   Param,
   Query,
   UseGuards,
+  UseInterceptors,
   Request,
   BadRequestException,
   ForbiddenException,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
+import { FileFieldsInterceptor } from '@nestjs/platform-express';
+import { UploadedFiles } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { LiveSalesService } from './live-sales.service';
@@ -26,6 +31,7 @@ import {
   LiveServiceBookingDto,
   JoinStreamDto,
   LeaveStreamDto,
+  LiveStreamProductDto,
 } from './dto/live-sales.dto';
 
 /**
@@ -160,11 +166,13 @@ export class LiveSalesController {
     @Body() updateStatusDto: UpdateStreamStatusDto,
   ) {
     const userId = req.user?.sub;
-    if (!userId) {
+    const accessToken = req.headers.authorization?.replace('Bearer ', '');
+
+    if (!userId || !accessToken) {
       throw new BadRequestException('User not authenticated');
     }
 
-    return this.liveSalesService.updateStreamStatus(streamId, userId, updateStatusDto);
+    return this.liveSalesService.updateStreamStatus(streamId, userId, updateStatusDto, accessToken);
   }
 
   /**
@@ -177,12 +185,38 @@ export class LiveSalesController {
     @Request() req: any,
   ) {
     const userId = req.user?.sub;
+    const accessToken = req.headers.authorization?.replace('Bearer ', '');
+
+    if (!userId || !accessToken) {
+      throw new BadRequestException('User not authenticated');
+    }
+
+    await this.liveSalesService.endStream(streamId, userId, accessToken);
+    return { success: true, message: 'Stream ended successfully' };
+  }
+
+  /**
+   * POST /live-sales/streams/:id/products
+   * Add a product to an existing live stream
+   */
+  @Post('streams/:id/products')
+  @HttpCode(HttpStatus.CREATED)
+  async addProductToStream(
+    @Param('id') streamId: string,
+    @Request() req: any,
+    @Body() productDto: LiveStreamProductDto,
+  ) {
+    const userId = req.user?.sub;
     if (!userId) {
       throw new BadRequestException('User not authenticated');
     }
 
-    await this.liveSalesService.endStream(streamId, userId);
-    return { success: true, message: 'Stream ended successfully' };
+    return this.liveSalesService.addProductToStream(
+      streamId,
+      userId,
+      productDto,
+      req.headers.authorization?.replace('Bearer ', ''),
+    );
   }
 
   /**
@@ -217,11 +251,13 @@ export class LiveSalesController {
     @Request() req: any,
   ) {
     const userId = req.user?.sub;
-    if (!userId) {
+    const accessToken = req.headers.authorization?.replace('Bearer ', '');
+
+    if (!userId || !accessToken) {
       throw new BadRequestException('User not authenticated');
     }
 
-    await this.liveSalesService.joinStream(streamId, userId);
+    await this.liveSalesService.joinStream(streamId, userId, accessToken);
     return { success: true, message: 'Joined stream successfully' };
   }
 
@@ -432,5 +468,169 @@ export class LiveSalesController {
     // Get detailed analytics for this stream
     const analytics = await this.liveSalesService.getStreamAnalytics(streamId, userId);
     return analytics;
+  }
+
+  // =====================
+  // PORTFOLIO SERVICES
+  // =====================
+
+  /**
+   * GET /live-sales/portfolio/:streamId
+   * Get portfolio services for a stream
+   */
+  @Get('portfolio/:streamId')
+  async getPortfolioServices(
+    @Param('streamId') streamId: string,
+  ) {
+    return this.liveSalesService.getPortfolioServices(streamId);
+  }
+
+  /**
+   * POST /live-sales/portfolio
+   * Upload/create a portfolio service for a stream
+   */
+  @Post('portfolio')
+  @UseInterceptors(
+    FileFieldsInterceptor([
+      { name: 'images', maxCount: 10 },
+    ]),
+  )
+  @HttpCode(HttpStatus.CREATED)
+  async createPortfolioService(
+    @Request() req: any,
+    @Body() body: any,
+    @UploadedFiles() files: { images?: Express.Multer.File[] },
+  ) {
+    const userId = req.user?.sub;
+    if (!userId) {
+      throw new BadRequestException('User not authenticated');
+    }
+
+    // Parse FormData fields manually
+    const portfolioData = {
+      stream_id: body.stream_id,
+      title: body.title,
+      description: body.description,
+      price: parseFloat(body.price),
+      category: body.category as 'work_sample' | 'consultation' | 'service_package' | 'testimonial',
+      display_order: body.display_order ? parseInt(body.display_order) : undefined,
+    };
+
+    // Parse image captions and primary flags from FormData
+    const imageCaptions: string[] = [];
+    const imageIsPrimary: boolean[] = [];
+    
+    if (files?.images && files.images.length > 0) {
+      files.images.forEach((_, index) => {
+        const captionKey = `image_captions[${index}]`;
+        const primaryKey = `image_is_primary[${index}]`;
+        imageCaptions.push(body[captionKey] || '');
+        imageIsPrimary.push(body[primaryKey] === 'true');
+      });
+    }
+
+    return this.liveSalesService.createPortfolioService(
+      userId,
+      portfolioData.stream_id,
+      portfolioData,
+      files?.images,
+      imageCaptions,
+      imageIsPrimary,
+      req.headers.authorization?.replace('Bearer ', ''),
+    );
+  }
+
+  /**
+   * DELETE /live-sales/portfolio/:portfolioId
+   * Delete a portfolio service
+   */
+  @Delete('portfolio/:portfolioId')
+  @HttpCode(HttpStatus.OK)
+  async deletePortfolioService(
+    @Param('portfolioId') portfolioId: string,
+    @Request() req: any,
+  ) {
+    const userId = req.user?.sub;
+    if (!userId) {
+      throw new BadRequestException('User not authenticated');
+    }
+
+    await this.liveSalesService.deletePortfolioService(
+      portfolioId,
+      userId,
+      req.headers.authorization?.replace('Bearer ', ''),
+    );
+    return { success: true, message: 'Portfolio service deleted successfully' };
+  }
+
+  /**
+   * POST /live-sales/portfolio/book
+   * Book a portfolio service
+   */
+  @Post('portfolio/book')
+  @HttpCode(HttpStatus.CREATED)
+  async bookPortfolioService(
+    @Request() req: any,
+    @Body() bookingData: {
+      stream_id: string;
+      portfolio_id: string;
+      service_date: string;
+      service_time: string;
+      service_notes?: string;
+    },
+  ) {
+    const userId = req.user?.sub;
+    if (!userId) {
+      throw new BadRequestException('User not authenticated');
+    }
+
+    return await this.liveSalesService.bookPortfolioService(
+      userId,
+      bookingData,
+    );
+  }
+
+  /**
+   * POST /live-sales/portfolio/:portfolioId/impression
+   * Track portfolio item impression
+   */
+  @Post('portfolio/:portfolioId/impression')
+  @HttpCode(HttpStatus.OK)
+  async trackPortfolioImpression(
+    @Param('portfolioId') portfolioId: string,
+  ) {
+    await this.liveSalesService.trackPortfolioImpression(portfolioId);
+    return { success: true };
+  }
+
+  /**
+   * POST /live-sales/portfolio/:portfolioId/add-to-cart
+   * Track portfolio item add to cart
+   */
+  @Post('portfolio/:portfolioId/add-to-cart')
+  @HttpCode(HttpStatus.OK)
+  async trackPortfolioAddToCart(
+    @Param('portfolioId') portfolioId: string,
+  ) {
+    await this.liveSalesService.trackPortfolioAddToCart(portfolioId);
+    return { success: true };
+  }
+
+  /**
+   * GET /live-sales/portfolio/analytics/:streamId
+   * Get portfolio analytics for a stream
+   */
+  @Get('portfolio/analytics/:streamId')
+  async getPortfolioAnalytics(
+    @Param('streamId') streamId: string,
+    @Request() req: any,
+  ) {
+    const userId = req.user?.sub;
+    if (!userId) {
+      throw new BadRequestException('User not authenticated');
+    }
+
+    // Verify user owns the stream (optional check)
+    return this.liveSalesService.getPortfolioAnalytics(streamId);
   }
 }

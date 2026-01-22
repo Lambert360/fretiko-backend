@@ -120,12 +120,34 @@ export class AdminService {
       return sum + (deliveryFee * riderCommissionRate);
     }, 0);
 
-    const totalPlatformFees = escrows?.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0) || 0;
-    const realizedRevenue = releasedEscrows.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0);
+    const totalPlatformFeesEscrow = escrows?.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0) || 0;
+    const realizedRevenueEscrow = releasedEscrows.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0);
     const pendingRevenue = heldEscrows.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0);
     const lostRevenue = refundedEscrows.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0);
 
-    // 2. Calculate revenue by order source
+    // 1b. Calculate gift revenue (platform share from gift conversions)
+    const { data: giftCommissionRows, error: giftCommissionError } = await this.supabase
+      .from('wallet_ledger')
+      .select('available_delta')
+      .eq('user_id', this.PLATFORM_USER_ID)
+      .eq('transaction_type', 'platform_commission')
+      .eq('reference_type', 'gift_conversion')
+      .gte('created_at', startDate)
+      .lte('created_at', endDate);
+
+    if (giftCommissionError) {
+      this.logger.error('Failed to fetch gift commission revenue:', giftCommissionError.message);
+    }
+
+    const giftRevenue = (giftCommissionRows || []).reduce(
+      (sum: number, row: any) => sum + (parseFloat(row.available_delta) || 0),
+      0,
+    );
+
+    const totalPlatformFees = totalPlatformFeesEscrow + giftRevenue;
+    const realizedRevenue = realizedRevenueEscrow + giftRevenue;
+
+    // 2. Calculate revenue by order source (including gifts)
     const revenueBySource = {
       regular: 0,
       live_stream: 0,
@@ -134,6 +156,7 @@ export class AdminService {
       invoice: 0,
       wishlist: 0,
       logistics: totalRiderCommission, // Rider commission revenue
+      gifts: giftRevenue, // Platform fee from gift conversions
     };
 
     escrows?.forEach(e => {
@@ -224,6 +247,137 @@ export class AdminService {
   }
 
   /**
+   * Get auction analytics summary for admin dashboard
+   */
+  async getAuctionAnalyticsSummary(userId: string, dateRange?: { start: string; end: string }) {
+    await this.verifyAdmin(userId);
+
+    const startDate = dateRange?.start || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const endDate = dateRange?.end || new Date().toISOString();
+
+    this.logger.log(`Fetching auction analytics from ${startDate} to ${endDate}`);
+
+    // 1. Get auctions in date range
+    const { data: auctions, error: auctionsError } = await this.supabase
+      .from('auctions')
+      .select(`
+        id,
+        title,
+        category_id,
+        status,
+        winning_bid,
+        starting_price,
+        current_bid,
+        total_bids,
+        unique_bidders,
+        created_at,
+        end_time
+      `)
+      .gte('created_at', startDate)
+      .lte('created_at', endDate);
+
+    if (auctionsError) {
+      this.logger.error('Failed to fetch auctions for analytics:', auctionsError.message);
+      throw new BadRequestException('Failed to fetch auction analytics');
+    }
+
+    const totalAuctions = auctions?.length || 0;
+    const soldAuctions = auctions?.filter(a => a.status === 'sold')?.length || 0;
+    const sellThroughRate = totalAuctions > 0 ? (soldAuctions / totalAuctions) * 100 : 0;
+
+    const totalBids = auctions?.reduce((sum, a) => sum + (a.total_bids || 0), 0) || 0;
+    const totalUniqueBidders = auctions?.reduce((sum, a) => sum + (a.unique_bidders || 0), 0) || 0;
+
+    const averageBidsPerAuction = totalAuctions > 0 ? totalBids / totalAuctions : 0;
+    const averageUniqueBiddersPerAuction = totalAuctions > 0 ? totalUniqueBidders / totalAuctions : 0;
+
+    // 2. Calculate auction revenue (platform side) from wallet_ledger (source = auction)
+    const { data: auctionLedger, error: ledgerError } = await this.supabase
+      .from('wallet_ledger')
+      .select('available_delta')
+      .eq('user_id', this.PLATFORM_USER_ID)
+      .eq('transaction_type', 'platform_commission')
+      .eq('reference_type', 'auction')
+      .gte('created_at', startDate)
+      .lte('created_at', endDate);
+
+    if (ledgerError) {
+      this.logger.error('Failed to fetch auction ledger entries:', ledgerError.message);
+    }
+
+    const totalAuctionRevenue =
+      auctionLedger?.reduce((sum, row: any) => sum + (parseFloat(row.available_delta) || 0), 0) || 0;
+
+    // 3. Category breakdown
+    const categoryMap: Record<
+      string,
+      { categoryId: string; categoryName: string; totalRevenue: number; totalBids: number }
+    > = {};
+
+    if (auctions && auctions.length > 0) {
+      const categoryIds = Array.from(new Set(auctions.map(a => a.category_id).filter(Boolean)));
+
+      if (categoryIds.length > 0) {
+        const { data: categories } = await this.supabase
+          .from('auction_categories')
+          .select('id, name')
+          .in('id', categoryIds as string[]);
+
+        categories?.forEach(cat => {
+          categoryMap[cat.id] = {
+            categoryId: cat.id,
+            categoryName: cat.name,
+            totalRevenue: 0,
+            totalBids: 0,
+          };
+        });
+      }
+
+      auctions.forEach(a => {
+        const catId = a.category_id;
+        if (!catId || !categoryMap[catId]) return;
+
+        const finalPrice = a.winning_bid || a.current_bid || a.starting_price || 0;
+        categoryMap[catId].totalRevenue += finalPrice;
+        categoryMap[catId].totalBids += a.total_bids || 0;
+      });
+    }
+
+    const topCategories = Object.values(categoryMap).sort((a, b) => b.totalRevenue - a.totalRevenue).slice(0, 10);
+
+    // 4. Top auctions by revenue
+    const topAuctions =
+      auctions
+        ?.map(a => {
+          const finalPrice = a.winning_bid || a.current_bid || a.starting_price || 0;
+          const categoryEntry = a.category_id ? categoryMap[a.category_id] : undefined;
+          return {
+            auctionId: a.id,
+            title: a.title,
+            categoryName: categoryEntry?.categoryName || null,
+            revenue: finalPrice,
+            totalBids: a.total_bids || 0,
+            uniqueBidders: a.unique_bidders || 0,
+            status: a.status,
+          };
+        })
+        .sort((a, b) => b.revenue - a.revenue)
+        .slice(0, 10) || [];
+
+    return {
+      totalAuctions,
+      soldAuctions,
+      sellThroughRate,
+      totalAuctionRevenue,
+      averageBidsPerAuction,
+      averageUniqueBiddersPerAuction,
+      topCategories,
+      topAuctions,
+      dateRange: { start: startDate, end: endDate },
+    };
+  }
+
+  /**
    * Get platform revenue for staff (staff version)
    */
   async getPlatformRevenueForStaff(staffId: string, dateRange?: { start: string; end: string }) {
@@ -296,9 +450,29 @@ export class AdminService {
 
     const pendingRevenue = heldEscrowsInRange?.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0) || 0;
     const lostRevenue = refundedEscrowsInRange?.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0) || 0;
-    const totalPlatformFees = realizedRevenue + pendingRevenue + lostRevenue;
 
-    // 2. Calculate revenue by order source
+    // 1b. Calculate gift revenue (platform share from gift conversions)
+    const { data: giftCommissionRows, error: giftCommissionError } = await this.supabase
+      .from('wallet_ledger')
+      .select('available_delta')
+      .eq('user_id', this.PLATFORM_USER_ID)
+      .eq('transaction_type', 'platform_commission')
+      .eq('reference_type', 'gift_conversion')
+      .gte('created_at', startDate)
+      .lte('created_at', endDate);
+
+    if (giftCommissionError) {
+      this.logger.error('Failed to fetch gift commission revenue (staff):', giftCommissionError.message);
+    }
+
+    const giftRevenue = (giftCommissionRows || []).reduce(
+      (sum: number, row: any) => sum + (parseFloat(row.available_delta) || 0),
+      0,
+    );
+
+    const totalPlatformFees = realizedRevenue + pendingRevenue + lostRevenue + giftRevenue;
+
+    // 2. Calculate revenue by order source (including gifts)
     const revenueBySource = {
       regular: 0,
       live_stream: 0,
@@ -307,6 +481,7 @@ export class AdminService {
       invoice: 0,
       wishlist: 0,
       logistics: totalRiderCommission, // Rider commission revenue
+      gifts: giftRevenue, // Platform fee from gift conversions
     };
 
     escrows?.forEach(e => {
@@ -4779,10 +4954,30 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       .not('released_at', 'is', null) // Ensure released_at exists
       .gte('released_at', thirtyDaysAgo);
 
-    const revenue = recentEscrows?.reduce(
+    const revenueFromEscrows = recentEscrows?.reduce(
       (sum, e) => sum + parseFloat(e.platform_amount || '0'),
       0
     ) || 0;
+
+    // Get gift conversion revenue (last 30 days)
+    const { data: recentGiftCommissions, error: recentGiftError } = await this.supabase
+      .from('wallet_ledger')
+      .select('available_delta')
+      .eq('user_id', this.PLATFORM_USER_ID)
+      .eq('transaction_type', 'platform_commission')
+      .eq('reference_type', 'gift_conversion')
+      .gte('created_at', thirtyDaysAgo);
+
+    if (recentGiftError) {
+      this.logger.error('Failed to fetch recent gift conversion revenue:', recentGiftError.message);
+    }
+
+    const giftRevenue = (recentGiftCommissions || []).reduce(
+      (sum: number, row: any) => sum + (parseFloat(row.available_delta) || 0),
+      0,
+    );
+
+    const revenue = revenueFromEscrows + giftRevenue;
 
     // Get previous period revenue for comparison (30-60 days ago)
     const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
@@ -4793,10 +4988,31 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       .gte('released_at', sixtyDaysAgo)
       .lt('released_at', thirtyDaysAgo);
 
-    const previousRevenue = previousEscrows?.reduce(
+    const previousRevenueFromEscrows = previousEscrows?.reduce(
       (sum, e) => sum + parseFloat(e.platform_amount || '0'),
       0
     ) || 0;
+
+    // Get previous period gift conversion revenue (30-60 days ago)
+    const { data: previousGiftCommissions, error: previousGiftError } = await this.supabase
+      .from('wallet_ledger')
+      .select('available_delta')
+      .eq('user_id', this.PLATFORM_USER_ID)
+      .eq('transaction_type', 'platform_commission')
+      .eq('reference_type', 'gift_conversion')
+      .gte('created_at', sixtyDaysAgo)
+      .lt('created_at', thirtyDaysAgo);
+
+    if (previousGiftError) {
+      this.logger.error('Failed to fetch previous gift conversion revenue:', previousGiftError.message);
+    }
+
+    const previousGiftRevenue = (previousGiftCommissions || []).reduce(
+      (sum: number, row: any) => sum + (parseFloat(row.available_delta) || 0),
+      0,
+    );
+
+    const previousRevenue = previousRevenueFromEscrows + previousGiftRevenue;
 
     const revenueChange = previousRevenue > 0
       ? ((revenue - previousRevenue) / previousRevenue) * 100

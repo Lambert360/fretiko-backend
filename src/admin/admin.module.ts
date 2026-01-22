@@ -21,6 +21,7 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { ContentReportsModule } from '../content-reports/content-reports.module';
 import { AuctionsModule } from '../auctions/auctions.module';
+import { GiftModule } from '../gifts/gift.module';
 import { EmailService } from '../shared/email.service';
 
 @Module({
@@ -41,6 +42,7 @@ import { EmailService } from '../shared/email.service';
     WalletModule,
     forwardRef(() => ContentReportsModule),
     AuctionsModule, // For fraud detection and auctions service
+    GiftModule, // For gift wallet statistics
   ],
   controllers: [
     AdminController, 

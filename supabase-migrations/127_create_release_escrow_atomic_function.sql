@@ -22,7 +22,14 @@ SECURITY DEFINER
 AS $$
 DECLARE
   v_escrow RECORD;
-  v_order RECORD;
+  v_order_id UUID;
+  v_order_number VARCHAR(50);
+  v_buyer_id UUID;
+  v_vendor_id UUID;
+  v_rider_id UUID;
+  v_order_status VARCHAR(50);
+  v_delivered_at TIMESTAMP;
+  v_order_confirmed_at TIMESTAMP;
   v_authorized BOOLEAN := FALSE;
   v_is_auto_release BOOLEAN := FALSE;
   v_is_buyer_confirmed BOOLEAN := FALSE;
@@ -42,15 +49,23 @@ BEGIN
     e.release_reason,
     e.created_at,
     e.updated_at,
-    o.id as order_id_full,
+    o.id,
     o.order_number,
     o.buyer_id,
     o.vendor_id,
     o.rider_id,
-    o.status as order_status,
+    o.status,
     o.delivered_at,
     o.order_confirmed_at
-  INTO v_escrow
+  INTO v_escrow,
+       v_order_id,
+       v_order_number,
+       v_buyer_id,
+       v_vendor_id,
+       v_rider_id,
+       v_order_status,
+       v_delivered_at,
+       v_order_confirmed_at
   FROM escrows e
   INNER JOIN orders o ON e.order_id = o.id
   WHERE e.id = p_escrow_id
@@ -66,23 +81,13 @@ BEGIN
     );
   END IF;
 
-  -- Build order record for easier access
-  v_order.id := v_escrow.order_id_full;
-  v_order.order_number := v_escrow.order_number;
-  v_order.buyer_id := v_escrow.buyer_id;
-  v_order.vendor_id := v_escrow.vendor_id;
-  v_order.rider_id := v_escrow.rider_id;
-  v_order.status := v_escrow.order_status;
-  v_order.delivered_at := v_escrow.delivered_at;
-  v_order.order_confirmed_at := v_escrow.order_confirmed_at;
-
   -- 2. Authorization check (if user_id provided)
   IF p_user_id IS NOT NULL THEN
-    IF v_order.vendor_id = p_user_id THEN
+    IF v_vendor_id = p_user_id THEN
       v_authorized := TRUE;
-    ELSIF v_order.buyer_id = p_user_id THEN
+    ELSIF v_buyer_id = p_user_id THEN
       v_authorized := TRUE;
-    ELSIF v_order.rider_id IS NOT NULL AND v_order.rider_id = p_user_id THEN
+    ELSIF v_rider_id IS NOT NULL AND v_rider_id = p_user_id THEN
       v_authorized := TRUE;
     -- TODO: Add admin check when admin system is implemented
     -- ELSIF is_admin(p_user_id) THEN
@@ -102,7 +107,7 @@ BEGIN
   END IF;
 
   -- 3. Validate order status
-  IF v_order.status = 'cancelled' THEN
+  IF v_order_status = 'cancelled' THEN
     RETURN jsonb_build_object(
       'success', false,
       'error', 'Cannot release escrow for cancelled order',
@@ -116,7 +121,7 @@ BEGIN
   
   IF NOT v_is_auto_release AND NOT v_is_buyer_confirmed THEN
     -- Manual release - must verify order is delivered or confirmed
-    IF v_order.delivered_at IS NULL AND v_order.order_confirmed_at IS NULL THEN
+    IF v_delivered_at IS NULL AND v_order_confirmed_at IS NULL THEN
       RETURN jsonb_build_object(
         'success', false,
         'error', 'Order must be delivered or confirmed before releasing escrow manually',
@@ -158,14 +163,14 @@ BEGIN
       'status', 'released'
     ),
     'order', jsonb_build_object(
-      'id', v_order.id,
-      'order_number', v_order.order_number,
-      'buyer_id', v_order.buyer_id,
-      'vendor_id', v_order.vendor_id,
-      'rider_id', v_order.rider_id,
-      'status', v_order.status,
-      'delivered_at', v_order.delivered_at,
-      'order_confirmed_at', v_order.order_confirmed_at
+      'id', v_order_id,
+      'order_number', v_order_number,
+      'buyer_id', v_buyer_id,
+      'vendor_id', v_vendor_id,
+      'rider_id', v_rider_id,
+      'status', v_order_status,
+      'delivered_at', v_delivered_at,
+      'order_confirmed_at', v_order_confirmed_at
     )
   );
 EXCEPTION
@@ -186,5 +191,6 @@ COMMENT ON FUNCTION release_escrow_atomic IS
 'Atomically releases an escrow with row-level locking to prevent race conditions. 
 Uses SELECT FOR UPDATE to lock the escrow row during the entire transaction, 
 ensuring only one release can succeed even with concurrent requests.
-Returns JSONB with success status and escrow/order data if successful, or error details if failed.';
+Returns JSONB with success status and escrow/order data if successful, or error details if failed.
+Fixed: Uses individual variables instead of RECORD for order data to avoid "record not assigned yet" error.';
 

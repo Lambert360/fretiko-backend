@@ -12,7 +12,8 @@ export class AuctionOwnerGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();
     const user = request.user;
-    const auctionId = request.params.id;
+    // Support both :id and :auctionId parameter names
+    const auctionId = request.params.auctionId || request.params.id;
 
     if (!user || !auctionId) {
       throw new ForbiddenException('Access denied');

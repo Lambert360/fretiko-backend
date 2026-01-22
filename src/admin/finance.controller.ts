@@ -4,6 +4,7 @@ import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
 import { PermissionsGuard } from '../staff/guards/permissions.guard';
 import { Permissions } from '../staff/decorators/permissions.decorator';
 import { WalletReconciliationService } from '../wallet/wallet-reconciliation.service';
+import { GiftService } from '../gifts/gift.service';
 
 /**
  * Finance Controller (Staff)
@@ -16,6 +17,7 @@ export class FinanceController {
   constructor(
     private readonly adminService: AdminService,
     private readonly walletReconciliationService: WalletReconciliationService,
+    private readonly giftService: GiftService,
   ) {}
 
   /**
@@ -257,6 +259,39 @@ export class FinanceController {
   @Permissions('view_revenue')
   async reconcileUserWallet(@Req() req, @Param('userId') userId: string) {
     return this.walletReconciliationService.reconcileUserWallet(userId);
+  }
+
+  /**
+   * Get gift wallet statistics
+   * GET /admin/finance/gift-wallet
+   * Requires: view_revenue permission
+   */
+  @Get('gift-wallet')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async getGiftWalletStats(@Req() req) {
+    return this.giftService.getGiftStats();
+  }
+
+  /**
+   * Get user gift holdings
+   * GET /admin/finance/gift-wallet/holdings
+   * Requires: view_revenue permission
+   */
+  @Get('gift-wallet/holdings')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async getUserGiftHoldings(
+    @Req() req,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('search') search?: string,
+  ) {
+    return this.giftService.getUserGiftHoldings({
+      page: page ? parseInt(page) : 1,
+      limit: limit ? parseInt(limit) : 20,
+      search,
+    });
   }
 }
 

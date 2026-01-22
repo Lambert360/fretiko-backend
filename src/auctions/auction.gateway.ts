@@ -9,7 +9,7 @@ import {
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { UseGuards, Inject, forwardRef } from '@nestjs/common';
+import { UseGuards, Inject, forwardRef, Logger } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AuctionsService } from './auctions.service';
 
@@ -31,6 +31,8 @@ import { AuctionsService } from './auctions.service';
 export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
+
+  private readonly logger = new Logger(AuctionGateway.name);
 
   private activeConnections = new Map<string, { userId?: string; auctionRooms: Set<string> }>();
 
@@ -129,7 +131,12 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       });
 
     } catch (error) {
-      client.emit('error', { message: 'Failed to join auction' });
+      this.logger.error(`Failed to join auction ${data.auction_id}`, {
+        clientId: client.id,
+        auctionId: data.auction_id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      client.emit('error', { message: 'Failed to join auction. Please try again.' });
     }
   }
 
@@ -190,9 +197,15 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       });
 
     } catch (error) {
+      this.logger.error(`Failed to place bid in auction ${data.auction_id}`, {
+        clientId: client.id,
+        auctionId: data.auction_id,
+        amount: data.amount,
+        error: error instanceof Error ? error.message : String(error),
+      });
       client.emit('bid_error', {
         auction_id: data.auction_id,
-        message: 'Failed to place bid',
+        message: 'Failed to place bid. Please check your connection and try again.',
       });
     }
   }
@@ -263,6 +276,36 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   }
 
   /**
+   * Broadcast stream URL update (when host starts/stops broadcasting)
+   */
+  async broadcastStreamUrlUpdate(auctionId: string, streamUrl: string | null) {
+    const roomName = `auction_${auctionId}`;
+    const eventData = {
+      auction_id: auctionId,
+      stream_url: streamUrl,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Broadcast to specific auction room
+    this.server.to(roomName).emit('stream_url_updated', eventData);
+    
+    // Also broadcast globally for discovery screen updates
+    this.server.emit('stream_url_updated', eventData);
+    
+    // Also emit broadcast_started event for compatibility
+    if (streamUrl) {
+      this.server.to(roomName).emit('broadcast_started', {
+        auction_id: auctionId,
+        timestamp: new Date().toISOString(),
+      });
+      this.server.emit('broadcast_started', {
+        auction_id: auctionId,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
    * Broadcast auction status change
    * Called from scheduler service
    * Broadcasts to both the specific auction room AND all connected clients (for discovery screen)
@@ -317,8 +360,13 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
    */
   getAuctionViewerCount(auctionId: string): number {
     const roomName = `auction_${auctionId}`;
-    const room = this.server.sockets.adapter.rooms.get(roomName);
-    return room ? room.size : 0;
+    if (this.server && this.server.sockets && this.server.sockets.adapter && this.server.sockets.adapter.rooms) {
+      const room = this.server.sockets.adapter.rooms.get(roomName);
+      return room?.size || 0;
+    } else {
+      this.logger.warn(`⚠️ Cannot access rooms in auction gateway - adapter not available`);
+      return 0;
+    }
   }
 
   /**
@@ -338,5 +386,90 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
         action_url: `/auctions/${auctionId}`,
       },
     });
+  }
+
+  /**
+   * Broadcast auction item event to auction room
+   * Events: item_ready, start_countdown, bidding_open, bidding_ended, item_sold, item_passed
+   */
+  async broadcastItemEvent(auctionId: string, itemId: string | null, eventType: string, data: any) {
+    const roomName = `auction_${auctionId}`;
+    
+    const eventData = {
+      auction_id: auctionId,
+      item_id: itemId,
+      event_type: eventType,
+      ...data,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Broadcast to specific auction room
+    this.server.to(roomName).emit('item_event', eventData);
+    
+    // Also broadcast globally for discovery screen updates
+    if (eventType === 'item_sold' || eventType === 'item_ready') {
+      this.server.emit('item_event', eventData);
+    }
+  }
+
+  /**
+   * Handle reaction from viewer
+   * Allows viewers to send reactions (hearts, applause, etc.) to provide feedback
+   */
+  @SubscribeMessage('send_reaction')
+  async handleSendReaction(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { auction_id: string; reaction_type: string },
+  ) {
+    try {
+      const connection = this.activeConnections.get(client.id);
+      if (!connection || !connection.userId) {
+        client.emit('error', { message: 'User not authenticated' });
+        return;
+      }
+
+      const userId = connection.userId;
+      const reactionType = data.reaction_type;
+
+      // Validate reaction type
+      const validReactionTypes = ['heart', 'thumbs_up', 'applause', 'fire'];
+      if (!validReactionTypes.includes(reactionType)) {
+        client.emit('error', { message: 'Invalid reaction type' });
+        return;
+      }
+
+      // Save reaction to database
+      await this.auctionsService.sendReaction(userId, data.auction_id, reactionType as any);
+
+      // Broadcast reaction to all viewers and auctioneer
+      const roomName = `auction_${data.auction_id}`;
+      const reactionData = {
+        auction_id: data.auction_id,
+        user_id: userId,
+        reaction_type: reactionType,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Broadcast to all viewers in the auction room
+      this.server.to(roomName).emit('new_reaction', reactionData);
+
+      // Also broadcast to auctioneer (seller) if they're connected
+      // The auctioneer can listen to the same room or a separate vendor room
+      this.server.to(roomName).emit('new_reaction', reactionData);
+      this.logger.log(`Reaction ${reactionType} sent by ${userId} in auction ${data.auction_id}`);
+    } catch (error) {
+      this.logger.error('Error handling reaction', {
+        clientId: client.id,
+        auctionId: data?.auction_id,
+        reactionType: data?.reaction_type,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      client.emit('error', {
+        message:
+          error instanceof Error && error.message
+            ? error.message
+            : 'Failed to send reaction. Please try again.',
+      });
+    }
   }
 }

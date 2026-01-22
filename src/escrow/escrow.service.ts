@@ -142,8 +142,17 @@ export class EscrowService {
       if (!atomicResult || !atomicResult.success) {
         const errorCode = atomicResult?.error_code || 'UNKNOWN';
         const errorMessage = atomicResult?.error || 'Escrow release failed';
+        const sqlErrorMessage = atomicResult?.error_message || null; // SQLERRM from database function
         
-        this.logger.warn(`Escrow release failed: ${errorMessage} (code: ${errorCode})`);
+        // Log detailed error information
+        this.logger.error(`Escrow release failed for ${escrowId}:`, {
+          errorCode,
+          errorMessage,
+          sqlErrorMessage,
+          userId: userId || 'system',
+          reason,
+          fullResult: atomicResult
+        });
         
         // Map error codes to appropriate HTTP status codes
         if (errorCode === 'ESCROW_NOT_FOUND') {
@@ -154,6 +163,14 @@ export class EscrowService {
           throw new HttpException(errorMessage, HttpStatus.BAD_REQUEST);
         } else if (errorCode === 'STATUS_CHANGED') {
           throw new HttpException(errorMessage, HttpStatus.CONFLICT);
+        } else if (errorCode === 'INTERNAL_ERROR') {
+          // INTERNAL_ERROR means an exception occurred in the database function
+          // Include the SQL error message if available
+          const detailedMessage = sqlErrorMessage 
+            ? `${errorMessage}: ${sqlErrorMessage}`
+            : errorMessage;
+          this.logger.error(`Database error during escrow release: ${sqlErrorMessage || 'No SQL error details available'}`);
+          throw new HttpException(detailedMessage, HttpStatus.INTERNAL_SERVER_ERROR);
         } else {
           throw new HttpException(errorMessage, HttpStatus.INTERNAL_SERVER_ERROR);
         }

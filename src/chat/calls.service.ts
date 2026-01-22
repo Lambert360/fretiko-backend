@@ -128,7 +128,11 @@ export class CallsService {
       this.scheduleCallTimeout(callSession.id, 60000);
 
       this.logger.log(`Call session created successfully: ${callSession.id}`);
-      return this.mapCallSessionResponse(callSession, []);
+      
+      // Generate Agora token for the call
+      const agoraConfig = await this.generateAgoraCallToken(callSession.id, userId);
+      
+      return this.mapCallSessionResponse(callSession, [], agoraConfig);
     } catch (error) {
       this.logger.error('Error starting call:', error);
       throw error;
@@ -387,7 +391,10 @@ export class CallsService {
         throw new BadRequestException('Access denied - you are not a participant in this conversation');
       }
 
-      return this.mapCallSessionResponse(callSession, callSession.call_participants);
+      // Generate Agora token for the call
+      const agoraConfig = await this.generateAgoraCallToken(callSessionId, userId);
+      
+      return this.mapCallSessionResponse(callSession, callSession.call_participants, agoraConfig);
     } catch (error) {
       this.logger.error('Error fetching call session:', error);
       throw error;
@@ -477,7 +484,8 @@ export class CallsService {
         throw new Error(`Database error: ${error.message}`);
       }
 
-      return callSessions?.map(session => this.mapCallSessionResponse(session, [])) || [];
+      // Note: For conversation calls list, we don't generate tokens (only needed when joining)
+      return callSessions?.map(session => this.mapCallSessionResponse(session, [], undefined)) || [];
     } catch (error) {
       this.logger.error('Error fetching conversation calls:', error);
       throw error;
@@ -580,7 +588,7 @@ export class CallsService {
     }, timeoutMs);
   }
 
-  private mapCallSessionResponse(callSession: any, participants: any[] = []): CallSessionResponseDto {
+  private mapCallSessionResponse(callSession: any, participants: any[] = [], agoraConfig?: any): CallSessionResponseDto {
     return {
       id: callSession.id,
       conversationId: callSession.conversation_id,
@@ -612,6 +620,8 @@ export class CallsService {
         avatarUrl: undefined,
       },
       metadata: callSession.metadata,
+      agoraConfig: agoraConfig, // Include Agora configuration for calls
+      rtcConfiguration: agoraConfig, // Backward compatibility with frontend
     };
   }
 
@@ -675,5 +685,96 @@ export class CallsService {
     } else {
       return `${secs}s`;
     }
+  }
+
+  /**
+   * Generate Agora RTC token for 1-on-1 calls
+   * Uses Communication profile (not LiveBroadcasting)
+   */
+  private async generateAgoraCallToken(callSessionId: string, userId: string): Promise<{
+    appId: string;
+    channel: string;
+    token: string;
+    uid: number;
+  }> {
+    try {
+      const appId = this.configService.get<string>('AGORA_APP_ID');
+      const appCertificate = this.configService.get<string>('AGORA_APP_CERTIFICATE');
+
+      if (!appId || !appCertificate) {
+        this.logger.warn('Agora credentials not configured, call will use tokenless mode');
+        // Return config without token (tokenless mode)
+        const channelName = `call_${callSessionId}`;
+        const uid = Math.abs(this.hashCode(userId)) % 1000000;
+        return {
+          appId: appId || '', // Ensure appId is always a string
+          channel: channelName,
+          token: '',
+          uid,
+        };
+      }
+
+      // Generate channel name for call (unique per call session)
+      const channelName = `call_${callSessionId}`;
+      
+      // Generate unique UID (use numeric part of user ID hash)
+      const uid = Math.abs(this.hashCode(userId)) % 1000000;
+      
+      // Token expires in 24 hours
+      const expirationTimeInSeconds = 86400;
+      const currentTimestamp = Math.floor(Date.now() / 1000);
+      const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+      // Generate Agora token for Communication profile (publisher role for both users)
+      const { RtcTokenBuilder, RtcRole } = require('agora-token');
+      const agoraRole = RtcRole.PUBLISHER; // Both users are publishers in Communication profile
+      
+      const token = RtcTokenBuilder.buildTokenWithUid(
+        appId,
+        appCertificate,
+        channelName,
+        uid,
+        agoraRole,
+        privilegeExpiredTs
+      );
+
+      this.logger.log(`Agora token generated for call: ${callSessionId}`, {
+        channel: channelName,
+        uid,
+        expiresAt: new Date(privilegeExpiredTs * 1000).toISOString(),
+      });
+
+      return {
+        appId,
+        channel: channelName,
+        token,
+        uid,
+      };
+    } catch (error) {
+      this.logger.error('Error generating Agora call token:', error);
+      // Return config without token if generation fails (tokenless mode for dev)
+      const appId = this.configService.get<string>('AGORA_APP_ID') || '';
+      const channelName = `call_${callSessionId}`;
+      const uid = Math.abs(this.hashCode(userId)) % 1000000;
+      return {
+        appId,
+        channel: channelName,
+        token: '',
+        uid,
+      };
+    }
+  }
+
+  /**
+   * Hash string to number (for UID generation)
+   */
+  private hashCode(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return hash;
   }
 }

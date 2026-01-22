@@ -11,7 +11,8 @@ export class AuctionActiveGuard implements CanActivate {
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();
-    const auctionId = request.body.auction_id || request.params.id;
+    // Support multiple parameter names: body.auction_id, params.auctionId, params.id
+    const auctionId = request.body.auction_id || request.params.auctionId || request.params.id;
 
     if (!auctionId) {
       throw new BadRequestException('Auction ID is required');

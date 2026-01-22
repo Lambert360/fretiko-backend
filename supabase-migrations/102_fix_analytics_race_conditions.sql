@@ -111,7 +111,13 @@ BEGIN
   SET
     viewer_count = v_viewer_count,
     total_viewers = GREATEST(total_viewers, v_viewer_count),
+    peak_viewers = v_peak_viewers,
+    total_comments = v_total_comments,
+    total_reactions = v_total_reactions,
+    total_gifts = v_total_gifts,
+    total_gift_value = v_total_gift_value,
     total_sales = v_total_sales,
+    engagement_score = v_engagement_score,
     updated_at = v_now
   WHERE id = p_stream_id;
 
