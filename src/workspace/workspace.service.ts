@@ -789,6 +789,8 @@ export class WorkspaceService {
         ...order,
         orderNumber: order.order_number,
         customerName: order.customer?.username || 'Unknown Customer',
+        // ✅ Include delivery type to distinguish pickup vs delivery
+        deliveryType: order.delivery_type || 'delivery',
         // ✅ Include PINs for handoff verification
         pickupPin: order.pickup_pin,
         deliveryPin: order.delivery_pin,
@@ -891,12 +893,30 @@ export class WorkspaceService {
       : this.supabase;
 
     try {
-      const { data, error } = await supabaseClient
+      // ✅ Fetch order first (authorization + buyer/vendor context)
+      const { data: order, error: fetchError } = await supabaseClient
+        .from('orders')
+        .select('id, order_number, buyer_id, vendor_id, status')
+        .eq('id', orderId)
+        .eq('vendor_id', userId)
+        .maybeSingle();
+
+      if (fetchError || !order) {
+        throw new Error('Order not found or unauthorized');
+      }
+
+      if (order.status !== 'pending') {
+        throw new Error('Only pending orders can be declined');
+      }
+
+      const declineReason = reason ? `Declined: ${reason}` : 'Order declined by vendor';
+
+      const { error } = await supabaseClient
         .from('orders')
         .update({
           status: 'cancelled',
           updated_at: new Date().toISOString(),
-          notes: reason ? `Declined: ${reason}` : 'Order declined by vendor',
+          notes: declineReason,
         })
         .eq('id', orderId)
         .eq('vendor_id', userId)
@@ -904,6 +924,29 @@ export class WorkspaceService {
 
       if (error) {
         throw new Error(`Failed to decline order: ${error.message}`);
+      }
+
+      // ✅ Refund escrow (if funds are held) so buyer gets money back immediately
+      try {
+        const { data: escrow } = await this.supabase
+          .from('escrows')
+          .select('id, status')
+          .eq('order_id', orderId)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (escrow?.id && escrow.status === 'held') {
+          await this.escrowService.refundEscrow(
+            escrow.id,
+            reason || 'Order rejected by vendor',
+            userId,
+          );
+          return { success: true, message: 'Order rejected and buyer refunded successfully' };
+        }
+      } catch (escrowError: any) {
+        // Don't block order rejection if refund fails; log for reconciliation
+        console.error('⚠️ Failed to refund escrow on decline (requires review):', escrowError?.message || escrowError);
       }
 
       return { success: true, message: 'Order declined successfully' };
