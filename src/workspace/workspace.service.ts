@@ -1,12 +1,13 @@
 import { Injectable, NotFoundException, ForbiddenException, forwardRef, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createSupabaseClient, createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { EscrowService } from '../escrow/escrow.service';
 
 @Injectable()
 export class WorkspaceService {
   private supabase;
+  private serviceSupabase; // Service role client for escrow operations
 
   constructor(
     private configService: ConfigService,
@@ -15,6 +16,7 @@ export class WorkspaceService {
     private escrowService: EscrowService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
+    this.serviceSupabase = createServiceSupabaseClient(this.configService); // Service role client
   }
 
   async getActiveOrders(userId: string, userToken?: string) {
@@ -888,12 +890,15 @@ export class WorkspaceService {
   }
 
   async declineOrder(userId: string, orderId: string, reason?: string, userToken?: string) {
+    console.log(`🔍 [DECLINE] Starting declineOrder: userId=${userId}, orderId=${orderId}, reason=${reason}`);
+    
     const supabaseClient = userToken
       ? createUserSupabaseClient(this.configService, userToken)
       : this.supabase;
 
     try {
       // ✅ Fetch order first (authorization + buyer/vendor context)
+      console.log(`🔍 [DECLINE] Fetching order for authorization check...`);
       const { data: order, error: fetchError } = await supabaseClient
         .from('orders')
         .select('id, order_number, buyer_id, vendor_id, status')
@@ -901,52 +906,103 @@ export class WorkspaceService {
         .eq('vendor_id', userId)
         .maybeSingle();
 
+      console.log(`🔍 [DECLINE] Order fetch result:`, { order: order?.id, status: order?.status, error: fetchError?.message });
+
       if (fetchError || !order) {
+        console.error(`❌ [DECLINE] Order not found or unauthorized:`, fetchError?.message);
         throw new Error('Order not found or unauthorized');
       }
 
       if (order.status !== 'pending') {
+        console.error(`❌ [DECLINE] Invalid order status: ${order.status} (expected: pending)`);
         throw new Error('Only pending orders can be declined');
       }
 
       const declineReason = reason ? `Declined: ${reason}` : 'Order declined by vendor';
+      console.log(`🔍 [DECLINE] Updating order status to cancelled with reason: ${declineReason}`);
 
       const { error } = await supabaseClient
         .from('orders')
         .update({
           status: 'cancelled',
           updated_at: new Date().toISOString(),
-          notes: declineReason,
+          metadata: { decline_reason: declineReason },
         })
         .eq('id', orderId)
         .eq('vendor_id', userId)
         .eq('status', 'pending');
 
       if (error) {
+        console.error(`❌ [DECLINE] Failed to update order:`, error.message);
         throw new Error(`Failed to decline order: ${error.message}`);
       }
 
-      // ✅ Refund escrow (if funds are held) so buyer gets money back immediately
+      console.log(` [DECLINE] Order updated successfully, now checking escrow...`);
+
+      // Refund escrow (if funds are held) so buyer gets money back immediately
       try {
-        const { data: escrow } = await this.supabase
+        console.log(` [DECLINE] Looking for escrow for order ${orderId}...`);
+        // FIX: Use service role client to bypass RLS and find escrow
+        const { data: escrow } = await this.serviceSupabase
           .from('escrows')
-          .select('id, status')
+          .select('id, status, total_amount')
           .eq('order_id', orderId)
           .order('created_at', { ascending: false })
           .limit(1)
           .maybeSingle();
 
+        console.log(` [DECLINE] Escrow found:`, { 
+          found: !!escrow?.id, 
+          status: escrow?.status, 
+          amount: escrow?.total_amount 
+        });
+
+        // 🔍 SURGICAL DEBUG: Check escrow system health
+        const { data: systemEscrows, count: escrowCount } = await this.serviceSupabase
+          .from('escrows')
+          .select('id, order_id, status', { count: 'exact' })
+          .limit(3);
+        
+        console.log(`🔍 [DEBUG] System escrow count: ${escrowCount}`);
+        if (escrowCount > 0) {
+          console.log(`🔍 [DEBUG] Recent escrows:`, systemEscrows?.map(e => ({ id: e.id, orderId: e.order_id, status: e.status })));
+        }
+
+        // 🔍 SURGICAL DEBUG: Check wallet transactions for this order
+        const { data: orderTxns } = await this.serviceSupabase
+          .from('wallet_transactions')
+          .select('id, transaction_type, amount, created_at')
+          .eq('reference_id', orderId)
+          .eq('reference_type', 'order')
+          .order('created_at', { ascending: false })
+          .limit(5);
+        
+        console.log(`🔍 [DEBUG] Wallet transactions for order ${orderId}:`, orderTxns?.map(t => ({ 
+          id: t.id, 
+          type: t.transaction_type, 
+          amount: t.amount,
+          created: t.created_at 
+        })));
+
         if (escrow?.id && escrow.status === 'held') {
+          console.log(` [DECLINE] Escrow is held, attempting refund to buyer ${order.buyer_id}...`);
           await this.escrowService.refundEscrow(
             escrow.id,
             reason || 'Order rejected by vendor',
             userId,
           );
+          console.log(` [DECLINE] Refund completed successfully!`);
           return { success: true, message: 'Order rejected and buyer refunded successfully' };
+        } else {
+          console.log(` [DECLINE] Escrow not eligible for refund:`, { 
+            hasId: !!escrow?.id, 
+            status: escrow?.status,
+            expectedStatus: 'held'
+          });
         }
       } catch (escrowError: any) {
         // Don't block order rejection if refund fails; log for reconciliation
-        console.error('⚠️ Failed to refund escrow on decline (requires review):', escrowError?.message || escrowError);
+        console.error(' [DECLINE] Failed to refund escrow on decline (requires review):', escrowError?.message || escrowError);
       }
 
       return { success: true, message: 'Order declined successfully' };

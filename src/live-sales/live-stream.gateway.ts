@@ -15,6 +15,7 @@ import { LiveSalesService } from './live-sales.service';
 import { AnalyticsService } from '../analytics/analytics.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { createSupabaseClient } from '../shared/supabase.client';
+import { GiftService } from '../gifts/gift.service';
 
 /**
  * Live Stream WebSocket Gateway
@@ -45,14 +46,49 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
   private readonly logger = new Logger(LiveStreamGateway.name);
   private connectedUsers = new Map<string, { userId: string; streamId?: string; role: string; accessToken?: string }>();
   private streamViewerCounts = new Map<string, Set<string>>(); // Fallback viewer tracking: streamId -> Set of userIds
+  private streamVendorCache = new Map<string, string>();
   private supabase;
 
   constructor(
     private readonly liveSalesService: LiveSalesService,
     private readonly analyticsService: AnalyticsService,
     private readonly configService: ConfigService,
+    private readonly giftService: GiftService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
+  }
+
+  private async getVendorIdForStream(streamId: string): Promise<string | null> {
+    const cached = this.streamVendorCache.get(streamId);
+    if (cached) return cached;
+
+    try {
+      const stream = await this.liveSalesService.getStreamById(streamId);
+      const vendorId = stream?.vendor_id || stream?.vendor?.id;
+      if (!vendorId) return null;
+      this.streamVendorCache.set(streamId, vendorId);
+      return vendorId;
+    } catch (error) {
+      this.logger.warn(`Could not resolve vendor for stream ${streamId}: ${error?.message || error}`);
+      return null;
+    }
+  }
+
+  private async emitToVendorByStreamId(streamId: string, event: string, payload: any): Promise<void> {
+    const vendorId = await this.getVendorIdForStream(streamId);
+    if (!vendorId) return;
+    this.server.to(`vendor:${vendorId}`).emit(event, payload);
+  }
+
+  broadcastStreamStatusUpdate(streamId: string, status: string): void {
+    const payload = {
+      streamId,
+      status,
+      timestamp: new Date().toISOString(),
+    };
+
+    this.server.to(`stream:${streamId}`).emit('stream_status_update', payload);
+    void this.emitToVendorByStreamId(streamId, 'stream_status_update', payload);
   }
 
   // =====================
@@ -187,7 +223,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
             streamId: userInfo.streamId,
             count: roomSize,
           });
-          this.server.to(`vendor:${userInfo.streamId}`).emit('viewer_count_update', {
+          await this.emitToVendorByStreamId(userInfo.streamId, 'viewer_count_update', {
             streamId: userInfo.streamId,
             count: roomSize,
           });
@@ -304,7 +340,8 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         const stream = await this.liveSalesService.getStreamById(data.streamId);
         if (stream && stream.vendor_id === userInfo.userId) {
           userInfo.role = 'vendor';
-          client.join(`vendor:${data.streamId}`);
+          this.streamVendorCache.set(data.streamId, userInfo.userId);
+          client.join(`vendor:${userInfo.userId}`);
           this.logger.log(`✅ User ${userInfo.userId} is the stream owner - joined as vendor`);
         }
       } catch (err) {
@@ -358,14 +395,14 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         streamId: data.streamId,
         count: roomSize,
       });
-      this.server.to(`vendor:${data.streamId}`).emit('viewer_count_update', {
+      await this.emitToVendorByStreamId(data.streamId, 'viewer_count_update', {
         streamId: data.streamId,
         count: roomSize,
       });
 
       // Broadcast real-time analytics update to vendor
       const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(data.streamId);
-      this.server.to(`vendor:${data.streamId}`).emit('analytics_update', realtimeAnalytics);
+      await this.emitToVendorByStreamId(data.streamId, 'analytics_update', realtimeAnalytics);
 
       client.emit('joined_stream', { 
         streamId: data.streamId, 
@@ -451,7 +488,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
 
         // Broadcast real-time analytics update to vendor
         const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(data.streamId);
-        this.server.to(`vendor:${data.streamId}`).emit('analytics_update', realtimeAnalytics);
+        await this.emitToVendorByStreamId(data.streamId, 'analytics_update', realtimeAnalytics);
         }
       }
 
@@ -472,7 +509,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         streamId: data.streamId,
         count: roomSize,
       });
-      this.server.to(`vendor:${data.streamId}`).emit('viewer_count_update', {
+      await this.emitToVendorByStreamId(data.streamId, 'viewer_count_update', {
         streamId: data.streamId,
         count: roomSize,
       });
@@ -518,20 +555,33 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         },
       });
 
-      // Broadcast comment to all viewers in the stream
-      this.server.to(`stream:${data.streamId}`).emit('new_comment', {
+      // Broadcast comment to all OTHER viewers in the stream (excluding sender)
+      // Use broadcast.to() to exclude the sender from receiving the broadcast
+      const commentData = {
         id: comment.id,
         user: comment.user,
         message: comment.message,
         timestamp: comment.created_at,
-        isOwn: false, // Will be true for the sender
-      });
+        isOwn: false,
+      };
+      
+      // Broadcast to all other clients in the stream room (excluding sender)
+      client.broadcast.to(`stream:${data.streamId}`).emit('new_comment', commentData);
+      
+      // Also broadcast to vendor room (excluding sender if they're the vendor)
+      // If sender is vendor, they'll get the direct emit below, not this broadcast
+      {
+        const vendorId = await this.getVendorIdForStream(data.streamId);
+        if (vendorId) {
+          client.broadcast.to(`vendor:${vendorId}`).emit('new_comment', commentData);
+        }
+      }
 
       // Broadcast real-time analytics update to vendor
       const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(data.streamId);
-      this.server.to(`vendor:${data.streamId}`).emit('analytics_update', realtimeAnalytics);
+      await this.emitToVendorByStreamId(data.streamId, 'analytics_update', realtimeAnalytics);
 
-      // Send confirmation to sender with isOwn: true
+      // Send confirmation ONLY to sender with isOwn: true (they won't receive the broadcast above)
       client.emit('new_comment', {
         id: comment.id,
         user: comment.user,
@@ -582,7 +632,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         },
       });
 
-      // Broadcast reaction animation to all viewers AND vendor
+      // Broadcast reaction animation to all viewers
       const reactionData = {
         userId: userInfo.userId,
         reactionType: data.reactionType,
@@ -590,11 +640,10 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       };
       
       this.server.to(`stream:${data.streamId}`).emit('new_reaction', reactionData);
-      this.server.to(`vendor:${data.streamId}`).emit('new_reaction', reactionData);
 
       // Broadcast real-time analytics update to vendor
       const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(data.streamId);
-      this.server.to(`vendor:${data.streamId}`).emit('analytics_update', realtimeAnalytics);
+      await this.emitToVendorByStreamId(data.streamId, 'analytics_update', realtimeAnalytics);
 
       this.logger.log(`Reaction ${data.reactionType} sent by ${userInfo.userId} in stream ${data.streamId}`);
     } catch (error) {
@@ -619,13 +668,56 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         return;
       }
 
-      // Process gift with wallet integration using live sales service
-      const giftResult = await this.liveSalesService.sendGift(userInfo.userId, {
-        stream_id: data.streamId,
-        gift_type: data.giftType as any,
+      // Verify stream + resolve vendor to gift recipient
+      const stream = await this.liveSalesService.getStreamById(data.streamId);
+
+      if (!stream?.vendor?.id) {
+        client.emit('error', { message: 'Stream vendor not found' });
+        return;
+      }
+
+      // Deduct gift from sender inventory and transfer to vendor (Model A)
+      await this.giftService.sendGift(userInfo.userId, {
+        gift_id: data.giftType,
         quantity: data.quantity,
+        recipient_id: stream.vendor.id,
+        session_type: 'stream',
+        session_id: data.streamId,
         message: data.message,
-      });
+      } as any);
+
+      // Resolve gift details from virtual gifts system (call/chat gifts)
+      let giftEmoji = '🎁';
+      let resolvedGiftType = data.giftType;
+      let unitValue = 0;
+
+      const { data: virtualGiftById } = await this.supabase
+        .from('virtual_gifts')
+        .select('id, name, emoji, credit_value, is_active')
+        .eq('id', data.giftType)
+        .eq('is_active', true)
+        .single();
+
+      if (virtualGiftById) {
+        giftEmoji = virtualGiftById.emoji || giftEmoji;
+        resolvedGiftType = virtualGiftById.name || resolvedGiftType;
+        unitValue = virtualGiftById.credit_value || 0;
+      } else {
+        const { data: virtualGiftByName } = await this.supabase
+          .from('virtual_gifts')
+          .select('id, name, emoji, credit_value, is_active')
+          .eq('name', data.giftType)
+          .eq('is_active', true)
+          .single();
+
+        if (virtualGiftByName) {
+          giftEmoji = virtualGiftByName.emoji || giftEmoji;
+          resolvedGiftType = virtualGiftByName.name || resolvedGiftType;
+          unitValue = virtualGiftByName.credit_value || 0;
+        }
+      }
+
+      const totalAmount = unitValue * (data.quantity || 1);
 
       // Track analytics event
       await this.analyticsService.recordAnalyticsEvent({
@@ -633,9 +725,9 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         userId: userInfo.userId,
         eventType: 'gift_sent',
         metadata: {
-          giftType: data.giftType,
+          giftType: resolvedGiftType,
           quantity: data.quantity,
-          amount: giftResult.total_amount,
+          amount: totalAmount,
           timestamp: new Date().toISOString(),
         },
       });
@@ -643,30 +735,32 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       // Broadcast gift animation to all viewers
       this.server.to(`stream:${data.streamId}`).emit('new_gift', {
         senderId: userInfo.userId,
-        giftType: data.giftType,
+        giftType: resolvedGiftType,
+        giftEmoji,
         quantity: data.quantity,
         message: data.message,
-        amount: giftResult.total_amount,
+        amount: totalAmount,
         timestamp: new Date().toISOString(),
       });
 
       // Notify vendor about the gift
-      this.server.to(`vendor:${data.streamId}`).emit('gift_received', {
+      await this.emitToVendorByStreamId(data.streamId, 'gift_received', {
         senderId: userInfo.userId,
-        giftType: data.giftType,
+        giftType: resolvedGiftType,
+        giftEmoji,
         quantity: data.quantity,
         message: data.message,
-        amount: giftResult.total_amount,
+        amount: totalAmount,
         timestamp: new Date().toISOString(),
       });
 
       // Broadcast real-time analytics update to vendor
       const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(data.streamId);
-      this.server.to(`vendor:${data.streamId}`).emit('analytics_update', realtimeAnalytics);
+      await this.emitToVendorByStreamId(data.streamId, 'analytics_update', realtimeAnalytics);
 
       client.emit('gift_sent', { success: true });
       
-      this.logger.log(`Gift ${data.giftType} x${data.quantity} sent by ${userInfo.userId} in stream ${data.streamId}`);
+      this.logger.log(`Gift ${resolvedGiftType} x${data.quantity} sent by ${userInfo.userId} in stream ${data.streamId}`);
     } catch (error) {
       client.emit('error', { message: error.message });
     }
@@ -726,6 +820,77 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
     }
   }
 
+  @SubscribeMessage('highlight_item')
+  async handleHighlightItem(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { 
+      streamId: string;
+      item: any;
+      highlightedBy?: string;
+      type?: string;
+    },
+  ) {
+    this.logger.log(`🌟 highlight_item event received from client ${client.id} for stream ${data.streamId}`);
+    try {
+      const userInfo = this.connectedUsers.get(client.id);
+      if (!userInfo || userInfo.userId === 'anonymous') {
+        this.logger.warn(`❌ highlight_item rejected: User not authenticated (client ${client.id})`);
+        client.emit('error', { message: 'User not authenticated' });
+        return;
+      }
+      this.logger.log(`✅ highlight_item: User authenticated - ${userInfo.userId}`);
+
+      // Verify user is the stream owner (vendor) and stream is live
+      try {
+        const stream = await this.liveSalesService.getStreamById(data.streamId);
+
+        if (stream.vendor_id !== userInfo.userId) {
+          client.emit('error', { message: 'Only stream owner can highlight items' });
+          return;
+        }
+
+        if (stream.status !== 'live') {
+          client.emit('error', { message: 'Can only highlight items during live streams' });
+          return;
+        }
+      } catch (error) {
+        if (error instanceof NotFoundException) {
+          client.emit('error', { message: 'Stream not found' });
+        } else {
+          client.emit('error', { message: 'Failed to verify stream' });
+        }
+        return;
+      }
+
+      // Broadcast highlight item to all OTHER viewers (excluding sender)
+      // Use broadcast.to() to exclude the sender from receiving the broadcast
+      const highlightData = {
+        streamId: data.streamId,
+        item: data.item,
+        highlightedBy: data.highlightedBy || userInfo.userId,
+        type: data.type,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Get room size for logging (excluding sender) - with safety check
+      let roomSize = 0;
+      if (this.server && this.server.sockets && this.server.sockets.adapter && this.server.sockets.adapter.rooms) {
+        roomSize = this.server.sockets.adapter.rooms.get(`stream:${data.streamId}`)?.size || 0;
+      }
+      const broadcastCount = Math.max(0, roomSize - 1); // Exclude sender
+      this.logger.log(`🌟 Broadcasting highlight_item to ${broadcastCount} other clients in stream:${data.streamId} (total in room: ${roomSize})`);
+      
+      // Broadcast to all OTHER clients (excluding sender)
+      client.broadcast.to(`stream:${data.streamId}`).emit('highlight_item', highlightData);
+      this.logger.log(`📡 highlight_item broadcast sent to stream:${data.streamId} room (excluding sender ${client.id})`);
+
+      this.logger.log(`✅ Item highlighted by ${userInfo.userId} in stream ${data.streamId} (type: ${data.type}, item: ${data.item ? 'present' : 'dismissed'})`);
+    } catch (error) {
+      this.logger.error(`Error highlighting item: ${error.message}`);
+      client.emit('error', { message: error.message });
+    }
+  }
+
   // =====================
   // LIVE COMMERCE
   // =====================
@@ -777,7 +942,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       // Notify vendor about the sale
-      this.server.to(`vendor:${data.streamId}`).emit('sale_made', {
+      await this.emitToVendorByStreamId(data.streamId, 'sale_made', {
         productId: data.productId,
         quantity: data.quantity,
         amount: purchaseResult.total_amount,
@@ -788,7 +953,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
 
       // Broadcast real-time analytics update to vendor
       const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(data.streamId);
-      this.server.to(`vendor:${data.streamId}`).emit('analytics_update', realtimeAnalytics);
+      await this.emitToVendorByStreamId(data.streamId, 'analytics_update', realtimeAnalytics);
 
       client.emit('purchase_initiated', { success: true });
       
@@ -837,7 +1002,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       // Notify vendor about the booking
-      this.server.to(`vendor:${data.streamId}`).emit('service_booked', {
+      await this.emitToVendorByStreamId(data.streamId, 'service_booked', {
         date: data.date,
         time: data.time,
         notes: data.notes,
@@ -849,7 +1014,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
 
       // Broadcast real-time analytics update to vendor
       const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(data.streamId);
-      this.server.to(`vendor:${data.streamId}`).emit('analytics_update', realtimeAnalytics);
+      await this.emitToVendorByStreamId(data.streamId, 'analytics_update', realtimeAnalytics);
 
       client.emit('booking_initiated', { success: true });
       
@@ -1245,8 +1410,15 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         return;
       }
 
-      // Join vendor room for notifications
-      client.join(`vendor:${data.streamId}`);
+      const stream = await this.liveSalesService.getStreamById(data.streamId);
+      if (!stream || stream.vendor_id !== userInfo.userId) {
+        client.emit('error', { message: 'Only stream owner can join vendor room' });
+        return;
+      }
+
+      this.streamVendorCache.set(data.streamId, userInfo.userId);
+      client.join(`vendor:${userInfo.userId}`);
+      
 
       // Update user role
       userInfo.role = 'vendor';
@@ -1300,7 +1472,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
    */
   broadcastAnalyticsUpdate(streamId: string, analytics: any): void {
     this.server.to(`analytics:${streamId}`).emit('analytics_update', analytics);
-    this.server.to(`vendor:${streamId}`).emit('analytics_update', analytics);
+    void this.emitToVendorByStreamId(streamId, 'analytics_update', analytics);
   }
 
   /**

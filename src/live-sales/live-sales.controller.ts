@@ -20,6 +20,7 @@ import { UploadedFiles } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { LiveSalesService } from './live-sales.service';
+import { LiveStreamGateway } from './live-stream.gateway';
 import { UsersService } from '../users/users.service';
 import {
   CreateLiveStreamDto,
@@ -48,6 +49,7 @@ import {
 export class LiveSalesController {
   constructor(
     private readonly liveSalesService: LiveSalesService,
+    private readonly liveStreamGateway: LiveStreamGateway,
     private readonly usersService: UsersService,
   ) {}
 
@@ -172,7 +174,9 @@ export class LiveSalesController {
       throw new BadRequestException('User not authenticated');
     }
 
-    return this.liveSalesService.updateStreamStatus(streamId, userId, updateStatusDto, accessToken);
+    const updatedStream = await this.liveSalesService.updateStreamStatus(streamId, userId, updateStatusDto, accessToken);
+    this.liveStreamGateway.broadcastStreamStatusUpdate(streamId, updatedStream.status);
+    return updatedStream;
   }
 
   /**

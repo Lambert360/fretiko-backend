@@ -992,14 +992,35 @@ export class LiveSalesService {
       }
 
       // 2. Get gift type details
-      const { data: giftType, error: giftError } = await this.supabase
+      let giftType: any = null;
+      const { data: giftTypeRow } = await this.supabase
         .from('gift_types')
         .select('id, name, base_value, is_active')
-        .eq('name', sendGiftDto.gift_type)
+        .or(`name.eq.${sendGiftDto.gift_type},id.eq.${sendGiftDto.gift_type}`)
         .eq('is_active', true)
         .single();
 
-      if (giftError || !giftType) {
+      if (giftTypeRow) {
+        giftType = giftTypeRow;
+      } else {
+        const { data: virtualGiftRow } = await this.supabase
+          .from('virtual_gifts')
+          .select('id, name, credit_value, is_active')
+          .eq('id', sendGiftDto.gift_type)
+          .eq('is_active', true)
+          .single();
+
+        if (virtualGiftRow) {
+          giftType = {
+            id: virtualGiftRow.id,
+            name: virtualGiftRow.name,
+            base_value: virtualGiftRow.credit_value,
+            is_active: virtualGiftRow.is_active,
+          };
+        }
+      }
+
+      if (!giftType) {
         throw new NotFoundException('Gift type not found or inactive');
       }
 

@@ -261,7 +261,7 @@ export class WalletService {
           ? referenceType.trim() 
           : null;
         
-        const { data, error } = await this.supabase.rpc('process_wallet_transaction', {
+        const { data: rawData, error } = await this.supabase.rpc('process_wallet_transaction', {
           p_user_id: userId,
           p_transaction_type: transactionType,
           p_amount: amount,
@@ -269,6 +269,9 @@ export class WalletService {
           p_reference_id: normalizedReferenceId,
           p_reference_type: normalizedReferenceType,
         });
+
+        // 🔧 FIX: Supabase RPC returns array for RETURNS TABLE functions, extract first element
+        const data = Array.isArray(rawData) && rawData.length > 0 ? rawData[0] : rawData;
 
         // Check for Supabase RPC call error
         if (error) {
@@ -318,7 +321,10 @@ export class WalletService {
 
         // Check for RPC function return value (data.success)
         if (!data || !data.success) {
-          const errorMsg = data?.error || 'Transaction failed without error message';
+          // 🔍 DEBUG: Log the actual RPC response to see what's being returned
+          this.logger.error(`🔍 RPC Response Debug for ${transactionType}:`, JSON.stringify(data, null, 2));
+          
+          const errorMsg = data?.error || data?.error_message || 'Transaction failed without error message';
           lastError = errorMsg;
           
           // ✅ PHASE 2: Log idempotent transaction detection (duplicate prevented)

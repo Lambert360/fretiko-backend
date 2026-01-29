@@ -2404,7 +2404,7 @@ export class AnalyticsService implements OnModuleDestroy {
   }) {
     try {
       // ✅ PHASE 6 FIX: Use atomic RPC function instead of separate queries
-      const { data, error } = await this.supabase.rpc('update_live_stream_analytics_atomic', {
+      const { data, error } = await this.serviceSupabase.rpc('update_live_stream_analytics_atomic', {
         p_stream_id: streamId,
         p_viewer_join: analyticsData.viewerJoin || false,
         p_viewer_join_count: 0, // For single events, use boolean flag
@@ -2744,12 +2744,9 @@ export class AnalyticsService implements OnModuleDestroy {
     return insights;
   }
 
-  /**
-   * Get real-time analytics for a specific live stream
-   */
   async getRealTimeLiveStreamAnalytics(streamId: string) {
     try {
-      const { data: stream, error: streamError } = await this.supabase
+      const { data: stream, error: streamError } = await this.serviceSupabase
         .from('live_streams')
         .select(`
           id,
@@ -2768,7 +2765,7 @@ export class AnalyticsService implements OnModuleDestroy {
         throw new Error(`Failed to fetch stream: ${streamError.message}`);
       }
 
-      const { data: analytics, error: analyticsError } = await this.supabase
+      const { data: analytics } = await this.serviceSupabase
         .from('live_stream_analytics')
         .select('*')
         .eq('stream_id', streamId)
@@ -2776,57 +2773,54 @@ export class AnalyticsService implements OnModuleDestroy {
         .limit(1)
         .single();
 
-      const { data: recentTransactions, error: transError } = await this.supabase
+      const { data: recentTransactions } = await this.serviceSupabase
         .from('live_stream_transactions')
         .select('total_amount, created_at')
         .eq('stream_id', streamId)
         .order('created_at', { ascending: false })
         .limit(10);
 
-      const { data: recentGifts, error: giftsError } = await this.supabase
+      const { data: recentGifts } = await this.serviceSupabase
         .from('live_stream_gifts')
         .select('total_amount, created_at')
         .eq('stream_id', streamId)
         .order('created_at', { ascending: false })
         .limit(10);
 
-      // Calculate stream duration
       let streamDuration = 0;
-      if (stream.started_at) {
-        const startTime = new Date(stream.started_at).getTime();
+      if ((stream as any)?.started_at) {
+        const startTime = new Date((stream as any).started_at).getTime();
         const currentTime = new Date().getTime();
-        streamDuration = Math.floor((currentTime - startTime) / 1000); // seconds
+        streamDuration = Math.floor((currentTime - startTime) / 1000);
       }
 
-      // Calculate engagement rate
       const engagementCount = (analytics?.total_comments || 0) +
                              (analytics?.total_reactions || 0) +
                              (analytics?.total_gifts || 0);
-      const engagementRate = stream.total_viewers > 0 ?
-        (engagementCount / stream.total_viewers) * 100 : 0;
+      const engagementRate = (stream as any)?.total_viewers > 0 ?
+        (engagementCount / (stream as any).total_viewers) * 100 : 0;
 
-      // Calculate conversion rate
-      const { data: transactionCount } = await this.supabase
+      const { data: transactionCount } = await this.serviceSupabase
         .from('live_stream_transactions')
         .select('id', { count: 'exact' })
         .eq('stream_id', streamId);
 
-      const conversionRate = stream.total_viewers > 0 ?
-        ((transactionCount?.length || 0) / stream.total_viewers) * 100 : 0;
+      const conversionRate = (stream as any)?.total_viewers > 0 ?
+        ((transactionCount?.length || 0) / (stream as any).total_viewers) * 100 : 0;
 
       return {
-        streamId: stream.id,
-        title: stream.title,
-        status: stream.status,
-        viewerCount: stream.viewer_count || 0,
-        totalViewers: stream.total_viewers || 0,
-        totalSales: stream.total_sales || 0,
+        streamId: (stream as any).id,
+        title: (stream as any).title,
+        status: (stream as any).status,
+        viewerCount: (stream as any).viewer_count || 0,
+        totalViewers: (stream as any).total_viewers || 0,
+        totalSales: (stream as any).total_sales || 0,
         engagementCount,
         giftCount: analytics?.total_gifts || 0,
         giftValue: analytics?.total_gift_value || 0,
         conversionRate,
         streamDuration,
-        averageWatchTime: streamDuration / Math.max(1, stream.total_viewers || 1),
+        averageWatchTime: streamDuration / Math.max(1, (stream as any).total_viewers || 1),
         peakViewers: analytics?.peak_viewers || 0,
         commentCount: analytics?.total_comments || 0,
         reactionCount: analytics?.total_reactions || 0,
@@ -2835,15 +2829,15 @@ export class AnalyticsService implements OnModuleDestroy {
         recentActivity: [
           ...(recentTransactions || []).map(tx => ({
             type: 'purchase' as const,
-            amount: tx.total_amount,
-            timestamp: tx.created_at,
+            amount: (tx as any).total_amount,
+            timestamp: (tx as any).created_at,
           })),
           ...(recentGifts || []).map(gift => ({
             type: 'gift' as const,
-            amount: gift.total_amount,
-            timestamp: gift.created_at,
+            amount: (gift as any).total_amount,
+            timestamp: (gift as any).created_at,
           })),
-        ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()),
+        ].sort((a, b) => new Date((b as any).timestamp).getTime() - new Date((a as any).timestamp).getTime()),
       };
     } catch (error) {
       console.error('Error fetching real-time live stream analytics:', error);
@@ -3127,7 +3121,7 @@ export class AnalyticsService implements OnModuleDestroy {
       // ✅ PHASE 6 FIX: Make single atomic update call with batch counts
       // Call RPC once with aggregated counts for better performance
       if (netViewerChange !== 0 || commentCount > 0 || reactionCount > 0) {
-        const { data, error } = await this.supabase.rpc('update_live_stream_analytics_atomic', {
+        const { data, error } = await this.serviceSupabase.rpc('update_live_stream_analytics_atomic', {
           p_stream_id: streamId,
           p_viewer_join: netViewerChange > 0,
           p_viewer_join_count: netViewerChange > 0 ? Math.abs(netViewerChange) : 0,

@@ -411,10 +411,25 @@ export class EscrowService {
 
       // Credit buyer wallet (refund)
       this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${escrow.total_amount}`);
+      
+      // 🔧 SURGICAL FIX: Validate amount and log parameters
+      const amount = parseFloat(escrow.total_amount);
+      this.logger.log(`🔍 Refund params: buyerId=${order.buyer_id}, amount=${amount}, orderId=${order.id}, escrowId=${escrowId}`);
+      
+      if (isNaN(amount) || amount <= 0) {
+        this.logger.error(`❌ Invalid escrow amount: ${escrow.total_amount} (parsed as ${amount})`);
+        throw new HttpException(`Invalid escrow amount: ${escrow.total_amount}`, HttpStatus.BAD_REQUEST);
+      }
+      
+      if (!order.buyer_id || !order.id) {
+        this.logger.error(`❌ Invalid order data: buyerId=${order.buyer_id}, orderId=${order.id}`);
+        throw new HttpException('Invalid order data for refund', HttpStatus.BAD_REQUEST);
+      }
+      
       const refundResult = await this.walletService.processWalletTransaction(
         order.buyer_id,
         WalletTransactionType.ESCROW_REFUND,
-        parseFloat(escrow.total_amount),
+        amount,
         `Refund for order ${order.order_number}`,
         order.id,
         'order',
