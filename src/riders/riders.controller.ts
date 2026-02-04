@@ -38,6 +38,7 @@ export interface RiderProfile {
   isOnline: boolean;
   trustScore?: number;
   completionRate?: number;
+  deliveryPromise?: string;
 }
 
 @Controller('riders')
@@ -227,5 +228,143 @@ export class RidersController {
     });
 
     return this.ridersService.setRiderActiveOrder(riderId, body.orderId);
+  }
+
+  // ===== RIDER ASSIGNMENT ENDPOINTS =====
+
+  @Post('assignments/:orderId/accept')
+  async acceptAssignment(
+    @Param('orderId') orderId: string,
+    @Request() req: any,
+  ): Promise<{
+    success: boolean;
+    message: string;
+    order?: {
+      id: string;
+      orderNumber: string;
+      deliveryFee: number;
+      pickupAddress: string;
+      deliveryAddress: string;
+      estimatedPickup: string;
+      estimatedDelivery: string;
+    };
+  }> {
+    console.log('✅ Rider accepting assignment:', {
+      orderId,
+      riderId: req.user.id,
+    });
+
+    return this.ridersService.acceptRiderAssignment(orderId, req.user.id);
+  }
+
+  @Post('assignments/:orderId/reject')
+  async rejectAssignment(
+    @Param('orderId') orderId: string,
+    @Body() body: { reason?: string },
+    @Request() req: any,
+  ): Promise<{
+    success: boolean;
+    message: string;
+  }> {
+    console.log('❌ Rider rejecting assignment:', {
+      orderId,
+      riderId: req.user.id,
+      reason: body.reason,
+    });
+
+    return this.ridersService.rejectRiderAssignment(orderId, req.user.id, body.reason);
+  }
+
+  @Get('assignments/pending')
+  async getPendingAssignments(
+    @Request() req: any,
+  ): Promise<{
+    assignments: Array<{
+      id: string;
+      orderNumber: string;
+      deliveryFee: number;
+      pickupAddress: string;
+      deliveryAddress: string;
+      assignedAt: string;
+      deadline: string;
+      timeRemaining: number; // seconds
+    }>;
+  }> {
+    console.log('📋 Getting pending assignments for rider:', {
+      riderId: req.user.id,
+    });
+
+    const assignments = await this.ridersService.getPendingAssignments(req.user.id);
+    return { assignments };
+  }
+
+  // ===== REPLACEMENT WORKFLOW ENDPOINTS =====
+
+  @Post('replacements/:orderId/initiate')
+  async initiateReplacement(
+    @Param('orderId') orderId: string,
+    @Request() req: any,
+  ): Promise<{
+    success: boolean;
+    stage: 'vendor_selection' | 'fastest_finger' | 'completed' | 'failed';
+    message: string;
+    data?: any;
+  }> {
+    console.log('🔄 Initiating replacement workflow:', {
+      orderId,
+      userId: req.user.id,
+    });
+
+    // This would call the replacement workflow service
+    // For now, return a placeholder response
+    return {
+      success: true,
+      stage: 'vendor_selection',
+      message: 'Replacement workflow initiated - implementation pending',
+    };
+  }
+
+  @Post('replacements/:orderId/vendor-select')
+  async vendorSelectRider(
+    @Param('orderId') orderId: string,
+    @Body() body: { riderId: string },
+    @Request() req: any,
+  ): Promise<{
+    success: boolean;
+    message: string;
+  }> {
+    console.log('🎯 Vendor selecting rider for replacement:', {
+      orderId,
+      riderId: body.riderId,
+      vendorId: req.user.id,
+    });
+
+    // This would call the replacement workflow service
+    return {
+      success: true,
+      message: 'Vendor selection processed - implementation pending',
+    };
+  }
+
+  @Get('replacements/:orderId/status')
+  async getReplacementStatus(
+    @Param('orderId') orderId: string,
+    @Request() req: any,
+  ): Promise<{
+    stage: string;
+    deadline?: string;
+    availableRiders?: any[];
+    message: string;
+  }> {
+    console.log('📊 Getting replacement status:', {
+      orderId,
+      userId: req.user.id,
+    });
+
+    // This would call the replacement workflow service
+    return {
+      stage: 'none',
+      message: 'No replacement in progress',
+    };
   }
 }

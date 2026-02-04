@@ -1,58 +1,97 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
-import { RiderAvailabilityRequest, OrderDetails, RiderProfile } from './riders.controller';
+
+export interface RiderLocation {
+  latitude: number;
+  longitude: number;
+  address: string;
+}
+
+export interface OrderDetails {
+  weight: number;
+  itemCount: number;
+  distance: number;
+  category?: string;
+}
+
+export interface RiderAvailabilityRequest {
+  pickupLocation: RiderLocation;
+  deliveryLocation: RiderLocation;
+  orderDetails: OrderDetails;
+  maxDistance?: number;
+}
+
+export interface RiderProfile {
+  id: string;
+  name: string;
+  avatar: string;
+  rating: number;
+  totalDeliveries: number;
+  vehicleType: 'wheelbarrow' | 'bike' | 'car';
+  price: number;
+  distanceFromPickup: number;
+  estimatedArrival: number;
+  isAvailable: boolean;
+  unavailableReason?: string;
+  specialties: string[];
+  isOnline: boolean;
+  trustScore?: number;
+  completionRate?: number;
+  deliveryPromise?: string;
+}
 
 @Injectable()
 export class RidersService {
-  private supabase;
+  private readonly logger = new Logger(RidersService.name);
+  private supabase: SupabaseClient;
 
   constructor(
     private configService: ConfigService,
     private notificationHelper: NotificationHelperService,
   ) {
-    this.supabase = createServiceSupabaseClient(this.configService);
+    this.supabase = createClient(
+      this.configService.get<string>('SUPABASE_URL')!,
+      this.configService.get<string>('SUPABASE_ANON_KEY')!,
+    );
   }
 
   async findNearbyRiders(
     request: RiderAvailabilityRequest,
-    userId?: string | null,
+    userId: string,
   ): Promise<RiderProfile[]> {
     try {
-      // Query riders from user_profiles where is_rider = true
-      // Join with rider_profiles to get actual pricing and vehicle info
-      const { data: riderProfiles, error } = await this.supabase
-        .from('user_profiles')
-        .select(`
-          id,
-          username,
-          avatar_url,
-          location,
-          preferences
-        `)
-        .eq('is_rider', true)
-        .limit(20);
+      console.log('🔍 Finding nearby riders for request:', {
+        pickup: request.pickupLocation.address,
+        orderDetails: request.orderDetails,
+        userId,
+      });
+
+      // Use the database function to find nearby riders
+      const { data: nearbyRiders, error } = await this.supabase.rpc('find_nearby_riders', {
+        pickup_lat: request.pickupLocation.latitude,
+        pickup_lon: request.pickupLocation.longitude,
+        max_distance: request.maxDistance || 5.0,
+      });
 
       if (error) {
-        console.error('❌ Database error fetching riders:', error);
+        console.error('❌ Error finding nearby riders:', error);
         return this.getMockRiders(request);
       }
 
-      if (!riderProfiles || riderProfiles.length === 0) {
-        console.log('📍 No riders found in database, returning mock data');
+      if (!nearbyRiders || nearbyRiders.length === 0) {
+        console.log('📍 No nearby riders found, returning mock data');
         return this.getMockRiders(request);
       }
 
-      // Get rider_profiles for pricing and vehicle info
-      const riderIds = riderProfiles.map(r => r.id);
-      const { data: riderProfilesData } = await this.supabase
+      // Get rider profiles and trust scores
+      const riderIds = nearbyRiders.map(r => r.rider_id);
+      const { data: riderProfiles } = await this.supabase
         .from('rider_profiles')
         .select('*')
-        .in('user_id', riderIds)
-        .eq('profile_status', 'active');
+        .in('user_id', riderIds);
 
-      // Get trust scores for riders
       const { data: trustScores } = await this.supabase
         .from('trust_scores')
         .select('user_id, rider_trust_score, completed_orders')
@@ -60,37 +99,31 @@ export class RidersService {
 
       // Transform database riders to RiderProfile format
       const riders: RiderProfile[] = await Promise.all(
-        riderProfiles.map(async (profile) => {
-          const trustData = trustScores?.find(ts => ts.user_id === profile.id);
-          const riderProfileData = riderProfilesData?.find(rp => rp.user_id === profile.id);
-          const preferences = profile.preferences || {};
+        nearbyRiders.map(async (rider) => {
+          const trustData = trustScores?.find(ts => ts.user_id === rider.rider_id);
+          const riderProfileData = riderProfiles?.find(rp => rp.user_id === rider.rider_id);
           
-          // Mock distance calculation (in real app, use geolocation)
-          const distance = Math.random() * 5; // 0-5km
-          
-          // Use rider_profiles data if available, otherwise fallback to preferences
-          const vehicleType = riderProfileData?.vehicle_type || preferences.vehicleType || 'bike';
-          const isOnline = riderProfileData?.is_online ?? (Math.random() > 0.3);
+          // Use rider_profiles data if available, otherwise fallback to defaults
+          const vehicleType = riderProfileData?.vehicle_type || 'bike';
+          const isOnline = rider.is_available;
           
           // Calculate price based on rider's service_pricing if available
           let price: number;
           let deliveryPromise: string | undefined;
           
           if (riderProfileData?.service_pricing) {
-            // Determine service category (default to intracity for now)
-            const serviceCategory = distance <= 10 ? 'intracity' : distance <= 50 ? 'intercity' : 'interstate';
-            const servicePricing = riderProfileData.service_pricing[serviceCategory];
+            const servicePricing = riderProfileData.service_pricing['intracity'];
             
             if (servicePricing?.enabled) {
               if (servicePricing.custom_price) {
                 price = servicePricing.custom_price;
               } else {
+                const distance = rider.distance || 1; // Default to 1km if not provided
                 price = (servicePricing.base_price || 2) + (distance * (servicePricing.per_km_rate || 0.5));
               }
             } else {
               // Fallback to default pricing
-              const basePrice = this.getBasePriceByVehicle(vehicleType);
-              price = basePrice + (distance * 1.5);
+              price = this.getBasePriceByVehicle(vehicleType);
             }
             
             // Get delivery promise message
@@ -99,27 +132,25 @@ export class RidersService {
             }
           } else {
             // Fallback to mock pricing
-            const basePrice = this.getBasePriceByVehicle(vehicleType);
-            price = basePrice + (distance * 1.5);
+            price = this.getBasePriceByVehicle(vehicleType);
           }
           
           return {
-            id: profile.id,
-            name: profile.username || 'Unknown Rider',
-            avatar: profile.avatar_url || `https://picsum.photos/100/100?random=${profile.id}`,
+            id: rider.rider_id,
+            name: rider.rider_name || 'Unknown Rider',
+            avatar: `https://picsum.photos/100/100?random=${rider.rider_id}`,
             rating: this.calculateRating(trustData?.completed_orders || 0),
             totalDeliveries: trustData?.completed_orders || 0,
             vehicleType: ['wheelbarrow', 'bike', 'car', 'van', 'truck'].includes(vehicleType) ? vehicleType as any : 'bike',
             price: Math.round(price * 100) / 100,
-            distanceFromPickup: Math.round(distance * 10) / 10,
-            estimatedArrival: Math.max(3, Math.round(distance * 3)), // 3 min per km minimum
-            isAvailable: this.checkAvailability(vehicleType, request.orderDetails),
-            unavailableReason: this.getUnavailableReason(vehicleType, request.orderDetails),
+            distanceFromPickup: Math.round((rider.distance || 1) * 10) / 10,
+            estimatedArrival: Math.max(3, Math.round((rider.distance || 1) * 3)), // 3 min per km minimum
+            isAvailable: rider.is_available,
             specialties: this.getSpecialtiesByVehicle(vehicleType),
             isOnline: isOnline,
             trustScore: trustData?.rider_trust_score || 750,
             completionRate: Math.min(99, 85 + (trustData?.completed_orders || 0) / 10),
-            deliveryPromise: deliveryPromise, // Add delivery promise
+            deliveryPromise: deliveryPromise,
           };
         })
       );
@@ -175,22 +206,7 @@ export class RidersService {
       }
 
       const vehicleType = profile.preferences?.vehicleType || 'bike';
-      
-      // Simple availability check based on vehicle type and order details
-      let isAvailable = true;
-      switch (vehicleType) {
-        case 'wheelbarrow':
-          isAvailable = orderDetails.distance <= 1.0 && orderDetails.weight <= 15;
-          break;
-        case 'bike':
-          isAvailable = orderDetails.weight <= 20 && orderDetails.itemCount <= 5;
-          break;
-        case 'car':
-          isAvailable = true; // Cars can handle everything
-          break;
-        default:
-          isAvailable = true;
-      }
+      const isAvailable = this.checkAvailability(vehicleType, orderDetails);
       
       return {
         available: isAvailable,
@@ -236,43 +252,20 @@ export class RidersService {
         avatar: profile.avatar_url || `https://picsum.photos/100/100?random=${profile.id}`,
         rating: this.calculateRating(trustData?.completed_orders || 0),
         totalDeliveries: trustData?.completed_orders || 0,
-        vehicleType: ['wheelbarrow', 'bike', 'car', 'van', 'truck'].includes(vehicleType) ? vehicleType as any : 'bike',
+        vehicleType: ['wheelbarrow', 'bike', 'car'].includes(vehicleType) ? vehicleType as 'wheelbarrow' | 'bike' | 'car' : 'bike',
         price: this.getBasePriceByVehicle(vehicleType),
         distanceFromPickup: 0,
-        estimatedArrival: 0,
+        estimatedArrival: 5,
         isAvailable: true,
-        unavailableReason: undefined,
         specialties: this.getSpecialtiesByVehicle(vehicleType),
         isOnline: true,
         trustScore: trustData?.rider_trust_score || 750,
         completionRate: Math.min(99, 85 + (trustData?.completed_orders || 0) / 10),
-        deliveryPromise: 'Standard delivery',
       };
-
     } catch (error) {
       console.error('❌ Error getting rider profile:', error);
       return null;
     }
-  }
-
-  private async createBroadcastAssignment(orderId: string, riderIds: string[], radius: number): Promise<string> {
-    const { data, error } = await this.supabase
-      .from('broadcast_assignments')
-      .insert({
-        order_id: orderId,
-        radius_km: radius,
-        rider_ids: riderIds,
-        status: 'active',
-        expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
-      })
-      .select('id')
-      .single();
-
-    if (error || !data) {
-      throw new Error('Failed to create broadcast assignment');
-    }
-
-    return data.id;
   }
 
   async getRiderStats(riderId: string): Promise<{
@@ -289,7 +282,7 @@ export class RidersService {
         .eq('user_id', riderId)
         .single();
 
-      const { data: profile } = await this.supabase.client
+      const { data: profile } = await this.supabase
         .from('user_profiles')
         .select('preferences')
         .eq('id', riderId)
@@ -400,37 +393,79 @@ export class RidersService {
 
   // ===== RIDER ASSIGNMENT METHODS =====
 
-  async acceptRiderAssignment(
-    orderId: string,
-    riderId: string,
-  ): Promise<{ success: boolean; message: string; order?: any }> {
+  async acceptRiderAssignment(orderId: string, riderId: string): Promise<{
+    success: boolean;
+    message: string;
+    order?: {
+      id: string;
+      orderNumber: string;
+      deliveryFee: number;
+      pickupAddress: string;
+      deliveryAddress: string;
+      estimatedPickup: string;
+      estimatedDelivery: string;
+    };
+  }> {
     try {
-      // Check if assignment exists and is pending
-      const { data: order, error } = await this.supabase
+      console.log(`✅ Rider ${riderId} accepting assignment for order ${orderId}`);
+
+      // Get order details and verify assignment
+      const { data: order, error: orderError } = await this.supabase
         .from('orders')
-        .select('*')
+        .select(`
+          id,
+          order_number,
+          delivery_fee,
+          delivery_address,
+          rider_id,
+          rider_acceptance_status,
+          rider_assignment_deadline,
+          vendor_id,
+          buyer_id,
+          user_profiles!inner(username, location)
+        `)
         .eq('id', orderId)
         .eq('rider_id', riderId)
-        .eq('rider_acceptance_status', 'pending')
         .single();
 
-      if (error || !order) {
-        return { success: false, message: 'Assignment not found or no longer pending' };
+      if (orderError || !order) {
+        console.error('❌ Order not found or rider not assigned:', orderError);
+        return { success: false, message: 'Order not found or rider not assigned' };
+      }
+
+      // Check if assignment is still pending
+      if (order.rider_acceptance_status !== 'pending') {
+        const statusMessage = {
+          'accepted': 'Assignment already accepted',
+          'rejected': 'Assignment already rejected',
+          'timeout': 'Assignment deadline expired',
+          'reassigned': 'Order has been reassigned'
+        }[order.rider_acceptance_status] || 'Assignment no longer pending';
+
+        return { success: false, message: statusMessage };
       }
 
       // Check if deadline has passed
-      const deadline = new Date(order.rider_assignment_deadline);
-      if (deadline < new Date()) {
-        return { success: false, message: 'Assignment deadline has passed' };
+      if (order.rider_assignment_deadline && new Date() > new Date(order.rider_assignment_deadline)) {
+        // Update status to timeout
+        await this.supabase
+          .from('orders')
+          .update({
+            rider_acceptance_status: 'timeout',
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', orderId);
+
+        return { success: false, message: 'Assignment deadline has expired' };
       }
 
-      // Update order status to accepted
+      // Accept the assignment
       const { error: updateError } = await this.supabase
         .from('orders')
         .update({
           rider_acceptance_status: 'accepted',
-          status: 'rider_assigned',
-          updated_at: new Date().toISOString(),
+          status: 'assigned',
+          updated_at: new Date().toISOString()
         })
         .eq('id', orderId);
 
@@ -439,49 +474,98 @@ export class RidersService {
         return { success: false, message: 'Failed to accept assignment' };
       }
 
-      return { 
-        success: true, 
+      // Calculate estimated times
+      const now = new Date();
+      const estimatedPickup = new Date(now.getTime() + 15 * 60000).toISOString();
+      const estimatedDelivery = new Date(now.getTime() + 45 * 60000).toISOString();
+
+      // Get vendor location for pickup address
+      const pickupAddress = order.user_profiles?.[0]?.location?.address || 'Vendor Location';
+      const deliveryAddress = order.delivery_address?.address || 'Delivery Location';
+
+      // Notify vendor and buyer
+      try {
+        await this.notificationHelper.notifyOrderAccepted(order.buyer_id, {
+          orderId,
+          orderNumber: order.order_number,
+          vendorId: order.vendor_id,
+        });
+
+        console.log(`✅ Notifications sent for accepted assignment ${order.order_number}`);
+      } catch (notifyError) {
+        console.error('Failed to send notifications (non-critical):', notifyError);
+      }
+
+      console.log(`✅ Rider ${riderId} accepted assignment for order ${order.order_number}`);
+
+      return {
+        success: true,
         message: 'Assignment accepted successfully',
         order: {
-          ...order,
-          rider_acceptance_status: 'accepted',
-          status: 'rider_assigned'
+          id: order.id,
+          orderNumber: order.order_number,
+          deliveryFee: order.delivery_fee,
+          pickupAddress,
+          deliveryAddress,
+          estimatedPickup,
+          estimatedDelivery,
         }
       };
+
     } catch (error) {
       console.error('❌ Error accepting rider assignment:', error);
       return { success: false, message: 'Internal server error' };
     }
   }
 
-  async rejectRiderAssignment(
-    orderId: string,
-    riderId: string,
-    reason?: string,
-  ): Promise<{ success: boolean; message: string }> {
+  async rejectRiderAssignment(orderId: string, riderId: string, reason?: string): Promise<{
+    success: boolean;
+    message: string;
+  }> {
     try {
-      // Check if assignment exists and is pending
-      const { data: order, error } = await this.supabase
+      console.log(`❌ Rider ${riderId} rejecting assignment for order ${orderId}`, { reason });
+
+      // Get order details and verify assignment
+      const { data: order, error: orderError } = await this.supabase
         .from('orders')
-        .select('*')
+        .select(`
+          id,
+          order_number,
+          rider_id,
+          rider_acceptance_status,
+          vendor_id,
+          buyer_id,
+          replacement_attempts
+        `)
         .eq('id', orderId)
         .eq('rider_id', riderId)
-        .eq('rider_acceptance_status', 'pending')
         .single();
 
-      if (error || !order) {
-        return { success: false, message: 'Assignment not found or no longer pending' };
+      if (orderError || !order) {
+        console.error('❌ Order not found or rider not assigned:', orderError);
+        return { success: false, message: 'Order not found or rider not assigned' };
       }
 
-      // Update order status to rejected and trigger replacement
+      // Check if assignment is still pending
+      if (order.rider_acceptance_status !== 'pending') {
+        const statusMessage = {
+          'accepted': 'Assignment already accepted',
+          'rejected': 'Assignment already rejected',
+          'timeout': 'Assignment deadline expired',
+          'reassigned': 'Order has been reassigned'
+        }[order.rider_acceptance_status] || 'Assignment no longer pending';
+
+        return { success: false, message: statusMessage };
+      }
+
+      // Reject the assignment
       const { error: updateError } = await this.supabase
         .from('orders')
         .update({
           rider_acceptance_status: 'rejected',
-          rider_id: null,
-          rider_assignment_deadline: null,
+          rider_id: null, // Remove rider from order
           replacement_attempts: (order.replacement_attempts || 0) + 1,
-          updated_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
         })
         .eq('id', orderId);
 
@@ -490,15 +574,45 @@ export class RidersService {
         return { success: false, message: 'Failed to reject assignment' };
       }
 
+      // Notify vendor and buyer
+      try {
+        await this.notificationHelper.notifySystemUpdate(order.vendor_id, 'Rider Assignment Rejected', `Rider ${riderId} rejected assignment for order ${order.order_number}`, {
+          orderId,
+          orderNumber: order.order_number,
+          riderId,
+          reason,
+        });
+
+        console.log(`✅ Notifications sent for rejected assignment ${order.order_number}`);
+      } catch (notifyError) {
+        console.error('Failed to send notifications (non-critical):', notifyError);
+      }
+
+      console.log(`❌ Rider ${riderId} rejected assignment for order ${order.order_number}`);
+
       return { success: true, message: 'Assignment rejected successfully' };
+
     } catch (error) {
       console.error('❌ Error rejecting rider assignment:', error);
       return { success: false, message: 'Internal server error' };
     }
   }
 
-  async getPendingAssignments(riderId: string): Promise<any[]> {
+  async getPendingAssignments(riderId: string): Promise<{
+    assignments: Array<{
+      id: string;
+      orderNumber: string;
+      deliveryFee: number;
+      pickupAddress: string;
+      deliveryAddress: string;
+      assignedAt: string;
+      deadline: string;
+      timeRemaining: number;
+    }>;
+  }> {
     try {
+      console.log(`📋 Getting pending assignments for rider ${riderId}`);
+
       const { data: assignments, error } = await this.supabase
         .from('orders')
         .select(`
@@ -507,114 +621,41 @@ export class RidersService {
           delivery_fee,
           delivery_address,
           rider_assignment_deadline,
-          created_at,
-          vendor_id,
-          buyer_id,
-          total_amount
+          updated_at,
+          user_profiles!inner(location)
         `)
         .eq('rider_id', riderId)
         .eq('rider_acceptance_status', 'pending')
-        .gt('rider_assignment_deadline', new Date().toISOString())
-        .order('created_at', { ascending: false });
+        .order('updated_at', { ascending: false });
 
       if (error) {
         console.error('❌ Error fetching pending assignments:', error);
-        return [];
+        return { assignments: [] };
       }
 
-      return assignments || [];
+      const processedAssignments = assignments.map(assignment => {
+        const now = new Date();
+        const deadline = new Date(assignment.rider_assignment_deadline);
+        const timeRemaining = Math.max(0, Math.floor((deadline.getTime() - now.getTime()) / 1000));
+
+        return {
+          id: assignment.id,
+          orderNumber: assignment.order_number,
+          deliveryFee: assignment.delivery_fee,
+          pickupAddress: assignment.user_profiles?.[0]?.location?.address || 'Vendor Location',
+          deliveryAddress: assignment.delivery_address?.address || 'Delivery Location',
+          assignedAt: assignment.updated_at,
+          deadline: assignment.rider_assignment_deadline,
+          timeRemaining,
+        };
+      });
+
+      return { assignments: processedAssignments };
+
     } catch (error) {
-      console.error('❌ Error fetching pending assignments:', error);
-      return [];
+      console.error('❌ Error getting pending assignments:', error);
+      return { assignments: [] };
     }
-  }
-
-  // Helper methods
-  private checkAvailability(vehicleType: string, orderDetails: OrderDetails): boolean {
-    switch (vehicleType) {
-      case 'wheelbarrow':
-        return orderDetails.distance <= 1.0 && orderDetails.weight <= 15;
-      case 'bike':
-        return orderDetails.weight <= 20 && orderDetails.itemCount <= 5;
-      case 'car':
-        return true; // Cars can handle everything
-      default:
-        return true;
-    }
-  }
-
-  private getUnavailableReason(vehicleType: string, orderDetails: OrderDetails): string | undefined {
-    switch (vehicleType) {
-      case 'wheelbarrow':
-        if (orderDetails.distance > 1.0) return 'Distance too far for wheelbarrow delivery';
-        if (orderDetails.weight > 15) return 'Order too heavy for wheelbarrow';
-        break;
-      case 'bike':
-        if (orderDetails.weight > 20) return 'Order too heavy for bike delivery';
-        if (orderDetails.itemCount > 5) return 'Too many items for bike delivery';
-        break;
-    }
-    return 'Not available for this order';
-  }
-
-  private getBasePriceByVehicle(vehicleType: string): number {
-    switch (vehicleType) {
-      case 'wheelbarrow': return 2.5;
-      case 'bike': return 7.5;
-      case 'car': return 12.0;
-      default: return 7.5;
-    }
-  }
-
-  private getSpecialtiesByVehicle(vehicleType: string): string[] {
-    switch (vehicleType) {
-      case 'wheelbarrow': return ['Eco-friendly', 'Local delivery', 'Fresh produce'];
-      case 'bike': return ['Fast delivery', 'Electronics', 'Same-day delivery'];
-      case 'car': return ['Bulk delivery', 'Long distance', 'Heavy items'];
-      default: return [];
-    }
-  }
-
-  private calculateRating(completedOrders: number): number {
-    // Base rating starts at 4.0, improves with experience
-    const baseRating = 4.0;
-    const experienceBonus = Math.min(0.9, completedOrders * 0.01); // Max 0.9 bonus
-    return Math.round((baseRating + experienceBonus) * 10) / 10;
-  }
-
-  private getAvgDeliveryTime(vehicleType: string): number {
-    switch (vehicleType) {
-      case 'wheelbarrow': return 20; // minutes
-      case 'bike': return 25;
-      case 'car': return 30;
-      default: return 25;
-    }
-  }
-
-  private calculateRecommendationScore(rider: RiderProfile, request: RiderAvailabilityRequest): number {
-    let score = 0;
-    
-    // Rating factor (0-50 points)
-    score += rider.rating * 10;
-    
-    // Distance factor (0-30 points)
-    score += Math.max(0, 30 - rider.distanceFromPickup * 6);
-    
-    // Experience factor (0-20 points)
-    score += Math.min(20, rider.totalDeliveries * 0.1);
-    
-    return Math.round(score);
-  }
-
-  private getRecommendationReasons(rider: RiderProfile, request: RiderAvailabilityRequest): string[] {
-    const reasons: string[] = [];
-    
-    if (rider.rating >= 4.8) reasons.push('Highly rated');
-    if (rider.distanceFromPickup <= 0.5) reasons.push('Very close');
-    if (rider.totalDeliveries >= 100) reasons.push('Experienced');
-    if (rider.estimatedArrival <= 5) reasons.push('Quick pickup');
-    
-    return reasons;
   }
 
   // ===== LOCATION TRACKING METHODS =====
@@ -741,6 +782,97 @@ export class RidersService {
       console.error('❌ Error in setRiderActiveOrder:', error);
       return { success: false };
     }
+  }
+
+  // ===== HELPER METHODS =====
+
+  private checkAvailability(vehicleType: string, orderDetails: OrderDetails): boolean {
+    switch (vehicleType) {
+      case 'wheelbarrow':
+        return orderDetails.distance <= 1.0 && orderDetails.weight <= 15;
+      case 'bike':
+        return orderDetails.weight <= 20 && orderDetails.itemCount <= 5;
+      case 'car':
+        return true; // Cars can handle everything
+      default:
+        return true;
+    }
+  }
+
+  private getUnavailableReason(vehicleType: string, orderDetails: OrderDetails): string | undefined {
+    if (this.checkAvailability(vehicleType, orderDetails)) return undefined;
+
+    switch (vehicleType) {
+      case 'wheelbarrow':
+        if (orderDetails.distance > 1.0) return 'Distance too far for wheelbarrow delivery';
+        if (orderDetails.weight > 15) return 'Order too heavy for wheelbarrow';
+        break;
+      case 'bike':
+        if (orderDetails.weight > 20) return 'Order too heavy for bike delivery';
+        if (orderDetails.itemCount > 5) return 'Too many items for bike delivery';
+        break;
+    }
+    return 'Not available for this order';
+  }
+
+  private getBasePriceByVehicle(vehicleType: string): number {
+    switch (vehicleType) {
+      case 'wheelbarrow': return 2.5;
+      case 'bike': return 7.5;
+      case 'car': return 12.0;
+      default: return 7.5;
+    }
+  }
+
+  private getSpecialtiesByVehicle(vehicleType: string): string[] {
+    switch (vehicleType) {
+      case 'wheelbarrow': return ['Eco-friendly', 'Local delivery', 'Fresh produce'];
+      case 'bike': return ['Fast delivery', 'Electronics', 'Same-day delivery'];
+      case 'car': return ['Bulk delivery', 'Long distance', 'Heavy items'];
+      default: return [];
+    }
+  }
+
+  private calculateRating(completedOrders: number): number {
+    // Base rating starts at 4.0, improves with experience
+    const baseRating = 4.0;
+    const experienceBonus = Math.min(0.9, completedOrders * 0.01); // Max 0.9 bonus
+    return Math.round((baseRating + experienceBonus) * 10) / 10;
+  }
+
+  private getAvgDeliveryTime(vehicleType: string): number {
+    switch (vehicleType) {
+      case 'wheelbarrow': return 20; // minutes
+      case 'bike': return 25;
+      case 'car': return 30;
+      default: return 25;
+    }
+  }
+
+  private calculateRecommendationScore(rider: RiderProfile, request: RiderAvailabilityRequest): number {
+    let score = 0;
+    
+    // Rating factor (0-50 points)
+    score += rider.rating * 10;
+    
+    // Distance factor (0-30 points)
+    score += Math.max(0, 30 - rider.distanceFromPickup * 6);
+    
+    // Experience factor (0-20 points)
+    score += Math.min(20, rider.totalDeliveries * 0.1);
+    
+    return Math.round(score);
+  }
+
+  private getRecommendationReasons(rider: RiderProfile, request: RiderAvailabilityRequest): string[] {
+    const reasons: string[] = [];
+    
+    if (rider.rating >= 4.8) reasons.push('Highly rated');
+    if (rider.distanceFromPickup <= 0.5) reasons.push('Very close');
+    if (rider.totalDeliveries >= 100) reasons.push('Experienced');
+    if (rider.estimatedArrival <= 5) reasons.push('Quick pickup');
+    
+    return reasons;
   }
 
   // Mock data fallback when no riders in database

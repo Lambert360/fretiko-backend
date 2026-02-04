@@ -345,7 +345,13 @@ export class AuctionsService {
   /**
    * Create a new auction
    */
-  async createAuction(userId: string, createAuctionDto: CreateAuctionDto, userToken?: string, images?: Express.Multer.File[], video?: Express.Multer.File): Promise<Auction> {
+  async createAuction(
+    userId: string, 
+    createAuctionDto: CreateAuctionDto, 
+    userToken?: string, 
+    images?: Express.Multer.File[], 
+    video?: Express.Multer.File[]
+  ): Promise<Auction> {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     // Verify user is a seller
@@ -383,7 +389,90 @@ export class AuctionsService {
       throw new BadRequestException('End time must be after start time');
     }
 
-    // Upload images to Supabase Storage if provided
+    // Validate live auction has items if provided
+    if (createAuctionDto.auction_type === 'live' && (!createAuctionDto.items || createAuctionDto.items.length === 0)) {
+      throw new BadRequestException('Live auctions must have at least one item');
+    }
+    // Handle media uploads based on auction type
+    let imageUrls: string[] = [];
+    let videoUrl: string | undefined = createAuctionDto.video_url;
+
+    if (createAuctionDto.auction_type === 'timed') {
+      // Timed auctions: upload images and video as before
+      imageUrls = await this.uploadImages(images || [], userId, client);
+      videoUrl = await this.uploadVideo(video?.[0], userId, client, createAuctionDto.video_url);
+    } else {
+      // Live auctions: files will be handled per item
+      console.log('📦 Live auction - files will be processed per item');
+      // Upload images for live auction
+      imageUrls = await this.uploadImages(images || [], userId, client);
+    }
+
+    // Generate thumbnail
+    let thumbnailUrl: string | null | undefined = createAuctionDto.thumbnail_url;
+    if (imageUrls.length > 0) {
+      thumbnailUrl = imageUrls[0];
+    } else if (video && video.length > 0 && !createAuctionDto.thumbnail_url) {
+      thumbnailUrl = await this.generateVideoThumbnail(video[0], userId, client);
+    }
+
+    // Prepare auction data
+    const auctionData = {
+      seller_id: userId,
+      category_id: createAuctionDto.category_id,
+      title: createAuctionDto.title,
+      description: createAuctionDto.description,
+      lot_number: createAuctionDto.lot_number,
+      starting_price: createAuctionDto.starting_price,
+      reserve_price: createAuctionDto.reserve_price,
+      bid_increment: createAuctionDto.bid_increment || 1.0,
+      auction_type: createAuctionDto.auction_type,
+      start_time: createAuctionDto.start_time,
+      end_time: createAuctionDto.end_time,
+      soft_close_enabled: createAuctionDto.soft_close_enabled ?? true,
+      soft_close_extension: createAuctionDto.soft_close_extension || 300,
+      images: imageUrls.length > 0 ? imageUrls : (createAuctionDto.images || []),
+      video_url: videoUrl,
+      thumbnail_url: thumbnailUrl,
+      stream_url: createAuctionDto.stream_url,
+      auctioneer_enabled: createAuctionDto.auctioneer_enabled ?? true,
+      crowd_sounds_enabled: createAuctionDto.crowd_sounds_enabled ?? true,
+    };
+
+    const { data, error } = await client
+      .from('auctions')
+      .insert(auctionData)
+      .select()
+      .single();
+
+    if (error) {
+      throw new BadRequestException(`Failed to create auction: ${error.message}`);
+    }
+
+    // Handle items based on auction type
+    if (createAuctionDto.auction_type === 'live') {
+      await this.createLiveAuctionItems(data.id, createAuctionDto.items || [], images || [], userId, client);
+    } else {
+      // Timed auctions: create initial item from auction data
+      await this.createTimedAuctionItem(data.id, createAuctionDto, imageUrls, videoUrl, userId, client);
+    }
+
+    // Broadcast auction creation event for scheduled auctions
+    if (data.status === 'scheduled') {
+      await this.auctionGateway.broadcastAuctionStatusChange(data.id, 'scheduled', {
+        message: 'New auction created',
+        auction: data,
+      });
+    }
+
+    console.log('✅ Auction created successfully:', data.id);
+    return data;
+  }
+
+  /**
+   * Helper method to upload images
+   */
+  private async uploadImages(images: Express.Multer.File[], userId: string, client: any): Promise<string[]> {
     const imageUrls: string[] = [];
     if (images && images.length > 0) {
       console.log(`📤 Uploading ${images.length} images to Supabase Storage...`);
@@ -412,9 +501,15 @@ export class AuctionsService {
         console.log(`✅ Image uploaded: ${publicUrlData.publicUrl}`);
       }
     }
+    return imageUrls;
+  }
 
-    // Upload video to Supabase Storage if provided
-    let videoUrl: string | undefined = createAuctionDto.video_url;
+  /**
+   * Helper method to upload video
+   */
+  private async uploadVideo(video: Express.Multer.File | undefined, userId: string, client: any, existingVideoUrl?: string): Promise<string | undefined> {
+    let videoUrl: string | undefined = existingVideoUrl;
+    
     if (video) {
       console.log(`🎥 Uploading video to Supabase Storage...`);
 
@@ -454,110 +549,167 @@ export class AuctionsService {
       videoUrl = publicUrlData.publicUrl;
       console.log(`✅ Video uploaded: ${publicUrlData.publicUrl}`);
     }
+    
+    return videoUrl;
+  }
 
-    // Generate thumbnail from video if no images provided
-    let thumbnailUrl: string | null | undefined = createAuctionDto.thumbnail_url;
-    if (imageUrls.length > 0) {
-      // If images provided, use first image as thumbnail
-      thumbnailUrl = imageUrls[0];
-    } else if (video && !createAuctionDto.thumbnail_url) {
-      // If no images but video provided, generate thumbnail from video
-      console.log('📸 No images provided, generating thumbnail from video...');
-      try {
-        const generatedThumbnail = await this.generateVideoThumbnail(video, userId, client);
-        if (generatedThumbnail) {
-          thumbnailUrl = generatedThumbnail;
-          console.log('✅ Video thumbnail generated successfully:', generatedThumbnail);
-        } else {
-          console.warn('⚠️ Failed to generate video thumbnail, using null');
-          thumbnailUrl = null;
-        }
-      } catch (error) {
-        console.error('⚠️ Error generating video thumbnail:', error);
-        thumbnailUrl = null;
+  /**
+   * Helper method to create items for live auctions
+   */
+  private async createLiveAuctionItems(
+    auctionId: string, 
+    items: CreateAuctionItemDto[], 
+    files: Express.Multer.File[], 
+    userId: string, 
+    client: any
+  ): Promise<void> {
+    console.log(`📦 Creating ${items.length} items for live auction ${auctionId}`);
+    console.log('📦 Raw items data:', JSON.stringify(items, null, 2));
+    
+    // Group files by item index (assuming frontend sends files with item index prefixes)
+    const filesByItem = this.groupFilesByItem(files, items.length);
+    console.log('📦 Files grouped by item:', Object.keys(filesByItem).map(key => `${key}: ${filesByItem[key].length} files`));
+    
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const itemFiles = filesByItem[i] || [];
+      
+      console.log(`📦 Processing item ${i}:`, {
+        title: item.title,
+        description: item.description,
+        starting_price: item.starting_price,
+        lot_number: item.lot_number,
+        hasFiles: itemFiles.length > 0
+      });
+      
+      // Upload images for this item
+      const itemImageUrls = await this.uploadImages(
+        itemFiles.filter(file => file.mimetype.startsWith('image/')), 
+        userId, 
+        client
+      );
+      
+      // Upload video for this item
+      const itemVideo = itemFiles.find(file => file.mimetype.startsWith('video/'));
+      const itemVideoUrl = await this.uploadVideo(itemVideo, userId, client);
+      
+      // Create auction item
+      const itemData = {
+        auction_id: auctionId,
+        title: item.title,
+        description: item.description || '',
+        lot_number: item.lot_number || `LOT-${i + 1}`,
+        starting_price: item.starting_price,
+        reserve_price: item.reserve_price,
+        current_bid: 0,
+        bid_increment: item.bid_increment || 1.0,
+        bidding_status: 'waiting',
+        order_in_auction: i + 1,
+        bidding_duration: item.bidding_duration || 120,
+        images: itemImageUrls,
+        video_url: itemVideoUrl,
+      };
+
+      const { data: createdItem, error: itemError } = await client
+        .from('auction_items')
+        .insert(itemData)
+        .select()
+        .single();
+
+      if (itemError) {
+        console.error(`⚠️ Failed to create auction item ${i + 1}:`, itemError);
+        throw new BadRequestException(`Failed to create auction item ${i + 1}: ${itemError.message}`);
+      }
+
+      console.log(`✅ Created auction item ${i + 1}:`, createdItem.id);
+
+      // Set first item as current item
+      if (i === 0) {
+        await client
+          .from('auctions')
+          .update({ current_item_id: createdItem.id })
+          .eq('id', auctionId);
       }
     }
+  }
 
-    // Prepare auction data
-    const auctionData = {
-      seller_id: userId,
-      category_id: createAuctionDto.category_id,
+  /**
+   * Helper method to create item for timed auctions
+   */
+  private async createTimedAuctionItem(
+    auctionId: string,
+    createAuctionDto: CreateAuctionDto,
+    imageUrls: string[],
+    videoUrl: string | undefined,
+    userId: string,
+    client: any
+  ): Promise<void> {
+    const initialItemData = {
+      auction_id: auctionId,
       title: createAuctionDto.title,
       description: createAuctionDto.description,
       lot_number: createAuctionDto.lot_number,
       starting_price: createAuctionDto.starting_price,
       reserve_price: createAuctionDto.reserve_price,
+      current_bid: 0,
       bid_increment: createAuctionDto.bid_increment || 1.0,
-      auction_type: createAuctionDto.auction_type,
-      start_time: createAuctionDto.start_time,
-      end_time: createAuctionDto.end_time,
-      soft_close_enabled: createAuctionDto.soft_close_enabled ?? true,
-      soft_close_extension: createAuctionDto.soft_close_extension || 300,
+      bidding_status: 'waiting',
+      order_in_auction: 1,
+      bidding_duration: 120, // Default 2 minutes
       images: imageUrls.length > 0 ? imageUrls : (createAuctionDto.images || []),
       video_url: videoUrl,
-      thumbnail_url: thumbnailUrl,
-      stream_url: createAuctionDto.stream_url,
-      auctioneer_enabled: createAuctionDto.auctioneer_enabled ?? true,
-      crowd_sounds_enabled: createAuctionDto.crowd_sounds_enabled ?? true,
     };
 
-    const { data, error } = await client
-      .from('auctions')
-      .insert(auctionData)
+    const { data: initialItem, error: itemError } = await client
+      .from('auction_items')
+      .insert(initialItemData)
       .select()
       .single();
 
-    if (error) {
-      throw new BadRequestException(`Failed to create auction: ${error.message}`);
+    if (itemError) {
+      console.error('⚠️ Failed to create initial auction item:', itemError);
+      // Don't fail the auction creation if item creation fails
+    } else {
+      // Set this as the current item
+      await client
+        .from('auctions')
+        .update({ current_item_id: initialItem.id })
+        .eq('id', auctionId);
+      console.log('✅ Initial auction item created for timed auction');
     }
+  }
 
-    // For live auctions, create initial auction item from auction data
-    if (data.auction_type === 'live') {
-      const initialItemData = {
-        auction_id: data.id,
-        title: data.title,
-        description: data.description,
-        lot_number: data.lot_number,
-        starting_price: data.starting_price,
-        reserve_price: data.reserve_price,
-        current_bid: 0,
-        bid_increment: data.bid_increment || 1.0,
-        bidding_status: 'waiting',
-        order_in_auction: 1,
-        bidding_duration: 120, // Default 2 minutes
-        images: imageUrls.length > 0 ? imageUrls : (createAuctionDto.images || []),
-        video_url: videoUrl,
-      };
-
-      const { data: initialItem, error: itemError } = await client
-        .from('auction_items')
-        .insert(initialItemData)
-        .select()
-        .single();
-
-      if (itemError) {
-        console.error('⚠️ Failed to create initial auction item:', itemError);
-        // Don't fail the auction creation if item creation fails
+  /**
+   * Helper method to group files by item index
+   * Expects files to be named with item index prefix (e.g., "item-0-image-0", "item-1-video-0")
+   */
+  private groupFilesByItem(files: Express.Multer.File[], itemCount: number): Record<number, Express.Multer.File[]> {
+    const filesByItem: Record<number, Express.Multer.File[]> = {};
+    
+    // Initialize empty arrays for each item
+    for (let i = 0; i < itemCount; i++) {
+      filesByItem[i] = [];
+    }
+    
+    // Group files by item index
+    files.forEach(file => {
+      // Try to extract item index from filename (new format: item-0-image-0)
+      const match = file.originalname.match(/item-(\d+)-(image|video)-\d+/);
+      if (match) {
+        const itemIndex = parseInt(match[1]);
+        if (itemIndex < itemCount) {
+          filesByItem[itemIndex].push(file);
+          console.log(`📁 Grouped file ${file.originalname} to item ${itemIndex}`);
+        }
       } else {
-        // Set this as the current item
-        await client
-          .from('auctions')
-          .update({ current_item_id: initialItem.id })
-          .eq('id', data.id);
-        console.log('✅ Initial auction item created for live auction');
+        // If no item index, assume it belongs to first item (backward compatibility)
+        filesByItem[0].push(file);
+        console.log(`📁 Grouped file ${file.originalname} to item 0 (default)`);
       }
-    }
-
-    // Broadcast auction creation event for scheduled auctions (so discovery screen can update)
-    if (data.status === 'scheduled') {
-      await this.auctionGateway.broadcastAuctionStatusChange(data.id, 'scheduled', {
-        message: 'New auction created',
-        seller_id: data.seller_id,
-        auction_type: data.auction_type,
-      });
-    }
-
-    return data;
+    });
+    
+    console.log('📦 Final file grouping:', Object.keys(filesByItem).map(key => `${key}: ${filesByItem[parseInt(key)].length} files`));
+    return filesByItem;
   }
 
   /**
@@ -1921,12 +2073,9 @@ export class AuctionsService {
       timestamp: new Date().toISOString(),
     });
 
-    // Schedule bidding end after duration
-    setTimeout(() => {
-      this.endItemBidding(auctionId, itemId, sellerId).catch(err => {
-        console.error('Error ending bidding:', err);
-      });
-    }, item.bidding_duration * 1000);
+    // Removed automatic bidding end - host now controls when to end bidding
+    // Timer completion will be handled by frontend to show cancel button
+    // Host can end bidding via gavel (markItemSold) or cancel (endItemBidding) buttons
   }
 
   /**

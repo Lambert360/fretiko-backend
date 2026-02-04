@@ -74,11 +74,29 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   handleDisconnect(client: Socket) {
     console.log(`Client disconnected: ${client.id}`);
 
-    // Leave all auction rooms
+    // Leave all auction rooms and update viewer counts
     const connection = this.activeConnections.get(client.id);
     if (connection) {
       connection.auctionRooms.forEach(auctionId => {
-        client.leave(`auction_${auctionId}`);
+        const roomName = `auction_${auctionId}`;
+        
+        // Broadcast updated viewer count
+        const viewerCount = this.getAuctionViewerCount(auctionId);
+        const viewerData = {
+          auction_id: auctionId,
+          view_count: viewerCount,
+          current_viewers: viewerCount,
+          timestamp: new Date().toISOString(),
+        };
+
+        // Broadcast to all remaining viewers in the auction room
+        this.server.to(roomName).emit('view_count_update', viewerData);
+        
+        // Notify room of viewer leaving
+        this.server.to(roomName).emit('viewer_left', {
+          auction_id: auctionId,
+          timestamp: new Date().toISOString(),
+        });
       });
     }
 
@@ -130,6 +148,18 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
         timestamp: new Date().toISOString(),
       });
 
+      // Broadcast updated viewer count
+      const viewerCount = this.getAuctionViewerCount(data.auction_id);
+      const viewerData = {
+        auction_id: data.auction_id,
+        view_count: viewerCount,
+        current_viewers: viewerCount,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Broadcast to all viewers in the auction room
+      this.server.to(roomName).emit('view_count_update', viewerData);
+
     } catch (error) {
       this.logger.error(`Failed to join auction ${data.auction_id}`, {
         clientId: client.id,
@@ -162,6 +192,18 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       auction_id: data.auction_id,
       timestamp: new Date().toISOString(),
     });
+
+    // Broadcast updated viewer count
+    const viewerCount = this.getAuctionViewerCount(data.auction_id);
+    const viewerData = {
+      auction_id: data.auction_id,
+      view_count: viewerCount,
+      current_viewers: viewerCount,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Broadcast to all viewers in the auction room
+    this.server.to(roomName).emit('view_count_update', viewerData);
 
     client.emit('auction_left', { auction_id: data.auction_id });
   }

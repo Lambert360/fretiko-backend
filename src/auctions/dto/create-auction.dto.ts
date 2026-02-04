@@ -1,5 +1,17 @@
-import { IsNotEmpty, IsString, IsNumber, IsOptional, IsEnum, IsArray, IsBoolean, Min, IsDateString } from 'class-validator';
-import { Transform } from 'class-transformer';
+import { IsNotEmpty, IsString, IsNumber, IsOptional, IsEnum, IsArray, IsBoolean, Min, IsDateString, ValidateNested, ArrayNotEmpty } from 'class-validator';
+import { Type, Transform } from 'class-transformer';
+import { CreateAuctionItemDto } from './create-auction-item.dto';
+
+/**
+ * Custom validator to handle file uploads vs URL arrays
+ */
+const IsStringArrayOrUndefined = () => {
+  return (target: any, propertyKey: string) => {
+    // This field will be handled by the file upload interceptor
+    // We'll skip validation for file uploads
+    return IsOptional()(target, propertyKey);
+  };
+};
 
 /**
  * DTO for creating a new auction
@@ -63,10 +75,9 @@ export class CreateAuctionDto {
   @Transform(({ value }) => value ? parseInt(value) : 300)
   soft_close_extension?: number;
 
-  // Media
+  // Media - For file uploads, images come through @UploadedFiles() decorator
+  // This field is optional during creation and will be populated by the service
   @IsOptional()
-  @IsArray()
-  @IsString({ each: true })
   images?: string[];
 
   @IsOptional()
@@ -91,4 +102,37 @@ export class CreateAuctionDto {
   @IsBoolean()
   @Transform(({ value }) => value !== false)
   crowd_sounds_enabled?: boolean;
+
+  // Multi-item support for live auctions
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => CreateAuctionItemDto)
+  @Transform(({ value }) => {
+    // Parse JSON string from FormData if needed
+    if (typeof value === 'string') {
+      try {
+        console.log('🔍 DTO Transform - Raw string value:', value);
+        const parsed = JSON.parse(value);
+        console.log('🔍 DTO Transform - Parsed JSON:', parsed);
+        
+        if (Array.isArray(parsed)) {
+          // Transform each plain object into CreateAuctionItemDto
+          const transformed = parsed.map(item => {
+            const dto = new CreateAuctionItemDto();
+            Object.assign(dto, item);
+            return dto;
+          });
+          console.log('🔍 DTO Transform - Transformed items:', transformed);
+          return transformed;
+        }
+        return [];
+      } catch (error) {
+        console.error('🔍 DTO Transform - JSON parse error:', error);
+        return [];
+      }
+    }
+    return Array.isArray(value) ? value : [];
+  })
+  items?: CreateAuctionItemDto[];
 }

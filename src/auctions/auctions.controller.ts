@@ -133,25 +133,41 @@ export class AuctionsController {
   @Post()
   @UseGuards(JwtAuthGuard)
   @UseInterceptors(
-    FileFieldsInterceptor([
-      { name: 'images', maxCount: 10 },
-      { name: 'video', maxCount: 1 }, // Single video for auctions
-    ]),
+    FilesInterceptor('files', 50, {
+      limits: {
+        fileSize: 50 * 1024 * 1024, // 50MB max file size
+      },
+      fileFilter: (req, file, cb) => {
+        // Accept all files and let the service handle the logic
+        cb(null, true);
+      },
+    }),
   )
   @HttpCode(HttpStatus.CREATED)
   async createAuction(
     @Body() createAuctionDto: CreateAuctionDto,
-    @UploadedFiles() files: { images?: Express.Multer.File[]; video?: Express.Multer.File[] },
+    @UploadedFiles() files: Express.Multer.File[],
     @Request() req: any,
   ) {
-    console.log('📸 Received', files?.images?.length || 0, 'images for auction creation');
-    console.log('🎥 Received', files?.video?.length || 0, 'video for auction creation');
+    console.log('📁 Received', files?.length || 0, 'total files for auction creation');
+    
+    // Always process files the same way regardless of auction type
+    const images = files?.filter(file => file.mimetype.startsWith('image/')) || [];
+    const video = files?.find(file => file.mimetype.startsWith('video/'));
+
+    console.log('📸 Received', images.length, 'images for auction creation');
+    console.log('🎥 Received', video ? '1 video' : '0 videos', 'for auction creation');
+    console.log('📝 Raw FormData body:', createAuctionDto);
+    console.log('📦 Items received:', JSON.stringify(createAuctionDto.items, null, 2));
+    console.log('📦 Items type:', typeof createAuctionDto.items);
+    console.log('📦 Items length:', createAuctionDto.items?.length);
+
     return this.auctionsService.createAuction(
       req.user.sub,
       createAuctionDto,
       req.supabaseToken,
-      files?.images || [],
-      files?.video?.[0], // Single video file
+      images,
+      video ? [video] : undefined,
     );
   }
 
@@ -354,20 +370,31 @@ export class AuctionsController {
   @Post(':auctionId/items')
   @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
   @UseInterceptors(
-    FileFieldsInterceptor([
-      { name: 'images', maxCount: 10 },
-    ]),
+    FilesInterceptor('files', 10, {
+      limits: {
+        fileSize: 50 * 1024 * 1024, // 50MB max file size
+      },
+      fileFilter: (req, file, cb) => {
+        // Accept all files and let the service handle the logic
+        cb(null, true);
+      },
+    }),
   )
   @HttpCode(HttpStatus.CREATED)
   async createAuctionItem(
     @Param('auctionId') auctionId: string,
     @Body() body: any, // Use any for FormData parsing
-    @UploadedFiles() files: { images?: Express.Multer.File[] },
+    @UploadedFiles() files: Express.Multer.File[],
     @Request() req: any,
   ) {
-    console.log('📸 Received', files?.images?.length || 0, 'images for auction item creation');
+    console.log('� Received', files?.length || 0, 'total files for auction item creation');
+    
+    // Filter only image files
+    const images = files?.filter(file => file.mimetype.startsWith('image/')) || [];
+    
+    console.log('📸 Received', images.length, 'images for auction item creation');
     console.log('📝 Raw FormData body:', body);
-
+    
     // Parse FormData fields manually (FormData sends everything as strings)
     const createAuctionItemDto: CreateAuctionItemDto = {
       title: body.title,
@@ -387,7 +414,7 @@ export class AuctionsController {
       req.user.sub,
       createAuctionItemDto,
       req.supabaseToken,
-      files?.images || [],
+      images,
     );
   }
 
