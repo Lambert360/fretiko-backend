@@ -34,7 +34,8 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
 
   private readonly logger = new Logger(AuctionGateway.name);
 
-  private activeConnections = new Map<string, { userId?: string; auctionRooms: Set<string> }>();
+  private activeConnections = new Map<string, { userId?: string; auctionRooms: Set<string>; role?: string }>();
+  private auctionViewerCounts = new Map<string, Set<string>>(); // Fallback viewer tracking: auctionId -> Set of userIds
 
   constructor(
     @Inject(forwardRef(() => AuctionsService))
@@ -79,6 +80,18 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
     if (connection) {
       connection.auctionRooms.forEach(auctionId => {
         const roomName = `auction_${auctionId}`;
+
+        // Remove from fallback tracking if we have a userId
+        if (connection.userId && this.auctionViewerCounts.has(auctionId)) {
+          this.auctionViewerCounts.get(auctionId)!.delete(connection.userId);
+        }
+
+        // Ensure the socket leaves the room before recounting
+        try {
+          client.leave(roomName);
+        } catch (leaveErr) {
+          this.logger.warn(`Failed to leave room ${roomName} on disconnect`, leaveErr as any);
+        }
         
         // Broadcast updated viewer count
         const viewerCount = this.getAuctionViewerCount(auctionId);
@@ -90,7 +103,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
         };
 
         // Broadcast to all remaining viewers in the auction room
-        this.server.to(roomName).emit('view_count_update', viewerData);
+        this.server.to(roomName).emit('view_count_updated', viewerData);
         
         // Notify room of viewer leaving
         this.server.to(roomName).emit('viewer_left', {
@@ -123,6 +136,16 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       // Join auction room
       const roomName = `auction_${data.auction_id}`;
       client.join(roomName);
+      
+      // Debug: Log room membership after join
+      setTimeout(() => {
+        try {
+          const room = this.server?.sockets?.adapter?.rooms?.get(roomName);
+          this.logger.log(`📊 Room ${roomName} now has ${room?.size || 0} members after ${data.user_id?.slice(-8) || 'unknown'} joined`);
+        } catch (error) {
+          this.logger.log(`📊 Could not check room size for ${roomName}`);
+        }
+      }, 100);
 
       // Update connection info
       const connection = this.activeConnections.get(client.id);
@@ -130,6 +153,24 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
         connection.auctionRooms.add(data.auction_id);
         if (data.user_id) {
           connection.userId = data.user_id;
+          
+          // Add to fallback viewer tracking (like live stream)
+          if (!this.auctionViewerCounts.has(data.auction_id)) {
+            this.auctionViewerCounts.set(data.auction_id, new Set());
+          }
+          this.auctionViewerCounts.get(data.auction_id)!.add(data.user_id);
+          
+          // Debug: Log user comparison
+          this.logger.log(`🔍 Checking host status: user_id=${data.user_id}, seller_id=${auction.seller_id}`);
+          
+          // Check if user is the auction host (owner)
+          if (data.user_id === auction.seller_id) {
+            connection.role = 'host';
+            this.logger.log(`✅ User ${data.user_id} is the auction owner - joined as host and included in viewer count`);
+          } else {
+            connection.role = 'viewer';
+            this.logger.log(`👤 User ${data.user_id} joined as viewer (seller is ${auction.seller_id})`);
+          }
         }
       }
 
@@ -148,7 +189,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
         timestamp: new Date().toISOString(),
       });
 
-      // Broadcast updated viewer count
+      // Broadcast updated viewer count immediately after join
       const viewerCount = this.getAuctionViewerCount(data.auction_id);
       const viewerData = {
         auction_id: data.auction_id,
@@ -157,8 +198,13 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
         timestamp: new Date().toISOString(),
       };
 
-      // Broadcast to all viewers in the auction room
-      this.server.to(roomName).emit('view_count_update', viewerData);
+      // Send to the joining client first (so they get current count immediately)
+      client.emit('view_count_updated', viewerData);
+      
+      // Then broadcast to all clients (so everyone gets updated count)
+      this.server.to(roomName).emit('view_count_updated', viewerData);
+
+      this.logger.log(`📊 Sent viewer count ${viewerCount} to new joiner and broadcasted to room`);
 
     } catch (error) {
       this.logger.error(`Failed to join auction ${data.auction_id}`, {
@@ -185,6 +231,9 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
     const connection = this.activeConnections.get(client.id);
     if (connection) {
       connection.auctionRooms.delete(data.auction_id);
+      if (connection.userId && this.auctionViewerCounts.has(data.auction_id)) {
+        this.auctionViewerCounts.get(data.auction_id)!.delete(connection.userId);
+      }
     }
 
     // Notify room of viewer leaving
@@ -203,9 +252,35 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
     };
 
     // Broadcast to all viewers in the auction room
-    this.server.to(roomName).emit('view_count_update', viewerData);
+    this.server.to(roomName).emit('view_count_updated', viewerData);
 
     client.emit('auction_left', { auction_id: data.auction_id });
+  }
+
+  /**
+   * Handle viewer count requests (for reconnect scenarios)
+   */
+  @SubscribeMessage('get_viewer_count')
+  handleGetViewerCount(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { auction_id: string },
+  ) {
+    try {
+      const viewerCount = this.getAuctionViewerCount(data.auction_id);
+      const viewerData = {
+        auction_id: data.auction_id,
+        view_count: viewerCount,
+        current_viewers: viewerCount,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Send current viewer count to requesting client
+      client.emit('view_count_updated', viewerData);
+      this.logger.log(`📊 Sent current viewer count ${viewerCount} for auction ${data.auction_id}`);
+    } catch (error) {
+      this.logger.error(`Failed to get viewer count for auction ${data.auction_id}:`, error);
+      client.emit('error', { message: 'Failed to get viewer count' });
+    }
   }
 
   /**
@@ -290,20 +365,6 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   }
 
   /**
-   * Broadcast watch count update to auction room
-   * Called when watchlist is toggled
-   */
-  async broadcastWatchCountUpdate(auctionId: string, watchCount: number) {
-    const roomName = `auction_${auctionId}`;
-
-    this.server.to(roomName).emit('watch_count_updated', {
-      auction_id: auctionId,
-      watch_count: watchCount,
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  /**
    * Broadcast view count update to auction room
    * Called when auction is viewed
    */
@@ -313,6 +374,20 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
     this.server.to(roomName).emit('view_count_updated', {
       auction_id: auctionId,
       view_count: viewCount,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Broadcast watch count update to auction room
+   * Called when watchlist is toggled
+   */
+  async broadcastWatchCountUpdate(auctionId: string, watchCount: number) {
+    const roomName = `auction_${auctionId}`;
+
+    this.server.to(roomName).emit('watch_count_updated', {
+      auction_id: auctionId,
+      watch_count: watchCount,
       timestamp: new Date().toISOString(),
     });
   }
@@ -385,6 +460,55 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   }
 
   /**
+   * Get active connections count for an auction
+   */
+  getAuctionViewerCount(auctionId: string): number {
+    const roomName = `auction_${auctionId}`;
+    
+    // Validate input
+    if (!auctionId || typeof auctionId !== 'string') {
+      this.logger.error(`Invalid auction ID provided to getAuctionViewerCount: ${auctionId}`);
+      return 0;
+    }
+    
+    try {
+      // For Socket.IO v4, use the proper adapter method
+      if (this.server && this.server.sockets && this.server.sockets.adapter) {
+        const adapter = this.server.sockets.adapter;
+        
+        // Method 1: Try adapter.sockets (works with Redis adapter)
+        if (adapter.sockets) {
+          const roomSockets = adapter.sockets(new Set([roomName]));
+          if (roomSockets instanceof Set) {
+            const count = roomSockets.size;
+            this.logger.log(`📊 Room ${roomName} has ${count} viewers (Redis adapter method)`);
+            return Math.max(0, count); // Ensure non-negative
+          }
+        }
+        
+        // Method 2: Try adapter.rooms (fallback for single server)
+        if (adapter.rooms) {
+          const room = adapter.rooms.get(roomName);
+          if (room) {
+            const count = room.size;
+            this.logger.log(`📊 Room ${roomName} has ${count} viewers (adapter.rooms method)`);
+            return Math.max(0, count); // Ensure non-negative
+          }
+        }
+      } else {
+        this.logger.warn(`📊 Socket.IO adapter not available for viewer count calculation`);
+      }
+    } catch (error) {
+      this.logger.error(`📊 Error calculating viewer count for auction ${auctionId}:`, error);
+    }
+    
+    // Fallback to manual tracking
+    const fallbackCount = this.auctionViewerCounts.get(auctionId)?.size || 0;
+    this.logger.log(`📊 Using fallback viewer count for auction ${auctionId}: ${fallbackCount}`);
+    return Math.max(0, fallbackCount); // Ensure non-negative
+  }
+
+  /**
    * Broadcast auction ending warning
    */
   async broadcastAuctionEndingWarning(auctionId: string, minutesRemaining: number) {
@@ -398,22 +522,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   }
 
   /**
-   * Get active connections count for an auction
-   */
-  getAuctionViewerCount(auctionId: string): number {
-    const roomName = `auction_${auctionId}`;
-    if (this.server && this.server.sockets && this.server.sockets.adapter && this.server.sockets.adapter.rooms) {
-      const room = this.server.sockets.adapter.rooms.get(roomName);
-      return room?.size || 0;
-    } else {
-      this.logger.warn(`⚠️ Cannot access rooms in auction gateway - adapter not available`);
-      return 0;
-    }
-  }
-
-  /**
    * Notify auction winner
-   * Sends real-time notification to winner about their win
    */
   async notifyAuctionWinner(winnerId: string, auctionId: string, auctionTitle: string, winningBid: number) {
     await this.sendUserNotification(winnerId, {
@@ -432,7 +541,6 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
 
   /**
    * Broadcast auction item event to auction room
-   * Events: item_ready, start_countdown, bidding_open, bidding_ended, item_sold, item_passed
    */
   async broadcastItemEvent(auctionId: string, itemId: string | null, eventType: string, data: any) {
     const roomName = `auction_${auctionId}`;
@@ -445,10 +553,8 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       timestamp: new Date().toISOString(),
     };
 
-    // Broadcast to specific auction room
     this.server.to(roomName).emit('item_event', eventData);
     
-    // Also broadcast globally for discovery screen updates
     if (eventType === 'item_sold' || eventType === 'item_ready') {
       this.server.emit('item_event', eventData);
     }
@@ -456,7 +562,6 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
 
   /**
    * Handle reaction from viewer
-   * Allows viewers to send reactions (hearts, applause, etc.) to provide feedback
    */
   @SubscribeMessage('send_reaction')
   async handleSendReaction(
@@ -473,17 +578,14 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       const userId = connection.userId;
       const reactionType = data.reaction_type;
 
-      // Validate reaction type
       const validReactionTypes = ['heart', 'thumbs_up', 'applause', 'fire'];
       if (!validReactionTypes.includes(reactionType)) {
         client.emit('error', { message: 'Invalid reaction type' });
         return;
       }
 
-      // Save reaction to database
       await this.auctionsService.sendReaction(userId, data.auction_id, reactionType as any);
 
-      // Broadcast reaction to all viewers and auctioneer
       const roomName = `auction_${data.auction_id}`;
       const reactionData = {
         auction_id: data.auction_id,
@@ -492,12 +594,15 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
         timestamp: new Date().toISOString(),
       };
 
-      // Broadcast to all viewers in the auction room
       this.server.to(roomName).emit('new_reaction', reactionData);
-
-      // Also broadcast to auctioneer (seller) if they're connected
-      // The auctioneer can listen to the same room or a separate vendor room
-      this.server.to(roomName).emit('new_reaction', reactionData);
+      
+      try {
+        const room = this.server?.sockets?.adapter?.rooms?.get(roomName);
+        this.logger.log(`🎯 Broadcasting reaction to room ${roomName} with ${room?.size || 0} members`);
+      } catch (error) {
+        this.logger.log(`🎯 Broadcasting reaction to room ${roomName} (room count unavailable)`);
+      }
+      
       this.logger.log(`Reaction ${reactionType} sent by ${userId} in auction ${data.auction_id}`);
     } catch (error) {
       this.logger.error('Error handling reaction', {
@@ -507,10 +612,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
         error: error instanceof Error ? error.message : String(error),
       });
       client.emit('error', {
-        message:
-          error instanceof Error && error.message
-            ? error.message
-            : 'Failed to send reaction. Please try again.',
+        message: 'Failed to send reaction. Please try again.',
       });
     }
   }

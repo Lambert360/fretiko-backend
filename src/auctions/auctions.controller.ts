@@ -115,6 +115,22 @@ export class AuctionsController {
   }
 
   /**
+   * Track auction view (increment viewer count)
+   * Requires authentication for unique user tracking
+   */
+  @Post(':id/view')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async trackAuctionView(
+    @Param('id') auctionId: string,
+    @Request() req: any,
+  ) {
+    const userId = req.user.sub;
+    const viewerCount = await this.auctionsService.trackAuctionView(auctionId, userId);
+    return { success: true, viewerCount };
+  }
+
+  /**
    * Get bid history for an auction
    */
   @Get(':id/bids')
@@ -138,6 +154,11 @@ export class AuctionsController {
         fileSize: 50 * 1024 * 1024, // 50MB max file size
       },
       fileFilter: (req, file, cb) => {
+        console.log('🔍 FilesInterceptor - Processing file:', {
+          originalname: file.originalname,
+          mimetype: file.mimetype,
+          size: file.size
+        });
         // Accept all files and let the service handle the logic
         cb(null, true);
       },
@@ -150,6 +171,19 @@ export class AuctionsController {
     @Request() req: any,
   ) {
     console.log('📁 Received', files?.length || 0, 'total files for auction creation');
+    
+    // Log ALL files received with details
+    if (files && files.length > 0) {
+      console.log('📁 ALL FILES RECEIVED:');
+      files.forEach((file, index) => {
+        console.log(`  File ${index}:`, {
+          originalname: file.originalname,
+          mimetype: file.mimetype,
+          size: file.size,
+          fieldname: file.fieldname
+        });
+      });
+    }
     
     // Always process files the same way regardless of auction type
     const images = files?.filter(file => file.mimetype.startsWith('image/')) || [];
@@ -387,12 +421,39 @@ export class AuctionsController {
     @UploadedFiles() files: Express.Multer.File[],
     @Request() req: any,
   ) {
-    console.log('� Received', files?.length || 0, 'total files for auction item creation');
+    console.log('🎯 CREATE AUCTION ITEM ENDPOINT HIT!');
+    console.log(`🎯 Auction ID: ${auctionId}`);
+    console.log(`🎯 User ID: ${req.user.sub}`);
+    console.log('📁 Received', files?.length || 0, 'total files for auction item creation');
     
-    // Filter only image files
+    // Log ALL files received with details
+    if (files && files.length > 0) {
+      console.log('📁 ALL FILES RECEIVED:');
+      files.forEach((file, index) => {
+        console.log(`  File ${index}:`, {
+          originalname: file.originalname,
+          mimetype: file.mimetype,
+          size: file.size,
+          fieldname: file.fieldname
+        });
+      });
+    }
+    
+    // Filter images and videos separately
     const images = files?.filter(file => file.mimetype.startsWith('image/')) || [];
-    
+    const video = files?.find(file => file.mimetype.startsWith('video/'));
+
     console.log('📸 Received', images.length, 'images for auction item creation');
+    console.log('🎥 Received', video ? '1 video' : '0 videos', 'for auction item creation');
+    
+    if (video) {
+      console.log('🎥 VIDEO DETAILS:', {
+        originalname: video.originalname,
+        mimetype: video.mimetype,
+        size: video.size
+      });
+    }
+    
     console.log('📝 Raw FormData body:', body);
     
     // Parse FormData fields manually (FormData sends everything as strings)
@@ -415,6 +476,7 @@ export class AuctionsController {
       createAuctionItemDto,
       req.supabaseToken,
       images,
+      video ? [video] : undefined,
     );
   }
 

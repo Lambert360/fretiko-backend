@@ -264,6 +264,70 @@ export class AuctionsService {
   }
 
   /**
+   * Track auction view (increment viewer count)
+   * Called from the dedicated endpoint for real-time viewer count updates
+   */
+  async trackAuctionView(auctionId: string, userId: string): Promise<number> {
+    try {
+      // Use service client to bypass RLS for view tracking
+      // Check if user has already viewed this auction
+      const { data: existingView } = await this.serviceSupabase
+        .from('auction_views')
+        .select('id')
+        .eq('auction_id', auctionId)
+        .eq('viewer_id', userId)
+        .single();
+
+      if (!existingView) {
+        // Insert view record (trigger will auto-increment view_count)
+        const { error: insertError } = await this.serviceSupabase
+          .from('auction_views')
+          .insert({
+            auction_id: auctionId,
+            viewer_id: userId,
+          });
+
+        if (!insertError) {
+          // Fetch updated view_count after trigger execution
+          const { data: updatedStats } = await this.serviceSupabase
+            .from('auctions')
+            .select('view_count')
+            .eq('id', auctionId)
+            .single();
+
+          if (updatedStats) {
+            // Broadcast view count update via WebSocket
+            try {
+              await this.auctionGateway.broadcastViewCountUpdate(auctionId, updatedStats.view_count);
+              console.log(`📊 Broadcasted view count update for auction ${auctionId}: ${updatedStats.view_count}`);
+            } catch (error) {
+              console.error(`[Auction ${auctionId}] Error broadcasting view count update:`, error);
+              // Don't throw - WebSocket broadcast failure shouldn't fail the request
+            }
+
+            return updatedStats.view_count;
+          }
+        } else {
+          // Log error but don't fail the request
+          console.error(`[Auction ${auctionId}] Error recording view for user ${userId}:`, insertError);
+        }
+      }
+      // If view already exists, just return current count without broadcasting again
+      const { data: currentStats } = await this.serviceSupabase
+        .from('auctions')
+        .select('view_count')
+        .eq('id', auctionId)
+        .single();
+
+      return currentStats?.view_count || 0;
+    } catch (error) {
+      // Log error but don't fail the request - view tracking is non-critical
+      console.error(`[Auction ${auctionId}] Error in trackAuctionView for user ${userId}:`, error);
+      return 0;
+    }
+  }
+
+  /**
    * Generate a thumbnail from a video file using ffmpeg
    */
   private async generateVideoThumbnail(
@@ -451,7 +515,14 @@ export class AuctionsService {
 
     // Handle items based on auction type
     if (createAuctionDto.auction_type === 'live') {
-      await this.createLiveAuctionItems(data.id, createAuctionDto.items || [], images || [], userId, client);
+      // Combine images and videos for live auction processing
+      const allFiles = [...(images || []), ...(video || [])];
+      console.log('🔧 Live auction - combining files for processing:', {
+        images: images?.length || 0,
+        videos: video?.length || 0,
+        totalFiles: allFiles.length
+      });
+      await this.createLiveAuctionItems(data.id, createAuctionDto.items || [], allFiles, userId, client);
     } else {
       // Timed auctions: create initial item from auction data
       await this.createTimedAuctionItem(data.id, createAuctionDto, imageUrls, videoUrl, userId, client);
@@ -591,6 +662,15 @@ export class AuctionsService {
       
       // Upload video for this item
       const itemVideo = itemFiles.find(file => file.mimetype.startsWith('video/'));
+      console.log(`🎥 Item ${i} video check:`, {
+        totalFiles: itemFiles.length,
+        videoFound: !!itemVideo,
+        videoDetails: itemVideo ? {
+          originalname: itemVideo.originalname,
+          mimetype: itemVideo.mimetype,
+          size: itemVideo.size
+        } : null
+      });
       const itemVideoUrl = await this.uploadVideo(itemVideo, userId, client);
       
       // Create auction item
@@ -693,6 +773,7 @@ export class AuctionsService {
     
     // Group files by item index
     files.forEach(file => {
+      console.log(`🔍 Processing file: ${file.originalname}, mimetype: ${file.mimetype}`);
       // Try to extract item index from filename (new format: item-0-image-0)
       const match = file.originalname.match(/item-(\d+)-(image|video)-\d+/);
       if (match) {
@@ -1710,12 +1791,14 @@ export class AuctionsService {
         throw new ForbiddenException('Only auction owner can start broadcast');
       }
 
-      // Update auction with stream_url (using Agora channel name as identifier)
+      // Update auction with stream_url and set status to active (using Agora channel name as identifier)
       const streamUrl = `agora://auction_${auctionId}`;
+      console.log(`🎬 Starting broadcast for auction ${auctionId}, setting status to 'active'`);
       const { data, error } = await this.serviceSupabase
         .from('auctions')
         .update({
           stream_url: streamUrl,
+          status: 'active', // Set auction to active when broadcasting starts
           updated_at: new Date().toISOString(),
         })
         .eq('id', auctionId)
@@ -1863,8 +1946,8 @@ export class AuctionsService {
       .eq('auction_id', auctionId)
       .order('order_in_auction', { ascending: true });
 
-    if (error || !data) {
-      return [];
+    if (error) {
+      throw new BadRequestException(`Failed to retrieve auction items: ${error.message}`);
     }
 
     return data as AuctionItem[];
@@ -1880,11 +1963,13 @@ export class AuctionsService {
     createAuctionItemDto: CreateAuctionItemDto,
     userToken?: string,
     images?: Express.Multer.File[],
+    videos?: Express.Multer.File[],
   ): Promise<AuctionItem> {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.serviceSupabase;
 
     // Verify auction exists and user owns it
     const auction = await this.findById(auctionId);
+
     if (!auction) {
       throw new BadRequestException('Auction not found');
     }
@@ -1940,6 +2025,26 @@ export class AuctionsService {
       }
     }
 
+    // Upload video to Supabase Storage if provided
+    console.log('🎥 Video upload check - videos array:', videos);
+    console.log('🎥 Video upload check - videos.length:', videos?.length);
+    console.log('🎥 Video upload check - videos[0]:', videos?.[0]);
+    
+    let videoUrl: string | undefined;
+    if (videos && videos.length > 0) {
+      const video = videos[0]; // Take first video
+      console.log(`🎥 Uploading video for auction item...`);
+      console.log(`🎥 Video details:`, {
+        originalname: video.originalname,
+        mimetype: video.mimetype,
+        size: video.size
+      });
+      videoUrl = await this.uploadVideo(video, userId, client);
+      console.log(`🎥 Video uploaded successfully: ${videoUrl}`);
+    } else {
+      console.log(`🎥 No videos provided for auction item`);
+    }
+
     // Get auction defaults for item if not provided
     const bidIncrement = createAuctionItemDto.bid_increment || auction.bid_increment || 1.0;
     const biddingDuration = createAuctionItemDto.bidding_duration || 120; // Default 2 minutes
@@ -1958,6 +2063,7 @@ export class AuctionsService {
       order_in_auction: nextOrder,
       bidding_duration: biddingDuration,
       images: imageUrls.length > 0 ? imageUrls : (createAuctionItemDto.images || []),
+      video_url: videoUrl,
     };
 
     const { data: newItem, error: insertError } = await this.serviceSupabase
@@ -2193,11 +2299,25 @@ export class AuctionsService {
     }
 
     // Broadcast item sold
+    let bidderDisplayId = null;
+    if (item.winner_id) {
+      const { data: winnerBid } = await this.serviceSupabase
+        .from('auction_bids')
+        .select('bidder_display_id')
+        .eq('auction_id', auctionId)
+        .eq('bidder_id', item.winner_id)
+        .order('amount', { ascending: false })
+        .limit(1)
+        .single();
+      bidderDisplayId = winnerBid?.bidder_display_id || 'Winner';
+    }
+
     await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'item_sold', {
       item_id: itemId,
       item_title: item.title,
       winner: item.winner_id ? {
         bidder_id: item.winner_id,
+        bidder_display_id: bidderDisplayId,
         amount: item.winning_bid,
       } : null,
       timestamp: new Date().toISOString(),
@@ -2276,8 +2396,8 @@ export class AuctionsService {
         timestamp: new Date().toISOString(),
       });
     } else {
-      // No more items - end auction
-      await this.endAuction(auctionId);
+      // No more items - auction remains active for live streaming
+      console.log(`Auction ${auctionId}: All items sold, auction remains active for live streaming`);
     }
   }
 
