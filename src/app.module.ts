@@ -41,9 +41,11 @@ import { MemosModule } from './memos/memos.module';
 import { ReportsModule } from './reports/reports.module';
 import { AuditModule } from './audit/audit.module';
 import { GiftModule } from './gifts/gift.module';
+import { LoggerModule } from './logger/logger.module';
 
 @Module({
   imports: [
+    LoggerModule,
     ConfigModule.forRoot({ 
       isGlobal: true,
       envFilePath: '.env'

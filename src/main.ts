@@ -7,11 +7,13 @@ import { ConfigService } from '@nestjs/config';
 import { ValidationPipe } from '@nestjs/common';
 import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { SocketIoAdapter } from './realtime/socket-io.adapter';
+import { WinstonLoggerService } from './logger/winston.logger.service';
 import * as express from 'express';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { logger: new WinstonLoggerService() });
   const configService = app.get(ConfigService);
+  const logger = app.get(WinstonLoggerService);
 
   // Enable CORS for frontend
   app.enableCors({
@@ -22,11 +24,11 @@ async function bootstrap() {
   });
 
   // Configure custom Socket.IO adapter
-  console.log('🔧 Configuring Socket.IO adapter...');
+  logger.log('🔧 Configuring Socket.IO adapter...');
   const socketAdapter = new SocketIoAdapter(app);
   await socketAdapter.connectToRedis(); // Initialize adapter (currently no-op)
   app.useWebSocketAdapter(socketAdapter);
-  console.log('✅ Socket.IO adapter configured');
+  logger.log('✅ Socket.IO adapter configured');
 
   // Configure raw body for Flutterwave webhook signature verification
   // This must be before other body parsers
@@ -45,7 +47,7 @@ async function bootstrap() {
   const port = configService.get<number>('PORT') || 3000;
   // Listen on 0.0.0.0 to accept connections from mobile devices/emulators
   await app.listen(port, '0.0.0.0');
-  console.log(`🚀 Server is running on http://0.0.0.0:${port}`);
-  console.log(`📱 Mobile devices can connect via your network IP on port ${port}`);
+  logger.log(`🚀 Server is running on http://0.0.0.0:${port}`);
+  logger.log(`📱 Mobile devices can connect via your network IP on port ${port}`);
 }
 bootstrap();
