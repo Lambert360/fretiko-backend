@@ -5,6 +5,8 @@ import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { OptionalJwtAuthGuard } from './optional-jwt-auth.guard';
+import { SocialAuthService } from './social-auth.service';
+import { EmailService } from './email.service';
 
 @Module({
   imports: [
@@ -17,8 +19,8 @@ import { OptionalJwtAuthGuard } from './optional-jwt-auth.guard';
       inject: [ConfigService],
     }),
   ],
-  providers: [AuthService, JwtAuthGuard, OptionalJwtAuthGuard],
+  providers: [AuthService, JwtAuthGuard, OptionalJwtAuthGuard, SocialAuthService, EmailService],
   controllers: [AuthController],
-  exports: [AuthService, JwtModule, JwtAuthGuard, OptionalJwtAuthGuard],
+  exports: [AuthService, JwtModule, JwtAuthGuard, OptionalJwtAuthGuard, SocialAuthService, EmailService],
 })
 export class AuthModule {}
