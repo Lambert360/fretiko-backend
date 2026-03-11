@@ -90,8 +90,101 @@ export class AuthController {
   @Throttle({ default: { limit: 5, ttl: 60 } }) // 5 attempts per minute
   @HttpCode(HttpStatus.OK)
   @Header('Cache-Control', 'no-store')
-  async signIn(@Body(new ValidationPipe()) signInDto: SignInDto) {
-    return this.authService.signIn(signInDto);
+  async signIn(@Req() req: Request) {
+    // Debug logging to see raw request body
+    console.log(' Raw request headers:', req.headers);
+    console.log(' Raw request body:', req.body);
+    
+    // Manual DTO parsing
+    const signInDto = {
+      email: req.body?.email,
+      password: req.body?.password,
+    };
+    
+    console.log(' Manual parsed DTO:', signInDto);
+    
+    try {
+      const result = await this.authService.signIn(signInDto as any);
+
+      return {
+        success: true,
+        message: 'Signed in successfully',
+        user: result.user,
+        accessToken: result.accessToken,
+        refreshToken: result.refreshToken,
+      };
+    } catch (error) {
+      throw error; // Let the error filter handle the response format
+    }
+  }
+
+  @Post('send-verification-email')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  async sendVerificationEmail(@Req() req: Request) {
+    try {
+      // Debug: Log raw request body
+      console.log(' Raw request body:', req.body);
+      
+      // Manual DTO parsing (same as signup endpoint)
+      const signUpDto = {
+        email: req.body?.email,
+        password: req.body?.password,
+        firstName: req.body?.firstName,
+        lastName: req.body?.lastName,
+        dateOfBirth: req.body?.dateOfBirth || null,
+        gender: req.body?.gender || null,
+        hasAcceptedTerms: req.body?.hasAcceptedTerms
+      };
+      
+      console.log(' Manual parsed DTO:', signUpDto);
+      console.log(' Email from manual parse:', signUpDto.email);
+      
+      // Use the new signup method which handles verification email sending
+      const result = await this.authService.signUp(signUpDto as any);
+
+      return {
+        success: true,
+        message: 'Verification email sent successfully. Please check your email.',
+        email: signUpDto.email,
+        requiresEmailVerification: result.requiresEmailVerification,
+      };
+    } catch (error) {
+      throw error; // Let the error filter handle the response format
+    }
+  }
+
+  @Post('create-verified-user')
+  @HttpCode(HttpStatus.CREATED)
+  @Header('Cache-Control', 'no-store')
+  async createVerifiedUser(@Req() req: Request) {
+    try {
+      // Manual DTO parsing
+      const signUpDto = {
+        email: req.body?.email,
+        password: req.body?.password,
+        firstName: req.body?.firstName,
+        lastName: req.body?.lastName,
+        dateOfBirth: req.body?.dateOfBirth || null,
+        gender: req.body?.gender || null,
+        hasAcceptedTerms: req.body?.hasAcceptedTerms,
+        user_role: req.body?.user_role,
+        is_seller: req.body?.is_seller,
+        is_rider: req.body?.is_rider,
+      };
+      
+      const result = await this.authService.createVerifiedUser(signUpDto as any);
+
+      return {
+        success: true,
+        message: 'Account created successfully! Welcome to Fretiko.',
+        user: result.user,
+        accessToken: result.accessToken,
+        refreshToken: result.refreshToken,
+      };
+    } catch (error) {
+      throw error; // Let the error filter handle the response format
+    }
   }
 
   @Post('migrate')
@@ -242,7 +335,17 @@ export class AuthController {
   @Throttle({ default: { limit: 10, ttl: 60 } }) // 10 attempts per minute
   @HttpCode(HttpStatus.OK)
   @Header('Cache-Control', 'no-store')
-  async verifyEmailToken(@Body(new ValidationPipe()) verifyTokenDto: VerifyTokenDto, @Req() req: Request) {
+  async verifyEmailToken(@Req() req: Request) {
+    // Manual DTO parsing (same as signup endpoint)
+    const verifyTokenDto = {
+      token: req.body?.token,
+      email: req.body?.email,
+      ipAddress: req.body?.ipAddress,
+      userAgent: req.body?.userAgent,
+    };
+
+    console.log('Manual parsed verification DTO:', verifyTokenDto);
+
     try {
       const result = await this.authService.verifyEmailToken(
         verifyTokenDto.token,
@@ -282,7 +385,6 @@ export class AuthController {
       return {
         success: true,
         message: result.message,
-        token: result.token, // For testing purposes
       };
     } catch (error) {
       return {

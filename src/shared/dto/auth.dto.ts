@@ -55,6 +55,29 @@ export class SignUpDto {
   @IsOptional()
   @Matches(/^(male|female|other|prefer_not_to_say)$/, { message: 'Invalid gender option' })
   gender?: string;
+
+  @IsString()
+  @IsOptional()
+  @Matches(/^(citizen|vendor|rider)$/, { message: 'Invalid role option' })
+  user_role?: string;
+
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (typeof value === 'string') {
+      return value.toLowerCase() === 'true';
+    }
+    return value;
+  })
+  is_seller?: boolean;
+
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (typeof value === 'string') {
+      return value.toLowerCase() === 'true';
+    }
+    return value;
+  })
+  is_rider?: boolean;
 }
 
 export class SignInDto {
@@ -90,7 +113,7 @@ export class MigrateAccountDto {
 }
 
 export class AuthResponse {
-  user: {
+  user?: {
     id: string;
     email: string;
     firstName?: string;
