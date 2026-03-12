@@ -58,6 +58,14 @@ export class SignUpDto {
 
   @IsString()
   @IsOptional()
+  ipAddress?: string;
+
+  @IsString()
+  @IsOptional()
+  userAgent?: string;
+
+  @IsString()
+  @IsOptional()
   @Matches(/^(citizen|vendor|rider)$/, { message: 'Invalid role option' })
   user_role?: string;
 

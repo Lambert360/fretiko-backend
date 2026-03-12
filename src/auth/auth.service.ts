@@ -1,8 +1,9 @@
-import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ConflictException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { createSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { SignUpDto, SignInDto, AuthResponse } from '../shared/dto/auth.dto';
+import { EmailService } from './email.service';
 
 @Injectable()
 export class AuthService {
@@ -12,6 +13,7 @@ export class AuthService {
   constructor(
     private configService: ConfigService,
     private jwtService: JwtService,
+    private emailService: EmailService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
@@ -51,6 +53,12 @@ export class AuthService {
     }
 
     const metadata = verificationRecord.metadata;
+    
+    // Extract terms acceptance data from verification metadata
+    const hasAcceptedTerms = metadata.hasAcceptedTerms || false;
+    const ipAddress = metadata.ipAddress || null;
+    const userAgent = metadata.userAgent || null;
+    const originalTermsAcceptedAt = metadata.termsAcceptedAt || null;
     
     // Check if verification is still valid (within reasonable time)
     const verificationTime = new Date(verificationRecord.created_at);
@@ -105,6 +113,11 @@ export class AuthService {
         is_seller: is_seller || false,
         is_rider: is_rider || false,
         date_of_birth: signupData.dateOfBirth,
+        gender: signupData.gender, // Add gender field
+        // Add terms acceptance tracking (using existing columns and original data)
+        terms_accepted_at: originalTermsAcceptedAt, // Use original timestamp from signup
+        terms_accepted_ip: ipAddress || null,
+        terms_accepted_user_agent: userAgent || null,
       })
       .eq('id', data.user.id);
 
@@ -129,6 +142,12 @@ export class AuthService {
         user_id: data.user.id,
         email: email,
         action: 'account_created',
+        metadata: {
+          hasAcceptedTerms,
+          termsAcceptedAt: originalTermsAcceptedAt, // Use original timestamp from signup
+          ipAddress,
+          userAgent,
+        },
       });
 
     // Fetch complete user profile
@@ -166,7 +185,24 @@ export class AuthService {
   }
 
   async signUp(signUpDto: SignUpDto): Promise<AuthResponse> {
-    const { email, password, firstName, lastName, dateOfBirth, gender } = signUpDto;
+    const { email, password, firstName, lastName, dateOfBirth, gender, hasAcceptedTerms, ipAddress, userAgent } = signUpDto;
+
+    // Validate minimum age (18 years)
+    if (!dateOfBirth) {
+      throw new BadRequestException('Date of birth is required');
+    }
+    
+    const birthDate = new Date(dateOfBirth);
+    const today = new Date();
+    const age = today.getFullYear() - birthDate.getFullYear();
+    const monthDifference = today.getMonth() - birthDate.getMonth();
+    
+    // Adjust age if birthday hasn't occurred yet this year
+    const actualAge = monthDifference < 0 || (monthDifference === 0 && today.getDate() < birthDate.getDate()) ? age - 1 : age;
+    
+    if (actualAge < 18) {
+      throw new BadRequestException('You must be at least 18 years old to create an account');
+    }
 
     // Check if user already exists in Supabase Auth
     console.log('🔍 Checking if user already exists...');
@@ -199,7 +235,13 @@ export class AuthService {
         dateOfBirth,
         gender,
         password,
-      }
+        hasAcceptedTerms,
+      },
+      // Track terms acceptance at signup stage
+      hasAcceptedTerms,
+      termsAcceptedAt: hasAcceptedTerms ? new Date().toISOString() : null,
+      ipAddress,
+      userAgent,
     };
 
     console.log('🔍 Storing verification metadata:', { email, token, expiresAt: verificationMetadata.expiresAt });
@@ -213,8 +255,8 @@ export class AuthService {
           email: email,
           action: 'signup_pending',
           metadata: verificationMetadata,
-          ip_address: null,
-          user_agent: null,
+          ip_address: ipAddress || null,
+          user_agent: userAgent || null,
         });
 
       if (insertError) {
@@ -646,51 +688,266 @@ export class AuthService {
   }
 
   async resetPassword(email: string): Promise<{ success: boolean; message: string }> {
+    console.log(`Password reset request for: ${email}`);
+
     try {
-      // Check if user exists
-      const { data: userData, error: userError } = await this.supabase.auth.admin.getUserByEmail(email);
-      
-      if (userError || !userData.user) {
+      // Generate custom 6-digit token
+      const { data: tokenData, error: tokenError } = await this.serviceSupabase
+        .rpc('generate_password_reset_token');
+
+      if (tokenError || !tokenData) {
+        console.error(`Failed to generate reset token for ${email}:`, tokenError);
         return {
           success: false,
-          message: 'If an account with this email exists, a password reset link has been sent.',
+          message: 'Failed to process password reset request',
         };
       }
 
-      // Generate reset token
-      const token = Math.random().toString(36).substring(2, 8).toUpperCase();
-      const expiresAt = new Date();
-      expiresAt.setHours(expiresAt.getHours() + 1); // 1 hour expiry
+      const resetToken = tokenData; // tokenData is now a TEXT string, not an array
+      
+      // Save the reset token to user profile
+      console.log('💾 Saving reset token to user profile...');
+      const { data: saveResult, error: saveError } = await this.supabase
+        .rpc('save_reset_token', { 
+          p_user_email: email.toLowerCase(), 
+          p_token: resetToken,
+          p_expires_hours: 1
+        });
 
-      // Store reset token in user_profiles
-      const { error: updateError } = await this.supabase
-        .from('user_profiles')
-        .update({
-          reset_token: token,
-          reset_token_expires_at: expiresAt.toISOString(),
-        })
-        .eq('id', userData.user.id);
-
-      if (updateError) {
-        throw new Error('Failed to generate reset token');
+      if (saveError) {
+        console.error(`Failed to save reset token for ${email}:`, saveError);
+        return {
+          success: false,
+          message: 'Failed to process password reset request',
+        };
       }
 
-      // Send reset email
-      const emailService = new (require('./email.service').EmailService)(this.configService);
-      const emailSent = await emailService.sendPasswordResetEmail(email, token);
+      if (!saveResult?.success) {
+        console.error(`Failed to save reset token for ${email}:`, saveResult?.message);
+        return {
+          success: false,
+          message: 'Failed to process password reset request',
+        };
+      }
+
+      console.log(`Reset token generated for: ${email}, token: ${resetToken}`);
+
+      // Send custom email with 6-digit token via Resend
+      console.log('🔍 Initializing password reset email service...');
+      const emailSent = await this.emailService.sendPasswordResetEmail(email, resetToken);
+
+      console.log('🔍 Password reset email service result:', { 
+        emailSent, 
+        email, 
+        tokenLength: resetToken.length,
+        token: resetToken
+      });
 
       if (!emailSent) {
-        throw new Error('Failed to send reset email');
+        console.error(`Failed to send password reset email to ${email}`);
+        return {
+          success: false,
+          message: 'Failed to send password reset email',
+        };
       }
+
+      console.log(`✅ Password reset email sent to: ${email}`);
 
       return {
         success: true,
-        message: 'If an account with this email exists, a password reset link has been sent.',
+        message: 'If an account with this email exists, you will receive a password reset code.',
       };
     } catch (error) {
+      console.error(`Password reset error for ${email}:`, error);
+      return {
+        success: true, // Return success for security - don't reveal if email exists
+        message: 'If an account with this email exists, you will receive a password reset code.',
+      };
+    }
+  }
+
+  async checkResetStatus(email: string): Promise<{ canReset: boolean; nextAttemptTime: string | null; message: string }> {
+    try {
+      console.log('🔍 Checking reset status for email:', email);
+      
+      // Check if there's a recent token (within last 24 hours)
+      const { data: existingTokens, error: tokenCheckError } = await this.serviceSupabase
+        .from('user_profiles')
+        .select('reset_token, reset_token_expires_at')
+        .not('reset_token', 'is', null)
+        .order('reset_token_expires_at', 'desc')
+        .limit(1);
+
+      if (tokenCheckError) {
+        console.error('❌ Error checking reset status:', tokenCheckError);
+        return {
+          canReset: true,
+          nextAttemptTime: null,
+          message: 'Unable to check reset status',
+        };
+      }
+
+      if (!existingTokens || existingTokens.length === 0) {
+        // No tokens found - user can reset
+        return {
+          canReset: true,
+          nextAttemptTime: null,
+          message: 'Password reset available',
+        };
+      }
+
+      const latestToken = existingTokens[0];
+      const tokenExpiry = new Date(latestToken.reset_token_expires_at);
+      const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      
+      if (tokenExpiry > twentyFourHoursAgo) {
+        // Token still valid - user must wait
+        const nextAttemptTime = new Date(tokenExpiry.getTime() + 60 * 60 * 1000);
+        
+        return {
+          canReset: false,
+          nextAttemptTime: nextAttemptTime.toISOString(),
+          message: `Password reset email already sent. Please check your email or try again after ${nextAttemptTime.toLocaleString()}.`,
+        };
+      } else {
+        // Token expired - user can reset again
+        return {
+          canReset: true,
+          nextAttemptTime: null,
+          message: 'Password reset available',
+        };
+      }
+    } catch (error) {
+      console.error('❌ Check reset status error:', error);
+      return {
+        canReset: false,
+        nextAttemptTime: null,
+        message: 'Failed to check reset status',
+      };
+    }
+  }
+
+  async verifyResetToken(email: string, token: string): Promise<{ valid: boolean; message: string }> {
+    try {
+      console.log('🔍 Verifying reset token with database function...');
+      console.log('- Email:', email);
+      console.log('- Token:', token);
+      
+      // Use database function to verify token
+      const { data: result, error: rpcError } = await this.supabase
+        .rpc('verify_reset_token_func', { 
+          p_email: email.toLowerCase(), 
+          p_token: token 
+        });
+
+      if (rpcError) {
+        console.error('❌ Database function error:', rpcError);
+        return {
+          valid: false,
+          message: 'Failed to verify reset token',
+        };
+      }
+
+      console.log('🔍 Database function result:', result);
+
+      if (result?.valid) {
+        console.log('✅ Token is valid!');
+        return {
+          valid: true,
+          message: result?.message || 'Token is valid',
+        };
+      } else {
+        console.log('❌ Token validation failed:', result?.message);
+        return {
+          valid: false,
+          message: result?.message || 'Invalid or expired reset token',
+        };
+      }
+    } catch (error) {
+      console.error('❌ Token verification error:', error);
+      return {
+        valid: false,
+        message: 'Failed to verify reset token',
+      };
+    }
+  }
+
+  async confirmResetPassword(email: string, token: string, newPassword: string): Promise<{ success: boolean; message: string }> {
+    try {
+      console.log('🔍 Confirming password reset...');
+      console.log('- Email:', email);
+      console.log('- Token:', token);
+      
+      // First verify the token using database function
+      const { data: verification, error: verifyError } = await this.supabase
+        .rpc('verify_reset_token_func', { 
+          p_email: email.toLowerCase(), 
+          p_token: token 
+        });
+
+      if (verifyError) {
+        console.error('❌ Token verification error:', verifyError);
+        return {
+          success: false,
+          message: 'Failed to verify reset token',
+        };
+      }
+
+      if (!verification?.valid) {
+        console.log('❌ Token validation failed:', verification?.message);
+        return {
+          success: false,
+          message: verification?.message || 'Invalid or expired reset token',
+        };
+      }
+
+      console.log('✅ Token verified, updating password...');
+      
+      // Update password using database function that integrates with Supabase Auth
+      const { data: result, error: updateError } = await this.supabase
+        .rpc('update_user_password', { 
+          p_user_email: email.toLowerCase(), 
+          p_new_password: newPassword 
+        });
+
+      if (updateError) {
+        console.error('❌ Password update error:', updateError);
+        return {
+          success: false,
+          message: 'Failed to update password',
+        };
+      }
+
+      console.log('🔍 Password update result:', result);
+
+      if (!result?.success) {
+        return {
+          success: false,
+          message: result?.message || 'Failed to update password',
+        };
+      }
+
+      // Clear the reset token (optional but good practice)
+      console.log('🧹 Clearing reset token...');
+      const { data: clearResult, error: clearError } = await this.supabase
+        .rpc('clear_reset_token', { p_profile_id: verification.user_id });
+
+      if (clearError) {
+        console.warn('⚠️ Warning: Failed to clear reset token:', clearError);
+      } else {
+        console.log('✅ Reset token cleared');
+      }
+
+      console.log('✅ Password reset completed successfully!');
+      return {
+        success: true,
+        message: 'Password has been reset successfully',
+      };
+    } catch (error) {
+      console.error('❌ Confirm reset password error:', error);
       return {
         success: false,
-        message: 'Failed to send password reset link',
+        message: 'Failed to reset password',
       };
     }
   }

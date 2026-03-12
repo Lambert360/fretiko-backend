@@ -227,10 +227,21 @@ export class EmailService {
       const resendApiKey = this.configService.get<string>('RESEND_API_KEY');
       const resendFromEmail = this.configService.get<string>('RESEND_FROM_EMAIL');
 
+      console.log('🔍 Password Reset Email Debug:');
+      console.log('- RESEND_API_KEY exists:', !!resendApiKey);
+      console.log('- RESEND_FROM_EMAIL:', resendFromEmail);
+      console.log('- Sending password reset email to:', email);
+      console.log('- Reset token:', token);
+
       if (!resendApiKey || !resendFromEmail) {
-        throw new Error('Resend configuration missing');
+        console.log('❌ Missing Resend configuration for password reset');
+        console.log('- RESEND_API_KEY:', resendApiKey);
+        console.log('- RESEND_FROM_EMAIL:', resendFromEmail);
+        return false;
       }
 
+      console.log('✅ Attempting to send password reset via Resend...');
+      
       const response = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: {
@@ -243,16 +254,25 @@ export class EmailService {
           subject: 'Password Reset Code - Fretiko',
           html: this.generatePasswordResetEmailContent(token),
         }),
+        signal: AbortSignal.timeout(30000), // 30 seconds timeout
       });
 
+      console.log('📧 Password Reset Resend API Response:');
+      console.log('- Status:', response.status);
+      console.log('- OK:', response.ok);
+      
+      const result = await response.json();
+      console.log('- Response data:', result);
+      
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(`Failed to send password reset email: ${errorData.message}`);
+        console.error('❌ Password Reset Resend API Error:', result);
+        return false;
       }
-
-      return true;
+      
+      console.log('✅ Password reset email sent successfully via Resend');
+      return response.ok;
     } catch (error) {
-      console.error('Error sending password reset email:', error);
+      console.error('Failed to send password reset email via Resend:', error);
       return false;
     }
   }

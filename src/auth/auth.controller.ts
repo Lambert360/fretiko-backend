@@ -211,6 +211,50 @@ export class AuthController {
     }
   }
 
+  @Post('verify-reset-token')
+  @HttpCode(HttpStatus.OK)
+  async verifyResetToken(@Body(new ValidationPipe()) verifyDto: { email: string; token: string }) {
+    try {
+      const result = await this.authService.verifyResetToken(verifyDto.email, verifyDto.token);
+
+      return {
+        valid: result.valid,
+        message: result.message,
+      };
+    } catch (error) {
+      return {
+        valid: false,
+        message: error.message || 'Failed to verify reset token',
+      };
+    }
+  }
+
+  @Post('confirm-reset-password')
+  @HttpCode(HttpStatus.OK)
+  async confirmResetPassword(@Body(new ValidationPipe()) confirmDto: { 
+    email: string; 
+    token: string; 
+    newPassword: string 
+  }) {
+    try {
+      const result = await this.authService.confirmResetPassword(
+        confirmDto.email, 
+        confirmDto.token, 
+        confirmDto.newPassword
+      );
+
+      return {
+        success: result.success,
+        message: result.message,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error.message || 'Failed to reset password',
+      };
+    }
+  }
+
   @Get('check-email-availability')
   @HttpCode(HttpStatus.OK)
   @Header('Cache-Control', 'no-cache')
