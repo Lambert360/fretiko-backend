@@ -34,8 +34,8 @@ export class SignUpDto {
   lastName: string;
 
   @IsString()
-  @IsOptional()
-  dateOfBirth?: string;
+  @IsNotEmpty({ message: 'Date of birth is required' })
+  dateOfBirth: string;
 
   @IsOptional()
   @Transform(({ value }) => {

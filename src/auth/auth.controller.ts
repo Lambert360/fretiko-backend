@@ -171,6 +171,8 @@ export class AuthController {
         user_role: req.body?.user_role,
         is_seller: req.body?.is_seller,
         is_rider: req.body?.is_rider,
+        ipAddress: req.body?.ipAddress,
+        userAgent: req.body?.userAgent,
       };
       
       const result = await this.authService.createVerifiedUser(signUpDto as any);

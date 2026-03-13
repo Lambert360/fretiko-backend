@@ -38,6 +38,27 @@ export class AuthService {
   async createVerifiedUser(signUpDto: SignUpDto): Promise<AuthResponse> {
     const { email, user_role, is_seller, is_rider } = signUpDto;
 
+    // Debug logging to track incoming data
+    console.log('🔍 createVerifiedUser received data:', {
+      email,
+      firstName: signUpDto.firstName,
+      lastName: signUpDto.lastName,
+      dateOfBirth: signUpDto.dateOfBirth,
+      gender: signUpDto.gender,
+      hasAcceptedTerms: signUpDto.hasAcceptedTerms,
+      user_role,
+      is_seller,
+      is_rider,
+      ipAddress: signUpDto.ipAddress,
+      userAgent: signUpDto.userAgent,
+    });
+
+    // Debug: Check what fields are actually present in signUpDto
+    console.log('🔍 signUpDto object keys:', Object.keys(signUpDto));
+    console.log('🔍 signUpDto full object:', signUpDto);
+    console.log('🔍 signUpDto.ipAddress type:', typeof signUpDto.ipAddress);
+    console.log('🔍 signUpDto.userAgent type:', typeof signUpDto.userAgent);
+
     // Find verification data in email_verification_logs
     const { data: verificationRecord, error: verificationError } = await this.serviceSupabase
       .from('email_verification_logs')
@@ -54,11 +75,11 @@ export class AuthService {
 
     const metadata = verificationRecord.metadata;
     
-    // Extract terms acceptance data from verification metadata
-    const hasAcceptedTerms = metadata.hasAcceptedTerms || false;
-    const ipAddress = metadata.ipAddress || null;
-    const userAgent = metadata.userAgent || null;
-    const originalTermsAcceptedAt = metadata.termsAcceptedAt || null;
+    // Extract terms acceptance data - prefer provided data, fallback to metadata
+    const hasAcceptedTerms = signUpDto.hasAcceptedTerms || metadata.hasAcceptedTerms || false;
+    const ipAddress = signUpDto.ipAddress || metadata.ipAddress || null;
+    const userAgent = signUpDto.userAgent || metadata.userAgent || null;
+    const originalTermsAcceptedAt = metadata.termsAcceptedAt || new Date().toISOString();
     
     // Check if verification is still valid (within reasonable time)
     const verificationTime = new Date(verificationRecord.created_at);
@@ -69,13 +90,13 @@ export class AuthService {
       throw new UnauthorizedException('Verification expired. Please verify your email again.');
     }
 
-    // Use stored signup data or provided data
-    const signupData = metadata.signupData || {
-      firstName: signUpDto.firstName,
-      lastName: signUpDto.lastName,
-      dateOfBirth: signUpDto.dateOfBirth,
-      gender: signUpDto.gender,
-      password: signUpDto.password,
+    // Use provided data first, fallback to stored metadata
+    const signupData = {
+      firstName: signUpDto.firstName || metadata.signupData?.firstName,
+      lastName: signUpDto.lastName || metadata.signupData?.lastName,
+      dateOfBirth: signUpDto.dateOfBirth || metadata.signupData?.dateOfBirth,
+      gender: signUpDto.gender || metadata.signupData?.gender,
+      password: signUpDto.password || metadata.signupData?.password,
     };
 
     // Create user in Supabase Auth (email already verified)
@@ -102,23 +123,33 @@ export class AuthService {
     });
 
     // Create or update user profile record with user ID, role, and verification data
+    const profileData = {
+      id: data.user.id, // Required for upsert
+      email_confirmed: true,
+      email_confirmation_token: metadata.token, // Store the token used
+      email_confirmation_expires_at: metadata.expiresAt, // Store expiry
+      user_role: user_role || 'citizen',
+      is_seller: is_seller || false,
+      is_rider: is_rider || false,
+      date_of_birth: signupData.dateOfBirth,
+      gender: signupData.gender, // Add gender field
+      // Add terms acceptance tracking (using existing columns and original data)
+      terms_accepted_at: originalTermsAcceptedAt, // Use original timestamp from signup
+      terms_accepted_ip: ipAddress || null,
+      terms_accepted_user_agent: userAgent || null,
+    };
+
+    console.log('🔍 Updating user profile with data:', {
+      userId: data.user.id,
+      gender: profileData.gender,
+      terms_accepted_at: profileData.terms_accepted_at,
+      terms_accepted_ip: profileData.terms_accepted_ip,
+      terms_accepted_user_agent: profileData.terms_accepted_user_agent,
+    });
+
     const { error: updateError } = await this.serviceSupabase
       .from('user_profiles')
-      .upsert({
-        id: data.user.id, // Required for upsert
-        email_confirmed: true,
-        email_confirmation_token: metadata.token, // Store the token used
-        email_confirmation_expires_at: metadata.expiresAt, // Store expiry
-        user_role: user_role || 'citizen',
-        is_seller: is_seller || false,
-        is_rider: is_rider || false,
-        date_of_birth: signupData.dateOfBirth,
-        gender: signupData.gender, // Add gender field
-        // Add terms acceptance tracking (using existing columns and original data)
-        terms_accepted_at: originalTermsAcceptedAt, // Use original timestamp from signup
-        terms_accepted_ip: ipAddress || null,
-        terms_accepted_user_agent: userAgent || null,
-      })
+      .upsert(profileData)
       .eq('id', data.user.id);
 
     if (updateError) {
@@ -187,14 +218,14 @@ export class AuthService {
   async signUp(signUpDto: SignUpDto): Promise<AuthResponse> {
     const { email, password, firstName, lastName, dateOfBirth, gender, hasAcceptedTerms, ipAddress, userAgent } = signUpDto;
 
-    // Validate minimum age (18 years)
-    if (!dateOfBirth) {
+    // Validate age requirement (18+)
+    if (!signUpDto.dateOfBirth) {
       throw new BadRequestException('Date of birth is required');
     }
-    
-    const birthDate = new Date(dateOfBirth);
+
+    const birthDate = new Date(signUpDto.dateOfBirth);
     const today = new Date();
-    const age = today.getFullYear() - birthDate.getFullYear();
+    let age = today.getFullYear() - birthDate.getFullYear();
     const monthDifference = today.getMonth() - birthDate.getMonth();
     
     // Adjust age if birthday hasn't occurred yet this year
