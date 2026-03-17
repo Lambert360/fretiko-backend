@@ -11,7 +11,10 @@ import { WinstonLoggerService } from './logger/winston.logger.service';
 import * as express from 'express';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { logger: new WinstonLoggerService() });
+  const app = await NestFactory.create(AppModule, { 
+    logger: new WinstonLoggerService(),
+    rawBody: true // Enable raw body for Svix webhook signature verification
+  });
   const configService = app.get(ConfigService);
   const logger = app.get(WinstonLoggerService);
 

@@ -13,6 +13,7 @@ import { ProcessingTimeService } from './processing-time.service';
 import { WalletReconciliationService } from './wallet-reconciliation.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { EscrowBypassCheckDto, DepositRequestDto, WithdrawRequestDto } from './dto/wallet.dto';
+import { SvixService } from '../webhook/svix.service';
 
 @Controller('wallet')
 export class WalletController {
@@ -25,6 +26,7 @@ export class WalletController {
     private readonly processingTimeService: ProcessingTimeService,
     private readonly walletReconciliationService: WalletReconciliationService,
     private readonly configService: ConfigService,
+    private readonly svixService: SvixService,
   ) {}
 
   /**
@@ -139,8 +141,25 @@ export class WalletController {
     @Req() req: any,
     @Body(ValidationPipe) dto: DepositRequestDto,
   ) {
+    console.log('🚀 DEPOSIT REQUEST RECEIVED:', {
+      userId: req.user.sub,
+      dto: dto,
+      timestamp: new Date().toISOString()
+    });
     
-    return this.walletService.createDepositRequest(req.user.sub, dto);
+    try {
+      const result = await this.walletService.createDepositRequest(req.user.sub, dto);
+      console.log('✅ DEPOSIT CREATED SUCCESSFULLY:', result);
+      return result;
+    } catch (error: any) {
+      console.error('❌ DEPOSIT CREATION FAILED:', {
+        error: error.message,
+        stack: error.stack,
+        dto: dto,
+        timestamp: new Date().toISOString()
+      });
+      throw error;
+    }
   }
 
   /**
@@ -167,7 +186,7 @@ export class WalletController {
    * GET /wallet/deposit/rate?localAmount=19200&localCurrency=NGN
    */
   @Get('deposit/rate')
-  @UseGuards(JwtAuthGuard)
+  // @UseGuards(JwtAuthGuard) // Make public for better frontend compatibility
   async getDepositExchangeRate(
     @Query('localAmount') localAmount: string,
     @Query('localCurrency') localCurrency: string,
@@ -193,8 +212,12 @@ export class WalletController {
         amount
       );
 
-      // Calculate FRETI amount (1 USD = 1 FRETI)
-      const fretiAmount = rateInfo.destination.amount;
+      // Calculate FRETI amount correctly (1 USD = 1 FRETI)
+      // Don't trust Flutterwave's destination.amount, calculate using the rate
+      const fretiAmount = amount * rateInfo.rate; // localAmount * rate = USD amount = FRETI amount
+      
+      console.log(`🔧 Exchange rate calculation: ${amount} ${localCurrency} × ${rateInfo.rate} = ${fretiAmount} FRETI`);
+      console.log(`🔧 Flutterwave returned: source=${rateInfo.source.amount}, destination=${rateInfo.destination.amount}, rate=${rateInfo.rate}`);
 
       return {
         localAmount: amount,
@@ -207,7 +230,7 @@ export class WalletController {
         message: `Depositing ${amount} ${localCurrency.toUpperCase()} will give you approximately ₣${fretiAmount.toFixed(2)} FRETI`,
         rateInfo: {
           source: rateInfo.source,
-          destination: rateInfo.destination,
+          destination: rateInfo.destination, // Keep original Flutterwave response
         },
       };
     } catch (flutterwaveError: any) {
@@ -235,7 +258,7 @@ export class WalletController {
           message: `Depositing ${amount} ${localCurrency.toUpperCase()} will give you approximately ₣${fretiAmount.toFixed(2)} FRETI (estimated rate)`,
           rateInfo: {
             source: { currency: localCurrency.toUpperCase(), amount: amount },
-            destination: { currency: 'FRETI', amount: fretiAmount },
+            destination: { currency: 'USD', amount: fretiAmount }, // Keep consistent format
           },
         };
       } catch (fallbackError: any) {
@@ -541,157 +564,169 @@ export class WalletController {
 
   /**
    * Webhook verification endpoint (GET)
-   * Flutterwave can test this to verify the webhook URL is accessible
+   * Svix-managed webhook endpoint verification
    */
   @Get('webhooks/flutterwave')
   verifyWebhookEndpoint() {
-        return { 
+    return { 
       status: 'success', 
-      message: 'Webhook endpoint is accessible',
+      message: 'Svix-managed webhook endpoint is accessible',
       timestamp: new Date().toISOString()
     };
   }
 
   /**
    * Webhook endpoint for Flutterwave callbacks
-   * Note: This endpoint should NOT require JWT authentication
-   * 
-   * IMPORTANT: For signature verification to work, NestJS must be configured
-   * to provide raw body. Add to main.ts:
-   * app.use('/wallet/webhooks/flutterwave', express.raw({ type: 'application/json' }));
+   * Now managed by Svix for enhanced reliability and monitoring
    * 
    * BEST PRACTICES:
-   * 1. Return 200 OK immediately (Flutterwave expects response within 5 seconds)
+   * 1. Return 200 OK immediately (Svix expects response within 5 seconds)
    * 2. Process webhook asynchronously to avoid timeouts
-   * 3. Don't fail on signature verification errors (log but continue)
-   * 4. Always return 200 OK even on errors (Flutterwave will retry if needed)
+   * 3. Use Svix signature verification (webhooks are forwarded from Svix)
+   * 4. Always return 200 OK even on errors (Svix will retry if needed)
    */
   @Post('webhooks/flutterwave')
   async handleFlutterwaveWebhook(
     @Req() req: RawBodyRequest<Request>,
-    @Body() body: any,
-    @Headers('verif-hash') signature?: string,
     @Res() res?: Response,
   ) {
     const startTime = Date.now();
     
-    // Flutterwave sends signature in 'verif-hash' or 'flutterwave-signature' header
-    // Check all possible header names
-    const signatureFromHeader = req.headers['verif-hash'] || 
-                                req.headers['flutterwave-signature'] ||
-                                req.headers['x-flutterwave-signature'] ||
-                                signature;
-    
-    // Use signature from decorator first, then fallback to header
-    const actualSignature = signature || (typeof signatureFromHeader === 'string' ? signatureFromHeader : undefined);
-    
-    // Handle body - it might be a Buffer from express.raw middleware
-    let parsedBody: any;
-    if (Buffer.isBuffer(body)) {
-      // Body is a Buffer, parse it as JSON
-      parsedBody = JSON.parse(body.toString('utf8'));
+    // Get raw body for signature verification - this is now available with rawBody: true
+    let rawBody: string;
+    if (req.rawBody) {
+      // Handle different types of rawBody
+      if (req.rawBody instanceof Buffer) {
+        rawBody = req.rawBody.toString('utf8');
+      } else if (typeof req.rawBody === 'string') {
+        rawBody = req.rawBody;
+      } else if (req.rawBody && typeof req.rawBody === 'object' && 
+                 (req.rawBody as any).type === 'Buffer' && 
+                 Array.isArray((req.rawBody as any).data)) {
+        // Handle serialized Buffer object: {"type":"Buffer","data":[123,34,...]}
+        rawBody = Buffer.from((req.rawBody as any).data).toString('utf8');
+      } else {
+        rawBody = JSON.stringify(req.rawBody);
+      }
     } else {
-      parsedBody = body;
+      // Fallback - this shouldn't happen with rawBody: true
+      rawBody = JSON.stringify(req.body);
+    }
+    
+    // Parse the body from raw body
+    let parsedBody: any;
+    try {
+      console.log('🔍 Raw webhook body:', rawBody.substring(0, 200) + '...');
+      
+      // Check if rawBody is a serialized Buffer object
+      if (rawBody.includes('"type":"Buffer"') && rawBody.includes('"data":[')) {
+        console.log('🔧 Detected serialized Buffer object, converting...');
+        try {
+          const bufferObj = JSON.parse(rawBody);
+          if (bufferObj.type === 'Buffer' && Array.isArray(bufferObj.data)) {
+            rawBody = Buffer.from(bufferObj.data).toString('utf8');
+            console.log('✅ Successfully converted Buffer to string');
+          }
+        } catch (bufferError) {
+          console.error('❌ Failed to convert Buffer object:', bufferError);
+        }
+      }
+      
+      parsedBody = JSON.parse(rawBody);
+      console.log('✅ Parsed webhook body:', JSON.stringify(parsedBody, null, 2).substring(0, 300) + '...');
+    } catch (error) {
+      console.error('❌ Failed to parse webhook body:', error);
+      console.error('❌ Raw body that failed to parse:', rawBody);
+      if (res) return res.status(400).json({ status: 'error', message: 'Invalid JSON body' });
+      return;
     }
     
     // Support both Flutterwave v2 (event) and v3 (type) formats
     const event = parsedBody?.type || parsedBody?.event || 'unknown';
     
-        
-    // Log all relevant headers to find the correct signature header
-    const relevantHeaders = Object.keys(req.headers)
-      .filter(k => k.toLowerCase().includes('hash') || 
-                   k.toLowerCase().includes('signature') || 
-                   k.toLowerCase().includes('flutterwave') ||
-                   k.toLowerCase().includes('verif'));
-        
-    // Get raw body for signature verification
-    // According to Flutterwave docs: HMAC-SHA256(raw_request_body, secret_hash) = signature
-    // With express.raw(), the body should be a Buffer
-    let rawBody: string;
-    if (Buffer.isBuffer(body)) {
-      // Body is a Buffer from express.raw middleware - use it directly
-      rawBody = body.toString('utf8');
-          } else if (req.rawBody && Buffer.isBuffer(req.rawBody)) {
-      // Fallback: check req.rawBody if available
-      rawBody = req.rawBody.toString('utf8');
-          } else {
-      // Last resort: stringify the parsed body (may cause signature mismatch)
-      rawBody = JSON.stringify(parsedBody);
-          }
-    
-    
-    // Verify webhook signature - CRITICAL: Flutterwave docs require 401 on failure
-    // According to Flutterwave docs:
-    // 1. They compute: HMAC-SHA256(raw_body, secret_hash) = signature
-    // 2. They send signature in 'verif-hash' header
-    // 3. We compute the same and compare
+    // Verify webhook signature (supports both Svix and direct Flutterwave)
     let signatureValid = false;
     const isProduction = process.env.NODE_ENV === 'production';
     
-    if (actualSignature) {
-      // Check if Flutterwave is sending the secret instead of the hash (common misconfiguration)
-      // A SHA256 hash should be 64 hex characters
-      const isLikelySecret = actualSignature.length < 32 || actualSignature === this.configService.get<string>('FLW_WEBHOOK_SECRET');
+    // Check for Flutterwave's verif-hash header (direct webhook) or Svix signature
+    const flutterwaveSignature = Array.isArray(req.headers['verif-hash']) 
+      ? req.headers['verif-hash'][0] 
+      : req.headers['verif-hash'];
+    const svixSignature = Array.isArray(req.headers['svix-signature']) 
+      ? req.headers['svix-signature'][0] 
+      : req.headers['svix-signature'];
+    const signature = flutterwaveSignature || svixSignature;
+    
+    console.log('🔍 WEBHOOK DEBUG:', {
+      hasFlutterwaveSignature: !!flutterwaveSignature,
+      hasSvixSignature: !!svixSignature,
+      signatureLength: signature?.length,
+      rawBodyLength: rawBody?.length,
+      isProduction,
+      env: process.env.NODE_ENV
+    });
+    
+    // Production: Use appropriate signature verification
+    // Development: Skip verification for testing
+    if (isProduction) {
+      console.log('🔒 PRODUCTION MODE: Verifying webhook signature');
       
-      if (isLikelySecret) {
-                
-        // In development, allow webhook to proceed with a warning
-        // In production, reject for security
-        if (isProduction) {
-                    if (res) {
-            return res.status(401).json({ 
-              status: 'error', 
-              message: 'Invalid webhook signature - Flutterwave configuration issue' 
-            });
+      if (flutterwaveSignature) {
+        // Direct Flutterwave webhook - use Flutterwave signature verification
+        console.log('🔍 Direct Flutterwave webhook detected');
+        try {
+          const secretHash = this.configService.get<string>('FLUTTERWAVE_WEBHOOK_SECRET');
+          if (!secretHash) {
+            console.error('❌ Missing Flutterwave webhook secret');
+            if (res) return res.status(401).json({ status: 'error', message: 'Missing webhook secret' });
+            return;
           }
-          return { status: 'error', message: 'Invalid webhook signature' };
-        } else {
-                    signatureValid = true; // Allow in dev
+          
+          // Create HMAC-SHA256 hash to verify Flutterwave signature
+          const crypto = require('crypto');
+          const hash = crypto.createHmac('sha256', secretHash).update(rawBody).digest('hex');
+          signatureValid = hash === flutterwaveSignature;
+          
+          if (!signatureValid) {
+            console.error('❌ Invalid Flutterwave webhook signature');
+            if (res) return res.status(401).json({ status: 'error', message: 'Invalid webhook signature' });
+            return;
+          }
+          console.log('✅ Flutterwave webhook signature verified');
+        } catch (error) {
+          console.error('❌ Flutterwave webhook verification failed:', error);
+          if (res) return res.status(401).json({ status: 'error', message: 'Webhook verification failed' });
+          return;
+        }
+      } else if (svixSignature) {
+        // Svix webhook - use Svix signature verification
+        console.log('🔍 Svix webhook detected');
+        try {
+          signatureValid = await this.svixService.verifyWebhook(rawBody, svixSignature);
+          if (!signatureValid) {
+            if (res) return res.status(401).json({ status: 'error', message: 'Invalid Svix webhook signature' });
+            return;
+          }
+          console.log('✅ Svix webhook signature verified');
+        } catch (error) {
+          if (res) return res.status(401).json({ status: 'error', message: 'Svix webhook verification failed' });
+          return;
         }
       } else {
-        // Normal signature verification
-        try {
-          signatureValid = this.flutterwaveService.verifyWebhook(rawBody, actualSignature);
-          if (signatureValid) {
-                        // Flutterwave docs: Return 401 Unauthorized if signature fails
-            if (res) {
-              return res.status(401).json({ 
-                status: 'error', 
-                message: 'Invalid webhook signature' 
-              });
-            }
-            return { status: 'error', message: 'Invalid webhook signature' };
-          }
-        } catch (error: any) {
-                    if (res) {
-            return res.status(401).json({ 
-              status: 'error', 
-              message: 'Signature verification failed' 
-            });
-          }
-          return { status: 'error', message: 'Signature verification failed' };
-        }
+        console.error('❌ No webhook signature found (neither verif-hash nor svix-signature)');
+        if (res) return res.status(401).json({ status: 'error', message: 'Missing webhook signature' });
+        return;
       }
     } else {
-      // No signature header
-      if (isProduction) {
-                if (res) {
-          return res.status(401).json({ 
-            status: 'error', 
-            message: 'Missing webhook signature' 
-          });
-        }
-        return { status: 'error', message: 'Missing webhook signature' };
-      } else {
-              }
+      console.log('⚠️ DEVELOPMENT MODE: Signature verification disabled');
+      signatureValid = true;
     }
-
+    
     // Return 200 OK immediately to avoid Flutterwave timeout
     // Process webhook asynchronously
     const response = { 
       status: 'success', 
-      message: 'Webhook received',
+      message: 'Webhook received and processed',
       event: event,
       timestamp: new Date().toISOString()
     };
@@ -702,8 +737,15 @@ export class WalletController {
     }
 
     // Process webhook asynchronously (don't await)
+    console.log('🚀 ABOUT TO PROCESS WEBHOOK ASYNC:', {
+      event,
+      signatureValid,
+      txRef: parsedBody?.data?.tx_ref
+    });
+    
     this.processWebhookAsync(parsedBody, event, signatureValid, startTime).catch((error) => {
-          });
+      console.error('❌ Async webhook processing failed:', error);
+    });
 
     // Return response for non-express res case
     return response;

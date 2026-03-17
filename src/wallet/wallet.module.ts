@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
 import { WalletController } from './wallet.controller';
+import { RateTestController } from './rate-test.controller';
 import { WalletService } from './wallet.service';
 import { PinService } from './pin.service';
 import { BankAccountService } from './bank-account.service';
@@ -10,11 +11,13 @@ import { WalletReconciliationService } from './wallet-reconciliation.service';
 import { ExchangeRateService } from '../shared/exchange-rate.service';
 import { ProcessingTimeService } from './processing-time.service';
 import { WithdrawalValidationService } from './withdrawal-validation.service';
+import { RateProviderService } from './rate-provider.service';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { WebhookModule } from '../webhook/webhook.module';
 
 @Module({
-  imports: [NotificationsModule, ScheduleModule],
-  controllers: [WalletController],
+  imports: [NotificationsModule, ScheduleModule, WebhookModule],
+  controllers: [WalletController, RateTestController],
   providers: [
     WalletService, 
     PinService, 
@@ -24,7 +27,8 @@ import { NotificationsModule } from '../notifications/notifications.module';
     WalletReconciliationService,
     ExchangeRateService, 
     ProcessingTimeService,
-    WithdrawalValidationService
+    WithdrawalValidationService,
+    RateProviderService
   ],
   exports: [
     WalletService, 

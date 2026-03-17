@@ -128,16 +128,19 @@ export class FlutterwaveService {
   private readonly logger = new Logger(FlutterwaveService.name);
   private flw: Flutterwave | null = null;
   
-  // Exchange rate cache: cache rates for 2 minutes (rates don't change every second)
+  // Exchange rate cache: cache rates for 30 seconds (development)
   // Cache key format: "SOURCE_DESTINATION" (e.g., "NGN_USD")
   // Note: Exchange rates are amount-independent, so we cache by currency pair only
-  private readonly RATE_CACHE_DURATION = 2 * 60 * 1000; // 2 minutes
+  private readonly RATE_CACHE_DURATION = 30 * 1000; // 30 seconds (bypass caching for testing)
   private rateCache = new Map<string, { 
     rate: number; 
     source: { currency: string; amount: number };
     destination: { currency: string; amount: number };
     expiry: number;
   }>();
+  
+  // Request deduplication: prevent multiple simultaneous calls for same rate
+  private pendingRequests = new Map<string, Promise<any>>();
 
   constructor(private configService: ConfigService) {
     // Use process.env as fallback if configService doesn't have it (for compatibility)
@@ -635,9 +638,9 @@ export class FlutterwaveService {
       
       // Add test scenario header for test mode (helps with testing)
       if (isTestMode) {
-        // Optional: Add scenario header for test mode transfers
-        // This helps simulate successful transfers in test mode
-        // headers['X-Scenario-Key'] = 'scenario:successful'; // Uncomment if needed
+        // Add scenario header to trigger webhook in test mode
+        // Without this, transfers remain in pending state and no webhook is sent
+        headers['X-Scenario-Key'] = 'scenario:successful';
       }
       
       // Make direct HTTP call to Flutterwave API
@@ -934,6 +937,13 @@ export class FlutterwaveService {
     const cacheKey = `${sourceCurrency.toUpperCase()}_${destinationCurrency.toUpperCase()}`;
     const cached = this.rateCache.get(cacheKey);
     
+    // Check for pending request to prevent duplicates
+    const pendingRequest = this.pendingRequests.get(cacheKey);
+    if (pendingRequest) {
+      this.logger.debug(`🔄 Request deduplication: Using pending request for ${cacheKey}`);
+      return pendingRequest;
+    }
+    
     // Only use cache for conversions to/from USD (most common case)
     // Cross-currency conversions need fresh API calls for accuracy
     const sourceUpper = sourceCurrency.toUpperCase();
@@ -941,16 +951,17 @@ export class FlutterwaveService {
     const isToOrFromUSD = sourceUpper === 'USD' || destUpper === 'USD';
     
     if (cached && Date.now() < cached.expiry && isToOrFromUSD) {
-      // Use cached rate, but recalculate amounts based on the new amount
+      // Use cached rate, but recalculate amounts based on new amount
+      this.logger.debug(`🔄 Using cached exchange rate: ${cacheKey} (rate: ${cached.rate.toFixed(4)})`);
       const cachedRate = cached.rate;
       let sourceAmount: number;
       let destinationAmount: number;
       
       if (destUpper === 'USD') {
-        // Converting to USD: destinationAmount = sourceAmount / rate
-        // Rate is from source to USD, so: USD = source / rate
+        // Converting to USD: destinationAmount = sourceAmount * rate
+        // Rate is from source to USD, so: USD = source * rate
         sourceAmount = amount;
-        destinationAmount = amount / cachedRate;
+        destinationAmount = amount * cachedRate;
       } else {
         // Converting from USD: destinationAmount = sourceAmount * rate
         // Rate is from USD to destination, so: destination = USD * rate
@@ -970,7 +981,37 @@ export class FlutterwaveService {
           amount: destinationAmount,
         },
       };
-    } else if (!isToOrFromUSD) {
+    }
+
+    // Create and store the promise for deduplication
+    const ratePromise = this.fetchExchangeRate(sourceCurrency, destinationCurrency, amount, cacheKey, isToOrFromUSD, cached);
+    this.pendingRequests.set(cacheKey, ratePromise);
+    
+    try {
+      const result = await ratePromise;
+      return result;
+    } finally {
+      // Clean up pending request
+      this.pendingRequests.delete(cacheKey);
+    }
+  }
+
+  private async fetchExchangeRate(
+    sourceCurrency: string,
+    destinationCurrency: string,
+    amount: number,
+    cacheKey: string,
+    isToOrFromUSD: boolean,
+    cached: any
+  ): Promise<{
+    rate: number;
+    source: { currency: string; amount: number };
+    destination: { currency: string; amount: number };
+  }> {
+    const sourceUpper = sourceCurrency.toUpperCase();
+    const destUpper = destinationCurrency.toUpperCase();
+
+    if (!isToOrFromUSD) {
       // Cross-currency conversion - bypass cache and make fresh API call
       this.logger.debug(`⚠️ Cross-currency conversion (${sourceUpper} → ${destUpper}), making fresh API call for accuracy`);
     }

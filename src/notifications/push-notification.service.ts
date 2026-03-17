@@ -333,8 +333,191 @@ export class PushNotificationService {
         return { emoji: '💳', channel: 'payments' };
       case 'chat':
         return { emoji: '💬', channel: 'messages' };
+      case 'wallet':
+        return { emoji: '💰', channel: 'wallet' };
+      case 'deposit':
+        return { emoji: '💵', channel: 'wallet' };
+      case 'withdrawal':
+        return { emoji: '💸', channel: 'wallet' };
+      case 'escrow':
+        return { emoji: '🔒', channel: 'wallet' };
+      case 'rewards':
+        return { emoji: '⭐', channel: 'wallet' };
       default:
         return { emoji: '🔔', channel: 'general' };
     }
+  }
+
+  /**
+   * Send deposit completion notification
+   */
+  async sendDepositNotification(
+    userId: string,
+    data: {
+      amount: number;
+      currency: string;
+      fretiAmount: number;
+      paymentMethod: string;
+    }
+  ) {
+    return this.sendPushNotification(userId, {
+      title: 'Deposit Completed! 💰',
+      body: `Your deposit of ${data.fretiAmount.toLocaleString()} FRETI has been processed successfully.`,
+      data: {
+        type: 'deposit',
+        amount: data.amount,
+        currency: data.currency,
+        fretiAmount: data.fretiAmount,
+        paymentMethod: data.paymentMethod,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+
+  /**
+   * Send withdrawal confirmation notification
+   */
+  async sendWithdrawalNotification(
+    userId: string,
+    data: {
+      amount: number;
+      fretiAmount: number;
+      bankName: string;
+      estimatedTime: string;
+    }
+  ) {
+    return this.sendPushNotification(userId, {
+      title: 'Withdrawal Initiated 💸',
+      body: `Your withdrawal of ${data.fretiAmount.toLocaleString()} FRETI to ${data.bankName} has been initiated. Estimated completion: ${data.estimatedTime}`,
+      data: {
+        type: 'withdrawal',
+        amount: data.amount,
+        fretiAmount: data.fretiAmount,
+        bankName: data.bankName,
+        estimatedTime: data.estimatedTime,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+
+  /**
+   * Send escrow release notification
+   */
+  async sendEscrowReleaseNotification(
+    userId: string,
+    data: {
+      amount: number;
+      orderNumber: string;
+      vendorName?: string;
+      riderName?: string;
+    }
+  ) {
+    const title = data.vendorName 
+      ? `Payment Released! 🎉 (${data.orderNumber})`
+      : `Delivery Earning Released! 🚚 (${data.orderNumber})`;
+
+    const body = data.vendorName
+      ? `₣${data.amount.toLocaleString()} has been credited to your wallet for order ${data.orderNumber}.`
+      : `₣${data.amount.toLocaleString()} delivery earning has been credited to your wallet for order ${data.orderNumber}.`;
+
+    return this.sendPushNotification(userId, {
+      title,
+      body,
+      data: {
+        type: 'escrow',
+        amount: data.amount,
+        orderNumber: data.orderNumber,
+        vendorName: data.vendorName,
+        riderName: data.riderName,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+
+  /**
+   * Send rewards credit notification
+   */
+  async sendRewardsNotification(
+    userId: string,
+    data: {
+      rewardsAmount: number;
+      monthlyTotal: number;
+      nextCreditDate: string;
+    }
+  ) {
+    return this.sendPushNotification(userId, {
+      title: 'Rewards Credited! ⭐',
+      body: `You've earned ₣${data.rewardsAmount.toLocaleString()} in rewards! Monthly total: ₣${data.monthlyTotal.toLocaleString()}`,
+      data: {
+        type: 'rewards',
+        rewardsAmount: data.rewardsAmount,
+        monthlyTotal: data.monthlyTotal,
+        nextCreditDate: data.nextCreditDate,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+
+  /**
+   * Send wallet balance alert
+   */
+  async sendBalanceAlert(
+    userId: string,
+    data: {
+      balance: number;
+      alertType: 'low_balance' | 'high_balance' | 'threshold_reached';
+      threshold?: number;
+    }
+  ) {
+    const messages = {
+      low_balance: `Your wallet balance is low: ₣${data.balance.toLocaleString()}`,
+      high_balance: `Your wallet balance is high: ₣${data.balance.toLocaleString()}`,
+      threshold_reached: `Your wallet has reached ₣${data.threshold?.toLocaleString()}!`,
+    };
+
+    return this.sendPushNotification(userId, {
+      title: 'Wallet Alert 💰',
+      body: messages[data.alertType],
+      data: {
+        type: 'wallet',
+        alertType: data.alertType,
+        balance: data.balance,
+        threshold: data.threshold,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+
+  /**
+   * Send transaction sync notification (for offline transactions)
+   */
+  async sendTransactionSyncNotification(
+    userId: string,
+    data: {
+      syncedCount: number;
+      failedCount: number;
+      transactionType: 'deposit' | 'withdrawal';
+    }
+  ) {
+    const title = data.failedCount > 0 
+      ? `Transactions Synced ⚠️`
+      : `Transactions Synced ✅`;
+
+    const body = data.failedCount > 0
+      ? `${data.syncedCount} ${data.transactionType}s synced, ${data.failedCount} failed. Check your transaction history.`
+      : `${data.syncedCount} ${data.transactionType}s synced successfully!`;
+
+    return this.sendPushNotification(userId, {
+      title,
+      body,
+      data: {
+        type: 'wallet',
+        subType: 'transaction_sync',
+        syncedCount: data.syncedCount,
+        failedCount: data.failedCount,
+        transactionType: data.transactionType,
+        timestamp: new Date().toISOString(),
+      },
+    });
   }
 }

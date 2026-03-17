@@ -18,6 +18,8 @@ import { ProcessingTimeService } from './processing-time.service';
 
 import { WithdrawalValidationService } from './withdrawal-validation.service';
 
+import { RateProviderService } from './rate-provider.service';
+
 import { WalletTransactionType, isValidTransactionType, getAllTransactionTypes } from './constants/transaction-types';
 
 import { randomUUID } from 'crypto';
@@ -110,7 +112,9 @@ export class WalletService {
 
     private processingTimeService: ProcessingTimeService,
 
-    private withdrawalValidation: WithdrawalValidationService
+    private withdrawalValidation: WithdrawalValidationService,
+
+    private rateProviderService: RateProviderService
 
   ) {
 
@@ -2376,128 +2380,66 @@ export class WalletService {
 
     }
 
-
-
     // Fetch real-time exchange rate estimate: USD → localCurrency
-
     // This gives users an accurate estimate before withdrawal
-
     let estimatedLocalAmount: number;
-
     let estimatedExchangeRate: number = this.FRETI_USD_RATE; // Default: 1:1 if same currency
 
-
-
     if (localCurrency !== 'USD') {
-
       try {
-
-        this.logger.log(`💱 Fetching real-time exchange rate for withdrawal: ${dto.fretiAmount} USD → ${localCurrency}`);
-
-        const rateInfo = await this.flutterwaveService.getExchangeRate('USD', localCurrency, dto.fretiAmount);
-
+        this.logger.log(`💱 Fetching exchange rate with fallback system for withdrawal: ${dto.fretiAmount} USD → ${localCurrency}`);
+        const rateInfo = await this.rateProviderService.getExchangeRate('USD', localCurrency, dto.fretiAmount);
         
-
-        // Use destination.amount directly (this is the actual local currency amount Flutterwave calculated)
-
-        estimatedLocalAmount = rateInfo.destination.amount;
-
-        // Calculate the rate from the actual conversion
-
-        estimatedExchangeRate = estimatedLocalAmount / dto.fretiAmount;
-
+        // Calculate the local currency amount using the rate from RateProviderService
+        estimatedLocalAmount = dto.fretiAmount * rateInfo.rate;
+        // The rate from RateProviderService is already the conversion rate
+        estimatedExchangeRate = rateInfo.rate;
         
-
-        this.logger.log(`✅ Fetched live exchange rate for withdrawal: ${dto.fretiAmount} USD → ${estimatedLocalAmount.toFixed(2)} ${localCurrency} (Rate: ${estimatedExchangeRate.toFixed(4)} ${localCurrency}/USD)`);
-
+        this.logger.log(`✅ Fetched exchange rate from ${rateInfo.provider} for withdrawal: ${dto.fretiAmount} USD → ${estimatedLocalAmount.toFixed(2)} ${localCurrency} (Rate: ${estimatedExchangeRate.toFixed(4)} ${localCurrency}/USD)`);
       } catch (rateError: any) {
-
-        this.logger.error(`❌ Could not fetch live exchange rate for withdrawal ${localCurrency}:`, {
-
+        this.logger.error(`❌ Could not fetch exchange rate for withdrawal ${localCurrency}:`, {
           error: rateError.message,
-
           fretiAmount: dto.fretiAmount,
-
           localCurrency,
-
           stack: rateError.stack,
-
         });
-
         // Don't silently fallback - inform user that rate service is unavailable
-
         throw new BadRequestException(
-
           `Unable to fetch exchange rate for ${localCurrency}. The exchange rate service is temporarily unavailable. Please try again in a few moments.`
-
         );
-
       }
-
     } else {
-
       // Same currency (USD → USD), no conversion needed
-
       estimatedLocalAmount = dto.fretiAmount;
-
       estimatedExchangeRate = 1.0;
-
     }
 
-
-
     // Get wallet ID (needed for ledger entry reference, but locking happens in RPC)
-
     // Note: Balance validation happens atomically in createLedgerEntry via atomic_wallet_operation
-
     const userWallet = await this.getWallet(userId);
-
     
-
     // ✅ BUG FIX: Removed redundant balance check - atomic_wallet_operation validates atomically
-
     // This prevents race conditions where balance could change between check and operation
 
-
-
     // Move funds from available to pending withdrawal (atomic operation with locking)
-
     // Note: createLedgerEntry now uses atomic_wallet_operation which handles locking and idempotency
-
     await this.createLedgerEntry({
-
       walletId: userWallet.id,
-
-      transactionType: 'withdrawal_burn',
-
+      transactionType: 'withdrawal_request',
       availableDelta: -dto.fretiAmount,
-
       escrowDelta: 0,
-
       pendingWithdrawalDelta: dto.fretiAmount,
-
       referenceType: 'payout_request',
-
       referenceId: payoutId,
-
       idempotencyKey: `${idempotencyKey}_hold`,
-
       description: 'Withdrawal request - funds held pending'
-
     }, userId);
 
-
-
     // Create payout request
-
     const { data: payoutData, error } = await this.supabase
-
       .from('payout_requests')
-
       .insert({
-
         id: payoutId,
-
         user_id: userId,
 
         freti_amount: dto.fretiAmount,
@@ -2591,47 +2533,41 @@ export class WalletService {
         reference: payoutId,
 
         callbackUrl: (() => {
-
           // Get callback URL and validate it's publicly accessible
-
           const apiUrl = this.configService.get<string>('API_URL');
-
-          const callbackUrl = `${apiUrl}/wallet/webhooks/flutterwave`;
-
           
-
-          // Validate callback URL (will throw if localhost/private IP)
-
-          try {
-
-            this.withdrawalValidation.validateCallbackUrl(callbackUrl);
-
-          } catch (error: any) {
-
-            this.logger.error(`❌ Invalid callback URL: ${error.message}`);
-
-            // In development, allow it but log warning
-
-            if (process.env.NODE_ENV !== 'production') {
-
-              this.logger.warn('⚠️ Allowing localhost callback URL in development mode. Webhooks will not work.');
-
-            } else {
-
-              throw new BadRequestException(
-
-                `Invalid API_URL configuration: ${error.message}. Please set API_URL to a publicly accessible HTTPS URL.`
-
-              );
-
-            }
-
+          if (!apiUrl) {
+            throw new Error('API_URL is not configured');
           }
-
           
-
+          const callbackUrl = `${apiUrl}/wallet/webhooks/flutterwave`;
+          
+          // In development, use ngrok if available, otherwise use localhost
+          if (process.env.NODE_ENV !== 'production') {
+            if (apiUrl.includes('localhost') || apiUrl.includes('127.0.0.1')) {
+              // Use ngrok URL for development webhook testing
+              const ngrokUrl = 'https://psychedelic-undefending-kyler.ngrok-free.dev';
+              const ngrokCallbackUrl = `${ngrokUrl}/wallet/webhooks/flutterwave`;
+              
+              this.logger.log(`🚀 Using ngrok URL for webhooks: ${ngrokCallbackUrl}`);
+              return ngrokCallbackUrl;
+            }
+          }
+          
+          // Validate callback URL (will throw if localhost/private IP)
+          try {
+            this.withdrawalValidation.validateCallbackUrl(callbackUrl);
+          } catch (error: any) {
+            this.logger.error(`❌ Invalid callback URL: ${error.message}`);
+            
+            if (process.env.NODE_ENV === 'production') {
+              throw error; // In production, fail hard
+            } else {
+              this.logger.warn('⚠️ Allowing invalid callback URL in development mode. Webhooks will not work.');
+            }
+          }
+          
           return callbackUrl;
-
         })(),
 
       });
@@ -3799,8 +3735,13 @@ export class WalletService {
    */
 
   async handleDepositWebhook(webhookData: any): Promise<void> {
-
     const startTime = Date.now();
+    console.log('📥 DEPOSIT WEBHOOK RECEIVED:', {
+      event: webhookData.event,
+      txRef: webhookData.data?.tx_ref || webhookData.data?.txRef,
+      timestamp: new Date().toISOString(),
+      processingTime: 'started'
+    });
 
     // Support both Flutterwave v2 (event) and v3 (type) formats
 
@@ -3836,7 +3777,36 @@ export class WalletService {
 
       });
 
-
+      // CRITICAL: Always verify transaction with Flutterwave API before processing
+      // This prevents fake webhooks and ensures data consistency
+      if (data?.id && event === 'charge.completed') {
+        console.log('🔍 Verifying transaction with Flutterwave API...');
+        try {
+          const verification = await this.flutterwaveService.verifyPayment(data.id);
+          console.log('✅ Transaction verification result:', {
+            status: verification.data.status,
+            amount: verification.data.amount,
+            currency: verification.data.currency,
+            tx_ref: verification.data.tx_ref,
+            isSuccessful: verification.data.status === 'successful'
+          });
+          
+          // Only proceed if verification matches webhook data
+          if (verification.data.status !== data.status ||
+              verification.data.amount !== data.amount ||
+              verification.data.currency !== data.currency ||
+              verification.data.tx_ref !== data.tx_ref) {
+            console.error('❌ Transaction verification mismatch - ignoring webhook');
+            console.error('Webhook data:', { status: data.status, amount: data.amount, currency: data.currency, tx_ref: data.tx_ref });
+            console.error('Verification data:', { status: verification.data.status, amount: verification.data.amount, currency: verification.data.currency, tx_ref: verification.data.tx_ref });
+            return;
+          }
+          console.log('✅ Transaction verification passed - proceeding with webhook');
+        } catch (verifyError) {
+          console.error('❌ Transaction verification failed:', verifyError);
+          return;
+        }
+      }
 
       // Find deposit by tx_ref
 
@@ -4553,17 +4523,21 @@ export class WalletService {
         
 
         // Log for audit
+        console.log(`🎉 DEPOSIT COMPLETED SUCCESSFULLY: ${txRef}`, {
+          userId: deposit.user_id,
+          amount: fretiAmount,
+          currency: data.currency,
+          processingTime,
+          timestamp: new Date().toISOString(),
+          flutterwaveTxId: data.id,
+          depositId: txRef
+        });
 
         this.logger.log(`Deposit completed: ${txRef}`, {
-
           userId: deposit.user_id,
-
           amount: fretiAmount,
-
           currency: data.currency,
-
           processingTime,
-
         });
 
       } else if (event === 'charge.failed' || (event === 'charge.completed' && data.status !== 'successful')) {
@@ -5984,7 +5958,11 @@ export class WalletService {
 
 
 
-        // Remove funds from pending_withdrawal (burn)
+        // Remove funds from pending_withdrawal (burn completion)
+
+        // Note: Initial withdrawal already created withdrawal_burn to move funds to pending
+
+        // This entry completes the process by removing from pending
 
         // Use transfer ID in idempotency key for better deduplication
 
@@ -5994,13 +5972,13 @@ export class WalletService {
 
           walletId: wallet.id,
 
-          transactionType: 'withdrawal_burn',
+          transactionType: 'withdrawal_burn', // Burn funds from pending_withdrawal
 
           availableDelta: 0,
 
           escrowDelta: 0,
 
-          pendingWithdrawalDelta: -payout.freti_amount, // Remove from pending
+          pendingWithdrawalDelta: -payout.freti_amount, // Remove from pending (burn)
 
           referenceType: 'payout_request',
 
