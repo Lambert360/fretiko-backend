@@ -173,9 +173,18 @@ export class BankAccountService {
         // For regular users, infer country from currency if not provided
         if (!country && dto.currency) {
           const currencyToCountry: Record<string, string> = {
+            // Major International Currencies
+            'USD': 'US', 'EUR': 'EU', 'GBP': 'GB', 'CAD': 'CA', 'AUD': 'AU',
+            
+            // African Currencies (Flutterwave's primary market)
             'NGN': 'NG', 'GHS': 'GH', 'KES': 'KE', 'ZAR': 'ZA', 'UGX': 'UG',
-            'TZS': 'TZ', 'RWF': 'RW', 'XAF': 'CM', 'XOF': 'SN', 'USD': 'US',
-            'EUR': 'EU', 'GBP': 'GB', 'CAD': 'CA', 'AUD': 'AU',
+            'TZS': 'TZ', 'RWF': 'RW', 'XAF': 'CM', 'XOF': 'SN', 'MWK': 'MW',
+            'ZMW': 'ZM', 'EGP': 'EG', 'MAD': 'MA', 'SLL': 'SL', 'BWP': 'BW',
+            'ETB': 'ET', 'MZN': 'MZ', 'MGA': 'MG', 'AOA': 'AO', 'SCR': 'SC',
+            'MUR': 'MU', 'SZL': 'SZ', 'LSL': 'LS', 'NAD': 'NA', 'BIF': 'BI',
+            'DJF': 'DJ', 'SOS': 'SO', 'SDG': 'SD', 'SSP': 'SS', 'STN': 'ST',
+            'CDF': 'CD', 'LRD': 'LR', 'GMD': 'GM', 'GNF': 'GN', 'TND': 'TN',
+            'DZD': 'DZ', 'MRU': 'MR',
           };
           country = currencyToCountry[dto.currency.toUpperCase()];
         }

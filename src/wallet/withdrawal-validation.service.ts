@@ -11,26 +11,63 @@ export class WithdrawalValidationService {
 
   // Minimum transfer amounts (in USD/FRETI equivalent)
   private readonly MIN_TRANSFER_AMOUNTS: Record<string, number> = {
+    // Major International Currencies
     'USD': 1.0,
-    'NGN': 50.0,      // ~$0.03 USD at current rates, but Flutterwave minimum is usually higher
-    'GHS': 1.0,
-    'KES': 10.0,
-    'ZAR': 10.0,
-    'UGX': 1000.0,
-    'TZS': 1000.0,
-    'RWF': 500.0,
-    'XAF': 500.0,
-    'XOF': 500.0,
     'EUR': 1.0,
     'GBP': 1.0,
     'CAD': 1.0,
     'AUD': 1.0,
+    
+    // African Currencies (Flutterwave's primary market)
+    'NGN': 50.0,      // Nigeria
+    'GHS': 1.0,       // Ghana
+    'KES': 10.0,      // Kenya
+    'ZAR': 10.0,      // South Africa
+    'UGX': 1000.0,    // Uganda
+    'TZS': 1000.0,    // Tanzania
+    'RWF': 500.0,     // Rwanda
+    'XAF': 500.0,     // Central African CFA
+    'XOF': 500.0,     // West African CFA
+    'MWK': 100.0,     // Malawi
+    'ZMW': 10.0,      // Zambia
+    'EGP': 10.0,      // Egypt
+    'MAD': 10.0,      // Morocco
+    'SLL': 1000.0,    // Sierra Leone
+    'BWP': 10.0,      // Botswana
+    'ETB': 10.0,      // Ethiopia
+    'MZN': 10.0,      // Mozambique
+    'MGA': 500.0,     // Madagascar
+    'AOA': 100.0,     // Angola
+    'SCR': 10.0,      // Seychelles
+    'MUR': 10.0,      // Mauritius
+    'SZL': 10.0,      // Eswatini
+    'LSL': 10.0,      // Lesotho
+    'NAD': 10.0,      // Namibia
+    'BIF': 500.0,     // Burundi
+    'DJF': 100.0,     // Djibouti
+    'SOS': 100.0,     // Somalia
+    'SDG': 10.0,      // Sudan
+    'SSP': 100.0,     // South Sudan
+    'STN': 10.0,      // São Tomé and Príncipe
+    'CDF': 500.0,     // Congo
+    'LRD': 10.0,      // Liberia
+    'GMD': 10.0,      // Gambia
+    'GNF': 1000.0,    // Guinea
+    'TND': 1.0,       // Tunisia
+    'DZD': 10.0,      // Algeria
+    'MRU': 10.0,      // Mauritania
   };
 
   // Currencies that don't support decimal places
   private readonly NO_DECIMAL_CURRENCIES = [
-    'NGN', 'JPY', 'KRW', 'VND', 'XOF', 'XAF', 'UGX', 'TZS', 'RWF',
-    'CLP', 'ISK', 'UZS', 'VES', 'IDR'
+    // African Currencies (typically no decimals)
+    'NGN', 'GHS', 'KES', 'ZAR', 'UGX', 'TZS', 'RWF', 'XAF', 'XOF',
+    'MWK', 'ZMW', 'BWP', 'ETB', 'MZN', 'MGA', 'AOA', 'SCR', 'MUR',
+    'SZL', 'LSL', 'NAD', 'BIF', 'DJF', 'SOS', 'SDG', 'SSP', 'STN',
+    'CDF', 'LRD', 'GMD', 'GNF', 'TND', 'DZD', 'MRU',
+    
+    // Asian Currencies (no decimals)
+    'JPY', 'KRW', 'VND', 'CLP', 'ISK', 'UZS', 'VES', 'IDR'
   ];
 
   // Maximum beneficiary name length (Flutterwave limit)
@@ -41,6 +78,14 @@ export class WithdrawalValidationService {
 
   // Minimum and maximum account number lengths by country
   private readonly ACCOUNT_NUMBER_LENGTHS: Record<string, { min: number; max: number }> = {
+    // Major International Countries
+    'US': { min: 4, max: 17 },     // USA
+    'GB': { min: 8, max: 8 },      // UK (account number)
+    'CA': { min: 7, max: 12 },     // Canada
+    'AU': { min: 6, max: 9 },      // Australia
+    'EU': { min: 8, max: 34 },     // EU (IBAN standard)
+    
+    // African Countries
     'NG': { min: 10, max: 10 },    // Nigeria
     'GH': { min: 10, max: 15 },    // Ghana
     'KE': { min: 10, max: 15 },    // Kenya
@@ -48,10 +93,36 @@ export class WithdrawalValidationService {
     'UG': { min: 10, max: 15 },    // Uganda
     'TZ': { min: 10, max: 15 },    // Tanzania
     'RW': { min: 10, max: 15 },    // Rwanda
-    'US': { min: 4, max: 17 },     // USA
-    'GB': { min: 8, max: 8 },      // UK (account number)
-    'CA': { min: 7, max: 12 },     // Canada
-    'AU': { min: 6, max: 9 },      // Australia
+    'MW': { min: 8, max: 13 },     // Malawi
+    'ZM': { min: 9, max: 14 },     // Zambia
+    'EG': { min: 14, max: 18 },    // Egypt
+    'MA': { min: 16, max: 24 },    // Morocco
+    'SL': { min: 11, max: 11 },    // Sierra Leone
+    'BW': { min: 10, max: 14 },    // Botswana
+    'ET': { min: 10, max: 14 },    // Ethiopia
+    'MZ': { min: 12, max: 17 },    // Mozambique
+    'MG': { min: 16, max: 17 },    // Madagascar
+    'AO': { min: 12, max: 17 },    // Angola
+    'SC': { min: 16, max: 17 },    // Seychelles
+    'MU': { min: 12, max: 19 },    // Mauritius
+    'SZ': { min: 10, max: 11 },    // Eswatini
+    'LS': { min: 12, max: 13 },    // Lesotho
+    'NA': { min: 10, max: 12 },    // Namibia
+    'BI': { min: 12, max: 16 },    // Burundi
+    'DJ': { min: 11, max: 12 },    // Djibouti
+    'SO': { min: 8, max: 12 },     // Somalia
+    'SD': { min: 10, max: 14 },    // Sudan
+    'SS': { min: 12, max: 16 },    // South Sudan
+    'ST': { min: 12, max: 17 },    // São Tomé and Príncipe
+    'CD': { min: 10, max: 17 },    // Congo
+    'LR': { min: 8, max: 12 },     // Liberia
+    'GM': { min: 10, max: 13 },    // Gambia
+    'GN': { min: 11, max: 12 },    // Guinea
+    'TN': { min: 13, max: 20 },    // Tunisia
+    'DZ': { min: 16, max: 20 },    // Algeria
+    'MR': { min: 14, max: 18 },    // Mauritania
+    'CM': { min: 8, max: 17 },     // Cameroon (for XAF)
+    'SN': { min: 9, max: 11 },     // Senegal (for XOF)
   };
 
   /**

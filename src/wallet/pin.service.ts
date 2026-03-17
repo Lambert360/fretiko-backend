@@ -7,6 +7,7 @@ import { Injectable, UnauthorizedException, BadRequestException, Logger } from '
 import { ConfigService } from '@nestjs/config';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { EmailService } from '../auth/email.service';
 import * as crypto from 'crypto';
 
 @Injectable()
@@ -14,7 +15,10 @@ export class PinService {
   private readonly logger = new Logger(PinService.name);
   private readonly supabase: SupabaseClient;
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly emailService: EmailService,
+  ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
 
@@ -240,31 +244,77 @@ export class PinService {
   }
 
   /**
-   * Reset PIN (requires email verification - to be implemented)
+   * Reset PIN (requires email verification)
    */
   async requestPinReset(userId: string): Promise<{ success: boolean; message: string }> {
     try {
-      // Generate reset token
-      const resetToken = crypto.randomBytes(32).toString('hex');
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
+      this.logger.log(`🔍 Starting PIN reset process for user: ${userId}`);
 
-      // Update PIN record with reset token
-      const { error } = await this.supabase
-        .from('user_pins')
-        .update({
-          reset_token: resetToken,
-          reset_token_expires_at: expiresAt,
-          requires_reset: true,
-        })
-        .eq('user_id', userId);
+      // Generate 6-digit reset token using database function
+      const { data: tokenData, error: tokenError } = await this.supabase
+        .rpc('generate_pin_reset_token');
 
-      if (error) {
-        this.logger.error(`Failed to request PIN reset for user ${userId}:`, error);
-        throw new BadRequestException('Failed to request PIN reset');
+      if (tokenError || !tokenData) {
+        this.logger.error(`Failed to generate PIN reset token for user ${userId}:`, tokenError);
+        return {
+          success: false,
+          message: 'Failed to process PIN reset request',
+        };
       }
 
-      // TODO: Send reset email with token
-      this.logger.log(`📧 PIN reset requested for user ${userId}. Token: ${resetToken}`);
+      const resetToken = tokenData;
+
+      // Save reset token to user_pins table
+      this.logger.log('💾 Saving PIN reset token to user profile...');
+      const { data: saveResult, error: saveError } = await this.supabase
+        .rpc('save_pin_reset_token', { 
+          p_user_id: userId, 
+          p_token: resetToken,
+          p_expires_hours: 1
+        });
+
+      if (saveError) {
+        this.logger.error(`Failed to save PIN reset token for user ${userId}:`, saveError);
+        return {
+          success: false,
+          message: 'Failed to process PIN reset request',
+        };
+      }
+
+      if (!saveResult?.success) {
+        this.logger.error(`Failed to save PIN reset token for user ${userId}:`, saveResult?.message);
+        return {
+          success: false,
+          message: 'Failed to process PIN reset request',
+        };
+      }
+
+      // Get user email for sending reset email
+      // Use service role client to bypass RLS on auth.users table
+      const { data: userEmail, error: emailError } = await this.supabase
+        .rpc('get_user_email_for_pin_reset', { p_user_id: userId });
+
+      if (emailError || !userEmail) {
+        this.logger.error(`Failed to get user email for PIN reset:`, emailError);
+        return {
+          success: false,
+          message: 'Failed to send PIN reset email',
+        };
+      }
+
+      // Send PIN reset email
+      this.logger.log('📧 Sending PIN reset email...');
+      const emailSent = await this.emailService.sendPinResetEmail(userEmail, resetToken);
+
+      if (!emailSent) {
+        this.logger.error(`Failed to send PIN reset email to ${userEmail}`);
+        return {
+          success: false,
+          message: 'Failed to send PIN reset email',
+        };
+      }
+
+      this.logger.log(`✅ PIN reset email sent successfully to ${userEmail}. Token: ${resetToken}`);
 
       return {
         success: true,
@@ -272,7 +322,115 @@ export class PinService {
       };
     } catch (error) {
       this.logger.error(`Error requesting PIN reset for user ${userId}:`, error);
-      throw error;
+      return {
+        success: false,
+        message: 'Failed to process PIN reset request',
+      };
+    }
+  }
+
+  /**
+   * Verify PIN reset token
+   */
+  async verifyPinReset(userId: string, token: string): Promise<{ valid: boolean; message: string }> {
+    try {
+      this.logger.log(`🔍 Verifying PIN reset token for user: ${userId}`);
+
+      const { data: verification, error: verifyError } = await this.supabase
+        .rpc('verify_pin_reset_token', { 
+          p_user_id: userId, 
+          p_token: token 
+        });
+
+      if (verifyError) {
+        this.logger.error('❌ PIN reset token verification error:', verifyError);
+        return {
+          valid: false,
+          message: 'Failed to verify reset token',
+        };
+      }
+
+      if (!verification?.valid) {
+        this.logger.log('❌ PIN reset token validation failed:', verification?.message);
+        return {
+          valid: false,
+          message: verification?.message || 'Invalid or expired reset token',
+        };
+      }
+
+      this.logger.log('✅ PIN reset token verified successfully');
+      return {
+        valid: true,
+        message: 'Reset token is valid',
+      };
+    } catch (error) {
+      this.logger.error(`Error verifying PIN reset token for user ${userId}:`, error);
+      return {
+        valid: false,
+        message: 'Failed to verify reset token',
+      };
+    }
+  }
+
+  /**
+   * Confirm PIN reset with new PIN
+   */
+  async confirmPinReset(userId: string, token: string, newPin: string): Promise<{ success: boolean; message: string }> {
+    try {
+      this.logger.log(`🔍 Confirming PIN reset for user: ${userId}`);
+
+      // First verify the token
+      const tokenVerification = await this.verifyPinReset(userId, token);
+      if (!tokenVerification.valid) {
+        return {
+          success: false,
+          message: tokenVerification.message,
+        };
+      }
+
+      // Validate new PIN format (6 digits)
+      if (!/^\d{6}$/.test(newPin)) {
+        return {
+          success: false,
+          message: 'PIN must be exactly 6 digits',
+        };
+      }
+
+      // Update PIN using database function
+      const { data: result, error: updateError } = await this.supabase
+        .rpc('update_user_pin', { 
+          p_user_id: userId, 
+          p_new_pin: newPin 
+        });
+
+      if (updateError) {
+        this.logger.error('❌ PIN update error:', updateError);
+        return {
+          success: false,
+          message: 'Failed to update PIN',
+        };
+      }
+
+      if (!result?.success) {
+        this.logger.error('❌ PIN update failed:', result?.message);
+        return {
+          success: false,
+          message: result?.message || 'Failed to update PIN',
+        };
+      }
+
+      this.logger.log(`✅ PIN reset completed successfully for user ${userId}`);
+
+      return {
+        success: true,
+        message: 'PIN has been reset successfully',
+      };
+    } catch (error) {
+      this.logger.error(`Error confirming PIN reset for user ${userId}:`, error);
+      return {
+        success: false,
+        message: 'Failed to reset PIN',
+      };
     }
   }
 

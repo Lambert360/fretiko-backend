@@ -563,6 +563,52 @@ export class WalletController {
   }
 
   /**
+   * Verify PIN reset token
+   */
+  @Post('pin/verify-reset')
+  @UseGuards(JwtAuthGuard)
+  async verifyPinReset(@Req() req: any, @Body() body: { token: string }) {
+    try {
+      const result = await this.pinService.verifyPinReset(req.user.sub, body.token);
+
+      return {
+        valid: result.valid,
+        message: result.message,
+      };
+    } catch (error) {
+      return {
+        valid: false,
+        message: error.message || 'Failed to verify reset token',
+      };
+    }
+  }
+
+  /**
+   * Confirm PIN reset with new PIN
+   */
+  @Post('pin/confirm-reset')
+  @UseGuards(JwtAuthGuard)
+  async confirmPinReset(@Req() req: any, @Body() body: { token: string; newPin: string }) {
+    try {
+      const result = await this.pinService.confirmPinReset(
+        req.user.sub, 
+        body.token, 
+        body.newPin
+      );
+
+      return {
+        success: result.success,
+        message: result.message,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error.message || 'Failed to reset PIN',
+      };
+    }
+  }
+
+  /**
    * Webhook verification endpoint (GET)
    * Svix-managed webhook endpoint verification
    */

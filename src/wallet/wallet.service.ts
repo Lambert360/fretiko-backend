@@ -2368,9 +2368,17 @@ export class WalletService {
 
     // Validate that currency conversion is supported
 
-    // Check if this is a supported currency for withdrawals
-
-    const supportedCurrencies = ['USD', 'NGN', 'EUR', 'GBP', 'CAD', 'AUD', 'GHS', 'KES', 'ZAR', 'UGX', 'TZS', 'RWF', 'XAF', 'XOF'];
+    // Comprehensive list of Flutterwave-supported currencies for withdrawals
+    const supportedCurrencies = [
+      // Major International Currencies
+      'USD', 'EUR', 'GBP', 'CAD', 'AUD',
+      
+      // African Currencies (Flutterwave's primary market)
+      'NGN', 'GHS', 'KES', 'ZAR', 'UGX', 'TZS', 'RWF', 'XAF', 'XOF',
+      'MWK', 'ZMW', 'EGP', 'MAD', 'SLL', 'BWP', 'ETB', 'MZN', 'MGA',
+      'AOA', 'SCR', 'MUR', 'SZL', 'LSL', 'NAD', 'BIF', 'DJF', 'SOS',
+      'SDG', 'SSP', 'STN', 'CDF', 'LRD', 'GMD', 'GNF', 'TND', 'DZD', 'MRU',
+    ];
 
     if (!supportedCurrencies.includes(localCurrency.toUpperCase())) {
 

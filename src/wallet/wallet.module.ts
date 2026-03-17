@@ -14,9 +14,10 @@ import { WithdrawalValidationService } from './withdrawal-validation.service';
 import { RateProviderService } from './rate-provider.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { WebhookModule } from '../webhook/webhook.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [NotificationsModule, ScheduleModule, WebhookModule],
+  imports: [NotificationsModule, ScheduleModule, WebhookModule, AuthModule],
   controllers: [WalletController, RateTestController],
   providers: [
     WalletService, 
