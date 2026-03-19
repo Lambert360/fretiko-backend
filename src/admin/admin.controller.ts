@@ -1,9 +1,10 @@
-import { Controller, Get, Post, Delete, Put, Patch, Query, Request, Body, Param, UseGuards, ValidationPipe, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Put, Patch, Query, Request, Body, Param, UseGuards, ValidationPipe, ForbiddenException, BadRequestException, HttpCode, HttpStatus } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { AdminNotificationsService } from './admin-notifications.service';
 import { HybridAdminGuard } from '../auth/hybrid-admin.guard';
 import type { CreateBankAccountDto, UpdateBankAccountDto } from '../wallet/bank-account.service';
 import { WithdrawRequestDto } from '../wallet/dto/wallet.dto';
+import { AdminForgotPasswordDto, AdminConfirmResetPasswordDto } from './dto/admin-forgot-password.dto';
 
 /**
  * Admin Controller
@@ -11,12 +12,51 @@ import { WithdrawRequestDto } from '../wallet/dto/wallet.dto';
  * Supports both regular admin users and staff users
  */
 @Controller('admin')
-@UseGuards(HybridAdminGuard)
 export class AdminController {
   constructor(
     private readonly adminService: AdminService,
     private readonly notificationsService: AdminNotificationsService,
   ) {}
+
+  /**
+   * Admin forgot password - send reset token to admin email
+   * POST /admin/forgot-password
+   * No authentication required for password reset
+   */
+  @Post('forgot-password')
+  @HttpCode(HttpStatus.OK)
+  async adminForgotPassword(@Body(new ValidationPipe()) forgotPasswordDto: AdminForgotPasswordDto) {
+    try {
+      const result = await this.adminService.adminForgotPassword(forgotPasswordDto);
+
+      return {
+        success: result.success,
+        message: result.message,
+      };
+    } catch (error) {
+      throw new BadRequestException(error.message);
+    }
+  }
+
+  /**
+   * Confirm admin password reset with token
+   * POST /admin/confirm-reset-password
+   * No authentication required for password reset confirmation
+   */
+  @Post('confirm-reset-password')
+  @HttpCode(HttpStatus.OK)
+  async adminConfirmResetPassword(@Body(new ValidationPipe()) confirmResetDto: AdminConfirmResetPasswordDto) {
+    try {
+      const result = await this.adminService.adminConfirmResetPassword(confirmResetDto);
+
+      return {
+        success: result.success,
+        message: result.message,
+      };
+    } catch (error) {
+      throw new BadRequestException(error.message);
+    }
+  }
 
   /**
    * Validate ISO date string format (YYYY-MM-DDTHH:mm:ss.sssZ)
@@ -36,6 +76,7 @@ export class AdminController {
    * Supports both regular admin users and staff users
    */
   @Get('revenue')
+  @UseGuards(HybridAdminGuard)
   async getPlatformRevenue(
     @Request() req,
     @Query('start') start?: string,

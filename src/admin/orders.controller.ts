@@ -3,20 +3,21 @@ import { AdminService } from './admin.service';
 import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
 import { PermissionsGuard } from '../staff/guards/permissions.guard';
 import { Permissions } from '../staff/decorators/permissions.decorator';
+import { RefundRequestDto } from './dto/refund.dto';
 
 /**
  * Orders Controller (Staff)
  * Handles order management endpoints for staff admin panel
  * Requires staff authentication and view_orders permission
  */
-@Controller('admin/orders')
+@Controller('dashboard/orders')
 @UseGuards(StaffJwtAuthGuard)
 export class OrdersController {
   constructor(private readonly adminService: AdminService) {}
 
   /**
    * Get order statistics
-   * GET /admin/orders/stats
+   * GET /dashboard/orders/stats
    * Requires: view_orders permission
    */
   @Get('stats')
@@ -91,6 +92,37 @@ export class OrdersController {
     @Body() body: { reason?: string },
   ) {
     return this.adminService.cancelOrderForStaff(req.user.sub, id, body.reason);
+  }
+
+  /**
+   * Process refund for order
+   * POST /admin/orders/:id/refund
+   * Requires: view_orders permission
+   */
+  @Post(':id/refund')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_orders')
+  async processRefund(
+    @Req() req,
+    @Param('id') id: string,
+    @Body() body: RefundRequestDto,
+  ) {
+    return this.adminService.processRefundForStaff(req.user.sub, id, body);
+  }
+
+  /**
+   * Get order escrow information
+   * GET /admin/orders/:id/escrow
+   * Requires: view_orders permission
+   */
+  @Get(':id/escrow')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_orders')
+  async getOrderEscrowInfo(
+    @Req() req,
+    @Param('id') id: string,
+  ) {
+    return this.adminService.getOrderEscrowInfoForStaff(req.user.sub, id);
   }
 }
 

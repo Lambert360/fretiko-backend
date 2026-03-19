@@ -16,7 +16,7 @@ import { AnalyticsService } from './analytics.service';
 export class AnalyticsController {
   constructor(private readonly analyticsService: AnalyticsService) {}
 
-  @Get()
+  @Get('stats')
   async getAnalytics(
     @Request() req,
     @Query('period') period: 'daily' | 'weekly' | 'monthly' = 'daily',

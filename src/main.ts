@@ -15,6 +15,7 @@ async function bootstrap() {
     logger: new WinstonLoggerService(),
     rawBody: true // Enable raw body for Svix webhook signature verification
   });
+
   const configService = app.get(ConfigService);
   const logger = app.get(WinstonLoggerService);
 

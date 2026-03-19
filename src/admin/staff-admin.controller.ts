@@ -15,34 +15,6 @@ export class StaffAdminController {
   constructor(private readonly adminService: AdminService) {}
 
   /**
-   * Get all users with filters
-   * GET /admin/users
-   * Requires: view_users permission
-   */
-  @Get('users')
-  @UseGuards(PermissionsGuard)
-  @Permissions('view_users')
-  async getAllUsers(
-    @Request() req,
-    @Query('role') role?: 'citizen' | 'vendor' | 'rider' | 'all',
-    @Query('status') status?: 'active' | 'suspended' | 'all',
-    @Query('search') search?: string,
-    @Query('page') page?: string,
-    @Query('limit') limit?: string,
-  ) {
-    return this.adminService.getAllUsersForStaff(
-      req.user.sub,
-      {
-        role: role === 'all' ? undefined : role,
-        status: status === 'all' ? undefined : status,
-        search,
-        page: page ? parseInt(page) : 1,
-        limit: limit ? parseInt(limit) : 20,
-      }
-    );
-  }
-
-  /**
    * Get user statistics
    * GET /admin/users/stats
    * Requires: view_users permission

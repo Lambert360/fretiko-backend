@@ -22,7 +22,9 @@ import { WalletModule } from '../wallet/wallet.module';
 import { ContentReportsModule } from '../content-reports/content-reports.module';
 import { AuctionsModule } from '../auctions/auctions.module';
 import { GiftModule } from '../gifts/gift.module';
-import { EmailService } from '../shared/email.service';
+import { EmailService as AuthEmailService } from '../auth/email.service';
+import { EmailService as SharedEmailService } from '../shared/email.service';
+import { EscrowModule } from '../escrow/escrow.module';
 
 @Module({
   imports: [
@@ -43,6 +45,7 @@ import { EmailService } from '../shared/email.service';
     forwardRef(() => ContentReportsModule),
     AuctionsModule, // For fraud detection and auctions service
     GiftModule, // For gift wallet statistics
+    EscrowModule, // For escrow release functionality in refunds
   ],
   controllers: [
     AdminController, 
@@ -57,10 +60,11 @@ import { EmailService } from '../shared/email.service';
     DisputesController,
   ],
   providers: [
-    AdminService, 
-    EmailService, 
-    AdminNotificationsGateway, 
+    AdminService,
+    AdminNotificationsGateway,
     AdminNotificationsService,
+    AuthEmailService,
+    SharedEmailService,
   ],
   exports: [AdminService, AdminNotificationsService],
 })
@@ -69,4 +73,3 @@ export class AdminModule {
   // AuctionFraudDetectionService is imported via AuctionsModule for admin auction management
   // AdminNotificationsGateway provides real-time WebSocket notifications for admin panel
 }
-

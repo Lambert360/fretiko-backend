@@ -8,9 +8,14 @@ import { NotificationHelperService } from '../notifications/notification-helper.
 import { AdminNotificationsService, AdminNotificationType } from './admin-notifications.service';
 import { AdminNotificationEventType, DisputeEscalatedEvent } from './events/admin-notification.events';
 import { WalletService } from '../wallet/wallet.service';
-import { EmailService } from '../shared/email.service';
+import { WalletTransactionType } from '../wallet/constants/transaction-types';
+import { EmailService as AuthEmailService } from '../auth/email.service';
+import { EmailService as SharedEmailService } from '../shared/email.service';
 import { BankAccountService, CreateBankAccountDto, UpdateBankAccountDto } from '../wallet/bank-account.service';
 import { WithdrawRequestDto } from '../wallet/dto/wallet.dto';
+import { RefundRequestDto } from './dto/refund.dto';
+import { EscrowService } from '../escrow/escrow.service';
+import { AdminForgotPasswordDto, AdminConfirmResetPasswordDto } from './dto/admin-forgot-password.dto';
 
 /**
  * Admin Service
@@ -29,8 +34,11 @@ export class AdminService {
     private eventEmitter: EventEmitter2, // For event-based notifications
     @Inject(forwardRef(() => WalletService))
     private walletService: WalletService,
-    private emailService: EmailService,
+    private authEmailService: AuthEmailService, // For password reset emails
+    private sharedEmailService: SharedEmailService, // For appeal emails
     private bankAccountService: BankAccountService,
+    @Inject(forwardRef(() => EscrowService))
+    private escrowService: EscrowService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -1710,6 +1718,136 @@ export class AdminService {
       .sort((a, b) => a.date.localeCompare(b.date));
 
     return timeSeries;
+  }
+
+  /**
+   * Get auction analytics summary for staff
+   */
+  async getAuctionAnalyticsSummaryForStaff(
+    staffId: string,
+    dateRange?: { start?: string; end?: string }
+  ) {
+    // Verify staff has permission
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`Staff ${staffId} fetching auction analytics summary`);
+
+    // Default date range to last 30 days if not provided
+    const startDate = dateRange?.start || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0] + 'T00:00:00.000Z';
+    const endDate = dateRange?.end || new Date().toISOString().split('T')[0] + 'T23:59:59.999Z';
+
+    // Get auction statistics
+    const { data: auctions, error: auctionsError } = await this.supabase
+      .from('auctions')
+      .select('*')
+      .gte('created_at', startDate)
+      .lte('created_at', endDate);
+
+    if (auctionsError) {
+      this.logger.error(`Failed to fetch auctions: ${auctionsError.message}`);
+      throw new Error('Failed to fetch auction data');
+    }
+
+    // Calculate auction metrics
+    const totalAuctions = auctions?.length || 0;
+    const activeAuctions = auctions?.filter(a => a.status === 'active').length || 0;
+    const completedAuctions = auctions?.filter(a => a.status === 'completed').length || 0;
+    const totalBids = auctions?.reduce((sum, a) => sum + (a.bid_count || 0), 0) || 0;
+    const totalAuctionValue = auctions?.reduce((sum, a) => sum + (a.current_bid || a.starting_bid || 0), 0) || 0;
+
+    // Get auction categories and bids data
+    const auctionIds = auctions?.map(a => a.id) || [];
+    
+    // Get bids data for unique bidder calculation
+    const { data: bids, error: bidsError } = await this.supabase
+      .from('auction_bids')
+      .select('auction_id, user_id')
+      .in('auction_id', auctionIds);
+
+    if (bidsError) {
+      this.logger.error(`Failed to fetch bids: ${bidsError.message}`);
+    }
+
+    // Calculate unique bidders per auction
+    const uniqueBiddersPerAuction = auctionIds.map(auctionId => {
+      const uniqueBidders = new Set(bids?.filter(b => b.auction_id === auctionId).map(b => b.user_id) || []);
+      return uniqueBidders.size;
+    });
+
+    const averageUniqueBiddersPerAuction = totalAuctions > 0 
+      ? Math.round((uniqueBiddersPerAuction.reduce((sum, count) => sum + count, 0) / totalAuctions) * 100) / 100 
+      : 0;
+
+    // Get categories data
+    const categoryIds = [...new Set(auctions?.map(a => a.category_id).filter(Boolean))] as string[];
+    
+    let categoryData: any[] = [];
+    if (categoryIds.length > 0) {
+      const { data: categories, error: categoriesError } = await this.supabase
+        .from('categories')
+        .select('id, name')
+        .in('id', categoryIds);
+
+      if (!categoriesError && categories) {
+        categoryData = categories;
+      }
+    }
+
+    // Calculate top categories
+    const categoryRevenueMap = new Map<string, { revenue: number; bids: number; name: string }>();
+    
+    auctions?.forEach(auction => {
+      const categoryId = auction.category_id;
+      const revenue = auction.current_bid || auction.starting_bid || 0;
+      const bids = auction.bid_count || 0;
+      const category = categoryData.find(c => c.id === categoryId);
+      
+      if (categoryId && category) {
+        const existing = categoryRevenueMap.get(categoryId) || { revenue: 0, bids: 0, name: category.name };
+        categoryRevenueMap.set(categoryId, {
+          revenue: existing.revenue + revenue,
+          bids: existing.bids + bids,
+          name: category.name
+        });
+      }
+    });
+
+    const topCategories = Array.from(categoryRevenueMap.entries())
+      .map(([categoryId, data]) => ({
+        categoryId,
+        categoryName: data.name,
+        totalRevenue: data.revenue,
+        totalBids: data.bids
+      }))
+      .sort((a, b) => b.totalRevenue - a.totalRevenue)
+      .slice(0, 10);
+
+    // Calculate top auctions
+    const topAuctions = auctions
+      ?.filter(a => a.status === 'completed' || a.status === 'active')
+      .map(auction => ({
+        auctionId: auction.id,
+        title: auction.title || 'Untitled Auction',
+        finalPrice: auction.current_bid || auction.starting_bid || 0,
+        totalBids: auction.bid_count || 0,
+        categoryId: auction.category_id,
+        categoryName: categoryData.find(c => c.id === auction.category_id)?.name || 'Unknown',
+        endTime: auction.end_time,
+        status: auction.status
+      }))
+      .sort((a, b) => b.finalPrice - a.finalPrice)
+      .slice(0, 10) || [];
+
+    return {
+      totalAuctions,
+      soldAuctions: completedAuctions,
+      sellThroughRate: totalAuctions > 0 ? Math.round((completedAuctions / totalAuctions) * 100) : 0,
+      totalAuctionRevenue: totalAuctionValue,
+      averageBidsPerAuction: totalAuctions > 0 ? Math.round((totalBids / totalAuctions) * 100) / 100 : 0,
+      averageUniqueBiddersPerAuction,
+      topCategories,
+      topAuctions,
+    };
   }
 
   /**
@@ -5236,6 +5374,9 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         source,
         created_at,
         updated_at,
+        rider_id,
+        delivery_type,
+        delivery_fee,
         buyer:user_profiles!buyer_id(id, username, preferences),
         vendor:user_profiles!vendor_id(id, username, preferences),
         order_items(id, service_id, product_id)
@@ -5282,6 +5423,9 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         status: this.mapOrderStatusForDisplay(order.status),
         type: orderType,
         createdAt: order.created_at,
+        riderId: order.rider_id,
+        deliveryType: order.delivery_type,
+        deliveryFee: order.delivery_fee ? parseFloat(order.delivery_fee) : undefined,
       };
     }) || [];
 
@@ -5452,6 +5596,251 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
 
     this.logger.log(`Staff ${staffId} cancelled order ${orderId}`);
     return { message: 'Order cancelled successfully' };
+  }
+
+  /**
+   * Process refund for order
+   */
+  async processRefundForStaff(
+    staffId: string,
+    orderId: string,
+    refundData: RefundRequestDto
+  ) {
+    // Verify staff has permission
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`Staff ${staffId} processing refund for order ${orderId}:`, refundData);
+
+    // Get order details
+    const { data: order, error: fetchError } = await this.supabase
+      .from('orders')
+      .select('id, order_number, buyer_id, vendor_id, rider_id, total_amount, status, delivery_type, delivery_fee')
+      .eq('id', orderId)
+      .single();
+
+    if (fetchError || !order) {
+      throw new NotFoundException('Order not found');
+    }
+
+    // Check if order has already been processed (completed/cancelled)
+    if (order.status === 'completed' || order.status === 'cancelled') {
+      throw new BadRequestException('This order has already been processed and cannot be refunded again');
+    }
+
+    // Get escrow details
+    const { data: escrow, error: escrowError } = await this.supabase
+      .from('escrows')
+      .select('*')
+      .eq('order_id', orderId)
+      .eq('status', 'held')
+      .single();
+
+    if (escrowError || !escrow) {
+      throw new NotFoundException('Escrow not found or already processed');
+    }
+
+    try {
+      switch (refundData.type) {
+        case 'full':
+          await this.processFullRefund(order, escrow, refundData.reason || 'Staff refund', staffId);
+          break;
+        case 'partial':
+          await this.processPartialRefund(order, escrow, refundData, staffId);
+          break;
+        case 'release':
+          await this.processReleaseFunds(order, escrow, refundData.reason || 'Staff fund release', staffId);
+          break;
+        default:
+          throw new BadRequestException('Invalid refund type');
+      }
+
+      this.logger.log(`✅ Staff ${staffId} successfully processed ${refundData.type} refund for order ${orderId}`);
+      return { message: 'Refund processed successfully' };
+    } catch (error: any) {
+      this.logger.error(`Failed to process refund for order ${orderId}:`, error);
+      throw new BadRequestException(`Failed to process refund: ${error.message}`);
+    }
+  }
+
+  /**
+   * Process full refund to buyer
+   */
+  private async processFullRefund(
+    order: any,
+    escrow: any,
+    reason: string,
+    staffId: string
+  ) {
+    // Refund full amount to buyer
+    await this.walletService.processWalletTransaction(
+      order.buyer_id,
+      WalletTransactionType.ESCROW_REFUND,
+      parseFloat(escrow.total_amount),
+      `Full refund for order ${order.order_number}`,
+      order.id,
+      'order',
+    );
+
+    // Update escrow status
+    await this.supabase
+      .from('escrows')
+      .update({
+        status: 'refunded',
+        refund_reason: reason,
+        refunded_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', escrow.id);
+
+    // Update order status
+    await this.supabase
+      .from('orders')
+      .update({
+        status: 'cancelled',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', order.id);
+  }
+
+  /**
+   * Process partial refund (rider keeps earnings)
+   */
+  private async processPartialRefund(
+    order: any,
+    escrow: any,
+    refundData: RefundRequestDto,
+    staffId: string
+  ) {
+    const riderEarnings = refundData.riderEarnings || 0;
+    const vendorAmount = refundData.vendorAmount || 0;
+    const buyerRefundAmount = parseFloat(escrow.total_amount) - riderEarnings - vendorAmount;
+
+    // Refund remaining amount to buyer
+    if (buyerRefundAmount > 0) {
+      await this.walletService.processWalletTransaction(
+        order.buyer_id,
+        WalletTransactionType.ESCROW_REFUND,
+        buyerRefundAmount,
+        `Partial refund for order ${order.order_number}`,
+        order.id,
+        'order',
+      );
+    }
+
+    // Pay vendor their share
+    if (vendorAmount > 0 && order.vendor_id) {
+      await this.walletService.processWalletTransaction(
+        order.vendor_id,
+        WalletTransactionType.ESCROW_RELEASE,
+        vendorAmount,
+        `Partial payment for order ${order.order_number}`,
+        order.id,
+        'order',
+      );
+    }
+
+    // Pay rider their earnings
+    if (riderEarnings > 0 && order.rider_id) {
+      await this.walletService.processWalletTransaction(
+        order.rider_id,
+        WalletTransactionType.ESCROW_RELEASE,
+        riderEarnings,
+        `Earnings for order ${order.order_number}`,
+        order.id,
+        'order',
+      );
+    }
+
+    // Update escrow status
+    await this.supabase
+      .from('escrows')
+      .update({
+        status: 'refunded',
+        refund_reason: refundData.reason,
+        refunded_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', escrow.id);
+
+    // Update order status
+    await this.supabase
+      .from('orders')
+      .update({
+        status: 'cancelled',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', order.id);
+  }
+
+  /**
+   * Release funds to all parties
+   */
+  private async processReleaseFunds(
+    order: any,
+    escrow: any,
+    reason: string,
+    staffId: string
+  ) {
+    try {
+      // Call the actual escrow release function (same as buyer order completion)
+      await this.escrowService.releaseEscrow(order.id, `Admin release: ${reason}`);
+
+      // Explicitly update order status to completed (admin override)
+      await this.supabase
+        .from('orders')
+        .update({
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', order.id);
+
+      this.logger.log(`✅ Admin ${staffId} successfully released funds and completed order ${order.id}`);
+    } catch (error: any) {
+      // Handle case where escrow is already released or not found
+      if (error.status === 404 || error.response === 'Escrow not found or already released') {
+        throw new BadRequestException('Funds have already been released for this order');
+      }
+      // Re-throw other errors
+      throw error;
+    }
+  }
+
+  /**
+   * Get order escrow information for staff
+   */
+  async getOrderEscrowInfoForStaff(staffId: string, orderId: string) {
+    // Verify staff has permission
+    await this.verifyContentModerator(staffId);
+
+    // Get order details
+    const { data: order, error: orderError } = await this.supabase
+      .from('orders')
+      .select('id, order_number, total_amount, buyer_id, vendor_id, rider_id')
+      .eq('id', orderId)
+      .single();
+
+    if (orderError || !order) {
+      throw new NotFoundException('Order not found');
+    }
+
+    // Get escrow details
+    const { data: escrow, error: escrowError } = await this.supabase
+      .from('escrows')
+      .select('total_amount, vendor_amount, rider_amount, platform_fee, status')
+      .eq('order_id', orderId)
+      .single();
+
+    if (escrowError || !escrow) {
+      throw new NotFoundException('Escrow not found for this order');
+    }
+
+    return {
+      totalAmount: parseFloat(escrow.total_amount),
+      vendorAmount: parseFloat(escrow.vendor_amount),
+      riderAmount: parseFloat(escrow.rider_amount),
+      platformFee: parseFloat(escrow.platform_fee || '0'),
+      status: escrow.status,
+    };
   }
 
   /**
@@ -5760,7 +6149,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     let userEmail: string | null = null;
     let username: string | null = null;
     try {
-      userEmail = await this.emailService.getUserEmail(appeal.user_id);
+      userEmail = await this.sharedEmailService.getUserEmail(appeal.user_id);
       // Get username from user_profiles
       const { data: userProfile } = await this.supabase
         .from('user_profiles')
@@ -5781,7 +6170,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         // Send email notification for approval
         if (userEmail) {
           try {
-            await this.emailService.sendAppealApprovalEmail(appeal.user_id, username || undefined);
+            await this.sharedEmailService.sendAppealApprovalEmail(appeal.user_id, username || undefined);
             this.logger.log(`Appeal approval email sent to ${userEmail}`);
           } catch (emailError) {
             this.logger.warn(`Failed to send appeal approval email: ${emailError.message}`);
@@ -5796,7 +6185,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       // Send email notification for rejection
       if (userEmail && username) {
         try {
-          await this.emailService.sendAppealRejectionEmail(appeal.user_id, username, notes || undefined);
+          await this.sharedEmailService.sendAppealRejectionEmail(appeal.user_id, username, notes || undefined);
           this.logger.log(`Appeal rejection email sent to ${userEmail}`);
         } catch (emailError) {
           this.logger.warn(`Failed to send appeal rejection email: ${emailError.message}`);
@@ -6181,35 +6570,45 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     this.logger.log(`Staff ${staffId} fetching regional revenue breakdown:`, options);
 
     try {
-      // Get regional breakdown from user locations and transactions
+      // Get wallet_ledger entries and join with users separately
       const { data: transactions, error } = await this.supabase
-        .from('wallet_transactions')
+        .from('wallet_ledger')
         .select(`
-          amount,
-          currency,
+          available_delta,
           created_at,
-          users!inner(
-            country,
-            city,
-            region
-          )
+          user_id
         `)
+        .eq('transaction_type', 'deposit_mint')
         .gte('created_at', options.startDate || this.getStartDate(options.period))
-        .lte('created_at', options.endDate || new Date().toISOString())
-        .order('created_at', { ascending: false });
+        .lte('created_at', options.endDate || new Date().toISOString());
 
       if (error) throw error;
 
+      // Get user information for each transaction
+      const userIds = [...new Set(transactions?.map(t => t.user_id) || [])];
+      const { data: users, error: userError } = await this.supabase
+        .from('user_profiles')
+        .select('id, location')
+        .in('id', userIds);
+
+      if (userError) throw userError;
+
+      // Create user lookup map
+      const userMap = users?.reduce((acc, user) => {
+        acc[user.id] = user;
+        return acc;
+      }, {} as Record<string, any>) || {};
+
       // Group by region and calculate totals
       const regionalData = transactions.reduce((acc: any, tx: any) => {
-        const country = tx.users?.country || 'Unknown';
-        const region = tx.users?.region || 'Unknown';
-        const key = `${country}-${region}`;
+        const user = userMap[tx.user_id] || {};
+        const location = user.location || 'Unknown';
+        const key = location;
         
         if (!acc[key]) {
           acc[key] = {
-            country,
-            region,
+            country: location,
+            region: location,
             volume: 0,
             users: new Set(),
             transactions: 0,
@@ -6217,8 +6616,8 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
           };
         }
         
-        acc[key].volume += Math.abs(tx.amount);
-        acc[key].users.add(tx.users.id);
+        acc[key].volume += Math.abs(tx.available_delta);
+        acc[key].users.add(tx.user_id);
         acc[key].transactions += 1;
         
         return acc;
@@ -6259,18 +6658,15 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     this.logger.log(`Staff ${staffId} fetching provider performance:`, options);
 
     try {
-      // Get deposit data with provider information
+      // Get deposit data from deposits table (without flutterwave_response field)
       const { data: deposits, error } = await this.supabase
         .from('deposits')
         .select(`
           id,
-          amount,
+          freti_amount,
           local_amount,
           local_currency,
           status,
-          payment_method,
-          payment_provider,
-          flutterwave_response,
           created_at,
           completed_at
         `)
@@ -6279,50 +6675,25 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
 
       if (error) throw error;
 
-      // Calculate provider metrics
-      const providerStats = deposits.reduce((acc: any, deposit: any) => {
-        const provider = deposit.payment_provider || 'flutterwave';
-        
-        if (!acc[provider]) {
-          acc[provider] = {
-            name: provider,
-            totalTransactions: 0,
-            successfulTransactions: 0,
-            failedTransactions: 0,
-            totalVolume: 0,
-            avgResponseTime: 0,
-            responseTimes: [],
-            successRate: 0
-          };
+      // Calculate provider metrics (all deposits use Flutterwave)
+      const providerStats = {
+        flutterwave: {
+          name: 'flutterwave',
+          totalTransactions: deposits?.length || 0,
+          successfulTransactions: deposits?.filter(d => d.status === 'completed').length || 0,
+          failedTransactions: deposits?.filter(d => d.status === 'failed').length || 0,
+          totalVolume: deposits?.reduce((sum, d) => sum + (d.freti_amount || 0), 0) || 0,
+          avgResponseTime: 1200, // Mock response time
+          successRate: 0
         }
-        
-        acc[provider].totalTransactions += 1;
-        acc[provider].totalVolume += deposit.amount;
-        
-        if (deposit.status === 'completed') {
-          acc[provider].successfulTransactions += 1;
-        } else if (deposit.status === 'failed') {
-          acc[provider].failedTransactions += 1;
-        }
-        
-        // Extract response time from Flutterwave response (mock calculation)
-        if (deposit.flutterwave_response) {
-          const responseTime = Math.random() * 2000 + 500; // Mock 500-2500ms
-          acc[provider].responseTimes.push(responseTime);
-        }
-        
-        return acc;
-      }, {});
+      };
 
-      // Calculate final metrics
       const result = Object.values(providerStats).map((provider: any) => ({
         ...provider,
         successRate: provider.totalTransactions > 0 
           ? (provider.successfulTransactions / provider.totalTransactions) * 100 
           : 0,
-        avgResponseTime: provider.responseTimes.length > 0
-          ? provider.responseTimes.reduce((sum: number, time: number) => sum + time, 0) / provider.responseTimes.length
-          : 0
+        avgResponseTime: provider.avgResponseTime
       }));
 
       return {
@@ -6356,16 +6727,14 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     this.logger.log(`Staff ${staffId} fetching transaction patterns:`, options);
 
     try {
-      // Get transaction data
+      // Get transaction data from wallet_ledger (since wallet_transactions doesn't exist)
       const { data: transactions, error } = await this.supabase
-        .from('wallet_transactions')
+        .from('wallet_ledger')
         .select(`
           transaction_type,
-          amount,
+          available_delta,
           created_at,
-          users!inner(
-            created_at as user_created_at
-          )
+          user_id
         `)
         .gte('created_at', options.startDate || this.getStartDate(options.period))
         .lte('created_at', options.endDate || new Date().toISOString());
@@ -6383,16 +6752,16 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         const hour = new Date(tx.created_at).getHours();
         const day = new Date(tx.created_at).getDay();
         
-        hourlyData[hour] += Math.abs(tx.amount);
-        dailyData[day] += Math.abs(tx.amount);
+        hourlyData[hour] += Math.abs(tx.available_delta);
+        dailyData[day] += Math.abs(tx.available_delta);
         
         if (!typeData[tx.transaction_type]) {
           typeData[tx.transaction_type] = 0;
         }
-        typeData[tx.transaction_type] += Math.abs(tx.amount);
+        typeData[tx.transaction_type] += Math.abs(tx.available_delta);
         
         if (tx.transaction_type === 'deposit_mint') {
-          avgDeposit.push(Math.abs(tx.amount));
+          avgDeposit.push(Math.abs(tx.available_delta));
         }
       });
 
@@ -6418,9 +6787,9 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         preferredCurrency: 'NGN', // Mock - would calculate from actual data
         summary: {
           totalTransactions: transactions.length,
-          totalVolume: transactions.reduce((sum, tx) => sum + Math.abs(tx.amount), 0),
+          totalVolume: transactions.reduce((sum, tx) => sum + Math.abs(tx.available_delta), 0),
           avgTransactionSize: transactions.length > 0 
-            ? transactions.reduce((sum, tx) => sum + Math.abs(tx.amount), 0) / transactions.length 
+            ? transactions.reduce((sum, tx) => sum + Math.abs(tx.available_delta), 0) / transactions.length 
             : 0
         }
       };
@@ -6444,57 +6813,110 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     this.logger.log(`Staff ${staffId} fetching enhanced revenue summary:`, options);
 
     try {
-      // Get comprehensive revenue data
-      const [depositsResult, withdrawalsResult, transactionsResult] = await Promise.all([
-        this.supabase
-          .from('deposits')
-          .select('amount, local_amount, local_currency, status, created_at')
-          .gte('created_at', options.startDate || this.getStartDate(options.period))
-          .lte('created_at', options.endDate || new Date().toISOString()),
-        
-        this.supabase
-          .from('withdraw_requests')
-          .select('freti_amount, status, created_at')
-          .gte('created_at', options.startDate || this.getStartDate(options.period))
-          .lte('created_at', options.endDate || new Date().toISOString()),
-        
-        this.supabase
-          .from('wallet_transactions')
-          .select('transaction_type, amount, created_at')
-          .gte('created_at', options.startDate || this.getStartDate(options.period))
-          .lte('created_at', options.endDate || new Date().toISOString())
-      ]);
+      // Use the same logic as the original getPlatformRevenueForStaff method
+      const startDate = options.startDate || this.getStartDate(options.period);
+      const endDate = options.endDate || new Date().toISOString();
 
-      // Calculate comprehensive metrics
-      const totalDeposits = depositsResult.data?.reduce((sum, d) => sum + (d.amount || 0), 0) || 0;
-      const totalWithdrawals = withdrawalsResult.data?.reduce((sum, w) => sum + (w.freti_amount || 0), 0) || 0;
-      const netRevenue = totalDeposits - totalWithdrawals;
+      // 1. Get all escrows with platform fees (like the original method)
+      const { data: escrows } = await this.supabase
+        .from('escrows')
+        .select(`
+          id,
+          platform_amount,
+          rider_amount,
+          status,
+          created_at,
+          released_at,
+          orders!inner(
+            id,
+            order_number,
+            source,
+            vendor_id,
+            buyer_id,
+            delivery_fee
+          )
+        `)
+        .not('released_at', 'is', null) // Only include escrows that have been released
+        .gte('released_at', startDate)
+        .lte('released_at', endDate);
+
+      // Calculate revenue metrics (same as original)
+      const riderCommissionRate = 0.1; // 10%
+      const totalRiderCommission = escrows?.reduce((sum, e) => {
+        if (e.status === 'released') {
+          const deliveryFee = parseFloat(e.orders?.delivery_fee || '0');
+          return sum + (deliveryFee * riderCommissionRate);
+        }
+        return sum;
+      }, 0) || 0;
+
+      const realizedRevenue = escrows?.reduce((sum, e) => {
+        if (e.status === 'released') {
+          return sum + parseFloat(e.platform_amount || '0');
+        }
+        return sum;
+      }, 0) || 0;
+
+      // Get held and refunded escrows
+      const { data: heldEscrowsInRange } = await this.supabase
+        .from('escrows')
+        .select('platform_amount')
+        .eq('status', 'held')
+        .gte('created_at', startDate)
+        .lte('created_at', endDate);
+
+      const { data: refundedEscrowsInRange } = await this.supabase
+        .from('escrows')
+        .select('platform_amount')
+        .eq('status', 'refunded')
+        .gte('created_at', startDate)
+        .lte('created_at', endDate);
+
+      const pendingRevenue = heldEscrowsInRange?.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0) || 0;
+      const lostRevenue = refundedEscrowsInRange?.reduce((sum, e) => sum + parseFloat(e.platform_amount || '0'), 0) || 0;
+
+      // Get gift revenue
+      const { data: giftCommissionRows } = await this.supabase
+        .from('wallet_ledger')
+        .select('available_delta')
+        .eq('user_id', this.PLATFORM_USER_ID)
+        .eq('transaction_type', 'platform_commission')
+        .eq('reference_type', 'gift_conversion')
+        .gte('created_at', startDate)
+        .lte('created_at', endDate);
+
+      const giftRevenue = (giftCommissionRows || []).reduce(
+        (sum: number, row: any) => sum + (parseFloat(row.available_delta) || 0),
+        0,
+      );
+
+      const totalPlatformFees = realizedRevenue + pendingRevenue + lostRevenue + giftRevenue;
 
       return {
         period: options.period,
-        startDate: options.startDate || this.getStartDate(options.period),
-        endDate: options.endDate || new Date().toISOString(),
+        startDate,
+        endDate,
         revenue: {
-          totalDeposits,
-          totalWithdrawals,
-          netRevenue,
-          fees: totalDeposits * 0.029, // 2.9% fee
-          netFees: totalDeposits * 0.029 * 0.7 // 70% after Flutterwave cut
+          totalDeposits: totalPlatformFees,
+          totalWithdrawals: totalRiderCommission,
+          netRevenue: totalPlatformFees - totalRiderCommission,
+          fees: totalPlatformFees * 0.029, // 2.9% fee
+          netFees: totalPlatformFees * 0.029 * 0.7 // 70% after Flutterwave cut
         },
         transactions: {
-          totalDeposits: depositsResult.data?.length || 0,
-          totalWithdrawals: withdrawalsResult.data?.length || 0,
-          successRate: 98.5 // Mock - would calculate from actual data
+          totalDeposits: escrows?.length || 0,
+          totalWithdrawals: escrows?.filter(e => e.status === 'released').length || 0,
+          successRate: escrows?.length > 0 ? ((escrows?.filter(e => e.status === 'released').length || 0) / escrows.length) * 100 : 0
         },
         growth: {
-          monthlyGrowth: 15.2, // Mock - would calculate from historical data
-          userGrowth: 12.8,
-          transactionGrowth: 18.3
+          monthlyGrowth: 0, // Would calculate from historical data
+          userGrowth: 0,
+          transactionGrowth: 0
         },
         users: {
-          activeUsers: 1250, // Mock - would calculate from actual data
-          newUsers: 156,
-          retentionRate: 87.3
+          activeUsers: 0, // Would calculate from actual data
+          newUsers: 0,
+          retentionRate: 0
         }
       };
     } catch (error) {
@@ -6524,6 +6946,217 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     }
     
     return startDate.toISOString();
+  }
+
+  /**
+   * Admin forgot password - send reset token to admin email
+   * Uses existing auth service infrastructure but saves to staff_accounts
+   */
+  async adminForgotPassword(forgotPasswordDto: AdminForgotPasswordDto): Promise<{ success: boolean; message: string }> {
+    const { email } = forgotPasswordDto;
+    
+    this.logger.log(`Admin password reset request for: ${email}`);
+
+    try {
+      // Check if admin exists in staff_accounts table
+      const { data: adminAccount, error: adminError } = await this.supabase
+        .from('staff_accounts')
+        .select('id, staff_id, email, full_name, is_active, is_suspended')
+        .eq('email', email)
+        .single();
+
+      if (adminError || !adminAccount) {
+        this.logger.warn(`Admin account not found for email: ${email}`);
+        // Return success for security - don't reveal if email exists
+        return {
+          success: true,
+          message: 'If an admin account with this email exists, you will receive a password reset code.',
+        };
+      }
+
+      // Check if admin account is active and not suspended
+      if (!adminAccount.is_active || adminAccount.is_suspended) {
+        this.logger.warn(`Inactive or suspended admin account attempted password reset: ${email}`);
+        return {
+          success: true,
+          message: 'If an admin account with this email exists, you will receive a password reset code.',
+        };
+      }
+
+      // Generate custom 6-digit token
+      const { data: tokenData, error: tokenError } = await this.supabase
+        .rpc('generate_password_reset_token');
+
+      if (tokenError || !tokenData) {
+        this.logger.error(`Failed to generate reset token for ${email}:`, tokenError);
+        return {
+          success: false,
+          message: 'Failed to process password reset request',
+        };
+      }
+
+      const resetToken = tokenData; // tokenData is a TEXT string
+      
+      // Save reset token to staff_accounts table
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour from now
+      const { error: saveError } = await this.supabase
+        .from('staff_accounts')
+        .update({
+          reset_token: resetToken,
+          reset_token_expires_at: expiresAt.toISOString(),
+        })
+        .eq('email', email);
+
+      if (saveError) {
+        this.logger.error(`Failed to save admin reset token for ${email}:`, saveError);
+        return {
+          success: false,
+          message: 'Failed to process password reset request',
+        };
+      }
+
+      this.logger.log(`Admin reset token generated for: ${email}, token: ${resetToken}`);
+
+      // Send password reset email using the existing email service
+      const emailSent = await this.authEmailService.sendPasswordResetEmail(email, resetToken);
+
+      if (!emailSent) {
+        this.logger.error(`Failed to send admin password reset email to ${email}`);
+        return {
+          success: false,
+          message: 'Failed to send password reset email',
+        };
+      }
+
+      this.logger.log(`✅ Admin password reset email sent to: ${email}`);
+
+      // Log the password reset request for audit
+      await this.auditService.logAction({
+        staffId: adminAccount.id,
+        action: AuditAction.CHANGE_PASSWORD,
+        entityType: AuditEntityType.STAFF,
+        entityId: adminAccount.id,
+        details: {
+          action: 'password_reset_requested',
+          email: email,
+          timestamp: new Date().toISOString(),
+        },
+        status: AuditStatus.SUCCESS,
+      });
+
+      return {
+        success: true,
+        message: 'If an admin account with this email exists, you will receive a password reset code.',
+      };
+    } catch (error) {
+      this.logger.error(`Admin password reset error for ${email}:`, error);
+      return {
+        success: true, // Return success for security - don't reveal if email exists
+        message: 'If an admin account with this email exists, you will receive a password reset code.',
+      };
+    }
+  }
+
+  /**
+   * Confirm admin password reset with token
+   * Uses existing auth service infrastructure but verifies against staff_accounts
+   */
+  async adminConfirmResetPassword(confirmResetDto: AdminConfirmResetPasswordDto): Promise<{ success: boolean; message: string }> {
+    const { email, token, newPassword } = confirmResetDto;
+    
+    this.logger.log('🔍 Confirming admin password reset...');
+    this.logger.log('- Email:', email);
+    this.logger.log('- Token:', token);
+
+    try {
+      // Verify admin account and token in staff_accounts table
+      const { data: adminAccount, error: adminError } = await this.supabase
+        .from('staff_accounts')
+        .select('id, staff_id, email, full_name, reset_token, reset_token_expires_at')
+        .eq('email', email)
+        .single();
+
+      if (adminError || !adminAccount) {
+        this.logger.error(`Admin account not found during reset confirmation: ${email}`);
+        return {
+          success: false,
+          message: 'Admin account not found',
+        };
+      }
+
+      // Verify token exists and is not expired
+      if (!adminAccount.reset_token || adminAccount.reset_token !== token) {
+        this.logger.error(`Invalid reset token for admin: ${email}`);
+        return {
+          success: false,
+          message: 'Invalid or expired reset token',
+        };
+      }
+
+      const now = new Date();
+      const expiresAt = new Date(adminAccount.reset_token_expires_at);
+      
+      if (now > expiresAt) {
+        this.logger.error(`Expired reset token for admin: ${email}`);
+        return {
+          success: false,
+          message: 'Reset token has expired',
+        };
+      }
+
+      // Hash the new password using bcrypt directly
+      const bcrypt = require('bcrypt');
+      const saltRounds = 10;
+      const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+
+      // Update admin password in staff_accounts table
+      const { error: updateError } = await this.supabase
+        .from('staff_accounts')
+        .update({
+          password_hash: hashedPassword,
+          password_changed_at: new Date().toISOString(),
+          must_change_password: false, // Clear forced password change flag
+          reset_token: null, // Clear reset token
+          reset_token_expires_at: null, // Clear token expiration
+          updated_at: new Date().toISOString(),
+        })
+        .eq('email', email);
+
+      if (updateError) {
+        this.logger.error(`Failed to update admin password for ${email}:`, updateError);
+        return {
+          success: false,
+          message: 'Failed to reset password',
+        };
+      }
+
+      this.logger.log('✅ Admin password reset completed successfully!');
+
+      // Log the successful password reset for audit
+      await this.auditService.logAction({
+        staffId: adminAccount.id,
+        action: AuditAction.CHANGE_PASSWORD,
+        entityType: AuditEntityType.STAFF,
+        entityId: adminAccount.id,
+        details: {
+          action: 'password_reset_completed',
+          email: email,
+          timestamp: new Date().toISOString(),
+        },
+        status: AuditStatus.SUCCESS,
+      });
+
+      return {
+        success: true,
+        message: 'Password has been reset successfully',
+      };
+    } catch (error) {
+      this.logger.error('❌ Admin confirm reset password error:', error);
+      return {
+        success: false,
+        message: 'Failed to reset password',
+      };
+    }
   }
 }
 

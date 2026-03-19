@@ -60,5 +60,24 @@ export class StaffAnalyticsController {
       timezoneOffset ? parseInt(timezoneOffset) : undefined,
     );
   }
+
+  /**
+   * Get auction analytics summary
+   * GET /admin/analytics/auctions/summary
+   * Requires: view_platform_stats permission
+   */
+  @Get('auctions/summary')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_platform_stats')
+  async getAuctionAnalyticsSummary(
+    @Req() req,
+    @Query('start') start?: string,
+    @Query('end') end?: string,
+  ) {
+    return this.adminService.getAuctionAnalyticsSummaryForStaff(
+      req.user.sub,
+      { start, end }
+    );
+  }
 }
 
