@@ -6,7 +6,7 @@ import { AppModule } from './app.module';
 import { ConfigService } from '@nestjs/config';
 import { ValidationPipe } from '@nestjs/common';
 import { MicroserviceOptions, Transport } from '@nestjs/microservices';
-import { SocketIoAdapter } from './realtime/socket-io.adapter';
+// import { SocketIoAdapter } from './realtime/socket-io.adapter';
 import { WinstonLoggerService } from './logger/winston.logger.service';
 import * as express from 'express';
 
@@ -27,12 +27,12 @@ async function bootstrap() {
     allowedHeaders: ['Content-Type', 'Authorization'],
   });
 
-  // Configure custom Socket.IO adapter
-  logger.log('🔧 Configuring Socket.IO adapter...');
-  const socketAdapter = new SocketIoAdapter(app);
-  await socketAdapter.connectToRedis(); // Initialize adapter (currently no-op)
-  app.useWebSocketAdapter(socketAdapter);
-  logger.log('✅ Socket.IO adapter configured');
+  // Configure custom Socket.IO adapter (temporarily disabled)
+  // logger.log('🔧 Configuring Socket.IO adapter...');
+  // const socketAdapter = new SocketIoAdapter(app);
+  // await socketAdapter.connectToRedis(); // Initialize adapter (currently no-op)
+  // app.useWebSocketAdapter(socketAdapter);
+  // logger.log('✅ Socket.IO adapter configured');
 
   // Configure raw body for Flutterwave webhook signature verification
   // This must be before other body parsers
