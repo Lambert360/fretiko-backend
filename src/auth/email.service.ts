@@ -10,7 +10,7 @@ export class EmailService {
     this.supabase = createSupabaseClient(this.configService);
   }
 
-  async sendVerificationEmail(email: string, token: string): Promise<boolean> {
+  async sendVerificationEmail(email: string, token: string, firstName?: string, lastName?: string): Promise<boolean> {
     try {
       const emailContent = this.generateVerificationEmailContent(token);
       
@@ -34,7 +34,7 @@ export class EmailService {
 
       if (resendApiKey && resendFromEmail) {
         console.log('✅ Attempting to send via Resend...');
-        const result = await this.sendViaResend(email, token, resendApiKey, resendFromEmail);
+        const result = await this.sendViaResend(email, token, resendApiKey, resendFromEmail, firstName, lastName);
         console.log('- Send result:', result);
         return result;
       } else {
@@ -53,7 +53,9 @@ export class EmailService {
     email: string, 
     token: string, 
     apiKey: string, 
-    fromEmail: string
+    fromEmail: string,
+    firstName?: string,
+    lastName?: string
   ): Promise<boolean> {
     try {
       const response = await fetch('https://api.resend.com/emails', {
@@ -63,7 +65,7 @@ export class EmailService {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          from: fromEmail,
+          from: `${firstName} ${lastName} <${fromEmail}>`, // Use display name format for Resend compliance
           to: [email],
           subject: 'Verify Your Fretiko Account',
           html: this.generateVerificationEmailContent(token),

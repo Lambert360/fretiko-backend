@@ -301,7 +301,7 @@ export class AuthService {
 
     // Send verification email
     console.log('🔍 Attempting to send verification email...');
-    const emailSent = await this.emailService.sendVerificationEmail(email, token);
+    const emailSent = await this.emailService.sendVerificationEmail(email, token, firstName, lastName);
     
     console.log('🔍 Email service result:', { emailSent, email, tokenLength: token.length });
 
@@ -562,7 +562,9 @@ export class AuthService {
       .from('user_profiles')
       .select(`
         id,
-        email_confirmed
+        email_confirmed,
+        first_name,
+        last_name
       `)
       .eq('email', email)
       .single();
@@ -581,6 +583,10 @@ export class AuthService {
     const expiresAt = new Date();
     expiresAt.setHours(expiresAt.getHours() + 24); // 24 hours
 
+    // Extract name from profile data
+    const firstName = profileData.first_name || '';
+    const lastName = profileData.last_name || '';
+
     // Update user profile with new token
     const { error: updateError } = await this.supabase
       .from('user_profiles')
@@ -595,7 +601,7 @@ export class AuthService {
     }
 
     // Send verification email
-    const emailSent = await this.emailService.sendVerificationEmail(email, token);
+    const emailSent = await this.emailService.sendVerificationEmail(email, token, firstName, lastName);
 
     if (!emailSent) {
       throw new Error('Failed to send verification email');
