@@ -34,8 +34,15 @@ import { GiftService } from '../gifts/gift.service';
  */
 @WebSocketGateway({
   cors: {
-    origin: '*', // Configure this properly for production
+    origin: [
+      'http://localhost:3001',
+      'http://localhost:3000',
+      'https://fretiko.com',
+      'exp://*', // Expo development
+      'https://fretiko-backend.onrender.com'
+    ],
     methods: ['GET', 'POST'],
+    credentials: true,
   },
   namespace: '/live-sales',
 })

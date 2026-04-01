@@ -27,7 +27,13 @@ interface AuthenticatedSocket extends Socket {
 @WebSocketGateway({
   namespace: '/notifications',
   cors: {
-    origin: true, // Allow all origins for development
+    origin: [
+      'http://localhost:3001',
+      'http://localhost:3000',
+      'https://fretiko.com',
+      'exp://*', // Expo development
+      'https://fretiko-backend.onrender.com'
+    ],
     credentials: true,
   },
 })

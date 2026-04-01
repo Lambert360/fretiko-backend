@@ -19,9 +19,15 @@ async function bootstrap() {
   const configService = app.get(ConfigService);
   const logger = app.get(WinstonLoggerService);
 
-  // Enable CORS for frontend
+  // Enable CORS for frontend and mobile app
   app.enableCors({
-    origin: ['http://localhost:3001', 'http://localhost:3000'],
+    origin: [
+      'http://localhost:3001', 
+      'http://localhost:3000',
+      'https://fretiko.com',
+      'exp://*', // Expo development
+      'https://fretiko-backend.onrender.com' // Render backend
+    ],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],

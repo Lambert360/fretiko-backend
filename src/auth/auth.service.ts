@@ -300,11 +300,8 @@ export class AuthService {
     }
 
     // Send verification email
-    console.log('🔍 Initializing email service...');
-    const emailService = new (require('./email.service').EmailService)(this.configService);
-    
     console.log('🔍 Attempting to send verification email...');
-    const emailSent = await emailService.sendVerificationEmail(email, token);
+    const emailSent = await this.emailService.sendVerificationEmail(email, token);
     
     console.log('🔍 Email service result:', { emailSent, email, tokenLength: token.length });
 
@@ -598,8 +595,7 @@ export class AuthService {
     }
 
     // Send verification email
-    const emailService = new (require('./email.service').EmailService)(this.configService);
-    const emailSent = await emailService.sendVerificationEmail(email, token);
+    const emailSent = await this.emailService.sendVerificationEmail(email, token);
 
     if (!emailSent) {
       throw new Error('Failed to send verification email');
