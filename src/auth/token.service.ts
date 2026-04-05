@@ -51,17 +51,23 @@ export class TokenService {
       expiresAt.setDate(expiresAt.getDate() + 30); // 30 days from now
 
       // Store refresh token in database
+      const insertData: any = {
+        user_id: userId,
+        token_hash: refreshTokenHash,
+        expires_at: expiresAt.toISOString(),
+        created_at: new Date().toISOString(),
+        last_used_at: new Date().toISOString(),
+        device_info: deviceInfo || 'unknown'
+      };
+
+      // Only add IP address if it's valid
+      if (ipAddress && ipAddress !== 'unknown') {
+        insertData.ip_address = ipAddress;
+      }
+
       const { error: insertError } = await this.serviceSupabase
         .from('refresh_tokens')
-        .insert({
-          user_id: userId,
-          token_hash: refreshTokenHash,
-          expires_at: expiresAt.toISOString(),
-          created_at: new Date().toISOString(),
-          last_used_at: new Date().toISOString(),
-          device_info: deviceInfo || 'unknown',
-          ip_address: (ipAddress && ipAddress !== 'unknown') ? ipAddress : '127.0.0.1'
-        });
+        .insert(insertData);
 
       if (insertError) {
         console.error('❌ Failed to store refresh token:', insertError);
