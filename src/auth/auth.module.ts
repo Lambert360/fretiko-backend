@@ -7,6 +7,7 @@ import { JwtAuthGuard } from './jwt-auth.guard';
 import { OptionalJwtAuthGuard } from './optional-jwt-auth.guard';
 import { SocialAuthService } from './social-auth.service';
 import { EmailService } from './email.service';
+import { TokenService } from './token.service';
 
 @Module({
   imports: [
@@ -14,13 +15,13 @@ import { EmailService } from './email.service';
       imports: [ConfigModule],
       useFactory: async (configService: ConfigService) => ({
         secret: configService.get<string>('JWT_SECRET'),
-        signOptions: { expiresIn: '1h' },
+        signOptions: { expiresIn: '7d' },
       }),
       inject: [ConfigService],
     }),
   ],
-  providers: [AuthService, JwtAuthGuard, OptionalJwtAuthGuard, SocialAuthService, EmailService],
+  providers: [AuthService, JwtAuthGuard, OptionalJwtAuthGuard, SocialAuthService, EmailService, TokenService],
   controllers: [AuthController],
-  exports: [AuthService, JwtModule, JwtAuthGuard, OptionalJwtAuthGuard, SocialAuthService, EmailService],
+  exports: [AuthService, JwtModule, JwtAuthGuard, OptionalJwtAuthGuard, SocialAuthService, EmailService, TokenService],
 })
 export class AuthModule {}
