@@ -7,14 +7,12 @@ import { createSupabaseClient } from '../shared/supabase.client';
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
   private supabase;
-  private jwtService: JwtService;
 
   constructor(
     private configService: ConfigService,
-    private jwtServiceParam: JwtService,
+    private jwtService: JwtService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
-    this.jwtService = jwtServiceParam;
   }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {

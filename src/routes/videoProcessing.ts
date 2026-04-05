@@ -18,7 +18,23 @@ declare global {
   }
 }
 
-const authenticateToken = new JwtAuthGuard(require('@nestjs/config').ConfigService).canActivate.bind(new JwtAuthGuard(require('@nestjs/config').ConfigService));
+const authenticateToken = async (req: any, res: any, next: any) => {
+  try {
+    const configService = new (require('@nestjs/config').ConfigService)();
+    const jwtService = new (require('@nestjs/jwt').JwtService)();
+    const guard = new JwtAuthGuard(configService, jwtService);
+    const canActivate = await guard.canActivate({ switchToHttp: () => ({ getRequest: () => req }) } as any);
+    
+    if (!canActivate) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    next();
+  } catch (error) {
+    console.error('Authentication error:', error);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+};
 
 const router = express.Router();
 
