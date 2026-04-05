@@ -7,12 +7,17 @@ import { createSupabaseClient } from '../shared/supabase.client';
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
   private supabase;
+  private jwtService: JwtService;
 
   constructor(
     private configService: ConfigService,
-    private jwtService: JwtService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
+    // Create JWT service instance directly to avoid injection issues
+    this.jwtService = new JwtService({
+      secret: this.configService.get<string>('JWT_SECRET'),
+      signOptions: { expiresIn: '7d' },
+    });
   }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -35,12 +40,11 @@ export class JwtAuthGuard implements CanActivate {
     try {
       console.log(' Validating custom JWT with our secret...');
 
-      const decoded = this.jwtService.verify(token, {
-        secret: this.configService.get<string>('JWT_SECRET'),
-      });
+      const decoded = this.jwtService.verify(token);
 
       console.log(' Custom JWT validated for user:', decoded.sub);
 
+      // Get user from Supabase for profile data (optional)
       const { data: supabaseUser, error: supabaseError } = await this.supabase.auth.admin.getUserById(
         decoded.sub
       );
@@ -49,6 +53,7 @@ export class JwtAuthGuard implements CanActivate {
         console.error(' Could not fetch user profile:', supabaseError.message);
       }
 
+      // Attach user to request
       request.user = { 
         sub: decoded.sub, 
         email: decoded.email || supabaseUser?.email,
@@ -71,5 +76,4 @@ export class JwtAuthGuard implements CanActivate {
       throw new UnauthorizedException('Invalid token');
     }
   }
-
 }
