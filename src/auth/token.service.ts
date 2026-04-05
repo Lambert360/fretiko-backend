@@ -57,8 +57,10 @@ export class TokenService {
           user_id: userId,
           token_hash: refreshTokenHash,
           expires_at: expiresAt.toISOString(),
-          device_info: deviceInfo || {},
-          ip_address: ipAddress,
+          created_at: new Date().toISOString(),
+          last_used_at: new Date().toISOString(),
+          device_info: deviceInfo || 'unknown',
+          ip_address: (ipAddress && ipAddress !== 'unknown') ? ipAddress : '127.0.0.1'
         });
 
       if (insertError) {
