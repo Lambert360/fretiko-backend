@@ -3,14 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 
 import { createSupabaseClient } from '../shared/supabase.client';
-
-interface JwtPayload {
-  sub: string;
-  email?: string;
-  type?: string;
-  iat: number;
-  exp: number;
-}
+import { RequestWithUser, JwtPayload } from '../shared/types';
 
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
@@ -31,7 +24,7 @@ export class JwtAuthGuard implements CanActivate {
   }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
-    const request = context.switchToHttp().getRequest();
+    const request = context.switchToHttp().getRequest<RequestWithUser>();
     const authHeader = request.headers.authorization;
 
     console.log(' Auth header received:', authHeader ? 'Present' : 'Missing');
@@ -50,7 +43,7 @@ export class JwtAuthGuard implements CanActivate {
     try {
       console.log(' Validating custom JWT with our secret...');
 
-      const decoded = this.jwtService.verify(token) as JwtPayload;
+      const decoded = this.jwtService.verify<JwtPayload>(token);
 
       console.log(' Custom JWT validated for user:', decoded.sub);
 
@@ -71,7 +64,7 @@ export class JwtAuthGuard implements CanActivate {
       // Attach user to request
       request.user = { 
         sub: decoded.sub, 
-        email: decoded.email || supabaseUser?.email,
+        email: decoded.email ?? supabaseUser?.email,
         type: decoded.type,
         iat: decoded.iat,
         exp: decoded.exp
