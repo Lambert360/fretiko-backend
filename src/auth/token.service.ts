@@ -125,10 +125,9 @@ export class TokenService {
         throw new UnauthorizedException('Refresh token expired');
       }
 
-      // Check if user is inactive (30 days) - TEMPORARILY DISABLED
-      // const isInactive = await this.serviceSupabase
-      //   .rpc('is_user_inactive', { p_user_id: tokenRecord.user_id });
-      const isInactive = false; // Temporarily disable inactivity check
+      // Check if user is inactive (30 days)
+      const isInactive = await this.serviceSupabase
+        .rpc('check_user_inactive', { p_user_id: tokenRecord.user_id });
       
       if (isInactive) {
         console.log('❌ User inactive, requiring re-authentication');
@@ -252,19 +251,15 @@ export class TokenService {
    */
   async logUserActivity(userId: string, activityType: string, metadata?: any) {
     try {
-      // TEMPORARILY DISABLED - Skip activity logging
-      console.log(`📝 Activity logging disabled: ${activityType} for user: ${userId}`);
-      return true;
-      
-      // const { error } = await this.serviceSupabase.rpc('log_user_activity', {
-      //   p_user_id: userId,
-      //   p_activity_type: activityType,
-      //   p_metadata: metadata || {}
-      // });
+      const { error } = await this.serviceSupabase.rpc('add_user_activity', {
+        p_user_id: userId,
+        p_activity_type: activityType,
+        p_metadata: metadata || {}
+      });
 
-      // if (error) {
-      //   console.error('❌ Failed to log user activity:', error);
-      // }
+      if (error) {
+        console.error('❌ Failed to log user activity:', error);
+      }
     } catch (error) {
       console.error('❌ Activity logging error:', error);
     }

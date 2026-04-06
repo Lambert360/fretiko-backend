@@ -4,6 +4,14 @@ import { JwtService } from '@nestjs/jwt';
 
 import { createSupabaseClient } from '../shared/supabase.client';
 
+interface JwtPayload {
+  sub: string;
+  email?: string;
+  type?: string;
+  iat: number;
+  exp: number;
+}
+
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
   private supabase;
@@ -13,11 +21,13 @@ export class JwtAuthGuard implements CanActivate {
     private configService: ConfigService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
-    // Create JWT service instance directly to avoid injection issues
-    this.jwtService = new JwtService({
-      secret: this.configService.get<string>('JWT_SECRET'),
-      signOptions: { expiresIn: '7d' },
-    });
+    // Create JWT service instance once to avoid security issues
+    if (!this.jwtService) {
+      this.jwtService = new JwtService({
+        secret: this.configService.get<string>('JWT_SECRET'),
+        signOptions: { expiresIn: '7d' },
+      });
+    }
   }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -40,17 +50,22 @@ export class JwtAuthGuard implements CanActivate {
     try {
       console.log(' Validating custom JWT with our secret...');
 
-      const decoded = this.jwtService.verify(token);
+      const decoded = this.jwtService.verify(token) as JwtPayload;
 
       console.log(' Custom JWT validated for user:', decoded.sub);
 
       // Get user from Supabase for profile data (optional)
-      const { data: supabaseUser, error: supabaseError } = await this.supabase.auth.admin.getUserById(
-        decoded.sub
-      );
-
-      if (supabaseError) {
-        console.error(' Could not fetch user profile:', supabaseError.message);
+      let supabaseUser = null;
+      try {
+        const { data, error: supabaseError } = await this.supabase.auth.admin.getUserById(
+          decoded.sub
+        );
+        
+        if (!supabaseError) {
+          supabaseUser = data;
+        }
+      } catch (error) {
+        console.log('⚠️ Could not fetch user profile from Supabase (expected with custom JWT)');
       }
 
       // Attach user to request
