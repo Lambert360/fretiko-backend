@@ -6,11 +6,7 @@ import { AuthenticatedUser } from '../shared/types';
 const authenticateToken = async (req: any, res: any, next: any) => {
   try {
     const configService = new (require('@nestjs/config').ConfigService)();
-    const jwtService = new (require('@nestjs/jwt').JwtService)({
-      secret: configService.get('JWT_SECRET'),
-      signOptions: { expiresIn: '7d' },
-    });
-    const guard = new JwtAuthGuard(configService, jwtService);
+    const guard = new JwtAuthGuard(configService);
     const canActivate = await guard.canActivate({ switchToHttp: () => ({ getRequest: () => req }) } as any);
     
     if (!canActivate) {

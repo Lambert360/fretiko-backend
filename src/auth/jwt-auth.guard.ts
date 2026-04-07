@@ -8,12 +8,17 @@ import { RequestWithUser, JwtPayload } from '../shared/types';
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
   private supabase;
+  private jwtService: JwtService;
 
   constructor(
     private configService: ConfigService,
-    private jwtService: JwtService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
+    // Create JWT service instance
+    this.jwtService = new JwtService({
+      secret: this.configService.get<string>('JWT_SECRET'),
+      signOptions: { expiresIn: '7d' },
+    });
   }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
