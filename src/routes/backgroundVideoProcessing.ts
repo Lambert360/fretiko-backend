@@ -1,14 +1,11 @@
 import express from 'express';
 import { backgroundVideoProcessor } from '../services/backgroundVideoProcessor';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
-import { AuthenticatedUser } from '../shared/types';
-import { ConfigService } from '@nestjs/config';
 
 const authenticateToken = async (req: any, res: any, next: any) => {
   try {
-    const configService = new ConfigService();
-    const guard = new JwtAuthGuard(configService);
-    const canActivate = await guard.canActivate({ switchToHttp: () => ({ getRequest: () => req }) } as any);
+    const jwtAuthGuard = new JwtAuthGuard();
+    const canActivate = await jwtAuthGuard.canActivate({ switchToHttp: () => ({ getRequest: () => req }) } as any);
     
     if (!canActivate) {
       return res.status(401).json({ error: 'Unauthorized' });

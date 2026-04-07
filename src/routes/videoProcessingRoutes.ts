@@ -1,16 +1,13 @@
 import { Router } from 'express';
 import { videoProcessingController } from '../controllers/videoProcessingController';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
-import { ConfigService } from '@nestjs/config';
 
 const router = Router();
 
-// Create auth middleware
-const configService = new ConfigService();
-const jwtAuthGuard = new JwtAuthGuard(configService);
-
-const authenticateToken = async (req: any, res: any, next: any) => {
+// All routes require authentication
+router.use(async (req, res, next) => {
   try {
+    const jwtAuthGuard = new JwtAuthGuard();
     const canActivate = await jwtAuthGuard.canActivate({ switchToHttp: () => ({ getRequest: () => req }) } as any);
     
     if (!canActivate) {
@@ -22,10 +19,7 @@ const authenticateToken = async (req: any, res: any, next: any) => {
     console.error('Authentication error:', error);
     return res.status(401).json({ error: 'Unauthorized' });
   }
-};
-
-// All routes require authentication
-router.use(authenticateToken);
+});
 
 /**
  * POST /api/video-processing/submit
