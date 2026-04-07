@@ -1,11 +1,17 @@
 import { videoProcessingService } from '../services/videoProcessingService';
-import { supabase } from '../lib/supabase';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { ConfigService } from '@nestjs/config';
 
 export class VideoProcessingWorker {
+  private supabase;
   private isRunning = false;
   private pollInterval = 5000; // 5 seconds
   private maxConcurrentJobs = 2;
   private currentJobs = 0;
+
+  constructor(private configService: ConfigService) {
+    this.supabase = createServiceSupabaseClient(configService);
+  }
 
   /**
    * Start the video processing worker
@@ -60,7 +66,7 @@ export class VideoProcessingWorker {
   private async processNextJob() {
     try {
       // Get next job from queue
-      const { data: jobs, error } = await supabase
+      const { data: jobs, error } = await this.supabase
         .rpc('get_next_video_processing_job');
 
       if (error) {
@@ -126,7 +132,7 @@ export class VideoProcessingWorker {
       await this.updateProgress(jobId, 80, 'Uploading processed video');
 
       // Mark job as completed
-      const { error: completeError } = await supabase
+      const { error: completeError } = await this.supabase
         .rpc('complete_video_processing_job', {
           job_id: jobId,
           processed_url: result.outputPath,
@@ -153,7 +159,7 @@ export class VideoProcessingWorker {
       console.error(`❌ Video processing failed for job ${jobId}:`, error);
       
       // Mark job as failed
-      const { error: failError } = await supabase
+      const { error: failError } = await this.supabase
         .rpc('fail_video_processing_job', {
           job_id: jobId,
           error_message: error instanceof Error ? error.message : 'Unknown error',
@@ -176,7 +182,7 @@ export class VideoProcessingWorker {
    */
   private async updateProgress(jobId: string, progress: number, stage: string) {
     try {
-      const { error } = await supabase
+      const { error } = await this.supabase
         .rpc('update_video_processing_progress', {
           job_id: jobId,
           progress,
@@ -228,4 +234,4 @@ export class VideoProcessingWorker {
 }
 
 // Create singleton instance
-export const videoProcessingWorker = new VideoProcessingWorker();
+export const videoProcessingWorker = new VideoProcessingWorker(new ConfigService());

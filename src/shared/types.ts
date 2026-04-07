@@ -1,5 +1,15 @@
 import { Request } from 'express';
 
+declare global {
+  namespace Express {
+    interface Request {
+      user?: AuthenticatedUser;
+      supabaseUser?: any;
+      supabaseToken?: string;
+    }
+  }
+}
+
 export interface JwtPayload {
   sub: string;
   email?: string;
@@ -10,14 +20,12 @@ export interface JwtPayload {
 
 export interface AuthenticatedUser extends JwtPayload {
   sub: string;
-  email: string;
+  id: string;
+  email?: string;
   type?: string;
+  isAdmin?: boolean;
   iat: number;
   exp: number;
 }
 
-export interface RequestWithUser extends Request {
-  user: AuthenticatedUser;
-  supabaseUser?: any;
-  supabaseToken?: string;
-}
+export interface RequestWithUser extends Request {}

@@ -143,6 +143,64 @@ export class VideoProcessingService {
   }
 
   /**
+   * Check if video needs conversion for the target platform
+   */
+  needsConversion(metadata: any, platform: string = 'android'): boolean {
+    if (!metadata) return true;
+
+    // Define platform-specific requirements
+    const requirements = {
+      android: {
+        codecs: ['h264', 'avc1'],
+        maxResolution: { width: 1920, height: 1080 },
+        maxBitrate: 5000000, // 5 Mbps
+        maxDuration: 600 // 10 minutes
+      },
+      ios: {
+        codecs: ['h264', 'avc1', 'hevc', 'h265'],
+        maxResolution: { width: 1920, height: 1080 },
+        maxBitrate: 10000000, // 10 Mbps
+        maxDuration: 600
+      },
+      web: {
+        codecs: ['h264', 'avc1', 'vp9', 'av1'],
+        maxResolution: { width: 1920, height: 1080 },
+        maxBitrate: 8000000, // 8 Mbps
+        maxDuration: 1200 // 20 minutes
+      }
+    };
+
+    const req = requirements[platform as keyof typeof requirements] || requirements.android;
+
+    // Check codec compatibility
+    if (!req.codecs.includes(metadata.codec.toLowerCase())) {
+      console.log(`❌ Codec ${metadata.codec} not supported for ${platform}`);
+      return true;
+    }
+
+    // Check resolution
+    if (metadata.width > req.maxResolution.width || metadata.height > req.maxResolution.height) {
+      console.log(`❌ Resolution ${metadata.resolution} exceeds ${platform} limit`);
+      return true;
+    }
+
+    // Check bitrate
+    if (metadata.bitrate > req.maxBitrate) {
+      console.log(`❌ Bitrate ${metadata.bitrate} exceeds ${platform} limit`);
+      return true;
+    }
+
+    // Check duration
+    if (metadata.duration > req.maxDuration) {
+      console.log(`❌ Duration ${metadata.duration}s exceeds ${platform} limit`);
+      return true;
+    }
+
+    console.log(`✅ Video is compatible with ${platform}`);
+    return false;
+  }
+
+  /**
    * Generate thumbnail from video
    */
   private async generateThumbnail(inputPath: string, outputDir: string, videoId: string): Promise<{ success: boolean; thumbnailUrl?: string; error?: string }> {
@@ -376,15 +434,16 @@ export class VideoProcessingService {
       let masterPlaylistUrl = '';
 
       for (const file of files) {
-        const localPath = path.join(localDir, file);
+        const fileName = typeof file === 'string' ? file : file.toString();
+        const localPath = path.join(localDir, fileName);
         const stat = fs.statSync(localPath);
         
         if (stat.isFile()) {
           const fileContent = fs.readFileSync(localPath);
-          const remotePath = path.join(remoteDir, file).replace(/\\/g, '/');
+          const remotePath = path.join(remoteDir, fileName).replace(/\\/g, '/');
           
-          const contentType = file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 
-                           file.endsWith('.ts') ? 'video/MP2T' : 'application/octet-stream';
+          const contentType = fileName.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 
+                           fileName.endsWith('.ts') ? 'video/MP2T' : 'application/octet-stream';
           
           const { data, error } = await this.storageClient
             .from('media')
@@ -395,12 +454,12 @@ export class VideoProcessingService {
             });
 
           if (error) {
-            console.error(`Failed to upload ${file}:`, error);
+            console.error(`Failed to upload ${fileName}:`, error);
             continue;
           }
 
           // Track master playlist URL
-          if (file.endsWith('playlist.m3u8')) {
+          if (fileName.endsWith('playlist.m3u8')) {
             const { data: publicUrlData } = this.storageClient
               .from('media')
               .getPublicUrl(data.path);

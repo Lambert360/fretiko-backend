@@ -1,8 +1,15 @@
 import { Request, Response } from 'express';
 import { videoProcessingService } from '../services/videoProcessingService';
-import { supabase } from '../lib/supabase';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { ConfigService } from '@nestjs/config';
 
 export class VideoProcessingController {
+  private supabase;
+
+  constructor(private configService: ConfigService) {
+    this.supabase = createServiceSupabaseClient(configService);
+  }
+
   /**
    * Submit a video for processing
    */
@@ -53,7 +60,7 @@ export class VideoProcessingController {
       }
 
       // Insert into processing queue
-      const { data: job, error } = await supabase
+      const { data: job, error } = await this.supabase
         .from('video_processing_queue')
         .insert({
           user_id: userId,
@@ -106,7 +113,7 @@ export class VideoProcessingController {
         return res.status(401).json({ error: 'Unauthorized' });
       }
 
-      const { data: job, error } = await supabase
+      const { data: job, error } = await this.supabase
         .from('video_processing_queue')
         .select('*')
         .eq('id', job_id)
@@ -159,7 +166,7 @@ export class VideoProcessingController {
         return res.status(401).json({ error: 'Unauthorized' });
       }
 
-      let query = supabase
+      let query = this.supabase
         .from('video_processing_queue')
         .select('*')
         .eq('user_id', userId)
@@ -218,7 +225,7 @@ export class VideoProcessingController {
         return res.status(401).json({ error: 'Unauthorized' });
       }
 
-      const { data: job, error } = await supabase
+      const { data: job, error } = await this.supabase
         .from('video_processing_queue')
         .select('status')
         .eq('id', job_id)
@@ -236,7 +243,7 @@ export class VideoProcessingController {
         });
       }
 
-      const { error: updateError } = await supabase
+      const { error: updateError } = await this.supabase
         .from('video_processing_queue')
         .update({ 
           status: 'failed',
@@ -278,7 +285,7 @@ export class VideoProcessingController {
         return res.status(401).json({ error: 'Unauthorized' });
       }
 
-      const { data: job, error } = await supabase
+      const { data: job, error } = await this.supabase
         .from('video_processing_queue')
         .select('status, retry_count, max_retries')
         .eq('id', job_id)
@@ -296,7 +303,7 @@ export class VideoProcessingController {
         });
       }
 
-      const { error: updateError } = await supabase
+      const { error: updateError } = await this.supabase
         .from('video_processing_queue')
         .update({ 
           status: 'pending',
@@ -329,4 +336,4 @@ export class VideoProcessingController {
   }
 }
 
-export const videoProcessingController = new VideoProcessingController();
+export const videoProcessingController = new VideoProcessingController(new ConfigService());

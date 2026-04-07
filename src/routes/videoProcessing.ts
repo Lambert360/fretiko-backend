@@ -1,28 +1,16 @@
 import express from 'express';
 import { videoProcessingService } from '../services/videoProcessingService';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
-
-// Define custom user interface for our JWT payload
-interface AuthenticatedUser {
-  sub: string;
-  email: string;
-  isAdmin?: boolean;
-}
-
-// Extend Express Request type
-declare global {
-  namespace Express {
-    interface Request {
-      user?: AuthenticatedUser;
-    }
-  }
-}
+import { AuthenticatedUser } from '../shared/types';
 
 const authenticateToken = async (req: any, res: any, next: any) => {
   try {
     const configService = new (require('@nestjs/config').ConfigService)();
-    const jwtService = new (require('@nestjs/jwt').JwtService)();
-    const guard = new JwtAuthGuard(configService);
+    const jwtService = new (require('@nestjs/jwt').JwtService)({
+      secret: configService.get('JWT_SECRET'),
+      signOptions: { expiresIn: '7d' },
+    });
+    const guard = new JwtAuthGuard(configService, jwtService);
     const canActivate = await guard.canActivate({ switchToHttp: () => ({ getRequest: () => req }) } as any);
     
     if (!canActivate) {

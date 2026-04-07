@@ -8,19 +8,12 @@ import { RequestWithUser, JwtPayload } from '../shared/types';
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
   private supabase;
-  private jwtService: JwtService;
 
   constructor(
     private configService: ConfigService,
+    private jwtService: JwtService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
-    // Create JWT service instance once to avoid security issues
-    if (!this.jwtService) {
-      this.jwtService = new JwtService({
-        secret: this.configService.get<string>('JWT_SECRET'),
-        signOptions: { expiresIn: '7d' },
-      });
-    }
   }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -43,15 +36,19 @@ export class JwtAuthGuard implements CanActivate {
     try {
       console.log(' Validating custom JWT with our secret...');
 
-      const decoded = this.jwtService.verify<JwtPayload>(token);
+      const decoded = this.jwtService.verify(token) as any;
+      
+      if (!decoded || typeof decoded !== 'object') {
+        throw new Error('Invalid token payload');
+      }
 
       console.log(' Custom JWT validated for user:', decoded.sub);
 
       // Get user from Supabase for profile data (optional)
-      let supabaseUser = null;
+      let supabaseUser: any = null;
       try {
         const { data, error: supabaseError } = await this.supabase.auth.admin.getUserById(
-          decoded.sub
+          (decoded as any).sub
         );
         
         if (!supabaseError) {
@@ -63,11 +60,12 @@ export class JwtAuthGuard implements CanActivate {
 
       // Attach user to request
       request.user = { 
-        sub: decoded.sub, 
-        email: decoded.email ?? supabaseUser?.email,
-        type: decoded.type,
-        iat: decoded.iat,
-        exp: decoded.exp
+        sub: (decoded as any).sub,
+        id: (decoded as any).sub, // Use sub as id since they're the same in our system
+        email: (decoded as any).email ?? (supabaseUser?.email || undefined),
+        type: (decoded as any).type,
+        iat: (decoded as any).iat,
+        exp: (decoded as any).exp
       };
 
       request.supabaseUser = supabaseUser;
