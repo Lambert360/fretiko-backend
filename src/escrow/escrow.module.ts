@@ -7,9 +7,11 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { ConnectionsModule } from '../connections/connections.module';
 import { WalletModule } from '../wallet/wallet.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     ConfigModule,
     NotificationsModule,
     WalletModule,

@@ -5,11 +5,12 @@ import { ProductsModule } from '../products/products.module';
 import { ServicesModule } from '../services/services.module';
 import { UsersModule } from '../users/users.module';
 import { RidersModule } from '../riders/riders.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [ProductsModule, ServicesModule, UsersModule, RidersModule],
+  imports: [AuthModule, ProductsModule, ServicesModule, UsersModule, RidersModule],
   controllers: [SearchController],
   providers: [SearchService],
-  exports: [SearchService], // Export SearchService so other modules can use it
+  exports: [SearchService],
 })
 export class SearchModule {}

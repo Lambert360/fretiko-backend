@@ -6,9 +6,11 @@ import { ChatModule } from '../chat/chat.module';
 import { EscrowModule } from '../escrow/escrow.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { RealtimeModule } from '../realtime/realtime.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     NotificationsModule,
     forwardRef(() => ChatModule), // Use forwardRef to avoid circular dependency
     forwardRef(() => EscrowModule), // EscrowService needed for wishlist orders

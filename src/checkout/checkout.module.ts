@@ -11,9 +11,11 @@ import { ChatModule } from '../chat/chat.module';
 import { WishlistModule } from '../wishlist/wishlist.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { AuctionsModule } from '../auctions/auctions.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     ConfigModule,
     CartModule,
     forwardRef(() => EscrowModule),
