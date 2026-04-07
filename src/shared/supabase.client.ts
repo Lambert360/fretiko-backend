@@ -37,9 +37,9 @@ const withRetry = async <T>(
 export { SupabaseClient, withRetry };
 
 // Shared Supabase client that all services can use
-export const createSupabaseClient = (configService: ConfigService) => {
-  const supabaseUrl = configService.get<string>('SUPABASE_URL');
-  const supabaseKey = configService.get<string>('SUPABASE_KEY');
+export const createSupabaseClient = (configService?: ConfigService) => {
+  const supabaseUrl = configService?.get<string>('SUPABASE_URL');
+  const supabaseKey = configService?.get<string>('SUPABASE_KEY');
 
   if (!supabaseUrl || !supabaseKey) {
     throw new Error('Supabase credentials not found in environment');
