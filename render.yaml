@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: fretiko-backend
+    env: node
+    plan: free
+    buildCommand: |
+      # Install FFmpeg for video processing
+      apt-get update && apt-get install -y ffmpeg
+      # Install Node.js dependencies
+      npm install
+      # Build the application
+      npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
+    autoDeploy: true

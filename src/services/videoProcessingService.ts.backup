@@ -29,9 +29,9 @@ export interface VideoProcessingResult {
   hlsUrls?: {
     masterPlaylist: string;
     variants: {
-      '480p'?: string;
-      '720p'?: string;
-      '1080p'?: string;
+      480p?: string;
+      720p?: string;
+      1080p?: string;
     };
   };
   thumbnailUrl?: string;
@@ -88,7 +88,7 @@ export class VideoProcessingService {
       }
 
       // Generate HLS if requested (production approach)
-      if (options.generateHLS) {
+      if (options.generateHLS !== false) {
         console.log('🎬 Generating HLS streams...');
         const hlsResult = await this.generateHLS(options, outputDir, videoId);
         if (hlsResult.success) {
@@ -99,7 +99,7 @@ export class VideoProcessingService {
       } else {
         // Fallback to single MP4 conversion
         console.log('🔄 Converting to MP4...');
-        const conversionResult = await this.convertToH264MP4(options, outputDir, videoId);
+        const conversionResult = await this.convertToMP4(options, outputDir, videoId);
         if (!conversionResult.success) {
           return conversionResult;
         }
@@ -140,6 +140,18 @@ export class VideoProcessingService {
       console.error('Failed to get video metadata:', error);
       return null;
     }
+  }
+
+  /**
+   * Check if video needs conversion based on platform requirements
+   */
+  needsConversion(metadata: any, platform: string = 'android'): boolean {
+    if (!metadata) return true;
+
+    const { codec, resolution, bitrate } = metadata;
+    
+    // Always convert to ensure compatibility and HLS support
+    return true;
   }
 
   /**
@@ -293,7 +305,7 @@ export class VideoProcessingService {
   /**
    * Create HLS master playlist content
    */
-  private createMasterPlaylist(variantUrls: { [key: string]: string }, qualities: { [key: string]: any }): string {
+  private createMasterPlaylist(variantUrls: any, qualities: any): string {
     let playlist = '#EXTM3U\n#EXT-X-VERSION:3\n';
     
     const qualityOrder = ['480p', '720p', '1080p'];
@@ -368,6 +380,218 @@ export class VideoProcessingService {
   }
 
   /**
+   * Convert video to MP4 (fallback method)
+   */
+  private async convertToMP4(options: VideoProcessingOptions, outputDir: string, videoId: string): Promise<VideoProcessingResult> {
+    try {
+      const outputPath = path.join(outputDir, `${videoId}_converted.mp4`);
+      
+      const settings = this.getOptimalSettings(options.platform || 'android', options.quality);
+      
+      const ffmpegCommand = [
+        'ffmpeg',
+        '-i', options.inputPath,
+        '-c:v', 'libx264', // Always convert to H.264
+        '-preset', 'medium',
+        '-crf', settings.crf,
+        '-maxrate', settings.maxBitrate,
+        '-bufsize', settings.bufsize,
+        '-pix_fmt', 'yuv420p',
+        '-vf', `scale=${settings.scale}`,
+        '-c:a', settings.audioCodec,
+        '-b:a', settings.audioBitrate,
+        '-movflags', '+faststart',
+        '-y'
+      ];
+
+      // Add duration limit if specified
+      if (options.maxDuration) {
+        ffmpegCommand.splice(ffmpegCommand.indexOf('-i') + 2, 0, '-t', options.maxDuration.toString());
+      }
+      
+      ffmpegCommand.push(outputPath);
+
+      console.log('🔧 FFmpeg MP4 conversion command:', ffmpegCommand.join(' '));
+      await execAsync(ffmpegCommand.join(' '));
+
+      // Upload converted video
+      const uploadResult = await this.uploadFile(outputPath, 'video/mp4');
+      
+      // Cleanup local file
+      if (fs.existsSync(outputPath)) {
+        fs.unlinkSync(outputPath);
+      }
+
+      if (uploadResult.success) {
+        return {
+          success: true,
+          outputPath: uploadResult.publicUrl
+        };
+      } else {
+        return { success: false, error: uploadResult.error };
+      }
+
+    } catch (error) {
+      console.error('MP4 conversion failed:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'MP4 conversion failed' 
+      };
+    }
+  }
+
+  /**
+   * Convert video to compatible format using FFmpeg
+   */
+  private async convertVideo(options: VideoProcessingOptions & { 
+    outputPath: string; 
+    metadata: any 
+  }): Promise<VideoProcessingResult> {
+    try {
+      console.log('🔄 Converting video to compatible format...');
+
+      // Determine optimal settings based on platform
+      const settings = this.getOptimalSettings(options.platform || 'android', options.quality);
+      
+      const ffmpegCommand = [
+        'ffmpeg',
+        '-i', options.inputPath,
+        '-c:v', settings.videoCodec,
+        '-preset', settings.preset,
+        '-crf', settings.crf,
+        '-maxrate', settings.maxBitrate.toString(),
+        '-bufsize', settings.bufsize,
+        '-pix_fmt', settings.pixelFormat,
+        '-vf', `scale=${settings.scale}`,
+        '-c:a', settings.audioCodec,
+        '-b:a', settings.audioBitrate,
+        '-movflags', '+faststart', // For web streaming
+        '-y', // Overwrite output file
+        options.outputPath
+      ];
+
+      console.log('🔧 FFmpeg command:', ffmpegCommand.join(' '));
+
+      const { stdout, stderr } = await execAsync(ffmpegCommand.join(' '));
+      
+      if (stderr && !stderr.includes('Conversion successful')) {
+        console.error('FFmpeg error:', stderr);
+        return { success: false, error: 'Video conversion failed' };
+      }
+
+      // Get new metadata
+      const newMetadata = await this.getVideoMetadata(options.outputPath);
+      
+      console.log('✅ Video conversion successful');
+      return {
+        success: true,
+        outputPath: options.outputPath,
+        metadata: newMetadata
+      };
+
+    } catch (error) {
+      console.error('Video conversion error:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Conversion failed' 
+      };
+    }
+  }
+
+  /**
+   * Get optimal video settings for target platform
+   */
+  private getOptimalSettings(platform: string, quality: string = 'medium') {
+    const baseSettings = {
+      android: {
+        videoCodec: 'libx264',
+        preset: 'medium',
+        crf: '23',
+        maxBitrate: '5M',
+        bufsize: '10M',
+        pixelFormat: 'yuv420p',
+        scale: 'min(1920,iw):-2:min(1080,ih)', // Max 1080p
+        audioCodec: 'aac',
+        audioBitrate: '128k'
+      },
+      ios: {
+        videoCodec: 'libx264',
+        preset: 'medium',
+        crf: '23',
+        maxBitrate: '10M',
+        bufsize: '20M',
+        pixelFormat: 'yuv420p',
+        scale: 'min(3840,iw):-2:min(2160,ih)', // Max 4K
+        audioCodec: 'aac',
+        audioBitrate: '128k'
+      }
+    };
+
+    // Adjust for quality
+    if (quality === 'low') {
+      baseSettings.android.crf = '28';
+      baseSettings.android.maxBitrate = '2M';
+      baseSettings.ios.crf = '28';
+      baseSettings.ios.maxBitrate = '4M';
+    } else if (quality === 'high') {
+      baseSettings.android.crf = '18';
+      baseSettings.android.maxBitrate = '8M';
+      baseSettings.ios.crf = '18';
+      baseSettings.ios.maxBitrate = '15M';
+    }
+
+    return baseSettings[platform as keyof typeof baseSettings] || baseSettings.android;
+  }
+
+  /**
+   * Generate output path for converted video
+   */
+  private generateOutputPath(inputPath: string): string {
+    const dir = path.dirname(inputPath);
+    const ext = path.extname(inputPath);
+    const name = path.basename(inputPath, ext);
+    return path.join(dir, `${name}_converted.mp4`);
+  }
+
+  /**
+   * Upload file to storage
+   */
+  private async uploadFile(filePath: string, contentType: string): Promise<{ success: boolean; publicUrl?: string; error?: string }> {
+    try {
+      const fileContent = fs.readFileSync(filePath);
+      const fileName = path.basename(filePath);
+      
+      const { data, error } = await this.storageClient
+        .from('media')
+        .upload(fileName, fileContent, {
+          contentType,
+          cacheControl: '3600',
+          upsert: false,
+        });
+
+      if (error) {
+        return { success: false, error: error.message };
+      }
+
+      const { data: publicUrlData } = this.storageClient
+        .from('media')
+        .getPublicUrl(data.path);
+
+      return {
+        success: true,
+        publicUrl: publicUrlData.publicUrl
+      };
+
+    } catch (error) {
+      console.error('Upload failed:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Upload failed' 
+      };
+    }
+  }
+
+  /**
    * Upload HLS directory to storage
    */
   private async uploadHLSDirectory(localDir: string, remoteDir: string): Promise<{ success: boolean; publicUrl?: string; error?: string }> {
@@ -423,154 +647,6 @@ export class VideoProcessingService {
       return { 
         success: false, 
         error: error instanceof Error ? error.message : 'HLS directory upload failed' 
-      };
-    }
-  }
-  private async convertToH264MP4(options: VideoProcessingOptions, outputDir: string, videoId: string): Promise<VideoProcessingResult> {
-    try {
-      const outputPath = path.join(outputDir, `${videoId}_converted.mp4`);
-      
-      // Get optimal settings based on platform
-      const settings = this.getOptimalSettings(options.platform || 'android', options.quality);
-      
-      const ffmpegCommand = [
-        'ffmpeg',
-        '-i', options.inputPath,
-        // Convert to H.264 (fixes H.265 issues)
-        '-c:v', 'libx264',
-        '-preset', 'medium',
-        '-crf', settings.crf,
-        '-maxrate', settings.maxBitrate,
-        '-bufsize', settings.bufsize,
-        '-pix_fmt', 'yuv420p',
-        '-vf', `scale=${settings.scale}`,
-        // Audio settings
-        '-c:a', settings.audioCodec,
-        '-b:a', settings.audioBitrate,
-        // Optimization for streaming
-        '-movflags', '+faststart',
-        '-y'
-      ];
-
-      // Add duration limit if specified
-      if (options.maxDuration) {
-        ffmpegCommand.splice(ffmpegCommand.indexOf('-i') + 2, 0, '-t', options.maxDuration.toString());
-      }
-      
-      ffmpegCommand.push(outputPath);
-
-      console.log('🔧 FFmpeg H.264 conversion command:', ffmpegCommand.join(' '));
-      await execAsync(ffmpegCommand.join(' '));
-
-      // Get new metadata
-      const newMetadata = await this.getVideoMetadata(outputPath);
-      
-      // Upload converted video
-      const uploadResult = await this.uploadFile(outputPath, 'video/mp4');
-      
-      // Cleanup local file
-      if (fs.existsSync(outputPath)) {
-        fs.unlinkSync(outputPath);
-      }
-
-      if (uploadResult.success) {
-        return {
-          success: true,
-          outputPath: uploadResult.publicUrl,
-          metadata: newMetadata
-        };
-      } else {
-        return { success: false, error: uploadResult.error };
-      }
-
-    } catch (error) {
-      console.error('H.264 conversion failed:', error);
-      return { 
-        success: false, 
-        error: error instanceof Error ? error.message : 'H.264 conversion failed' 
-      };
-    }
-  }
-
-  /**
-   * Get optimal video settings for target platform
-   */
-  private getOptimalSettings(platform: string, quality: string = 'medium') {
-    const baseSettings = {
-      android: {
-        videoCodec: 'libx264',
-        preset: 'medium',
-        crf: '23',
-        maxBitrate: '5M',
-        bufsize: '10M',
-        pixelFormat: 'yuv420p',
-        scale: 'min(1920,iw):-2:min(1080,ih)', // Max 1080p
-        audioCodec: 'aac',
-        audioBitrate: '128k'
-      },
-      ios: {
-        videoCodec: 'libx264',
-        preset: 'medium',
-        crf: '23',
-        maxBitrate: '10M',
-        bufsize: '20M',
-        pixelFormat: 'yuv420p',
-        scale: 'min(3840,iw):-2:min(2160,ih)', // Max 4K
-        audioCodec: 'aac',
-        audioBitrate: '128k'
-      }
-    };
-
-    // Adjust for quality
-    if (quality === 'low') {
-      baseSettings.android.crf = '28';
-      baseSettings.android.maxBitrate = '2M';
-      baseSettings.ios.crf = '28';
-      baseSettings.ios.maxBitrate = '4M';
-    } else if (quality === 'high') {
-      baseSettings.android.crf = '18';
-      baseSettings.android.maxBitrate = '8M';
-      baseSettings.ios.crf = '18';
-      baseSettings.ios.maxBitrate = '15M';
-    }
-
-    return baseSettings[platform as keyof typeof baseSettings] || baseSettings.android;
-  }
-
-  /**
-   * Upload file to storage
-   */
-  private async uploadFile(filePath: string, contentType: string): Promise<{ success: boolean; publicUrl?: string; error?: string }> {
-    try {
-      const fileContent = fs.readFileSync(filePath);
-      const fileName = path.basename(filePath);
-      
-      const { data, error } = await this.storageClient
-        .from('media')
-        .upload(fileName, fileContent, {
-          contentType,
-          cacheControl: '3600',
-          upsert: false,
-        });
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      const { data: publicUrlData } = this.storageClient
-        .from('media')
-        .getPublicUrl(data.path);
-
-      return {
-        success: true,
-        publicUrl: publicUrlData.publicUrl
-      };
-
-    } catch (error) {
-      console.error('Upload failed:', error);
-      return { 
-        success: false, 
-        error: error instanceof Error ? error.message : 'Upload failed' 
       };
     }
   }
