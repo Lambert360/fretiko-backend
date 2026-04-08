@@ -432,7 +432,7 @@ export class UsersService {
         related_content_type,
         created_at,
         warned_by,
-        staff_accounts:staff_accounts!warned_by(
+        staff_accounts!warned_by(
           id,
           full_name,
           email
