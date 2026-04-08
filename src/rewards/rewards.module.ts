@@ -8,9 +8,10 @@ import { ConfigModule } from '@nestjs/config';
 import { RewardsController } from './rewards.controller';
 import { RewardsService } from './rewards.service';
 import { RewardsSchedulerService } from './rewards-scheduler.service';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [ConfigModule],
+  imports: [ConfigModule, AuthModule],
   controllers: [RewardsController],
   providers: [
     RewardsService,
