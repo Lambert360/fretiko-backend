@@ -44,7 +44,7 @@ export class VideoProcessingService {
     this.storageClient = new StorageClient(
       process.env.SUPABASE_URL + '/storage/v1',
       {
-        apikey: process.env.SUPABASE_ANON_KEY || '',
+        apikey: process.env.SUPABASE_KEY || '',
       }
     );
   }
@@ -563,7 +563,7 @@ export class VideoProcessingService {
         maxBitrate: '5M',
         bufsize: '10M',
         pixelFormat: 'yuv420p',
-        scale: 'min(1920,iw):-2:min(1080,ih)', // Max 1080p
+        scale: '1920:1080', // Max 1080p
         audioCodec: 'aac',
         audioBitrate: '128k'
       },
@@ -574,7 +574,7 @@ export class VideoProcessingService {
         maxBitrate: '10M',
         bufsize: '20M',
         pixelFormat: 'yuv420p',
-        scale: 'min(3840,iw):-2:min(2160,ih)', // Max 4K
+        scale: '1920:1080', // Max 1080p for compatibility
         audioCodec: 'aac',
         audioBitrate: '128k'
       }

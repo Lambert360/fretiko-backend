@@ -3,6 +3,7 @@ import { StorageClient } from '@supabase/storage-js';
 import { Worker } from 'worker_threads';
 import path from 'path';
 import fs from 'fs';
+import { createClient } from '@supabase/supabase-js';
 
 export interface VideoProcessingJob {
   id: string;
@@ -27,13 +28,20 @@ export class BackgroundVideoProcessor {
   private activeWorkers: Map<string, Worker> = new Map();
   private maxConcurrentJobs = 3;
   private storageClient: StorageClient;
+  private supabase: any;
 
   constructor() {
     this.storageClient = new StorageClient(
       process.env.SUPABASE_URL + '/storage/v1',
       {
-        apikey: process.env.SUPABASE_ANON_KEY || '',
+        apikey: process.env.SUPABASE_KEY || '',
       }
+    );
+    
+    // Initialize Supabase client for database operations
+    this.supabase = createClient(
+      process.env.SUPABASE_URL || '',
+      process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || ''
     );
     
     // Start processing loop
@@ -224,15 +232,31 @@ export class BackgroundVideoProcessor {
    */
   private async updateServiceVideo(serviceId: string, processedVideoUrl: string): Promise<void> {
     try {
-      // This would update the service in your database
-      // Implementation depends on your database structure
-      console.log(`📝 Updated service ${serviceId} with processed video: ${processedVideoUrl}`);
+      console.log(`\ud83d\udcdd Updating chat file upload ${serviceId} with processed video: ${processedVideoUrl}`);
       
-      // Example: await this.db.services.update(serviceId, { 
-      //   processedVideoUrl,
-      //   videoProcessed: true,
-      //   videoProcessedAt: new Date()
-      // });
+      // Update the chat_file_uploads table with the processed video URL
+      const { error } = await this.supabase
+        .from('chat_file_uploads')
+        .update({
+          public_url: processedVideoUrl,
+          metadata: {
+            videoProcessing: {
+              processing: false,
+              processed: true,
+              processedVideoUrl,
+              processedAt: new Date().toISOString()
+            }
+          }
+        })
+        .eq('message_id', serviceId)
+        .eq('file_type', 'video');
+
+      if (error) {
+        console.error('Failed to update chat file upload:', error);
+        throw error;
+      }
+      
+      console.log(`\u2705 Successfully updated chat file upload ${serviceId} with processed video`);
       
     } catch (error) {
       console.error('Failed to update service video:', error);
