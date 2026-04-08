@@ -422,6 +422,7 @@ export class UsersService {
    * Get current user's warnings
    */
   async getMyWarnings(userId: string) {
+    // First, get warnings without the problematic relationship
     const { data: warnings, error } = await this.supabase
       .from('user_warnings')
       .select(`
@@ -431,12 +432,7 @@ export class UsersService {
         related_content_id,
         related_content_type,
         created_at,
-        warned_by,
-        staff_accounts!warned_by(
-          id,
-          full_name,
-          email
-        )
+        warned_by
       `)
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
@@ -445,18 +441,46 @@ export class UsersService {
       throw new Error(`Failed to fetch warnings: ${error.message}`);
     }
 
-    return (warnings || []).map((warning: any) => ({
+    // If no warnings or no staff references, return as-is
+    if (!warnings || warnings.length === 0) {
+      return [];
+    }
+
+    // Get unique staff IDs from warnings
+    const staffIds = [...new Set(warnings
+      .filter(w => w.warned_by)
+      .map(w => w.warned_by)
+    )];
+
+    // Fetch staff information separately to avoid RLS recursion
+    let staffMap: { [key: string]: any } = {};
+    if (staffIds.length > 0) {
+      const { data: staffData, error: staffError } = await this.supabase
+        .from('staff_accounts')
+        .select('id, full_name, email')
+        .in('id', staffIds);
+
+      if (!staffError && staffData) {
+        staffMap = staffData.reduce((acc, staff) => {
+          acc[staff.id] = staff;
+          return acc;
+        }, {});
+      }
+    }
+
+    // Combine warnings with staff information
+    return warnings.map((warning: any) => ({
       id: warning.id,
       severity: warning.severity,
       reason: warning.reason,
       relatedContentId: warning.related_content_id,
       relatedContentType: warning.related_content_type,
       createdAt: warning.created_at,
-      warnedBy: warning.staff_accounts
+      warnedBy: warning.warned_by && staffMap[warning.warned_by]
         ? {
-            id: warning.staff_accounts.id,
-            fullName: warning.staff_accounts.full_name,
-            email: warning.staff_accounts.email,
+            id: staffMap[warning.warned_by].id,
+            fullName: staffMap[warning.warned_by].full_name,
+            email: staffMap[warning.warned_by].email,
           }
         : null,
     }));
