@@ -42,6 +42,7 @@ import { ReportsModule } from './reports/reports.module';
 import { AuditModule } from './audit/audit.module';
 import { GiftModule } from './gifts/gift.module';
 import { LoggerModule } from './logger/logger.module';
+import { VideoProcessingModule } from './video-processing/video-processing.module';
 
 @Module({
   imports: [
@@ -89,6 +90,7 @@ import { LoggerModule } from './logger/logger.module';
     ReportsModule,
     AuditModule,
     GiftModule,
+    VideoProcessingModule,
   ],
   controllers: [AppController, ExchangeRateController],
   providers: [
