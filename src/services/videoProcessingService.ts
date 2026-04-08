@@ -497,15 +497,18 @@ export class VideoProcessingService {
         '-i', options.inputPath,
         // Convert to H.264 (fixes H.265 issues)
         '-c:v', 'libx264',
-        '-preset', 'medium',
+        '-preset', 'veryfast', // Faster encoding for mobile
         '-crf', settings.crf,
         '-maxrate', settings.maxBitrate,
         '-bufsize', settings.bufsize,
         '-pix_fmt', 'yuv420p',
+        '-profile:v', 'baseline', // Maximum compatibility
+        '-level', '3.0', // Mobile-friendly level
         '-vf', `scale=${settings.scale}`,
         // Audio settings
         '-c:a', settings.audioCodec,
         '-b:a', settings.audioBitrate,
+        '-ar', '44100', // Standard sample rate
         // Optimization for streaming
         '-movflags', '+faststart',
         '-y'
