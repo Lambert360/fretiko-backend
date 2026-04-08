@@ -11,9 +11,12 @@ import { NotificationsService } from './notifications.service';
 import { NotificationHelperService } from './notification-helper.service';
 import { NotificationsGateway } from './notifications.gateway';
 import { PushNotificationService } from './push-notification.service';
+import { AuthModule } from '../auth/auth.module';
+import { forwardRef } from '@nestjs/common';
 
 @Module({
   imports: [
+    AuthModule,
     ConfigModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],

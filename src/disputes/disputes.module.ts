@@ -5,9 +5,11 @@ import { DisputesController } from './disputes.controller';
 import { EscrowModule } from '../escrow/escrow.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { RealtimeModule } from '../realtime/realtime.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     ConfigModule,
     forwardRef(() => EscrowModule),
     NotificationsModule,
