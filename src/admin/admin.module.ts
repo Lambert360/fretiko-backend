@@ -25,9 +25,11 @@ import { GiftModule } from '../gifts/gift.module';
 import { EmailService as AuthEmailService } from '../auth/email.service';
 import { EmailService as SharedEmailService } from '../shared/email.service';
 import { EscrowModule } from '../escrow/escrow.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     ConfigModule,
     EventEmitterModule.forRoot(), // For event-based notifications
     JwtModule.registerAsync({

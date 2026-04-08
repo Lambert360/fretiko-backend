@@ -2,8 +2,10 @@ import { Module } from '@nestjs/common';
 import { VideoProcessingController } from './video-processing.controller';
 import { VideoProcessingService } from '../services/videoProcessingService';
 import { BackgroundVideoProcessor } from '../services/backgroundVideoProcessor';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
+  imports: [AuthModule],
   controllers: [VideoProcessingController],
   providers: [
     VideoProcessingService,
