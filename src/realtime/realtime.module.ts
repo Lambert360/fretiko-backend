@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
-import { JwtModule } from '@nestjs/jwt';
 import { RealtimeGateway } from './realtime.gateway';
 import { RealtimeService } from './realtime.service';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [JwtModule],
+  imports: [AuthModule],
   providers: [RealtimeGateway, RealtimeService],
   exports: [RealtimeGateway, RealtimeService],
 })

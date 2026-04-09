@@ -14,8 +14,9 @@ import { ConfigService } from '@nestjs/config';
 import { LiveSalesService } from './live-sales.service';
 import { AnalyticsService } from '../analytics/analytics.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
-import { createSupabaseClient } from '../shared/supabase.client';
 import { GiftService } from '../gifts/gift.service';
+import { JwtService } from '@nestjs/jwt';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 
 /**
  * Live Stream WebSocket Gateway
@@ -61,8 +62,9 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
     private readonly analyticsService: AnalyticsService,
     private readonly configService: ConfigService,
     private readonly giftService: GiftService,
+    private readonly jwtService: JwtService,
   ) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   private async getVendorIdForStream(streamId: string): Promise<string | null> {
@@ -120,38 +122,39 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       // Attempt to authenticate on connection if token is provided
       if (token) {
         try {
-          const { data: { user }, error } = await this.supabase.auth.getUser(token);
+          // Validate JWT token with our custom JWT service
+          const decoded = this.jwtService.verify(token) as any;
           
-          if (error || !user) {
-            this.logger.warn(`Invalid token on connection: ${client.id}`, error?.message);
+          if (!decoded || !decoded.sub) {
+            this.logger.warn(`Invalid token on connection: ${client.id}`);
             this.connectedUsers.set(client.id, {
               userId: 'anonymous',
               role: 'viewer',
               accessToken: undefined,
             });
           } else {
-            this.logger.log(`Authenticated user on connection: ${user.id}`);
+            this.logger.log(`Authenticated user on connection: ${decoded.sub}`);
             this.connectedUsers.set(client.id, {
-              userId: user.id,
+              userId: decoded.sub,
               role: 'viewer',
               accessToken: token,  // Store token for user-authenticated operations
             });
             // Join vendor room if user is a vendor
-            if (user.user_metadata?.is_seller || user.user_metadata?.is_vendor) {
-              client.join(`vendor:${user.id}`);
+            if (decoded.is_seller || decoded.is_rider) {
+              client.join(`vendor:${decoded.sub}`);
               this.connectedUsers.get(client.id)!.role = 'vendor';
             }
 
             // Emit authentication confirmation to client (industry standard)
             const authData = {
               success: true,
-              userId: user.id,
+              userId: decoded.sub,
               role: this.connectedUsers.get(client.id)?.role || 'viewer',
               timestamp: new Date().toISOString()
             };
 
             client.emit('authenticated', authData);
-            this.logger.log(`✅ Authentication event emitted to client ${client.id} for user: ${user.id} (role: ${authData.role})`);
+            this.logger.log(`Authentication event emitted to client ${client.id} for user: ${decoded.sub} (role: ${authData.role})`);
           }
         } catch (authError) {
           this.logger.warn(`Auth error on connection: ${client.id}`, authError.message);
@@ -259,22 +262,22 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         return;
       }
 
-      // Verify JWT token using Supabase Auth
-      const { data: { user }, error } = await this.supabase.auth.getUser(data.token);
+      // Verify JWT token using our custom JWT service
+      const decoded = this.jwtService.verify(data.token) as any;
       
-      if (error || !user) {
-        this.logger.warn(`Authentication failed: ${client.id}`, error?.message);
+      if (!decoded || !decoded.sub) {
+        this.logger.warn(`Authentication failed: ${client.id}`, 'Invalid token');
         client.emit('authentication_error', { 
-          message: error?.message || 'Invalid token' 
+          message: 'Invalid token' 
         });
         return;
       }
 
       // Verify userId matches token payload (if provided)
-      if (data.userId && data.userId !== user.id) {
+      if (data.userId && data.userId !== decoded.sub) {
         this.logger.warn(`User ID mismatch: ${client.id}`, {
           provided: data.userId,
-          token: user.id
+          token: decoded.sub
         });
         client.emit('authentication_error', { 
           message: 'User ID does not match token' 
@@ -285,39 +288,39 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       // Update user info with authenticated user
       const userInfo = this.connectedUsers.get(client.id);
       if (userInfo) {
-        userInfo.userId = user.id;
-        userInfo.role = user.user_metadata?.is_seller || user.user_metadata?.is_vendor 
+        userInfo.userId = decoded.sub;
+        userInfo.role = decoded.is_seller || decoded.is_rider 
           ? 'vendor' 
           : 'viewer';
         this.connectedUsers.set(client.id, userInfo);
         
         // Join vendor room if user is a vendor
         if (userInfo.role === 'vendor') {
-          client.join(`vendor:${user.id}`);
+          client.join(`vendor:${decoded.sub}`);
         }
       } else {
         // Create new entry if doesn't exist
         this.connectedUsers.set(client.id, {
-          userId: user.id,
-          role: user.user_metadata?.is_seller || user.user_metadata?.is_vendor 
+          userId: decoded.sub,
+          role: decoded.is_seller || decoded.is_rider 
             ? 'vendor' 
             : 'viewer',
         });
         if (this.connectedUsers.get(client.id)!.role === 'vendor') {
-          client.join(`vendor:${user.id}`);
+          client.join(`vendor:${decoded.sub}`);
         }
       }
 
       // Emit authentication confirmation to client (industry standard)
       const authData = {
         success: true,
-        userId: user.id,
+        userId: decoded.sub,
         role: this.connectedUsers.get(client.id)?.role || 'viewer',
         timestamp: new Date().toISOString()
       };
 
       client.emit('authenticated', authData);
-      this.logger.log(`✅ Authentication event emitted to client ${client.id} for user: ${user.id} (role: ${authData.role})`);
+      this.logger.log(`Authentication event emitted to client ${client.id} for user: ${decoded.sub} (role: ${authData.role})`);
     } catch (error) {
       this.logger.error(`Authentication error: ${client.id}`, error);
       client.emit('authentication_error', { 
