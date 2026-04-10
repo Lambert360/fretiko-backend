@@ -50,8 +50,14 @@ export class JwtAuthGuard implements CanActivate {
           throw new Error('Invalid token format');
         }
         
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-        decoded = payload;
+        // Verify signature using JWT_SECRET from environment
+        const jwt = require('jsonwebtoken');
+        const JWT_SECRET = process.env.JWT_SECRET;
+        if (!JWT_SECRET) {
+          throw new Error('JWT_SECRET not configured');
+        }
+        
+        decoded = jwt.verify(token, JWT_SECRET) as any;
       }
       
       if (!decoded || typeof decoded !== 'object') {
