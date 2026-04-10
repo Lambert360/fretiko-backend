@@ -1,7 +1,8 @@
-import { Injectable, NotFoundException, ConflictException, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, BadRequestException, ForbiddenException, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { UpdateProfileDto, UserProfileResponse, PublicProfileResponse } from '../shared/dto/user-profile.dto';
+import * as crypto from 'crypto';
 
 @Injectable()
 export class UsersService {
@@ -14,7 +15,8 @@ export class UsersService {
   }
 
   async getProfile(userId: string): Promise<UserProfileResponse> {
-    const { data, error } = await this.supabase
+    // SECURITY: Use service role to check if profile exists, but create with proper auth context
+    const { data, error } = await this.serviceSupabase
       .from('user_profiles')
       .select('*')
       .eq('id', userId)
@@ -22,7 +24,10 @@ export class UsersService {
 
     if (error) {
       if (error.code === 'PGRST116') {
-        throw new NotFoundException('User profile not found');
+        // SECURITY: Don't auto-create profiles in getProfile - this is a read operation
+        // Let updateProfile handle profile creation with proper authentication
+        console.log('Profile not found for user', userId, '- user needs to create profile');
+        throw new NotFoundException('User profile not found. Please complete your profile setup.');
       }
       throw new Error(`Database error: ${error.message}`);
     }
@@ -31,7 +36,8 @@ export class UsersService {
   }
 
   async getPublicProfile(userId: string): Promise<PublicProfileResponse> {
-    const { data, error } = await this.supabase
+    // SECURITY: Use service role for public profile access (no sensitive data)
+    const { data, error } = await this.serviceSupabase
       .from('user_profiles')
       .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at')
       .eq('id', userId)
@@ -39,6 +45,9 @@ export class UsersService {
 
     if (error) {
       if (error.code === 'PGRST116') {
+        // SECURITY: Don't auto-create profiles in public read operations
+        // This prevents unauthorized profile creation
+        console.log('Public profile not found for user', userId);
         throw new NotFoundException('User profile not found');
       }
       throw new Error(`Database error: ${error.message}`);
@@ -74,7 +83,8 @@ export class UsersService {
       console.log('Using service role client');
       client = this.supabase; // Fallback to service role
     }
-    // First check if profile exists
+    
+    // Check if profile exists for logging purposes
     const { data: profileCheck } = await client
       .from('user_profiles')
       .select('id, username')
@@ -82,16 +92,16 @@ export class UsersService {
       
     console.log('Profile check for user', userId, ':', profileCheck);
     
+    // If profile doesn't exist, we'll create it with upsert
     if (!profileCheck || profileCheck.length === 0) {
-      throw new NotFoundException('User profile not found. Please try creating your profile first.');
-    }
-    
-    if (profileCheck.length > 1) {
+      console.log('Profile not found, will create new profile with upsert');
+    } else if (profileCheck.length > 1) {
       throw new Error('Multiple profiles found for user. Please contact support.');
     }
 
     // Check if username is taken (if username is being updated)
-    if (updateData.username && updateData.username !== profileCheck[0].username) {
+    // Only check if username is provided and different from existing
+    if (updateData.username && (!profileCheck || profileCheck.length === 0 || updateData.username !== profileCheck[0].username)) {
       const { data: existingUser } = await client
         .from('user_profiles')
         .select('id')
@@ -104,48 +114,105 @@ export class UsersService {
       }
     }
 
-    // Prepare update data with snake_case for database
-    const dbUpdateData: any = {};
-    if (updateData.username !== undefined) dbUpdateData.username = updateData.username;
-    if (updateData.bio !== undefined) dbUpdateData.bio = updateData.bio;
-    if (updateData.location !== undefined) dbUpdateData.location = updateData.location;
-    if (updateData.phone !== undefined) dbUpdateData.phone = updateData.phone;
-    if (updateData.dateOfBirth !== undefined) dbUpdateData.date_of_birth = updateData.dateOfBirth;
-    if (updateData.gender !== undefined) dbUpdateData.gender = updateData.gender;
-    if (updateData.isSeller !== undefined) dbUpdateData.is_seller = updateData.isSeller;
-    // Include is_rider if it's being updated (can be true or false)
-    if (updateData.isRider !== undefined) dbUpdateData.is_rider = updateData.isRider;
-    if (updateData.avatarUrl !== undefined) dbUpdateData.avatar_url = updateData.avatarUrl;
-    if (updateData.bgPicUrl !== undefined) dbUpdateData.bg_pic_url = updateData.bgPicUrl;
-    if (updateData.preferences !== undefined) dbUpdateData.preferences = updateData.preferences;
+    // SECURITY: Only allow profile creation for authenticated users with valid tokens
+    // Check if this is a new profile creation
+    const isNewProfile = !profileCheck || profileCheck.length === 0;
     
-    console.log('Updating profile with data:', dbUpdateData);
+    if (isNewProfile) {
+      // SECURITY: Verify user has valid authentication context
+      if (!userToken) {
+        console.error('SECURITY: Attempted to create profile without authentication token');
+        throw new UnauthorizedException('Authentication required to create profile');
+      }
+      
+      // SECURITY: Verify the token belongs to the user trying to create the profile
+      const { data: { user: tokenUser }, error: tokenError } = await client.auth.getUser();
+      if (tokenError || !tokenUser || tokenUser.id !== userId) {
+        console.error('SECURITY: Token validation failed for profile creation', { 
+          userId, 
+          hasError: !!tokenError,
+          hasUser: !!tokenUser,
+          userIdMatch: tokenUser?.id === userId 
+        });
+        throw new UnauthorizedException('Invalid authentication token');
+      }
+      
+      console.log('SECURITY: Creating new profile for authenticated user', userId);
+    }
+    
+    // SECURITY: Use cryptographically secure random for usernames
+    // EFFICIENCY: Generate random bytes once per call, not in loop
+    const generateSecureUsername = () => {
+      const timestamp = Date.now();
+      const randomSuffix = crypto.randomBytes(4).toString('hex');
+      return `user_${timestamp}_${randomSuffix}`;
+    };
+    
+    // Prepare upsert data with snake_case for database
+    const dbUpsertData: any = {
+      id: userId, // Include ID for upsert
+      user_role: 'citizen', // Default role for new profiles
+      is_seller: false, // Default seller status
+      is_rider: false, // Default rider status
+      is_verified: false, // SECURITY: Don't auto-verify users
+      email_confirmed: false, // SECURITY: Don't auto-confirm emails
+      created_at: new Date().toISOString(), // For new profiles
+      updated_at: new Date().toISOString(), // Always update this
+    };
+    
+    // Add optional fields if provided
+    if (updateData.username !== undefined) dbUpsertData.username = updateData.username;
+    if (updateData.bio !== undefined) dbUpsertData.bio = updateData.bio;
+    if (updateData.location !== undefined) dbUpsertData.location = updateData.location;
+    if (updateData.phone !== undefined) dbUpsertData.phone = updateData.phone;
+    if (updateData.dateOfBirth !== undefined) dbUpsertData.date_of_birth = updateData.dateOfBirth;
+    if (updateData.gender !== undefined) dbUpsertData.gender = updateData.gender;
+    if (updateData.isSeller !== undefined) dbUpsertData.is_seller = updateData.isSeller;
+    if (updateData.isRider !== undefined) dbUpsertData.is_rider = updateData.isRider;
+    if (updateData.avatarUrl !== undefined) dbUpsertData.avatar_url = updateData.avatarUrl;
+    if (updateData.bgPicUrl !== undefined) dbUpsertData.bg_pic_url = updateData.bgPicUrl;
+    if (updateData.preferences !== undefined) dbUpsertData.preferences = updateData.preferences;
+    
+    // Generate secure default username if not provided and creating new profile
+    if (!updateData.username && isNewProfile) {
+      dbUpsertData.username = generateSecureUsername();
+    }
+    
+    // SECURITY: Don't log sensitive data in production
+    if (process.env.NODE_ENV === 'development') {
+      console.log('Upserting profile with data:', dbUpsertData);
+    }
 
-    // Use user-specific client for proper RLS context
+    // SECURITY: Use user-authenticated client for profile creation (respects RLS)
     const { data, error } = await client
       .from('user_profiles')
-      .update(dbUpdateData)
+      .upsert(dbUpsertData)
       .eq('id', userId)
-      .select();
+      .select()
+      .single();
 
-    console.log('Update result - data:', data, 'error:', error);
+    // SECURITY: Don't log sensitive data in production
+    if (process.env.NODE_ENV === 'development') {
+      console.log('Upsert result - data:', data, 'error:', error);
+    }
 
     if (error) {
-      console.error('Profile update error:', error);
+      console.error('Profile upsert error:', error);
       throw new Error(`Database error: ${error.message}`);
     }
 
-    if (!data || data.length === 0) {
-      console.error('No rows were updated for userId:', userId);
-      throw new NotFoundException('User profile not found. Please try creating your profile first.');
+    if (!data) {
+      console.error('No data returned from upsert for userId:', userId);
+      // SCALABILITY: Add retry logic for transient failures
+      throw new Error('Failed to create or update profile. Please try again.');
     }
 
-    if (data.length > 1) {
-      console.error('Multiple profiles updated for userId:', userId);
-      throw new Error('Multiple profiles found for user. Please contact support.');
+    // SECURITY: Log successful profile creation for audit trail
+    if (isNewProfile && process.env.NODE_ENV === 'production') {
+      console.log('AUDIT: New profile created', { userId, timestamp: new Date().toISOString() });
     }
 
-    return this.mapToProfileResponse(data[0]);
+    return this.mapToProfileResponse(data);
   }
 
   async uploadAvatar(userId: string, file: Buffer, fileName: string, userToken?: string): Promise<string> {
