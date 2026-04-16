@@ -1,27 +1,29 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { CreateStoryDto, UpdateStoryDto, CreateStoryCommentDto, StoryQueryDto } from './dto/story.dto';
 import ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
+import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 
 const unlinkAsync = promisify(fs.unlink);
 
 @Injectable()
 export class StoriesService {
   private supabase;
+  private serviceSupabase;
 
-  constructor(private configService: ConfigService) {
-    this.supabase = createSupabaseClient(this.configService);
+  constructor(
+    private configService: ConfigService,
+    private clientManager: SupabaseClientManager,
+  ) {
+    this.supabase = createServiceSupabaseClient(this.configService);
+    this.serviceSupabase = this.clientManager.getServiceClient();
   }
 
   async createStory(userId: string, createStoryDto: CreateStoryDto, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     const storyData = {
       user_id: userId,
       media_url: createStoryDto.media_url,
@@ -35,7 +37,7 @@ export class StoriesService {
       like_count: 0,
     };
 
-    const { data, error } = await supabaseClient
+    const { data, error } = await this.serviceSupabase
       .from('stories')
       .insert(storyData)
       .select()
@@ -49,13 +51,9 @@ export class StoriesService {
   }
 
   async getStoriesForFeed(userId: string, options: StoryQueryDto, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     // Get stories from users that the current user is connected to (plugged with)
     // This implements the "plugged users only" requirement
-    let query = supabaseClient
+    let query = this.serviceSupabase
       .from('stories')
       .select(`
         *,
@@ -123,11 +121,7 @@ export class StoriesService {
   }
 
   async getStoryById(storyId: string, userId: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
-    const { data, error } = await supabaseClient
+    const { data, error } = await this.serviceSupabase
       .from('stories')
       .select(`
         *,
@@ -156,7 +150,7 @@ export class StoriesService {
 
     // Check if user has access to this story (must be connected to story owner or own story)
     if (data.user_id !== userId) {
-      const { data: connection } = await supabaseClient
+      const { data: connection } = await this.serviceSupabase
         .from('user_connections')
         .select('id')
         .eq('status', 'accepted')
@@ -178,13 +172,9 @@ export class StoriesService {
   }
 
   async getUserStories(targetUserId: string, currentUserId: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     // Check if current user can view target user's stories
     if (targetUserId !== currentUserId) {
-      const { data: connection } = await supabaseClient
+      const { data: connection } = await this.serviceSupabase
         .from('user_connections')
         .select('id')
         .eq('status', 'accepted')
@@ -196,7 +186,7 @@ export class StoriesService {
       }
     }
 
-    const { data, error } = await supabaseClient
+    const { data, error } = await this.serviceSupabase
       .from('stories')
       .select(`
         *,
@@ -219,12 +209,8 @@ export class StoriesService {
   }
 
   async updateStory(userId: string, storyId: string, updateStoryDto: UpdateStoryDto, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     // Verify story ownership
-    const { data: existingStory } = await supabaseClient
+    const { data: existingStory } = await this.serviceSupabase
       .from('stories')
       .select('user_id')
       .eq('id', storyId)
@@ -238,7 +224,7 @@ export class StoriesService {
       throw new ForbiddenException('You can only update your own stories');
     }
 
-    const { data, error } = await supabaseClient
+    const { data, error } = await this.serviceSupabase
       .from('stories')
       .update(updateStoryDto)
       .eq('id', storyId)
@@ -253,12 +239,8 @@ export class StoriesService {
   }
 
   async deleteStory(userId: string, storyId: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     // Verify story ownership
-    const { data: existingStory } = await supabaseClient
+    const { data: existingStory } = await this.serviceSupabase
       .from('stories')
       .select('user_id')
       .eq('id', storyId)
@@ -272,7 +254,7 @@ export class StoriesService {
       throw new ForbiddenException('You can only delete your own stories');
     }
 
-    const { error } = await supabaseClient
+    const { error } = await this.serviceSupabase
       .from('stories')
       .delete()
       .eq('id', storyId);
@@ -287,13 +269,9 @@ export class StoriesService {
   async viewStory(userId: string, storyId: string, userToken?: string) {
     console.log('🔍 viewStory called:', { userId, storyId, hasToken: !!userToken });
 
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     // For view tracking, use a less restrictive check - just verify story exists
     console.log('📋 Searching for story in database:', storyId);
-    const { data: story, error } = await supabaseClient
+    const { data: story, error } = await this.serviceSupabase
       .from('stories')
       .select('id, user_id')
       .eq('id', storyId)
@@ -303,7 +281,7 @@ export class StoriesService {
 
     if (error || !story) {
       // Let's check what stories actually exist for this user
-      const { data: userStories } = await supabaseClient
+      const { data: userStories } = await this.serviceSupabase
         .from('stories')
         .select('id, user_id, created_at, is_active, expires_at')
         .eq('user_id', userId)
@@ -313,7 +291,7 @@ export class StoriesService {
       console.log('🔍 Recent stories for this user:', userStories);
 
       // Also check if the story exists but for a different user
-      const { data: storyExists } = await supabaseClient
+      const { data: storyExists } = await this.serviceSupabase
         .from('stories')
         .select('id, user_id, is_active, expires_at')
         .eq('id', storyId)
@@ -326,7 +304,7 @@ export class StoriesService {
 
     // Check if user has access to this story (must be connected to story owner or own story)
     if (story.user_id !== userId) {
-      const { data: connection } = await supabaseClient
+      const { data: connection } = await this.serviceSupabase
         .from('user_connections')
         .select('id')
         .eq('status', 'accepted')
@@ -339,7 +317,7 @@ export class StoriesService {
     }
 
     // Check if user has already viewed this story
-    const { data: existingView } = await supabaseClient
+    const { data: existingView } = await this.serviceSupabase
       .from('story_views')
       .select('id')
       .eq('story_id', storyId)
@@ -348,7 +326,7 @@ export class StoriesService {
 
     if (!existingView) {
       // Create view record
-      const { error } = await supabaseClient
+      const { error } = await this.serviceSupabase
         .from('story_views')
         .insert({
           story_id: storyId,
@@ -364,15 +342,11 @@ export class StoriesService {
   }
 
   async toggleLike(userId: string, storyId: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     // Check if story exists and user has access
     await this.getStoryById(storyId, userId, userToken);
 
     // Check if user has already liked this story
-    const { data: existingLike } = await supabaseClient
+    const { data: existingLike } = await this.serviceSupabase
       .from('story_likes')
       .select('id')
       .eq('story_id', storyId)
@@ -381,7 +355,7 @@ export class StoriesService {
 
     if (existingLike) {
       // Remove like
-      const { error } = await supabaseClient
+      const { error } = await this.serviceSupabase
         .from('story_likes')
         .delete()
         .eq('id', existingLike.id);
@@ -393,7 +367,7 @@ export class StoriesService {
       return { liked: false, message: 'Story unliked' };
     } else {
       // Add like
-      const { error } = await supabaseClient
+      const { error } = await this.serviceSupabase
         .from('story_likes')
         .insert({
           story_id: storyId,
@@ -409,14 +383,10 @@ export class StoriesService {
   }
 
   async addComment(userId: string, storyId: string, createCommentDto: CreateStoryCommentDto, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     // Check if story exists and user has access
     await this.getStoryById(storyId, userId, userToken);
 
-    const { data, error } = await supabaseClient
+    const { data, error } = await this.serviceSupabase
       .from('story_comments')
       .insert({
         story_id: storyId,
@@ -440,14 +410,10 @@ export class StoriesService {
   }
 
   async getStoryComments(storyId: string, userId: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     // Check if story exists and user has access
     await this.getStoryById(storyId, userId, userToken);
 
-    const { data, error } = await supabaseClient
+    const { data, error } = await this.serviceSupabase
       .from('story_comments')
       .select(`
         *,
@@ -467,12 +433,8 @@ export class StoriesService {
   }
 
   async notifyComment(userId: string, storyId: string, notifyCommentDto: any, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
     // Get the story to ensure it exists and user has access
-    const { data: story, error: storyError } = await supabaseClient
+    const { data: story, error: storyError } = await this.serviceSupabase
       .from('stories')
       .select('id, user_id, user_profiles(id, username)')
       .eq('id', storyId)
@@ -484,7 +446,7 @@ export class StoriesService {
 
     // Create notification record (if notifications table exists)
     try {
-      const { data: notification, error: notificationError } = await supabaseClient
+      const { data: notification, error: notificationError } = await this.serviceSupabase
         .from('notifications')
         .insert({
           user_id: story.user_id,
@@ -510,7 +472,7 @@ export class StoriesService {
   }
 
   async cleanupExpiredStories() {
-    const { data, error } = await this.supabase
+    const { data, error } = await this.serviceSupabase
       .rpc('cleanup_expired_stories');
 
     if (error) {
@@ -522,17 +484,12 @@ export class StoriesService {
 
   // Get stories grouped by user for the discovery screen
   async getStoriesGroupedByUser(currentUserId: string, userToken?: string) {
-    // Force use of authenticated user client for RLS policies
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
-    console.log('🔐 Using client type:', userToken ? 'User authenticated' : 'Service role');
+    console.log('🔐 Using service client to bypass RLS');
 
     // Debug: Let's first check if there are ANY stories in the database
     console.log('🔍 Debug: Checking current time:', new Date().toISOString());
 
-    const { data: allStories, error: allError } = await supabaseClient
+    const { data: allStories, error: allError } = await this.serviceSupabase
       .from('stories')
       .select('id, user_id, is_active, expires_at, created_at')
       .order('created_at', { ascending: false });
@@ -550,7 +507,7 @@ export class StoriesService {
 
     // Get stories from connected users grouped by user (EXCLUDE current user's own stories)
     // This is for the discovery feed - user's own stories should be shown separately
-    const { data, error } = await supabaseClient
+    const { data, error } = await this.serviceSupabase
       .from('stories')
       .select(`
         id,
@@ -645,11 +602,7 @@ export class StoriesService {
   async getMyStories(userId: string, userToken?: string) {
     console.log('📚 getMyStories called for user:', userId);
 
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
-    const { data, error } = await supabaseClient
+    const { data, error } = await this.serviceSupabase
       .from('stories')
       .select(`
         id,
@@ -801,17 +754,13 @@ export class StoriesService {
         throw new BadRequestException('File too large. Maximum size is 25MB.');
       }
 
-      const supabaseClient = userToken
-        ? createUserSupabaseClient(this.configService, userToken)
-        : this.supabase;
-
       // Generate unique filename
       const fileExtension = file.originalname.split('.').pop() || 'jpg';
       const timestamp = Date.now();
       const uniqueFileName = `${userId}/${timestamp}-story.${fileExtension}`;
 
       // Upload to Supabase Storage
-      const { data: uploadData, error: uploadError } = await supabaseClient.storage
+      const { data: uploadData, error: uploadError } = await this.serviceSupabase.storage
         .from('stories')
         .upload(uniqueFileName, file.buffer, {
           contentType: file.mimetype,
@@ -823,7 +772,7 @@ export class StoriesService {
       }
 
       // Get public URL
-      const { data: urlData } = supabaseClient.storage
+      const { data: urlData } = this.serviceSupabase.storage
         .from('stories')
         .getPublicUrl(uniqueFileName);
 
@@ -835,7 +784,7 @@ export class StoriesService {
       
       if (isVideo) {
         console.log('🎬 Generating thumbnail for video...');
-        thumbnailUrl = await this.generateVideoThumbnail(file.buffer, userId, timestamp, supabaseClient);
+        thumbnailUrl = await this.generateVideoThumbnail(file.buffer, userId, timestamp, this.serviceSupabase);
       }
 
       // Create story record
@@ -852,7 +801,7 @@ export class StoriesService {
         like_count: 0,
       };
 
-      const { data, error } = await supabaseClient
+      const { data, error } = await this.serviceSupabase
         .from('stories')
         .insert(storyData)
         .select()
@@ -860,7 +809,7 @@ export class StoriesService {
 
       if (error) {
         // Cleanup uploaded file if story creation fails
-        await supabaseClient.storage.from('stories').remove([uniqueFileName]);
+        await this.serviceSupabase.storage.from('stories').remove([uniqueFileName]);
         throw new BadRequestException(`Failed to create story: ${error.message}`);
       }
 

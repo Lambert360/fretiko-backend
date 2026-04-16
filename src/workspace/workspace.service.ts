@@ -15,7 +15,7 @@ export class WorkspaceService {
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
   ) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService); // Service role client
   }
 

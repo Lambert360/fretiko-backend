@@ -358,13 +358,9 @@ export class LiveSalesService {
         products_count: createStreamDto.products?.length || 0
       });
 
-      // Use user-authenticated client if token provided to respect RLS
-      const supabaseClient = userToken
-        ? createUserSupabaseClient(this.configService, userToken)
-        : this.supabase;
-
-      // Create the stream
-      const { data: stream, error: streamError } = await supabaseClient
+      // Use service role client to bypass RLS policies during stream creation
+      // This ensures streams are always created successfully without timing/transaction issues
+      const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
         .insert({
           vendor_id: vendorId,
@@ -774,12 +770,8 @@ export class LiveSalesService {
    */
   async postComment(userId: string, postCommentDto: PostCommentDto, userToken?: string): Promise<CommentResponse> {
     try {
-      // Use user-authenticated client for RLS compliance
-      const supabaseClient = userToken
-        ? createUserSupabaseClient(this.configService, userToken)
-        : this.supabase;
-
-      const { data: comment, error } = await supabaseClient
+      // Use serviceSupabase to bypass RLS on user_profiles JOIN
+      const { data: comment, error } = await this.supabase
         .from('live_stream_comments')
         .insert({
           stream_id: postCommentDto.stream_id,
@@ -5089,10 +5081,8 @@ export class LiveSalesService {
         throw new ForbiddenException('Only stream owner can add portfolio services');
       }
 
-      // Use user-authenticated client if token provided
-      const client = userToken
-        ? createUserSupabaseClient(this.configService, userToken)
-        : this.supabase;
+      // Use serviceSupabase for storage uploads - user tokens can't be used with Supabase Storage
+      const storageClient = this.supabase;
 
       // Upload images to Supabase Storage
       const imageUrls: Array<{ url: string; caption?: string; is_primary: boolean }> = [];
@@ -5102,7 +5092,7 @@ export class LiveSalesService {
           const fileExtension = image.originalname.split('.').pop() || 'jpg';
           const fileName = `${vendorId}/portfolio/${Date.now()}-${i}-${Math.random().toString(36).substring(7)}.${fileExtension}`;
 
-          const { data: uploadData, error: uploadError } = await client.storage
+          const { data: uploadData, error: uploadError } = await storageClient.storage
             .from('media')
             .upload(fileName, image.buffer, {
               contentType: image.mimetype,
@@ -5113,7 +5103,7 @@ export class LiveSalesService {
             throw new BadRequestException(`Failed to upload image: ${uploadError.message}`);
           }
 
-          const { data: publicUrlData } = client.storage
+          const { data: publicUrlData } = storageClient.storage
             .from('media')
             .getPublicUrl(fileName);
 

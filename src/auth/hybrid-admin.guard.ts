@@ -4,8 +4,6 @@ import { ConfigService } from '@nestjs/config';
 
 import { JwtService } from '@nestjs/jwt';
 
-import { createSupabaseClient } from '../shared/supabase.client';
-
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 
 
@@ -38,7 +36,7 @@ export class HybridAdminGuard implements CanActivate {
 
   ) {
 
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
 
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
 

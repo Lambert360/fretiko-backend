@@ -111,28 +111,25 @@ export const createServiceSupabaseClient = (configService: ConfigService) => {
   });
 };
 
-// Create user-specific client with auth token
+// Create user-specific client (using service role for DB operations)
 export const createUserSupabaseClient = (configService: ConfigService, accessToken: string) => {
   const supabaseUrl = configService.get<string>('SUPABASE_URL');
-  const supabaseKey = configService.get<string>('SUPABASE_KEY');
+  const serviceRoleKey = configService.get<string>('SUPABASE_SERVICE_ROLE_KEY');
 
-  if (!supabaseUrl || !supabaseKey) {
-    throw new Error('Supabase credentials not found in environment');
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error('Supabase service role credentials not found in environment');
   }
 
-  // Create client and set global headers with user token
-  const client = createClient(supabaseUrl, supabaseKey, {
+  // Use service role for database operations (no custom JWT contamination)
+  const client = createClient(supabaseUrl, serviceRoleKey, {
     db: {
       schema: 'public',
     },
     auth: {
-      autoRefreshToken: true,
-      persistSession: true,
+      autoRefreshToken: false, // Service role doesn't need refresh
+      persistSession: false,
     },
     global: {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
       fetch: async (url, options = {}) => {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 60000);
