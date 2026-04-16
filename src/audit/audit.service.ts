@@ -48,15 +48,21 @@ export class AuditService {
 
       if (error) {
         this.logger.error(`Failed to log audit: ${error.message}`);
-        // Don't throw - audit logging should not break the main flow
         return { id: null };
       }
 
       return { id: data.id };
     } catch (error) {
-      this.logger.error(`Exception in logAction: ${error.message}`);
+      this.logger.error(`Audit logging error: ${error.message}`);
       return { id: null };
     }
+  }
+
+  /**
+   * Alias for logAction to match the interface used in logistics services
+   */
+  async log(logDto: LogAuditDto): Promise<{ id: string | null }> {
+    return this.logAction(logDto);
   }
 
   /**

@@ -42,6 +42,12 @@ import { ReportsModule } from './reports/reports.module';
 import { AuditModule } from './audit/audit.module';
 import { GiftModule } from './gifts/gift.module';
 import { LoggerModule } from './logger/logger.module';
+import { LogisticsPartnersModule } from './logistics-partners/logistics-partners.module';
+import { RiderVerificationModule } from './rider-verification/rider-verification.module';
+import { PartnershipsModule } from './partnerships/partnerships.module';
+import { PartnersModule } from './partners/partners.module';
+import { GeneralPartnershipsModule } from './general-partnerships/general-partnerships.module';
+import { WebsiteContentModule } from './website-content/website-content.module';
 
 @Module({
   imports: [
@@ -82,13 +88,18 @@ import { LoggerModule } from './logger/logger.module';
     DisputesModule,
     ContentReportsModule,
     AdminModule,
-    // Internal Tool Modules
-    StaffModule,
     DepartmentsModule,
     MemosModule,
     ReportsModule,
     AuditModule,
     GiftModule,
+    StaffModule,
+    LogisticsPartnersModule,
+    RiderVerificationModule,
+    PartnershipsModule,
+    PartnersModule,
+    GeneralPartnershipsModule,
+    WebsiteContentModule,
   ],
   controllers: [AppController, ExchangeRateController],
   providers: [

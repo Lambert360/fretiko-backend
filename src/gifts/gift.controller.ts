@@ -1,7 +1,6 @@
 import { Controller, Get, Post, Body, UseGuards, Req, Param, Put, Delete, Query } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AdminGuard } from '../auth/admin.guard';
-import { HybridAdminGuard } from '../auth/hybrid-admin.guard';
 import { GiftService } from './gift.service';
 import {
   CreateGiftDto,
@@ -110,8 +109,7 @@ export class GiftController {
    * Allows both admin role and staff with view_revenue permission
    */
   @Post('admin')
-  @UseGuards(HybridAdminGuard)
-  async createGift(@Req() req, @Body() dto: CreateGiftDto) {
+    async createGift(@Req() req, @Body() dto: CreateGiftDto) {
     return await this.giftService.createGift(dto);
   }
 
@@ -121,8 +119,7 @@ export class GiftController {
    * Allows both admin role and staff with view_revenue permission
    */
   @Put('admin/:id')
-  @UseGuards(HybridAdminGuard)
-  async updateGift(@Req() req, @Param('id') id: string, @Body() dto: UpdateGiftDto) {
+    async updateGift(@Req() req, @Param('id') id: string, @Body() dto: UpdateGiftDto) {
     return await this.giftService.updateGift(id, dto);
   }
 
@@ -132,8 +129,7 @@ export class GiftController {
    * Allows both admin role and staff with view_revenue permission
    */
   @Delete('admin/:id')
-  @UseGuards(HybridAdminGuard)
-  async deleteGift(@Req() req, @Param('id') id: string) {
+    async deleteGift(@Req() req, @Param('id') id: string) {
     await this.giftService.deleteGift(id);
     return { success: true, message: 'Gift deleted successfully' };
   }
@@ -144,8 +140,7 @@ export class GiftController {
    * Allows both admin role and staff with view_revenue permission
    */
   @Get('admin/all')
-  @UseGuards(HybridAdminGuard)
-  async getAllGifts(@Req() req) {
+    async getAllGifts(@Req() req) {
     return await this.giftService.getAllGiftsForAdmin();
   }
 }

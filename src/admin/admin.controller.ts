@@ -1,7 +1,6 @@
 import { Controller, Get, Post, Delete, Put, Patch, Query, Request, Body, Param, UseGuards, ValidationPipe, ForbiddenException, BadRequestException, HttpCode, HttpStatus } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { AdminNotificationsService } from './admin-notifications.service';
-import { HybridAdminGuard } from '../auth/hybrid-admin.guard';
 import type { CreateBankAccountDto, UpdateBankAccountDto } from '../wallet/bank-account.service';
 import { WithdrawRequestDto } from '../wallet/dto/wallet.dto';
 import { AdminForgotPasswordDto, AdminConfirmResetPasswordDto } from './dto/admin-forgot-password.dto';
@@ -76,8 +75,7 @@ export class AdminController {
    * Supports both regular admin users and staff users
    */
   @Get('revenue')
-  @UseGuards(HybridAdminGuard)
-  async getPlatformRevenue(
+    async getPlatformRevenue(
     @Request() req,
     @Query('start') start?: string,
     @Query('end') end?: string,
