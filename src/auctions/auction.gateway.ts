@@ -25,7 +25,14 @@ import { AuctionsService } from './auctions.service';
 @WebSocketGateway({
   namespace: '/auctions',
   cors: {
-    origin: '*', // Configure appropriately for production
+    origin: [
+      'http://localhost:3001',
+      'http://localhost:3000',
+      'https://fretiko.com',
+      'exp://*', // Expo development
+      'https://fretiko-backend.onrender.com'
+    ],
+    credentials: true,
   },
 })
 export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {

@@ -28,9 +28,11 @@ import { EmailService as SharedEmailService } from '../shared/email.service';
 import { EscrowModule } from '../escrow/escrow.module';
 import { PartnershipsModule } from '../partnerships/partnerships.module';
 import { WebsiteContentModule } from '../website-content/website-content.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     ConfigModule,
     EventEmitterModule.forRoot(), // For event-based notifications
     JwtModule.registerAsync({

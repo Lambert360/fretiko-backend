@@ -6,6 +6,7 @@ import { GiftService } from './gift.service';
 import { WalletModule } from '../wallet/wallet.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { RealtimeModule } from '../realtime/realtime.module';
+import { AuthModule } from '../auth/auth.module';
 
 /**
  * Gifts Module
@@ -19,6 +20,7 @@ import { RealtimeModule } from '../realtime/realtime.module';
  */
 @Module({
   imports: [
+    AuthModule,
     forwardRef(() => WalletModule),
     NotificationsModule,
     RealtimeModule,

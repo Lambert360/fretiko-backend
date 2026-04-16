@@ -6,9 +6,10 @@ import { RiderProfileController } from './rider-profile.controller';
 import { RiderProfileService } from './rider-profile.service';
 import { RiderOptimizationService } from './rider-optimization.service';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [ConfigModule, NotificationsModule],
+  imports: [AuthModule, ConfigModule, NotificationsModule],
   controllers: [RidersController, RiderProfileController],
   providers: [RidersService, RiderProfileService, RiderOptimizationService],
   exports: [RidersService, RiderProfileService, RiderOptimizationService],

@@ -102,6 +102,14 @@ export class SignInDto {
   })
   @IsNotEmpty({ message: 'Password is required' })
   password: string;
+
+  @IsString()
+  @IsOptional()
+  ipAddress?: string;
+
+  @IsString()
+  @IsOptional()
+  userAgent?: string;
 }
 
 export class MigrateAccountDto {

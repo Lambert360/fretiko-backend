@@ -34,6 +34,7 @@ import { ContentReportsModule } from './content-reports/content-reports.module';
 import { AdminModule } from './admin/admin.module';
 import { ExchangeRateController } from './shared/exchange-rate.controller';
 import { ExchangeRateService } from './shared/exchange-rate.service';
+import { HealthController } from './health/health.controller';
 // Internal Tool Modules
 import { StaffModule } from './staff/staff.module';
 import { DepartmentsModule } from './departments/departments.module';
@@ -48,6 +49,7 @@ import { PartnershipsModule } from './partnerships/partnerships.module';
 import { PartnersModule } from './partners/partners.module';
 import { GeneralPartnershipsModule } from './general-partnerships/general-partnerships.module';
 import { WebsiteContentModule } from './website-content/website-content.module';
+import { VideoProcessingModule } from './video-processing/video-processing.module';
 
 @Module({
   imports: [
@@ -100,8 +102,9 @@ import { WebsiteContentModule } from './website-content/website-content.module';
     PartnersModule,
     GeneralPartnershipsModule,
     WebsiteContentModule,
+    VideoProcessingModule,
   ],
-  controllers: [AppController, ExchangeRateController],
+  controllers: [AppController, ExchangeRateController, HealthController],
   providers: [
     AppService,
     ExchangeRateService,

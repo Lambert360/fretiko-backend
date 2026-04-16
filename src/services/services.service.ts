@@ -230,8 +230,7 @@ export class ServicesService {
         )
       `)
       .eq('status', 'active')
-      // Temporarily remove video filter to see if we have any services at all
-      // .not('videos', 'eq', '{}')  // Only services with videos
+      .not('videos', 'eq', '{}')  // Only services with videos
       .order('created_at', { ascending: false })  // Most recent first
       .limit(options.limit || 10);
 

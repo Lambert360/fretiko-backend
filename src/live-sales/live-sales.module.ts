@@ -8,6 +8,7 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { UsersModule } from '../users/users.module';
 import { GiftModule } from '../gifts/gift.module';
+import { AuthModule } from '../auth/auth.module';
 
 /**
  * Live Sales Module
@@ -20,6 +21,7 @@ import { GiftModule } from '../gifts/gift.module';
  */
 @Module({
   imports: [
+    AuthModule,
     AnalyticsModule,
     forwardRef(() => EscrowModule),
     NotificationsModule,

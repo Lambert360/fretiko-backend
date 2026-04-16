@@ -4,6 +4,7 @@ import { JwtService } from '@nestjs/jwt';
 import { createSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { SignUpDto, SignInDto, AuthResponse } from '../shared/dto/auth.dto';
 import { EmailService } from './email.service';
+import { TokenService } from './token.service';
 
 @Injectable()
 export class AuthService {
@@ -14,6 +15,7 @@ export class AuthService {
     private configService: ConfigService,
     private jwtService: JwtService,
     private emailService: EmailService,
+    private tokenService: TokenService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
@@ -208,10 +210,22 @@ export class AuthService {
       is_verified: completeProfileData?.is_verified || false,
     };
 
+    // Generate token pair for the newly created user
+    const deviceInfo = {
+      userAgent: userAgent || 'account_creation',
+      platform: 'unknown',
+    };
+    
+    const tokenPair = await this.tokenService.generateTokenPair(
+      data.user.id,
+      deviceInfo,
+      ipAddress || 'unknown'
+    );
+
     return {
       user: userData,
-      accessToken: '', // No session - user needs to sign in
-      refreshToken: '', // No session - user needs to sign in
+      accessToken: tokenPair.accessToken,
+      refreshToken: tokenPair.refreshToken,
     };
   }
 
@@ -300,11 +314,8 @@ export class AuthService {
     }
 
     // Send verification email
-    console.log('🔍 Initializing email service...');
-    const emailService = new (require('./email.service').EmailService)(this.configService);
-    
     console.log('🔍 Attempting to send verification email...');
-    const emailSent = await emailService.sendVerificationEmail(email, token);
+    const emailSent = await this.emailService.sendVerificationEmail(email, token, firstName, lastName);
     
     console.log('🔍 Email service result:', { emailSent, email, tokenLength: token.length });
 
@@ -324,7 +335,7 @@ export class AuthService {
     };
   }
 
-  async signIn(signInDto: SignInDto): Promise<AuthResponse> {
+  async signIn(signInDto: SignInDto, ipAddress?: string, userAgent?: string): Promise<AuthResponse> {
     const { email, password } = signInDto;
 
     console.log('🔍 SignIn Debug:', {
@@ -435,12 +446,24 @@ export class AuthService {
       is_verified: profileData?.is_verified,
     };
 
-    // Return Supabase session tokens with complete user profile
+    // Generate our custom token pair (7-day access + 30-day refresh)
+    const deviceInfo = {
+      userAgent: userAgent || 'signin_request',
+      platform: 'unknown',
+    };
+    
+    const tokenPair = await this.tokenService.generateTokenPair(
+      data.user.id,
+      deviceInfo,
+      ipAddress || 'unknown'
+    );
+
+    // Return our custom tokens with complete user profile
     // Industry standard: Allow suspended users to authenticate but mark them
     return {
       user: userData,
-      accessToken: data.session?.access_token || '',
-      refreshToken: data.session?.refresh_token || '',
+      accessToken: tokenPair.accessToken,
+      refreshToken: tokenPair.refreshToken,
       isSuspended: isSuspended, // Suspended users can authenticate but have limited access
     };
   }
@@ -565,7 +588,9 @@ export class AuthService {
       .from('user_profiles')
       .select(`
         id,
-        email_confirmed
+        email_confirmed,
+        first_name,
+        last_name
       `)
       .eq('email', email)
       .single();
@@ -584,6 +609,10 @@ export class AuthService {
     const expiresAt = new Date();
     expiresAt.setHours(expiresAt.getHours() + 24); // 24 hours
 
+    // Extract name from profile data
+    const firstName = profileData.first_name || '';
+    const lastName = profileData.last_name || '';
+
     // Update user profile with new token
     const { error: updateError } = await this.supabase
       .from('user_profiles')
@@ -598,8 +627,7 @@ export class AuthService {
     }
 
     // Send verification email
-    const emailService = new (require('./email.service').EmailService)(this.configService);
-    const emailSent = await emailService.sendVerificationEmail(email, token);
+    const emailSent = await this.emailService.sendVerificationEmail(email, token, firstName, lastName);
 
     if (!emailSent) {
       throw new Error('Failed to send verification email');
@@ -705,10 +733,22 @@ export class AuthService {
           is_verified: migratedProfileData?.is_verified,
         };
 
+        // Generate token pair for the migrated user
+        const deviceInfo = {
+          userAgent: 'account_migration',
+          platform: 'unknown',
+        };
+        
+        const tokenPair = await this.tokenService.generateTokenPair(
+          signInData.user.id,
+          deviceInfo,
+          'migration_ip'
+        );
+
         return {
           user: migratedUserData,
-          accessToken: signInData.session?.access_token || '',
-          refreshToken: signInData.session?.refresh_token || '',
+          accessToken: tokenPair.accessToken,
+          refreshToken: tokenPair.refreshToken,
         };
       }
 

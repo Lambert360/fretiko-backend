@@ -9,9 +9,11 @@ import { EscrowModule } from '../escrow/escrow.module';
 import { RewardsModule } from '../rewards/rewards.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { RealtimeModule } from '../realtime/realtime.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     ConfigModule,
     NotificationsModule,
     forwardRef(() => ChatModule),

@@ -1,0 +1,201 @@
+import AWS from 'aws-sdk';
+import { s3Config, validateS3Config } from '../config/s3.config';
+
+export class S3StorageService {
+  private s3: AWS.S3;
+  private cloudFront: AWS.CloudFront;
+
+  constructor() {
+    const validation = validateS3Config();
+    if (!validation.isValid) {
+      throw new Error(`Missing S3 configuration: ${validation.missing.join(', ')}`);
+    }
+
+    this.s3 = new AWS.S3({
+      accessKeyId: s3Config.accessKeyId,
+      secretAccessKey: s3Config.secretAccessKey,
+      region: s3Config.region
+    });
+
+    if (s3Config.cloudFrontDomain) {
+      this.cloudFront = new AWS.CloudFront({
+        accessKeyId: s3Config.accessKeyId,
+        secretAccessKey: s3Config.secretAccessKey,
+        region: s3Config.region
+      });
+    }
+  }
+
+  /**
+   * Upload file to S3 with proper content type and caching
+   */
+  async uploadFile(
+    fileBuffer: Buffer,
+    key: string,
+    contentType: string,
+    cacheControl: string = 'max-age=3600'
+  ): Promise<{ success: boolean; url?: string; error?: string }> {
+    try {
+      const params: AWS.S3.PutObjectRequest = {
+        Bucket: s3Config.bucket,
+        Key: key,
+        Body: fileBuffer,
+        ContentType: contentType,
+        CacheControl: cacheControl,
+        ACL: 'private' // Will use CloudFront OAC for access
+      };
+
+      const result = await this.s3.upload(params).promise();
+      
+      // Generate CloudFront URL if available
+      const url = s3Config.cloudFrontDomain 
+        ? `https://${s3Config.cloudFrontDomain}/${key}`
+        : `https://${s3Config.bucket}.s3.amazonaws.com/${key}`;
+
+      console.log(`✅ Uploaded to S3: ${key}`);
+      
+      return {
+        success: true,
+        url
+      };
+
+    } catch (error) {
+      console.error('❌ S3 upload failed:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown S3 upload error'
+      };
+    }
+  }
+
+  /**
+   * Upload HLS directory (multiple files)
+   */
+  async uploadHLSDirectory(
+    localDir: string,
+    remoteDir: string,
+    files: { name: string; content: Buffer; type: string }[]
+  ): Promise<{ success: boolean; urls?: { [key: string]: string }; error?: string }> {
+    try {
+      const uploadPromises = files.map(async (file) => {
+        const key = `${remoteDir}/${file.name}`;
+        const result = await this.uploadFile(file.content, key, file.type);
+        
+        if (result.success && result.url) {
+          return { name: file.name, url: result.url };
+        }
+        return null;
+      });
+
+      const results = await Promise.all(uploadPromises);
+      const validResults = results.filter(r => r !== null) as { name: string; url: string }[];
+      
+      const urls: { [key: string]: string } = {};
+      validResults.forEach(result => {
+        urls[result.name] = result.url;
+      });
+
+      console.log(`✅ Uploaded HLS directory: ${remoteDir} (${validResults.length} files)`);
+      
+      return {
+        success: true,
+        urls
+      };
+
+    } catch (error) {
+      console.error('❌ HLS directory upload failed:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown HLS upload error'
+      };
+    }
+  }
+
+  /**
+   * Delete file from S3
+   */
+  async deleteFile(key: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      await this.s3.deleteObject({
+        Bucket: s3Config.bucket,
+        Key: key
+      }).promise();
+
+      console.log(`🗑️ Deleted from S3: ${key}`);
+      
+      return { success: true };
+
+    } catch (error) {
+      console.error('❌ S3 delete failed:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown S3 delete error'
+      };
+    }
+  }
+
+  /**
+   * Generate signed URL for upload (client-side uploads)
+   */
+  generateUploadUrl(
+    key: string,
+    contentType: string,
+    expiresIn: number = 3600
+  ): { url: string; fields: any } {
+    const params = {
+      Bucket: s3Config.bucket,
+      Key: key,
+      Expires: new Date(Date.now() + expiresIn * 1000),
+      ContentType: contentType,
+      ACL: 'private'
+    };
+
+    return this.s3.createPresignedPost(params);
+  }
+
+  /**
+   * Invalidate CloudFront cache
+   */
+  async invalidateCloudFrontCache(paths: string[]): Promise<{ success: boolean; error?: string }> {
+    if (!this.cloudFront || !s3Config.cloudFrontDomain) {
+      console.log('ℹ️ CloudFront not configured, skipping cache invalidation');
+      return { success: true };
+    }
+
+    try {
+      const params: AWS.CloudFront.CreateInvalidationRequest = {
+        DistributionId: process.env.AWS_CLOUDFRONT_DISTRIBUTION_ID,
+        InvalidationBatch: {
+          Paths: {
+            Quantity: paths.length,
+            Items: paths
+          }
+        }
+      };
+
+      const result = await this.cloudFront.createInvalidation(params).promise();
+      
+      console.log(`✅ CloudFront cache invalidated: ${paths.join(', ')}`);
+      
+      return { success: true };
+
+    } catch (error) {
+      console.error('❌ CloudFront invalidation failed:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown CloudFront invalidation error'
+      };
+    }
+  }
+
+  /**
+   * Get public URL for a file
+   */
+  getPublicUrl(key: string): string {
+    return s3Config.cloudFrontDomain 
+      ? `https://${s3Config.cloudFrontDomain}/${key}`
+      : `https://${s3Config.bucket}.s3.amazonaws.com/${key}`;
+  }
+}
+
+export const s3StorageService = new S3StorageService();

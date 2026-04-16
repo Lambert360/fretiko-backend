@@ -11,8 +11,9 @@ import {
 import { Logger, OnModuleDestroy } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { RealtimeService } from './realtime.service';
-import { createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
 
 @WebSocketGateway({
   cors: {
@@ -34,6 +35,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   constructor(
     private readonly realtimeService: RealtimeService,
     private readonly configService: ConfigService,
+    private readonly jwtService: JwtService,
   ) {}
 
   afterInit(server: Server) {
@@ -769,7 +771,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
   }
 
-  // Helper method to extract user ID from token using Supabase validation
+  // Helper method to extract user ID from token using custom JWT validation
   private async extractUserIdFromToken(token: string): Promise<string | null> {
     try {
       if (!token) {
@@ -785,27 +787,19 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         return null;
       }
 
-      // Create Supabase client for token validation using service role
-      const supabase = createUserSupabaseClient(this.configService, cleanToken);
+      // Validate the JWT token with our custom JWT service
+      const decoded = this.jwtService.verify(cleanToken) as any;
 
-      // Validate the JWT token with Supabase
-      const { data: { user }, error } = await supabase.auth.getUser(cleanToken);
-
-      if (error) {
-        this.logger.warn(`🚫 Token validation failed: ${error.message}`);
+      if (!decoded || !decoded.sub) {
+        this.logger.warn('🚫 No user ID found in validated token');
         return null;
       }
 
-      if (!user || !user.id) {
-        this.logger.warn('🚫 No user found in validated token');
-        return null;
-      }
-
-      this.logger.debug(`✅ Token validated successfully for user: ${user.id}`);
-      return user.id;
+      this.logger.debug(`✅ Custom JWT validated successfully for user: ${decoded.sub}`);
+      return decoded.sub;
 
     } catch (error) {
-      this.logger.error('💥 Error validating token:', error.stack || error.message);
+      this.logger.warn(`� Token validation failed: invalid JWT: ${error.message}`);
       return null;
     }
   }

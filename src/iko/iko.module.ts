@@ -9,9 +9,11 @@ import { ProductsModule } from '../products/products.module';
 import { ServicesModule } from '../services/services.module';
 import { UsersModule } from '../users/users.module';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     SearchModule,
     ProductsModule,
     ServicesModule,

@@ -2,6 +2,11 @@ import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { FileUploadDto } from './dto/chat.dto';
+import { backgroundVideoProcessor } from '../services/backgroundVideoProcessor';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 @Injectable()
 export class FileUploadService {
@@ -106,6 +111,11 @@ export class FileUploadService {
       }
 
       this.logger.log(`File uploaded successfully: ${publicUrl}`);
+
+      // Check if this is a video that needs processing
+      if (fileMetadata.type === 'video') {
+        await this.checkAndProcessVideo(publicUrl, fileMetadata, userId, messageId);
+      }
 
       return {
         publicUrl,
@@ -336,6 +346,135 @@ export class FileUploadService {
     // - Cloud services like Cloudinary
     this.logger.log(`Generating thumbnail for ${fileType}: ${fileUrl}`);
     return null;
+  }
+
+  /**
+   * Check if video needs processing and queue it if necessary
+   */
+  private async checkAndProcessVideo(
+    videoUrl: string, 
+    fileMetadata: any, 
+    userId: string, 
+    messageId: string
+  ): Promise<void> {
+    try {
+      this.logger.log(`Checking video codec for: ${videoUrl}`);
+      
+      // Download video temporarily to check codec
+      const tempPath = await this.downloadVideoTemporarily(videoUrl);
+      
+      try {
+        // Get video codec using FFprobe
+        const codec = await this.getVideoCodec(tempPath);
+        this.logger.log(`Detected video codec: ${codec}`);
+        
+        // Check if codec needs processing (HEVC/H.265)
+        if (this.needsVideoProcessing(codec)) {
+          this.logger.log(`Video ${videoUrl} uses incompatible codec ${codec}, queuing for processing`);
+          
+          // Add to background processing queue
+          const jobId = await backgroundVideoProcessor.addVideoToQueue(videoUrl, userId, {
+            serviceId: messageId, // Use messageId as service identifier
+            platform: 'android', // Default to android for maximum compatibility
+            priority: 'medium'
+          });
+          
+          this.logger.log(`Video queued for processing with job ID: ${jobId}`);
+          
+          // Update database to indicate processing is in progress
+          await this.updateVideoProcessingStatus(messageId, {
+            processing: true,
+            jobId,
+            originalCodec: codec,
+            processingStartedAt: new Date().toISOString()
+          });
+        } else {
+          this.logger.log(`Video ${videoUrl} uses compatible codec ${codec}, no processing needed`);
+        }
+      } finally {
+        // Clean up temp file
+        if (tempPath && require('fs').existsSync(tempPath)) {
+          require('fs').unlinkSync(tempPath);
+        }
+      }
+    } catch (error) {
+      this.logger.error('Error checking video codec:', error);
+      // Don't fail the upload, just log the error
+    }
+  }
+
+  /**
+   * Download video temporarily for codec analysis
+   */
+  private async downloadVideoTemporarily(url: string): Promise<string> {
+    const https = require('https');
+    const fs = require('fs');
+    const path = require('path');
+    
+    return new Promise((resolve, reject) => {
+      const fileName = `temp_video_check_${Date.now()}.mp4`;
+      const filePath = path.join('/tmp', fileName);
+      
+      const file = fs.createWriteStream(filePath);
+      
+      https.get(url, (response: any) => {
+        response.pipe(file);
+      }).on('error', reject).on('end', () => {
+        file.close();
+        resolve(filePath);
+      });
+    });
+  }
+
+  /**
+   * Get video codec using FFprobe
+   */
+  private async getVideoCodec(videoPath: string): Promise<string> {
+    try {
+      const { stdout } = await execAsync(`ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`);
+      return stdout.trim().toLowerCase();
+    } catch (error) {
+      this.logger.error('Failed to get video codec:', error);
+      return 'unknown';
+    }
+  }
+
+  /**
+   * Check if video needs processing based on codec
+   */
+  private needsVideoProcessing(codec: string): boolean {
+    // HEVC/H.265 codecs that need conversion to H.264
+    const incompatibleCodecs = ['hevc', 'h265', 'vp9', 'av1'];
+    return incompatibleCodecs.includes(codec);
+  }
+
+  /**
+   * Update video processing status in database
+   */
+  private async updateVideoProcessingStatus(messageId: string, processingInfo: {
+    processing: boolean;
+    jobId?: string;
+    originalCodec?: string;
+    processingStartedAt?: string;
+  }): Promise<void> {
+    try {
+      const { error } = await this.supabase
+        .from('chat_file_uploads')
+        .update({
+          metadata: {
+            videoProcessing: processingInfo,
+            updated_at: new Date().toISOString()
+          }
+        })
+        .eq('message_id', messageId)
+        .eq('file_type', 'video');
+
+      if (error) {
+        this.logger.error('Failed to update video processing status:', error);
+      }
+    } catch (error) {
+      this.logger.error('Error updating video processing status:', error);
+    }
   }
 
   // Get file usage statistics

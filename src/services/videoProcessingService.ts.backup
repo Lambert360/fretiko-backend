@@ -1,0 +1,690 @@
+import { StorageClient } from '@supabase/storage-js';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import * as fs from 'fs';
+import path from 'path';
+
+const execAsync = promisify(exec);
+
+export interface VideoProcessingOptions {
+  inputPath: string;
+  outputPath?: string;
+  quality?: 'low' | 'medium' | 'high';
+  platform?: 'android' | 'ios' | 'web';
+  generateHLS?: boolean;
+  generateThumbnail?: boolean;
+  maxDuration?: number; // in seconds
+}
+
+export interface VideoProcessingResult {
+  success: boolean;
+  outputPath?: string;
+  error?: string;
+  metadata?: {
+    codec: string;
+    resolution: string;
+    bitrate: number;
+    duration: number;
+  };
+  hlsUrls?: {
+    masterPlaylist: string;
+    variants: {
+      480p?: string;
+      720p?: string;
+      1080p?: string;
+    };
+  };
+  thumbnailUrl?: string;
+}
+
+export class VideoProcessingService {
+  private storageClient: StorageClient;
+
+  constructor() {
+    this.storageClient = new StorageClient(
+      process.env.SUPABASE_URL + '/storage/v1',
+      {
+        apikey: process.env.SUPABASE_ANON_KEY || '',
+      }
+    );
+  }
+
+  /**
+   * Process video for optimal compatibility across all platforms
+   */
+  async processVideo(options: VideoProcessingOptions): Promise<VideoProcessingResult> {
+    try {
+      console.log('🎥 Starting video processing:', options);
+
+      // Validate input file exists
+      if (!fs.existsSync(options.inputPath)) {
+        return { success: false, error: 'Input video file not found' };
+      }
+
+      // Get video metadata
+      const metadata = await this.getVideoMetadata(options.inputPath);
+      console.log('📊 Original video metadata:', metadata);
+
+      // Create output directory
+      const outputDir = options.outputPath ? path.dirname(options.outputPath) : path.dirname(options.inputPath);
+      const videoId = path.basename(options.inputPath, path.extname(options.inputPath));
+      
+      if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+      }
+
+      const result: VideoProcessingResult = {
+        success: true,
+        metadata
+      };
+
+      // Generate thumbnail if requested
+      if (options.generateThumbnail !== false) {
+        console.log('🖼️ Generating thumbnail...');
+        const thumbnailResult = await this.generateThumbnail(options.inputPath, outputDir, videoId);
+        if (thumbnailResult.success) {
+          result.thumbnailUrl = thumbnailResult.thumbnailUrl;
+        }
+      }
+
+      // Generate HLS if requested (production approach)
+      if (options.generateHLS !== false) {
+        console.log('🎬 Generating HLS streams...');
+        const hlsResult = await this.generateHLS(options, outputDir, videoId);
+        if (hlsResult.success) {
+          result.hlsUrls = hlsResult.hlsUrls;
+        } else {
+          return hlsResult; // Return HLS error as main error
+        }
+      } else {
+        // Fallback to single MP4 conversion
+        console.log('🔄 Converting to MP4...');
+        const conversionResult = await this.convertToMP4(options, outputDir, videoId);
+        if (!conversionResult.success) {
+          return conversionResult;
+        }
+        result.outputPath = conversionResult.outputPath;
+      }
+
+      console.log('✅ Video processing completed successfully');
+      return result;
+
+    } catch (error) {
+      console.error('❌ Video processing failed:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Unknown processing error' 
+      };
+    }
+  }
+
+  /**
+   * Get video metadata using FFprobe
+   */
+  async getVideoMetadata(videoPath: string): Promise<any> {
+    try {
+      const { stdout } = await execAsync(`ffprobe -v quiet -print_format json -show_streams "${videoPath}"`);
+      const probeData = JSON.parse(stdout);
+      
+      const videoStream = probeData.streams.find((stream: any) => stream.codec_type === 'video');
+      
+      return {
+        codec: videoStream?.codec_name || 'unknown',
+        resolution: `${videoStream?.width || 0}x${videoStream?.height || 0}`,
+        bitrate: parseInt(videoStream?.bit_rate || '0'),
+        duration: parseFloat(probeData.format?.duration || '0'),
+        width: videoStream?.width || 0,
+        height: videoStream?.height || 0
+      };
+    } catch (error) {
+      console.error('Failed to get video metadata:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Check if video needs conversion based on platform requirements
+   */
+  needsConversion(metadata: any, platform: string = 'android'): boolean {
+    if (!metadata) return true;
+
+    const { codec, resolution, bitrate } = metadata;
+    
+    // Always convert to ensure compatibility and HLS support
+    return true;
+  }
+
+  /**
+   * Generate thumbnail from video
+   */
+  private async generateThumbnail(inputPath: string, outputDir: string, videoId: string): Promise<{ success: boolean; thumbnailUrl?: string; error?: string }> {
+    try {
+      const thumbnailPath = path.join(outputDir, `${videoId}_thumbnail.jpg`);
+      
+      const ffmpegCommand = [
+        'ffmpeg',
+        '-i', inputPath,
+        '-ss', '00:00:01', // Take frame at 1 second
+        '-vframes', '1',
+        '-vf', 'scale=320:240', // Small thumbnail size
+        '-y',
+        thumbnailPath
+      ];
+
+      console.log('🖼️ Generating thumbnail:', ffmpegCommand.join(' '));
+      await execAsync(ffmpegCommand.join(' '));
+
+      // Upload thumbnail
+      const uploadResult = await this.uploadFile(thumbnailPath, 'image/jpeg');
+      
+      // Cleanup local file
+      if (fs.existsSync(thumbnailPath)) {
+        fs.unlinkSync(thumbnailPath);
+      }
+
+      return uploadResult;
+
+    } catch (error) {
+      console.error('Thumbnail generation failed:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Thumbnail generation failed' 
+      };
+    }
+  }
+
+  /**
+   * Generate HLS streams with proper master playlist
+   */
+  private async generateHLS(options: VideoProcessingOptions, outputDir: string, videoId: string): Promise<VideoProcessingResult> {
+    try {
+      console.log('🎬 Starting HLS generation...');
+      
+      const hlsDir = path.join(outputDir, 'hls');
+      if (!fs.existsSync(hlsDir)) {
+        fs.mkdirSync(hlsDir, { recursive: true });
+      }
+
+      // Generate different quality variants
+      const qualities = this.getHLSQualities(options.quality);
+      const variantUrls: { [key: string]: string } = {};
+
+      for (const [qualityName, config] of Object.entries(qualities)) {
+        const qualityConfig = config as { crf: string; bitrate: string; scale: string; bandwidth: string; resolution: string };
+        const qualityDir = path.join(hlsDir, qualityName);
+        if (!fs.existsSync(qualityDir)) {
+          fs.mkdirSync(qualityDir, { recursive: true });
+        }
+
+        console.log(`🎥 Generating ${qualityName} variant...`);
+        
+        const ffmpegCommand = [
+          'ffmpeg',
+          '-i', options.inputPath,
+          // Video settings
+          '-c:v', 'libx264', // Always convert to H.264
+          '-preset', 'medium',
+          '-crf', qualityConfig.crf,
+          '-b:v', qualityConfig.bitrate,
+          '-maxrate', `${parseInt(qualityConfig.bitrate) * 1.5}k`,
+          '-bufsize', `${parseInt(qualityConfig.bitrate) * 3}k`,
+          '-vf', `scale=${qualityConfig.scale}`,
+          '-pix_fmt', 'yuv420p',
+          // Audio settings
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-ar', '44100',
+          // HLS settings
+          '-hls_time', '6',
+          '-hls_list_size', '0',
+          '-hls_segment_filename', path.join(qualityDir, 'segment%03d.ts'),
+          '-f', 'hls',
+          '-y',
+          path.join(qualityDir, 'playlist.m3u8')
+        ];
+
+        // Add duration limit if specified
+        if (options.maxDuration) {
+          ffmpegCommand.splice(ffmpegCommand.indexOf('-i') + 2, 0, '-t', options.maxDuration.toString());
+        }
+
+        console.log(`🔧 FFmpeg command for ${qualityName}:`, ffmpegCommand.join(' '));
+        
+        try {
+          await execAsync(ffmpegCommand.join(' '));
+          
+          // Upload variant playlist and segments
+          const variantUploadResult = await this.uploadHLSDirectory(qualityDir, `videos/hls/${qualityName}`);
+          if (variantUploadResult.success) {
+            variantUrls[qualityName] = variantUploadResult.publicUrl!;
+          }
+          
+        } catch (error) {
+          console.error(`Failed to generate ${qualityName} variant:`, error);
+          // Continue with other qualities
+        }
+      }
+
+      // Create master playlist
+      const masterPlaylistPath = path.join(hlsDir, 'master.m3u8');
+      const masterPlaylist = this.createMasterPlaylist(variantUrls, qualities);
+      
+      fs.writeFileSync(masterPlaylistPath, masterPlaylist);
+      
+      // Upload master playlist
+      const masterUploadResult = await this.uploadFile(masterPlaylistPath, 'application/vnd.apple.mpegurl');
+      
+      if (!masterUploadResult.success) {
+        return { success: false, error: masterUploadResult.error };
+      }
+
+      // Cleanup HLS directory
+      await this.cleanupTempFiles([hlsDir]);
+
+      return {
+        success: true,
+        hlsUrls: {
+          masterPlaylist: masterUploadResult.publicUrl!,
+          variants: {
+            '480p': variantUrls['480p'],
+            '720p': variantUrls['720p'],
+            '1080p': variantUrls['1080p']
+          }
+        }
+      };
+
+    } catch (error) {
+      console.error('HLS generation failed:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'HLS generation failed' 
+      };
+    }
+  }
+
+  /**
+   * Create HLS master playlist content
+   */
+  private createMasterPlaylist(variantUrls: any, qualities: any): string {
+    let playlist = '#EXTM3U\n#EXT-X-VERSION:3\n';
+    
+    const qualityOrder = ['480p', '720p', '1080p'];
+    
+    for (const quality of qualityOrder) {
+      if (variantUrls[quality]) {
+        const config = qualities[quality];
+        playlist += `#EXT-X-STREAM-INF:BANDWIDTH=${config.bandwidth},RESOLUTION=${config.resolution},CODECS="avc1.42E01E,mp4a.40.2"\n`;
+        playlist += `${variantUrls[quality]}\n`;
+      }
+    }
+    
+    return playlist;
+  }
+
+  /**
+   * Get HLS quality configurations
+   */
+  private getHLSQualities(baseQuality: string = 'medium'): { [key: string]: { crf: string; bitrate: string; scale: string; bandwidth: string; resolution: string } } {
+    const baseConfigs = {
+      low: {
+        '480p': {
+          crf: '28',
+          bitrate: '1000k',
+          scale: '854:480',
+          bandwidth: '1000000',
+          resolution: '854x480'
+        }
+      },
+      medium: {
+        '480p': {
+          crf: '28',
+          bitrate: '1000k',
+          scale: '854:480',
+          bandwidth: '1000000',
+          resolution: '854x480'
+        },
+        '720p': {
+          crf: '23',
+          bitrate: '2500k',
+          scale: '1280:720',
+          bandwidth: '2500000',
+          resolution: '1280x720'
+        }
+      },
+      high: {
+        '480p': {
+          crf: '28',
+          bitrate: '1000k',
+          scale: '854:480',
+          bandwidth: '1000000',
+          resolution: '854x480'
+        },
+        '720p': {
+          crf: '23',
+          bitrate: '2500k',
+          scale: '1280:720',
+          bandwidth: '2500000',
+          resolution: '1280x720'
+        },
+        '1080p': {
+          crf: '18',
+          bitrate: '5000k',
+          scale: '1920:1080',
+          bandwidth: '5000000',
+          resolution: '1920x1080'
+        }
+      }
+    };
+
+    return baseConfigs[baseQuality as keyof typeof baseConfigs] || baseConfigs.medium;
+  }
+
+  /**
+   * Convert video to MP4 (fallback method)
+   */
+  private async convertToMP4(options: VideoProcessingOptions, outputDir: string, videoId: string): Promise<VideoProcessingResult> {
+    try {
+      const outputPath = path.join(outputDir, `${videoId}_converted.mp4`);
+      
+      const settings = this.getOptimalSettings(options.platform || 'android', options.quality);
+      
+      const ffmpegCommand = [
+        'ffmpeg',
+        '-i', options.inputPath,
+        '-c:v', 'libx264', // Always convert to H.264
+        '-preset', 'medium',
+        '-crf', settings.crf,
+        '-maxrate', settings.maxBitrate,
+        '-bufsize', settings.bufsize,
+        '-pix_fmt', 'yuv420p',
+        '-vf', `scale=${settings.scale}`,
+        '-c:a', settings.audioCodec,
+        '-b:a', settings.audioBitrate,
+        '-movflags', '+faststart',
+        '-y'
+      ];
+
+      // Add duration limit if specified
+      if (options.maxDuration) {
+        ffmpegCommand.splice(ffmpegCommand.indexOf('-i') + 2, 0, '-t', options.maxDuration.toString());
+      }
+      
+      ffmpegCommand.push(outputPath);
+
+      console.log('🔧 FFmpeg MP4 conversion command:', ffmpegCommand.join(' '));
+      await execAsync(ffmpegCommand.join(' '));
+
+      // Upload converted video
+      const uploadResult = await this.uploadFile(outputPath, 'video/mp4');
+      
+      // Cleanup local file
+      if (fs.existsSync(outputPath)) {
+        fs.unlinkSync(outputPath);
+      }
+
+      if (uploadResult.success) {
+        return {
+          success: true,
+          outputPath: uploadResult.publicUrl
+        };
+      } else {
+        return { success: false, error: uploadResult.error };
+      }
+
+    } catch (error) {
+      console.error('MP4 conversion failed:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'MP4 conversion failed' 
+      };
+    }
+  }
+
+  /**
+   * Convert video to compatible format using FFmpeg
+   */
+  private async convertVideo(options: VideoProcessingOptions & { 
+    outputPath: string; 
+    metadata: any 
+  }): Promise<VideoProcessingResult> {
+    try {
+      console.log('🔄 Converting video to compatible format...');
+
+      // Determine optimal settings based on platform
+      const settings = this.getOptimalSettings(options.platform || 'android', options.quality);
+      
+      const ffmpegCommand = [
+        'ffmpeg',
+        '-i', options.inputPath,
+        '-c:v', settings.videoCodec,
+        '-preset', settings.preset,
+        '-crf', settings.crf,
+        '-maxrate', settings.maxBitrate.toString(),
+        '-bufsize', settings.bufsize,
+        '-pix_fmt', settings.pixelFormat,
+        '-vf', `scale=${settings.scale}`,
+        '-c:a', settings.audioCodec,
+        '-b:a', settings.audioBitrate,
+        '-movflags', '+faststart', // For web streaming
+        '-y', // Overwrite output file
+        options.outputPath
+      ];
+
+      console.log('🔧 FFmpeg command:', ffmpegCommand.join(' '));
+
+      const { stdout, stderr } = await execAsync(ffmpegCommand.join(' '));
+      
+      if (stderr && !stderr.includes('Conversion successful')) {
+        console.error('FFmpeg error:', stderr);
+        return { success: false, error: 'Video conversion failed' };
+      }
+
+      // Get new metadata
+      const newMetadata = await this.getVideoMetadata(options.outputPath);
+      
+      console.log('✅ Video conversion successful');
+      return {
+        success: true,
+        outputPath: options.outputPath,
+        metadata: newMetadata
+      };
+
+    } catch (error) {
+      console.error('Video conversion error:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Conversion failed' 
+      };
+    }
+  }
+
+  /**
+   * Get optimal video settings for target platform
+   */
+  private getOptimalSettings(platform: string, quality: string = 'medium') {
+    const baseSettings = {
+      android: {
+        videoCodec: 'libx264',
+        preset: 'medium',
+        crf: '23',
+        maxBitrate: '5M',
+        bufsize: '10M',
+        pixelFormat: 'yuv420p',
+        scale: 'min(1920,iw):-2:min(1080,ih)', // Max 1080p
+        audioCodec: 'aac',
+        audioBitrate: '128k'
+      },
+      ios: {
+        videoCodec: 'libx264',
+        preset: 'medium',
+        crf: '23',
+        maxBitrate: '10M',
+        bufsize: '20M',
+        pixelFormat: 'yuv420p',
+        scale: 'min(3840,iw):-2:min(2160,ih)', // Max 4K
+        audioCodec: 'aac',
+        audioBitrate: '128k'
+      }
+    };
+
+    // Adjust for quality
+    if (quality === 'low') {
+      baseSettings.android.crf = '28';
+      baseSettings.android.maxBitrate = '2M';
+      baseSettings.ios.crf = '28';
+      baseSettings.ios.maxBitrate = '4M';
+    } else if (quality === 'high') {
+      baseSettings.android.crf = '18';
+      baseSettings.android.maxBitrate = '8M';
+      baseSettings.ios.crf = '18';
+      baseSettings.ios.maxBitrate = '15M';
+    }
+
+    return baseSettings[platform as keyof typeof baseSettings] || baseSettings.android;
+  }
+
+  /**
+   * Generate output path for converted video
+   */
+  private generateOutputPath(inputPath: string): string {
+    const dir = path.dirname(inputPath);
+    const ext = path.extname(inputPath);
+    const name = path.basename(inputPath, ext);
+    return path.join(dir, `${name}_converted.mp4`);
+  }
+
+  /**
+   * Upload file to storage
+   */
+  private async uploadFile(filePath: string, contentType: string): Promise<{ success: boolean; publicUrl?: string; error?: string }> {
+    try {
+      const fileContent = fs.readFileSync(filePath);
+      const fileName = path.basename(filePath);
+      
+      const { data, error } = await this.storageClient
+        .from('media')
+        .upload(fileName, fileContent, {
+          contentType,
+          cacheControl: '3600',
+          upsert: false,
+        });
+
+      if (error) {
+        return { success: false, error: error.message };
+      }
+
+      const { data: publicUrlData } = this.storageClient
+        .from('media')
+        .getPublicUrl(data.path);
+
+      return {
+        success: true,
+        publicUrl: publicUrlData.publicUrl
+      };
+
+    } catch (error) {
+      console.error('Upload failed:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Upload failed' 
+      };
+    }
+  }
+
+  /**
+   * Upload HLS directory to storage
+   */
+  private async uploadHLSDirectory(localDir: string, remoteDir: string): Promise<{ success: boolean; publicUrl?: string; error?: string }> {
+    try {
+      const files = fs.readdirSync(localDir, { recursive: true });
+      let masterPlaylistUrl = '';
+
+      for (const file of files) {
+        const localPath = path.join(localDir, file);
+        const stat = fs.statSync(localPath);
+        
+        if (stat.isFile()) {
+          const fileContent = fs.readFileSync(localPath);
+          const remotePath = path.join(remoteDir, file).replace(/\\/g, '/');
+          
+          const contentType = file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 
+                           file.endsWith('.ts') ? 'video/MP2T' : 'application/octet-stream';
+          
+          const { data, error } = await this.storageClient
+            .from('media')
+            .upload(remotePath, fileContent, {
+              contentType,
+              cacheControl: '3600',
+              upsert: false,
+            });
+
+          if (error) {
+            console.error(`Failed to upload ${file}:`, error);
+            continue;
+          }
+
+          // Track master playlist URL
+          if (file.endsWith('playlist.m3u8')) {
+            const { data: publicUrlData } = this.storageClient
+              .from('media')
+              .getPublicUrl(data.path);
+            masterPlaylistUrl = publicUrlData.publicUrl;
+          }
+        }
+      }
+
+      if (!masterPlaylistUrl) {
+        return { success: false, error: 'No master playlist uploaded' };
+      }
+
+      return {
+        success: true,
+        publicUrl: masterPlaylistUrl
+      };
+
+    } catch (error) {
+      console.error('HLS directory upload failed:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'HLS directory upload failed' 
+      };
+    }
+  }
+
+  /**
+   * Clean up temporary files
+   */
+  private async cleanupTempFiles(filePaths: string[]): Promise<void> {
+    for (const filePath of filePaths) {
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          console.log('🗑️ Cleaned up temp file:', filePath);
+        }
+      } catch (error) {
+        console.error('Failed to clean up temp file:', error);
+      }
+    }
+  }
+
+  /**
+   * Batch process multiple videos
+   */
+  async processBatchVideos(videos: Array<{ inputPath: string; platform?: string }>): Promise<VideoProcessingResult[]> {
+    console.log(`🎥 Starting batch processing of ${videos.length} videos`);
+    
+    const results = await Promise.all(
+      videos.map(video => this.processVideo({
+        ...video,
+        platform: video.platform as 'android' | 'ios' | 'web' | undefined
+      }))
+    );
+
+    const successCount = results.filter(r => r.success).length;
+    console.log(`✅ Batch processing complete: ${successCount}/${videos.length} successful`);
+
+    return results;
+  }
+}
+
+export const videoProcessingService = new VideoProcessingService();
