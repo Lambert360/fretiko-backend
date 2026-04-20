@@ -141,7 +141,7 @@ export class AuthService {
 
     if (updateError) {
       console.error('❌ Failed to update user profile:', updateError);
-      // Don't throw error - user created successfully in auth
+      throw new BadRequestException('Failed to create user profile');
     }
 
     // Update verification log with user_id
@@ -195,22 +195,9 @@ export class AuthService {
       is_verified: completeProfileData?.is_verified || false,
     };
 
-    // Generate token pair for the newly created user
-    const deviceInfo = {
-      userAgent: userAgent || 'account_creation',
-      platform: 'unknown',
-    };
-    
-    const tokenPair = await this.tokenService.generateTokenPair(
-      data.user.id,
-      deviceInfo,
-      ipAddress || 'unknown'
-    );
-
+    // Return user data only - tokens will be created by signin in WelcomeScreen
     return {
       user: userData,
-      accessToken: tokenPair.accessToken,
-      refreshToken: tokenPair.refreshToken,
     };
   }
 

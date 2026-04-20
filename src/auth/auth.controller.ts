@@ -185,8 +185,6 @@ export class AuthController {
         success: true,
         message: 'Account created successfully! Welcome to Fretiko.',
         user: result.user,
-        accessToken: result.accessToken,
-        refreshToken: result.refreshToken,
       };
     } catch (error) {
       throw error; // Let the error filter handle the response format
