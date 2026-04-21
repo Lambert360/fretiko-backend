@@ -1,7 +1,7 @@
 import { Injectable, UnauthorizedException, ConflictException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { createSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
+import { SupabaseClientManager } from './supabase-client-manager.service';
 import { SignUpDto, SignInDto, AuthResponse } from '../shared/dto/auth.dto';
 import { EmailService } from './email.service';
 import { TokenService } from './token.service';
@@ -13,28 +13,13 @@ export class AuthService {
 
   constructor(
     private configService: ConfigService,
+    private clientManager: SupabaseClientManager,
     private jwtService: JwtService,
     private emailService: EmailService,
     private tokenService: TokenService,
   ) {
-    this.supabase = createSupabaseClient(this.configService);
-    this.serviceSupabase = createServiceSupabaseClient(this.configService);
-    
-    // Debug: Check if service role key is available
-    const serviceRoleKey = this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY');
-    const supabaseUrl = this.configService.get<string>('SUPABASE_URL');
-    const supabaseKey = this.configService.get<string>('SUPABASE_KEY');
-    
-    console.log('🔍 Supabase Config:', {
-      hasUrl: !!supabaseUrl,
-      hasServiceKey: !!serviceRoleKey,
-      hasRegularKey: !!supabaseKey,
-      serviceKeyLength: serviceRoleKey?.length,
-      regularKeyLength: supabaseKey?.length,
-      urlPrefix: supabaseUrl?.substring(0, 20) + '...',
-      serviceKeyPrefix: serviceRoleKey?.substring(0, 10) + '...',
-      regularKeyPrefix: supabaseKey?.substring(0, 10) + '...'
-    });
+    this.supabase = this.clientManager.getUserClient();
+    this.serviceSupabase = this.clientManager.getServiceClient();
   }
 
   async createVerifiedUser(signUpDto: SignUpDto): Promise<AuthResponse> {
@@ -156,7 +141,7 @@ export class AuthService {
 
     if (updateError) {
       console.error('❌ Failed to update user profile:', updateError);
-      // Don't throw error - user created successfully in auth
+      throw new BadRequestException('Failed to create user profile');
     }
 
     // Update verification log with user_id
@@ -210,22 +195,9 @@ export class AuthService {
       is_verified: completeProfileData?.is_verified || false,
     };
 
-    // Generate token pair for the newly created user
-    const deviceInfo = {
-      userAgent: userAgent || 'account_creation',
-      platform: 'unknown',
-    };
-    
-    const tokenPair = await this.tokenService.generateTokenPair(
-      data.user.id,
-      deviceInfo,
-      ipAddress || 'unknown'
-    );
-
+    // Return user data only - tokens will be created by signin in WelcomeScreen
     return {
       user: userData,
-      accessToken: tokenPair.accessToken,
-      refreshToken: tokenPair.refreshToken,
     };
   }
 
@@ -557,15 +529,15 @@ export class AuthService {
 
   async checkEmailAvailability(email: string): Promise<boolean> {
     try {
-      // Check if user exists in Supabase Auth
-      const { data: existingUser } = await this.supabase.auth.admin.getUserByEmail(email);
+      // Check if user exists in Supabase Auth using serviceSupabase
+      const { data: existingUser } = await this.serviceSupabase.auth.admin.getUserByEmail(email);
       
       if (existingUser?.user) {
         return false; // Email is taken
       }
 
-      // Check if user exists in user_profiles (legacy check)
-      const { data: profileData } = await this.supabase
+      // Check if user exists in user_profiles (legacy check) using serviceSupabase
+      const { data: profileData } = await this.serviceSupabase
         .from('user_profiles')
         .select('email')
         .eq('email', email)
@@ -677,7 +649,7 @@ export class AuthService {
         }
 
         // Create new Supabase Auth user with admin API (no email confirmation needed)
-        const { data, error } = await this.supabase.auth.admin.createUser({
+        const { data, error } = await this.serviceSupabase.auth.admin.createUser({
           email,
           password: newPassword,
           user_metadata: {
@@ -778,9 +750,9 @@ export class AuthService {
       
       // Save the reset token to user profile
       console.log('💾 Saving reset token to user profile...');
-      const { data: saveResult, error: saveError } = await this.supabase
-        .rpc('save_reset_token', { 
-          p_user_email: email.toLowerCase(), 
+      const { data: saveResult, error: saveError } = await this.serviceSupabase
+        .rpc('save_reset_token', {
+          p_user_email: email.toLowerCase(),
           p_token: resetToken,
           p_expires_hours: 1
         });
@@ -905,10 +877,10 @@ export class AuthService {
       console.log('- Token:', token);
       
       // Use database function to verify token
-      const { data: result, error: rpcError } = await this.supabase
-        .rpc('verify_reset_token_func', { 
-          p_email: email.toLowerCase(), 
-          p_token: token 
+      const { data: result, error: rpcError } = await this.serviceSupabase
+        .rpc('verify_reset_token_func', {
+          p_email: email.toLowerCase(),
+          p_token: token
         });
 
       if (rpcError) {
@@ -950,10 +922,10 @@ export class AuthService {
       console.log('- Token:', token);
       
       // First verify the token using database function
-      const { data: verification, error: verifyError } = await this.supabase
-        .rpc('verify_reset_token_func', { 
-          p_email: email.toLowerCase(), 
-          p_token: token 
+      const { data: verification, error: verifyError } = await this.serviceSupabase
+        .rpc('verify_reset_token_func', {
+          p_email: email.toLowerCase(),
+          p_token: token
         });
 
       if (verifyError) {
@@ -975,10 +947,10 @@ export class AuthService {
       console.log('✅ Token verified, updating password...');
       
       // Update password using database function that integrates with Supabase Auth
-      const { data: result, error: updateError } = await this.supabase
-        .rpc('update_user_password', { 
-          p_user_email: email.toLowerCase(), 
-          p_new_password: newPassword 
+      const { data: result, error: updateError } = await this.serviceSupabase
+        .rpc('update_user_password', {
+          p_user_email: email.toLowerCase(),
+          p_new_password: newPassword
         });
 
       if (updateError) {
@@ -1000,7 +972,7 @@ export class AuthService {
 
       // Clear the reset token (optional but good practice)
       console.log('🧹 Clearing reset token...');
-      const { data: clearResult, error: clearError } = await this.supabase
+      const { data: clearResult, error: clearError } = await this.serviceSupabase
         .rpc('clear_reset_token', { p_profile_id: verification.user_id });
 
       if (clearError) {

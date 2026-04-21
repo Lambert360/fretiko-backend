@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import {
   CreateLivestreamDto,
   UpdateLivestreamDto,
@@ -14,7 +14,7 @@ export class LivestreamService {
   private readonly logger = new Logger(LivestreamService.name);
 
   constructor(private configService: ConfigService) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   async createLivestream(userId: string, createLivestreamDto: CreateLivestreamDto, userToken?: string): Promise<LivestreamResponseDto> {

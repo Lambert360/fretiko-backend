@@ -141,8 +141,8 @@ export class AuthResponse {
     is_rider?: boolean;
     is_verified?: boolean;
   };
-  accessToken: string;
-  refreshToken: string;
+  accessToken?: string;
+  refreshToken?: string;
   isSuspended?: boolean; // Industry standard: allow suspended users to authenticate
   requiresEmailVerification?: boolean; // New flag for email verification requirement
 }

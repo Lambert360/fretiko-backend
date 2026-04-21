@@ -61,10 +61,10 @@ export class AnalyticsService implements OnModuleDestroy {
   private batchIntervalId: NodeJS.Timeout | null = null;
 
   constructor(private configService: ConfigService) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
     
-    // ✅ PHASE 5 FIX: Load configurable values from environment
+    // PHASE 5 FIX: Load configurable values from environment
     this.PLATFORM_COMMISSION_RATE = parseFloat(
       this.configService.get<string>('PLATFORM_COMMISSION_RATE', '0.1')
     );

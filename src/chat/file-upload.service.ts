@@ -1,6 +1,6 @@
 import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { FileUploadDto } from './dto/chat.dto';
 import { backgroundVideoProcessor } from '../services/backgroundVideoProcessor';
 import { exec } from 'child_process';
@@ -31,7 +31,7 @@ export class FileUploadService {
   private readonly MAX_VIDEO_SIZE = 100 * 1024 * 1024; // 100MB
 
   constructor(private configService: ConfigService) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   async uploadFile(
@@ -45,6 +45,9 @@ export class FileUploadService {
     // Validate file
     this.validateFile(file);
 
+    // Use serviceSupabase for storage uploads - user tokens can't be used with Supabase Storage
+    const storageClient = this.supabase;
+    // Use user token client for DB operations (RLS compliance for user-specific data)
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     try {
@@ -56,7 +59,7 @@ export class FileUploadService {
       const bucket = this.getStorageBucket(file.mimetype);
       
       // Upload file to Supabase Storage
-      const { data: uploadData, error: uploadError } = await client.storage
+      const { data: uploadData, error: uploadError } = await storageClient.storage
         .from(bucket)
         .upload(uniqueFileName, file.buffer, {
           contentType: file.mimetype,
@@ -69,7 +72,7 @@ export class FileUploadService {
       }
 
       // Get public URL
-      const { data: urlData } = client.storage
+      const { data: urlData } = storageClient.storage
         .from(bucket)
         .getPublicUrl(uniqueFileName);
 
@@ -106,7 +109,7 @@ export class FileUploadService {
       if (dbError) {
         this.logger.error('Failed to save file metadata:', dbError);
         // Cleanup uploaded file
-        await client.storage.from(bucket).remove([uniqueFileName]);
+        await storageClient.storage.from(bucket).remove([uniqueFileName]);
         throw new BadRequestException(`Failed to save file metadata: ${dbError.message}`);
       }
 
@@ -155,6 +158,9 @@ export class FileUploadService {
   async deleteFile(userId: string, fileId: string, userToken?: string): Promise<void> {
     this.logger.log(`Deleting file: ${fileId} for user: ${userId}`);
 
+    // Use serviceSupabase for storage operations
+    const storageClient = this.supabase;
+    // Use user token client for DB operations (RLS compliance)
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     try {
@@ -174,9 +180,9 @@ export class FileUploadService {
         throw new BadRequestException('Access denied');
       }
 
-      // Delete from storage
+      // Delete from storage using serviceSupabase
       const bucket = this.getStorageBucket(fileData.mime_type);
-      const { error: deleteError } = await client.storage
+      const { error: deleteError } = await storageClient.storage
         .from(bucket)
         .remove([fileData.storage_path]);
 
@@ -229,6 +235,9 @@ export class FileUploadService {
     expiresIn: number = 3600, // 1 hour default
     userToken?: string
   ): Promise<string> {
+    // Use serviceSupabase for storage operations
+    const storageClient = this.supabase;
+    // Use user token client for DB operations (RLS compliance)
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     try {
@@ -263,9 +272,9 @@ export class FileUploadService {
         throw new BadRequestException('Access denied');
       }
 
-      // Generate presigned URL
+      // Generate presigned URL using serviceSupabase
       const bucket = this.getStorageBucket(fileData.mime_type);
-      const { data: urlData, error: urlError } = await client.storage
+      const { data: urlData, error: urlError } = await storageClient.storage
         .from(bucket)
         .createSignedUrl(fileData.storage_path, expiresIn);
 

@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import {
   AIResearchRequestDto,
   CreateActivityPlanDto,
@@ -12,7 +12,7 @@ export class AIAssistantService {
   private readonly logger = new Logger(AIAssistantService.name);
 
   constructor(private configService: ConfigService) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   async generateAIResponse(userId: string, conversationId: string, userMessage: string, userToken?: string): Promise<string> {

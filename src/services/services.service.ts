@@ -1,14 +1,20 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { CreateServiceDto, UpdateServiceDto } from './dto/service.dto';
+import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 
 @Injectable()
 export class ServicesService {
   private supabase;
+  private serviceSupabase;
 
-  constructor(private configService: ConfigService) {
+  constructor(
+    private configService: ConfigService,
+    private supabaseClientManager: SupabaseClientManager,
+  ) {
     this.supabase = createSupabaseClient(this.configService);
+    this.serviceSupabase = createServiceSupabaseClient(this.configService);
   }
 
   async getCategories() {
@@ -26,10 +32,8 @@ export class ServicesService {
   }
 
   async createService(userId: string, createServiceDto: CreateServiceDto, userToken?: string) {
-    // Create user-specific Supabase client if token is provided
-    const supabaseClient = userToken 
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
+    // Use serviceSupabase for all DB operations - user tokens can't be used for Supabase DB queries
+    const supabaseClient = this.serviceSupabase;
 
     // First verify the user is a seller or rider
     console.log('👤 Checking user profile for service creation, userId:', userId);
@@ -99,9 +103,8 @@ export class ServicesService {
   }
 
   async getServicesByUser(userId: string, userToken?: string) {
-    const supabaseClient = userToken 
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
+    // Use serviceSupabase - user tokens can't be used for DB operations
+    const supabaseClient = this.serviceSupabase;
 
     const { data, error } = await supabaseClient
       .from('services')
@@ -129,7 +132,7 @@ export class ServicesService {
     limit?: number;
     offset?: number;
   }) {
-    let query = this.supabase
+    let query = this.serviceSupabase
       .from('services')
       .select(`
         *,
@@ -215,7 +218,7 @@ export class ServicesService {
     console.log('🎥 getVideoFeed called with userId:', userId, 'options:', options);
 
     // Get services that have videos for the TikTok-style video feed
-    const query = this.supabase
+    const query = this.serviceSupabase
       .from('services')
       .select(`
         *,
@@ -254,7 +257,7 @@ export class ServicesService {
 
     if (userId) {
       // Fetch likes
-      const { data: likes, error: likesError } = await this.supabase
+      const { data: likes, error: likesError } = await this.serviceSupabase
         .from('service_likes')
         .select('service_id')
         .eq('user_id', userId);
@@ -265,7 +268,7 @@ export class ServicesService {
       }
 
       // Fetch bookmarks
-      const { data: bookmarks, error: bookmarksError } = await this.supabase
+      const { data: bookmarks, error: bookmarksError } = await this.serviceSupabase
         .from('service_bookmarks')
         .select('service_id')
         .eq('user_id', userId);
@@ -281,7 +284,7 @@ export class ServicesService {
     const commentCountsMap = new Map<string, number>();
 
     if (serviceIds.length > 0) {
-      const { data: commentCounts, error: commentsError } = await this.supabase
+      const { data: commentCounts, error: commentsError } = await this.serviceSupabase
         .from('service_comments')
         .select('service_id')
         .in('service_id', serviceIds);
@@ -348,7 +351,7 @@ export class ServicesService {
   }
 
   async getService(id: string) {
-    const { data, error } = await this.supabase
+    const { data, error } = await this.serviceSupabase
       .from('services')
       .select(`
         *,
@@ -370,7 +373,7 @@ export class ServicesService {
     }
 
     // Increment view count
-    await this.supabase
+    await this.serviceSupabase
       .from('services')
       .update({ view_count: data.view_count + 1 })
       .eq('id', id);
@@ -379,9 +382,8 @@ export class ServicesService {
   }
 
   async updateService(userId: string, serviceId: string, updateServiceDto: UpdateServiceDto, userToken?: string) {
-    const supabaseClient = userToken 
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
+    // Use serviceSupabase for all DB operations
+    const supabaseClient = this.serviceSupabase;
 
     // First verify the service belongs to the user
     const { data: existingService } = await supabaseClient
@@ -437,9 +439,8 @@ export class ServicesService {
   }
 
   async deleteService(userId: string, serviceId: string, userToken?: string) {
-    const supabaseClient = userToken 
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
+    // Use serviceSupabase for all DB operations
+    const supabaseClient = this.serviceSupabase;
 
     // First verify the service belongs to the user
     const { data: existingService } = await supabaseClient
@@ -469,9 +470,8 @@ export class ServicesService {
   }
 
   async toggleLike(userId: string, serviceId: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
+    // Use serviceSupabase to bypass RLS for like operations
+    const supabaseClient = this.serviceSupabase;
 
     // Check if user has already liked this service
     const { data: existingLike, error: checkError } = await supabaseClient
@@ -543,9 +543,8 @@ export class ServicesService {
   }
 
   async toggleBookmark(userId: string, serviceId: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
+    // Use serviceSupabase to bypass RLS
+    const supabaseClient = this.serviceSupabase;
 
     // Check if user has already bookmarked this service
     const { data: existingBookmark } = await supabaseClient
@@ -615,9 +614,8 @@ export class ServicesService {
   }
 
   async incrementShareCount(serviceId: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
+    // Use serviceSupabase to bypass RLS
+    const supabaseClient = this.serviceSupabase;
 
     // Get current service
     const { data: service } = await supabaseClient
@@ -645,11 +643,8 @@ export class ServicesService {
   }
 
   async getServiceComments(serviceId: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
-    const { data: comments, error } = await supabaseClient
+    // Use serviceSupabase to bypass RLS on user_profiles JOIN
+    const { data: comments, error } = await this.serviceSupabase
       .from('service_comments')
       .select(`
         id,
@@ -685,12 +680,8 @@ export class ServicesService {
   }
 
   async addComment(userId: string, serviceId: string, content: string, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
-
-    // Insert comment
-    const { data: comment, error } = await supabaseClient
+    // Use serviceSupabase to bypass RLS on user_profiles JOIN
+    const { data: comment, error } = await this.serviceSupabase
       .from('service_comments')
       .insert({
         service_id: serviceId,
@@ -729,9 +720,8 @@ export class ServicesService {
   }
 
   async addRating(userId: string, serviceId: string, rating: number, userToken?: string) {
-    const supabaseClient = userToken
-      ? createUserSupabaseClient(this.configService, userToken)
-      : this.supabase;
+    // Use serviceSupabase to bypass RLS
+    const supabaseClient = this.serviceSupabase;
 
     if (rating < 1 || rating > 5) {
       throw new Error('Rating must be between 1 and 5');
@@ -817,12 +807,12 @@ export class ServicesService {
         }
       }
 
-      const supabaseClient = userToken
-        ? createUserSupabaseClient(this.configService, userToken)
-        : this.supabase;
+      // Use service role client for storage uploads - user tokens cannot be used
+      // with Supabase Storage because they use a different JWT signing secret
+      const supabaseClient = this.serviceSupabase;
 
-      // Verify user is a seller or rider
-      const { data: userProfile } = await supabaseClient
+      // Verify user is a seller or rider using serviceSupabase to bypass RLS
+      const { data: userProfile } = await this.serviceSupabase
         .from('user_profiles')
         .select('is_seller, is_rider')
         .eq('id', userId)

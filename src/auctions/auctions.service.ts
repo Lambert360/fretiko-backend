@@ -416,10 +416,11 @@ export class AuctionsService {
     images?: Express.Multer.File[], 
     video?: Express.Multer.File[]
   ): Promise<Auction> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+    // Use serviceSupabase for all operations - user tokens can't be used for Supabase DB/Storage
+    const client = this.serviceSupabase;
 
-    // Verify user is a seller
-    const { data: userProfile } = await client
+    // Verify user is a seller using serviceSupabase to bypass RLS
+    const { data: userProfile } = await this.serviceSupabase
       .from('user_profiles')
       .select('is_seller')
       .eq('id', userId)
@@ -429,7 +430,7 @@ export class AuctionsService {
       throw new ForbiddenException('Only sellers can create auctions');
     }
 
-    // Verify category exists
+    // Verify category exists using serviceSupabase
     const { data: category } = await client
       .from('auction_categories')
       .select('id')
@@ -844,8 +845,8 @@ export class AuctionsService {
       bidderDisplayId = existingBid.data.bidder_display_id;
     } else {
       // Count unique bidders for this auction to generate new display ID
-      // Fetch all bidder_ids and count unique ones
-      const { data: allBids } = await client
+      // Use serviceSupabase to bypass RLS - need to see ALL bids, not just user's own
+      const { data: allBids } = await this.serviceSupabase
         .from('auction_bids')
         .select('bidder_id')
         .eq('auction_id', placeBidDto.auction_id)
@@ -1954,8 +1955,7 @@ export class AuctionsService {
   }
 
   /**
-   * Create a new auction item during live auction
-   * Allows hosts to add items on-the-fly
+   * Create a new auction item
    */
   async createAuctionItem(
     auctionId: string,
@@ -1965,7 +1965,8 @@ export class AuctionsService {
     images?: Express.Multer.File[],
     videos?: Express.Multer.File[],
   ): Promise<AuctionItem> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.serviceSupabase;
+    // Use serviceSupabase for all operations - user tokens can't be used for Supabase Storage
+    const client = this.serviceSupabase;
 
     // Verify auction exists and user owns it
     const auction = await this.findById(auctionId);

@@ -1,8 +1,6 @@
 import { Injectable, CanActivate, ExecutionContext } from '@nestjs/common';
-
-import { ConfigService } from '@nestjs/config';
-
-import { createSupabaseClient } from '../shared/supabase.client';
+import { JwtService } from '@nestjs/jwt';
+import { JwtPayload } from '../shared/types';
 
 
 
@@ -20,15 +18,7 @@ import { createSupabaseClient } from '../shared/supabase.client';
 
 export class OptionalJwtAuthGuard implements CanActivate {
 
-  private supabase;
-
-
-
-  constructor(private configService: ConfigService) {
-
-    this.supabase = createSupabaseClient(this.configService);
-
-  }
+  constructor(private jwtService: JwtService) {}
 
 
 
@@ -58,38 +48,27 @@ export class OptionalJwtAuthGuard implements CanActivate {
 
     try {
 
-      console.log('🔐 Optional auth: Validating token with Supabase...');
+      console.log('🔐 Optional auth: Validating token with custom JWT...');
 
+      const decoded = this.jwtService.verify<JwtPayload>(token);
 
-
-      // Let Supabase handle token validation
-
-      const { data: { user }, error } = await this.supabase.auth.getUser(token);
-
-
-
-      if (error || !user) {
-
-        // Log warning but don't throw - allow request to continue without user
-
-        console.warn('⚠️ Optional auth: Token validation failed, continuing without user:', error?.message);
-
+      if (!decoded || typeof decoded !== 'object' || !(decoded as any).sub) {
+        console.warn('⚠️ Optional auth: Token payload invalid, continuing without user');
         return true;
-
       }
 
+      console.log('✅ Optional auth: Token validated for user:', (decoded as any).sub);
 
+      request.user = {
+        sub: (decoded as any).sub,
+        id: (decoded as any).sub,
+        email: (decoded as any).email,
+        type: (decoded as any).type,
+        iat: (decoded as any).iat,
+        exp: (decoded as any).exp,
+      };
 
-      console.log('✅ Optional auth: Token validated for user:', user.id);
-
-
-
-      // Attach user to request
-
-      request.user = { sub: user.id, email: user.email };
-
-      request.supabaseUser = user;
-
+      request.supabaseUser = null;
       request.supabaseToken = token;
 
       return true;

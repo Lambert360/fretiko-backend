@@ -1,7 +1,7 @@
 import { Injectable, UnauthorizedException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { SupabaseClientManager } from './supabase-client-manager.service';
 import * as crypto from 'crypto';
 
 @Injectable()
@@ -9,10 +9,10 @@ export class TokenService {
   private serviceSupabase;
 
   constructor(
-    private configService: ConfigService,
+    private clientManager: SupabaseClientManager,
     private jwtService: JwtService,
   ) {
-    this.serviceSupabase = createServiceSupabaseClient(this.configService);
+    this.serviceSupabase = this.clientManager.getServiceClient();
   }
 
   /**

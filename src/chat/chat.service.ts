@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException, Logger, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import {
@@ -27,7 +27,7 @@ export class ChatService {
     @Inject(forwardRef(() => RealtimeGateway))
     private realtimeGateway: RealtimeGateway
   ) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   async getConversations(userId: string, query: GetConversationsDto, userToken?: string): Promise<ConversationResponseDto[]> {
@@ -270,9 +270,10 @@ export class ChatService {
       const allParticipants = [...new Set([userId, ...participantIds])].sort();
 
       // Generate participant hash using PostgreSQL function
-      // Convert strings to UUIDs for the function call
+      // Use JWT-compatible function when user token is provided, otherwise use UUID version
+      const functionName = userToken ? 'generate_participant_hash_jwt' : 'generate_participant_hash_uuid';
       const { data: hashResult, error: hashError } = await client
-        .rpc('generate_participant_hash', { participant_ids: allParticipants });
+        .rpc(functionName, { participant_ids: allParticipants });
 
       if (hashError) {
         this.logger.error('Error generating participant hash:', hashError);

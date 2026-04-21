@@ -9,14 +9,17 @@ import { EscrowService } from '../escrow/escrow.service';
 import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 
 @Injectable()
 export class WishlistService {
   private supabase;
+  private serviceSupabase;
   private readonly PLATFORM_COMMISSION_RATE: number;
 
   constructor(
     private configService: ConfigService,
+    private clientManager: SupabaseClientManager,
     private notificationsService: NotificationsService,
     private notificationHelper: NotificationHelperService,
     @Inject(forwardRef(() => ChatService))
@@ -26,16 +29,15 @@ export class WishlistService {
     private walletService: WalletService,
     private realtimeGateway: RealtimeGateway,
   ) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
+    this.serviceSupabase = this.clientManager.getServiceClient();
     this.PLATFORM_COMMISSION_RATE = parseFloat(
       this.configService.get<string>('PLATFORM_COMMISSION_RATE', '0.1')
     );
   }
 
   async getWishlistItems(userId: string, userToken?: string) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    const { data, error } = await client
+    const { data, error } = await this.serviceSupabase
       .from('wishlist')
       .select(`
         *,
@@ -88,12 +90,10 @@ export class WishlistService {
   }
 
   async addToWishlist(userId: string, wishlistData: { productId: string; productName: string; productImage: string; price: number }, userToken?: string) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
     console.log('💖 Adding to wishlist for user:', userId, wishlistData);
 
     // Check if product exists
-    const { data: product, error: productError } = await client
+    const { data: product, error: productError } = await this.serviceSupabase
       .from('products')
       .select('id, name')
       .eq('id', wishlistData.productId)
@@ -105,7 +105,7 @@ export class WishlistService {
     }
 
     // Check if item already exists in wishlist
-    const { data: existingItem } = await client
+    const { data: existingItem } = await this.serviceSupabase
       .from('wishlist')
       .select('id')
       .eq('user_id', userId)
@@ -117,7 +117,7 @@ export class WishlistService {
     }
 
     // Add new item to wishlist
-    const { error: insertError } = await client
+    const { error: insertError } = await this.serviceSupabase
       .from('wishlist')
       .insert({
         user_id: userId,
@@ -133,11 +133,9 @@ export class WishlistService {
   }
 
   async removeFromWishlist(userId: string, productId: string, userToken?: string) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
     console.log('💖 Removing from wishlist for user:', userId, 'productId:', productId);
 
-    const { error } = await client
+    const { error } = await this.serviceSupabase
       .from('wishlist')
       .delete()
       .eq('user_id', userId)
@@ -152,8 +150,6 @@ export class WishlistService {
   }
 
   async removePurchasedItems(userId: string, wishlistItemIds: string[], userToken?: string) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
     if (!wishlistItemIds || wishlistItemIds.length === 0) {
       console.log('💖 No wishlist item IDs provided for removal');
       return { message: 'No items to remove', removedCount: 0 };
@@ -162,7 +158,7 @@ export class WishlistService {
     console.log('💖 Removing purchased wishlist items for user:', userId, 'itemIds:', wishlistItemIds);
 
     // Delete wishlist items by their IDs (wishlist.id, not product_id)
-    const { data, error } = await client
+    const { data, error } = await this.serviceSupabase
       .from('wishlist')
       .delete()
       .eq('user_id', userId)
@@ -181,9 +177,7 @@ export class WishlistService {
   }
 
   async clearWishlist(userId: string, userToken?: string) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    const { error } = await client
+    const { error } = await this.serviceSupabase
       .from('wishlist')
       .delete()
       .eq('user_id', userId);
@@ -197,9 +191,7 @@ export class WishlistService {
   }
 
   async getWishlistCount(userId: string, userToken?: string) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    const { count, error } = await client
+    const { count, error } = await this.serviceSupabase
       .from('wishlist')
       .select('*', { count: 'exact', head: true })
       .eq('user_id', userId);
@@ -213,9 +205,7 @@ export class WishlistService {
   }
 
   async checkIsInWishlist(userId: string, productId: string, userToken?: string) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    const { data, error } = await client
+    const { data, error } = await this.serviceSupabase
       .from('wishlist')
       .select('id')
       .eq('user_id', userId)

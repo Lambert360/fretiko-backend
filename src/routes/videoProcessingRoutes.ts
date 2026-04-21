@@ -1,19 +1,39 @@
 import { Router } from 'express';
 import { videoProcessingController } from '../controllers/videoProcessingController';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { JwtService } from '@nestjs/jwt';
 
 const router = Router();
 
 // All routes require authentication
 router.use(async (req, res, next) => {
   try {
-    const jwtAuthGuard = new JwtAuthGuard();
-    const canActivate = await jwtAuthGuard.canActivate({ switchToHttp: () => ({ getRequest: () => req }) } as any);
-    
-    if (!canActivate) {
+    const authHeader = req.headers?.authorization;
+    if (!authHeader) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    
+
+    const token = authHeader.replace('Bearer ', '');
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      return res.status(500).json({ error: 'Server misconfigured' });
+    }
+
+    const jwtService = new JwtService({ secret: jwtSecret });
+    const decoded: any = jwtService.verify(token);
+
+    if (!decoded?.sub) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    req.user = {
+      sub: decoded.sub,
+      id: decoded.sub,
+      email: decoded.email,
+      type: decoded.type,
+      iat: decoded.iat,
+      exp: decoded.exp,
+    };
+
     next();
   } catch (error) {
     console.error('Authentication error:', error);

@@ -1,7 +1,8 @@
 import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto, ProductResponseDto, ProductCategoryDto } from './dto/product.dto';
+import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 import ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -10,9 +11,14 @@ import * as os from 'os';
 @Injectable()
 export class ProductsService {
   private supabase;
+  private serviceSupabase;
 
-  constructor(private configService: ConfigService) {
-    this.supabase = createSupabaseClient(this.configService);
+  constructor(
+    private configService: ConfigService,
+    private supabaseClientManager: SupabaseClientManager,
+  ) {
+    this.supabase = createServiceSupabaseClient(this.configService);
+    this.serviceSupabase = createServiceSupabaseClient(this.configService);
   }
 
   async getCategories(): Promise<ProductCategoryDto[]> {
@@ -30,11 +36,8 @@ export class ProductsService {
   }
 
   async createProduct(userId: string, createProductDto: CreateProductDto, userToken?: string): Promise<ProductResponseDto> {
-    // Use user-authenticated client if available
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    // Verify user is a seller
-    const { data: userProfile } = await client
+    // Verify user is a seller using serviceSupabase to bypass RLS
+    const { data: userProfile } = await this.serviceSupabase
       .from('user_profiles')
       .select('is_seller')
       .eq('id', userId)
@@ -44,15 +47,30 @@ export class ProductsService {
       throw new ForbiddenException('Only sellers can create products');
     }
 
-    // Verify category exists
-    const { data: category } = await client
+    // Verify category exists using serviceSupabase
+    console.log(' Validating category_id:', createProductDto.category_id);
+
+    const { data: category, error: categoryError } = await this.serviceSupabase
       .from('product_categories')
-      .select('id')
+      .select('id, name')
       .eq('id', createProductDto.category_id)
       .single();
 
+    console.log(' Category query result:', { category, categoryError });
+
+    if (categoryError) {
+      console.error(' Category query error:', categoryError);
+    }
+
     if (!category) {
-      throw new BadRequestException('Invalid category');
+      // Check what categories actually exist
+      const { data: allCategories } = await this.serviceSupabase
+        .from('product_categories')
+        .select('id, name')
+        .limit(10);
+      console.log(' Available categories:', allCategories);
+
+      throw new BadRequestException(`Invalid category: ${createProductDto.category_id}`);
     }
 
     // Prepare product data
@@ -75,7 +93,8 @@ export class ProductsService {
       status: 'active',
     };
 
-    const { data, error } = await client
+    // Use serviceSupabase for product insert - user tokens can't be used for DB operations
+    const { data, error } = await this.serviceSupabase
       .from('products')
       .insert([productData])
       .select()
@@ -135,9 +154,8 @@ export class ProductsService {
   }
 
   async getMyProducts(userId: string, userToken?: string): Promise<ProductResponseDto[]> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    const { data, error } = await client
+    // Use serviceSupabase - user tokens can't be used for DB operations
+    const { data, error } = await this.serviceSupabase
       .from('products')
       .select('*')
       .eq('user_id', userId)
@@ -153,7 +171,7 @@ export class ProductsService {
 
   async getProduct(id: string): Promise<ProductResponseDto> {
     try {
-      const { data, error } = await this.supabase
+      const { data, error } = await this.serviceSupabase
         .from('products')
         .select(`
           *,
@@ -181,7 +199,7 @@ export class ProductsService {
 
       // Increment view count with null safety
       const currentViewCount = data.view_count || 0;
-      await this.supabase
+      await this.serviceSupabase
         .from('products')
         .update({ view_count: currentViewCount + 1 })
         .eq('id', id);
@@ -197,8 +215,8 @@ export class ProductsService {
   }
 
   async updateProduct(id: string, userId: string, updateProductDto: UpdateProductDto, userToken?: string): Promise<ProductResponseDto> {
-    // Verify product ownership
-    const { data: product } = await this.supabase
+    // Verify product ownership using serviceSupabase
+    const { data: product } = await this.serviceSupabase
       .from('products')
       .select('user_id')
       .eq('id', id)
@@ -229,10 +247,8 @@ export class ProductsService {
     if (updateProductDto.tags !== undefined) updateData.tags = updateProductDto.tags;
     if (updateProductDto.status !== undefined) updateData.status = updateProductDto.status;
 
-    // Use user-authenticated client if available
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    const { data, error } = await client
+    // Use serviceSupabase for update - user tokens can't be used for DB operations
+    const { data, error } = await this.serviceSupabase
       .from('products')
       .update(updateData)
       .eq('id', id)
@@ -248,7 +264,7 @@ export class ProductsService {
 
   async deleteProduct(id: string, userId: string, userToken?: string): Promise<void> {
     // Verify product ownership
-    const { data: product } = await this.supabase
+    const { data: product } = await this.serviceSupabase
       .from('products')
       .select('user_id')
       .eq('id', id)
@@ -262,10 +278,8 @@ export class ProductsService {
       throw new ForbiddenException('You can only delete your own products');
     }
 
-    // Soft delete
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    const { error } = await client
+    // Soft delete using serviceSupabase
+    const { error } = await this.serviceSupabase
       .from('products')
       .update({ deleted_at: new Date().toISOString() })
       .eq('id', id);
@@ -280,7 +294,7 @@ export class ProductsService {
       console.log(`Fetching reviews for product: ${productId}`);
 
       // Join with user_profiles to get reviewer information
-      const { data, error } = await this.supabase
+      const { data, error } = await this.serviceSupabase
         .from('product_ratings')
         .select(`
           *,
@@ -321,7 +335,7 @@ export class ProductsService {
   }
 
   async addProductReview(productId: string, userId: string, reviewData: { rating: number; comment: string }, userToken?: string) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
+    // Use serviceSupabase - user tokens can't be used for DB operations
 
     // Validate rating
     if (reviewData.rating < 1 || reviewData.rating > 5) {
@@ -329,7 +343,7 @@ export class ProductsService {
     }
 
     // Check if product exists
-    const { data: product } = await client
+    const { data: product } = await this.serviceSupabase
       .from('products')
       .select('id')
       .eq('id', productId)
@@ -340,7 +354,7 @@ export class ProductsService {
     }
 
     // Check if user already reviewed this product
-    const { data: existingReview } = await client
+    const { data: existingReview } = await this.serviceSupabase
       .from('product_ratings')
       .select('id')
       .eq('product_id', productId)
@@ -352,7 +366,7 @@ export class ProductsService {
     }
 
     // Add the review - product_ratings table has 'review' column, not 'comment'
-    const { data, error } = await client
+    const { data, error } = await this.serviceSupabase
       .from('product_ratings')
       .insert({
         product_id: productId,
@@ -429,12 +443,12 @@ export class ProductsService {
         throw new BadRequestException('At least one image or video file is required');
       }
 
-      const supabaseClient = userToken
-        ? createUserSupabaseClient(this.configService, userToken)
-        : this.supabase;
+      // Use service role client for storage uploads - user tokens cannot be used
+      // with Supabase Storage because they use a different JWT signing secret
+      const supabaseClient = this.serviceSupabase;
 
-      // Verify user is a seller
-      const { data: userProfile } = await supabaseClient
+      // Verify user is a seller using serviceSupabase to bypass RLS
+      const { data: userProfile } = await this.serviceSupabase
         .from('user_profiles')
         .select('is_seller')
         .eq('id', userId)

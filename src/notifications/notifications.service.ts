@@ -27,7 +27,7 @@ export class NotificationsService {
   private readonly serviceSupabase: SupabaseClient;
 
   constructor(private readonly configService: ConfigService) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
   }
 

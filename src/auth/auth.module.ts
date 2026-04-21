@@ -8,6 +8,7 @@ import { OptionalJwtAuthGuard } from './optional-jwt-auth.guard';
 import { SocialAuthService } from './social-auth.service';
 import { EmailService } from './email.service';
 import { TokenService } from './token.service';
+import { SupabaseClientManager } from './supabase-client-manager.service';
 
 @Module({
   imports: [
@@ -20,8 +21,25 @@ import { TokenService } from './token.service';
       inject: [ConfigService],
     }),
   ],
-  providers: [AuthService, JwtAuthGuard, OptionalJwtAuthGuard, SocialAuthService, EmailService, TokenService],
+  providers: [
+    AuthService, 
+    JwtAuthGuard, 
+    OptionalJwtAuthGuard, 
+    SocialAuthService, 
+    EmailService, 
+    TokenService,
+    SupabaseClientManager
+  ],
   controllers: [AuthController],
-  exports: [AuthService, JwtModule, JwtAuthGuard, OptionalJwtAuthGuard, SocialAuthService, EmailService, TokenService],
+  exports: [
+    AuthService, 
+    JwtModule, 
+    JwtAuthGuard, 
+    OptionalJwtAuthGuard, 
+    SocialAuthService, 
+    EmailService, 
+    TokenService,
+    SupabaseClientManager
+  ],
 })
 export class AuthModule {}

@@ -25,7 +25,7 @@ import type { ResetPasswordDto } from './dto/reset-password.dto';
 import type { VerifyTokenDto, ResendTokenDto } from './dto/verify-token.dto';
 import { SocialAuthService } from './social-auth.service';
 import { TokenService } from './token.service';
-import { createSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { ConfigService } from '@nestjs/config';
 import type { Request, Response } from 'express';
 
@@ -39,7 +39,7 @@ export class AuthController {
     private readonly tokenService: TokenService,
     private readonly configService: ConfigService,
   ) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   @MessagePattern('ping')
@@ -185,8 +185,6 @@ export class AuthController {
         success: true,
         message: 'Account created successfully! Welcome to Fretiko.',
         user: result.user,
-        accessToken: result.accessToken,
-        refreshToken: result.refreshToken,
       };
     } catch (error) {
       throw error; // Let the error filter handle the response format

@@ -3,15 +3,19 @@ import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { UpdateProfileDto, UserProfileResponse, PublicProfileResponse } from '../shared/dto/user-profile.dto';
 import * as crypto from 'crypto';
+import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 
 @Injectable()
 export class UsersService {
   private supabase;
   private serviceSupabase; // Service role client for operations that need to bypass RLS
 
-  constructor(private configService: ConfigService) {
+  constructor(
+    private configService: ConfigService,
+    private clientManager: SupabaseClientManager,
+  ) {
     this.supabase = createSupabaseClient(this.configService);
-    this.serviceSupabase = createServiceSupabaseClient(this.configService);
+    this.serviceSupabase = this.clientManager.getServiceClient();
   }
 
   async getProfile(userId: string): Promise<UserProfileResponse> {
@@ -67,25 +71,10 @@ export class UsersService {
   }
 
   async updateProfile(userId: string, updateData: UpdateProfileDto, userToken?: string): Promise<UserProfileResponse> {
-    // Create user-authenticated client - let Supabase handle all auth logic
-    let client;
-    if (userToken) {
-      console.log('Creating user-authenticated client with token');
-      client = createUserSupabaseClient(this.configService, userToken);
-      
-      // Verify the client can access user info
-      const { data: { user: sessionUser }, error: userError } = await client.auth.getUser();
-      if (userError) {
-        console.error('Failed to verify user with token:', userError);
-      }
-      console.log('User client verification:', !!sessionUser, 'userId:', sessionUser?.id);
-    } else {
-      console.log('Using service role client');
-      client = this.supabase; // Fallback to service role
-    }
+    console.log('🔐 Using serviceSupabase for profile operations (bypasses RLS)');
     
     // Check if profile exists for logging purposes
-    const { data: profileCheck } = await client
+    const { data: profileCheck } = await this.serviceSupabase
       .from('user_profiles')
       .select('id, username')
       .eq('id', userId);
@@ -97,21 +86,6 @@ export class UsersService {
       console.log('Profile not found, will create new profile with upsert');
     } else if (profileCheck.length > 1) {
       throw new Error('Multiple profiles found for user. Please contact support.');
-    }
-
-    // Check if username is taken (if username is being updated)
-    // Only check if username is provided and different from existing
-    if (updateData.username && (!profileCheck || profileCheck.length === 0 || updateData.username !== profileCheck[0].username)) {
-      const { data: existingUser } = await client
-        .from('user_profiles')
-        .select('id')
-        .eq('username', updateData.username)
-        .neq('id', userId)
-        .single();
-
-      if (existingUser) {
-        throw new ConflictException('Username is already taken');
-      }
     }
 
     // SECURITY: Only allow profile creation for authenticated users with valid tokens
@@ -126,7 +100,9 @@ export class UsersService {
       }
       
       // SECURITY: Verify the token belongs to the user trying to create the profile
-      const { data: { user: tokenUser }, error: tokenError } = await client.auth.getUser();
+      // Use user-authenticated client only for token validation
+      const tempClient = createUserSupabaseClient(this.configService, userToken);
+      const { data: { user: tokenUser }, error: tokenError } = await tempClient.auth.getUser();
       if (tokenError || !tokenUser || tokenUser.id !== userId) {
         console.error('SECURITY: Token validation failed for profile creation', { 
           userId, 
@@ -140,6 +116,21 @@ export class UsersService {
       console.log('SECURITY: Creating new profile for authenticated user', userId);
     }
     
+    // Check if username is taken (if username is being updated)
+    // Only check if username is provided and different from existing
+    if (updateData.username && (!profileCheck || profileCheck.length === 0 || updateData.username !== profileCheck[0].username)) {
+      const { data: existingUser } = await this.serviceSupabase
+        .from('user_profiles')
+        .select('id')
+        .eq('username', updateData.username)
+        .neq('id', userId)
+        .single();
+
+      if (existingUser) {
+        throw new ConflictException('Username is already taken');
+      }
+    }
+
     // SECURITY: Use cryptographically secure random for usernames
     // EFFICIENCY: Generate random bytes once per call, not in loop
     const generateSecureUsername = () => {
@@ -183,8 +174,8 @@ export class UsersService {
       console.log('Upserting profile with data:', dbUpsertData);
     }
 
-    // SECURITY: Use user-authenticated client for profile creation (respects RLS)
-    const { data, error } = await client
+    // Use serviceSupabase to bypass RLS for database operations
+    const { data, error } = await this.serviceSupabase
       .from('user_profiles')
       .upsert(dbUpsertData)
       .eq('id', userId)
@@ -216,16 +207,13 @@ export class UsersService {
   }
 
   async uploadAvatar(userId: string, file: Buffer, fileName: string, userToken?: string): Promise<string> {
-    // Create user-authenticated client for storage operations
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-    
     try {
       // Create unique filename
       const fileExt = fileName.split('.').pop();
       const uniqueFileName = `${userId}/${Date.now()}.${fileExt}`;
 
       // Upload to Supabase Storage
-      const { data, error } = await client.storage
+      const { data, error } = await this.serviceSupabase.storage
         .from('avatars')
         .upload(uniqueFileName, file, {
           contentType: `image/${fileExt}`,
@@ -237,14 +225,14 @@ export class UsersService {
       }
 
       // Get public URL
-      const { data: urlData } = client.storage
+      const { data: urlData } = this.serviceSupabase.storage
         .from('avatars')
         .getPublicUrl(uniqueFileName);
 
       const avatarUrl = urlData.publicUrl;
 
-      // Update user profile with new avatar URL using user-authenticated client
-      await client
+      // Update user profile with new avatar URL using serviceSupabase
+      await this.serviceSupabase
         .from('user_profiles')
         .update({ avatar_url: avatarUrl })
         .eq('id', userId);
@@ -256,16 +244,13 @@ export class UsersService {
   }
 
   async uploadBackground(userId: string, file: Buffer, fileName: string, userToken?: string): Promise<string> {
-    // Create user-authenticated client for storage operations
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-    
     try {
       // Create unique filename
       const fileExt = fileName.split('.').pop();
       const uniqueFileName = `${userId}/${Date.now()}.${fileExt}`;
 
       // Upload to Supabase Storage - using 'backgrounds' bucket
-      const { data, error } = await client.storage
+      const { data, error } = await this.serviceSupabase.storage
         .from('backgrounds')
         .upload(uniqueFileName, file, {
           contentType: `image/${fileExt}`,
@@ -277,14 +262,14 @@ export class UsersService {
       }
 
       // Get public URL
-      const { data: urlData } = client.storage
+      const { data: urlData } = this.serviceSupabase.storage
         .from('backgrounds')
         .getPublicUrl(uniqueFileName);
 
       const bgPicUrl = urlData.publicUrl;
 
-      // Update user profile with new background URL using user-authenticated client
-      await client
+      // Update user profile with new background URL using serviceSupabase
+      await this.serviceSupabase
         .from('user_profiles')
         .update({ bg_pic_url: bgPicUrl })
         .eq('id', userId);
@@ -296,10 +281,11 @@ export class UsersService {
   }
 
   async searchUsers(query: string, limit: number = 20): Promise<PublicProfileResponse[]> {
-    const { data, error } = await this.supabase
+    const { data, error } = await this.serviceSupabase
       .from('user_profiles')
       .select('id, username, bio, avatar_url, location, is_seller, created_at')
       .or(`username.ilike.%${query}%,bio.ilike.%${query}%`)
+      .not('id', 'in', '("00000000-0000-4000-8000-000000000002","00000000-0000-4000-8000-000000000003")')
       .limit(limit)
       .order('created_at', { ascending: false });
 
@@ -319,13 +305,12 @@ export class UsersService {
   }
 
   async deleteAccount(userId: string, userToken?: string): Promise<{ message: string; deletedData: any }> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-    
     console.log('🗑️ Starting account deletion for user:', userId);
     
+    // ... (rest of the code remains the same)
     try {
       // Get user profile first to log what we're deleting
-      const { data: profile } = await client
+      const { data: profile } = await this.serviceSupabase
         .from('user_profiles')
         .select('username, is_seller, is_rider')
         .eq('id', userId)
@@ -344,7 +329,7 @@ export class UsersService {
       
       // 1. Delete user's products and related data
       console.log('🗑️ Deleting user products...');
-      const { error: productsError } = await client
+      const { error: productsError } = await this.serviceSupabase
         .from('products')
         .delete()
         .eq('user_id', userId);
@@ -356,7 +341,7 @@ export class UsersService {
       
       // 2. Delete user's wishlist items
       console.log('🗑️ Deleting wishlist items...');
-      const { error: wishlistError } = await client
+      const { error: wishlistError } = await this.serviceSupabase
         .from('wishlist')
         .delete()
         .eq('user_id', userId);
@@ -368,7 +353,7 @@ export class UsersService {
       
       // 3. Delete user's cart items
       console.log('🗑️ Deleting cart items...');
-      const { error: cartError } = await client
+      const { error: cartError } = await this.serviceSupabase
         .from('cart')
         .delete()
         .eq('user_id', userId);
@@ -380,7 +365,7 @@ export class UsersService {
       
       // 4. Delete user's orders
       console.log('🗑️ Deleting orders...');
-      const { error: ordersError } = await client
+      const { error: ordersError } = await this.serviceSupabase
         .from('orders')
         .delete()
         .eq('user_id', userId);
@@ -392,7 +377,7 @@ export class UsersService {
       
       // 5. Delete user's connections
       console.log('🗑️ Deleting connections...');
-      const { error: connectionsError } = await client
+      const { error: connectionsError } = await this.serviceSupabase
         .from('connections')
         .delete()
         .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`);
@@ -404,7 +389,7 @@ export class UsersService {
       
       // 6. Delete user's chat messages
       console.log('🗑️ Deleting chat messages...');
-      const { error: messagesError } = await client
+      const { error: messagesError } = await this.serviceSupabase
         .from('chat_messages')
         .delete()
         .eq('sender_id', userId);
@@ -416,7 +401,7 @@ export class UsersService {
       
       // 7. Delete user's notifications
       console.log('🗑️ Deleting notifications...');
-      const { error: notificationsError } = await client
+      const { error: notificationsError } = await this.serviceSupabase
         .from('notifications')
         .delete()
         .eq('user_id', userId);
@@ -428,7 +413,7 @@ export class UsersService {
       
       // 8. Delete user's wallet transactions
       console.log('🗑️ Deleting wallet transactions...');
-      const { error: walletError } = await client
+      const { error: walletError } = await this.serviceSupabase
         .from('wallet_transactions')
         .delete()
         .eq('user_id', userId);
@@ -440,7 +425,7 @@ export class UsersService {
       
       // 9. Delete user's wallet
       console.log('🗑️ Deleting wallet...');
-      const { error: walletDeleteError } = await client
+      const { error: walletDeleteError } = await this.serviceSupabase
         .from('wallet')
         .delete()
         .eq('user_id', userId);
@@ -452,7 +437,7 @@ export class UsersService {
       
       // 10. Delete user's profile (this should be last)
       console.log('🗑️ Deleting user profile...');
-      const { error: profileError } = await client
+      const { error: profileError } = await this.serviceSupabase
         .from('user_profiles')
         .delete()
         .eq('id', userId);
@@ -464,7 +449,7 @@ export class UsersService {
       
       // 11. Finally, delete the auth user from Supabase Auth
       console.log('🗑️ Deleting auth user...');
-      const { error: authError } = await client.auth.admin.deleteUser(userId);
+      const { error: authError } = await this.serviceSupabase.auth.admin.deleteUser(userId);
       
       if (authError) {
         console.error('Error deleting auth user:', authError);
@@ -490,7 +475,7 @@ export class UsersService {
    */
   async getMyWarnings(userId: string) {
     // First, get warnings without the problematic relationship
-    const { data: warnings, error } = await this.supabase
+    const { data: warnings, error } = await this.serviceSupabase
       .from('user_warnings')
       .select(`
         id,
@@ -522,7 +507,7 @@ export class UsersService {
     // Fetch staff information separately to avoid RLS recursion
     let staffMap: { [key: string]: any } = {};
     if (staffIds.length > 0) {
-      const { data: staffData, error: staffError } = await this.supabase
+      const { data: staffData, error: staffError } = await this.serviceSupabase
         .from('staff_accounts')
         .select('id, full_name, email')
         .in('id', staffIds);
@@ -558,7 +543,7 @@ export class UsersService {
    */
   async getAccountStatus(userId: string) {
     // Get warnings
-    const { data: warnings, error: warningsError } = await this.supabase
+    const { data: warnings, error: warningsError } = await this.serviceSupabase
       .from('user_warnings')
       .select('severity, created_at')
       .eq('user_id', userId);
@@ -577,7 +562,7 @@ export class UsersService {
       : null;
 
     // Get user profile for suspension/ban status
-    const { data: user, error: userError } = await this.supabase
+    const { data: user, error: userError } = await this.serviceSupabase
       .from('user_profiles')
       .select('preferences')
       .eq('id', userId)

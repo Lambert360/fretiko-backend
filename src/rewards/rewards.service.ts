@@ -5,7 +5,7 @@
 
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { SupabaseClient, createSupabaseClient } from '../shared/supabase.client';
+import { SupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 
 export interface RewardsBalance {
   user_id: string;
@@ -38,7 +38,7 @@ export class RewardsService {
   private readonly supabase: SupabaseClient;
 
   constructor(private readonly configService: ConfigService) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
   }
 
   // ============================================

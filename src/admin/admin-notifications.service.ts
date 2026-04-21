@@ -6,7 +6,7 @@
 import { Injectable, Logger, BadRequestException, Inject, forwardRef, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
-import { createSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { AdminNotificationsGateway } from './admin-notifications.gateway';
 import { AdminNotificationEventType } from './events/admin-notification.events';
 import type {
@@ -72,7 +72,7 @@ export class AdminNotificationsService implements OnModuleInit {
     private configService: ConfigService,
     private eventEmitter: EventEmitter2,
   ) {
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
     this.logger.log('🔧 AdminNotificationsService constructor called');
   }
