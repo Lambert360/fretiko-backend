@@ -1,4 +1,4 @@
-import { Controller, Get, Post, UseGuards, Req } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, Body, UseGuards, Req } from '@nestjs/common';
 import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
 import { PermissionsGuard } from '../staff/guards/permissions.guard';
 import { Permissions } from '../staff/decorators/permissions.decorator';
@@ -62,5 +62,57 @@ export class MonitoringController {
   @Permissions('process_payouts')
   async manualReconciliation(@Req() req) {
     return this.backgroundProcessingService.manualReconciliation();
+  }
+
+  /**
+   * Get recent system alerts
+   * GET /admin/monitoring/alerts?limit=50&severity=&resolved=
+   * Requires: view_revenue permission
+   */
+  @Get('alerts')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async getAlerts(
+    @Query('limit') limit?: string,
+    @Query('severity') severity?: string,
+    @Query('resolved') resolved?: string,
+  ) {
+    const parsedLimit = limit ? parseInt(limit, 10) : 50;
+    const parsedResolved = resolved !== undefined ? resolved === 'true' : undefined;
+    
+    return this.backgroundProcessingService.getAlerts(parsedLimit, severity, parsedResolved);
+  }
+
+  /**
+   * Dismiss an alert
+   * POST /admin/monitoring/alerts/:id/dismiss
+   * Requires: view_revenue permission
+   */
+  @Post('alerts/:id/dismiss')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async dismissAlert(
+    @Param('id') alertId: string,
+    @Req() req,
+  ) {
+    const resolvedBy = req.user?.staffId || req.user?.sub || 'staff';
+    return this.backgroundProcessingService.dismissAlert(alertId, resolvedBy);
+  }
+
+  /**
+   * Resolve an alert with optional notes
+   * POST /admin/monitoring/alerts/:id/resolve
+   * Requires: view_revenue permission
+   */
+  @Post('alerts/:id/resolve')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async resolveAlert(
+    @Param('id') alertId: string,
+    @Body() body: { notes?: string },
+    @Req() req,
+  ) {
+    const resolvedBy = req.user?.staffId || req.user?.sub || 'staff';
+    return this.backgroundProcessingService.resolveAlert(alertId, body?.notes, resolvedBy);
   }
 }

@@ -14,7 +14,7 @@ import {
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
 import { StaffJwtAuthGuard } from '../../staff/guards/staff-jwt-auth.guard';
 import { BlogPostsService } from '../services/blog-posts.service';
-import { CreateBlogPostDto, UpdateBlogPostDto, BlogPostQueryDto } from '../dto/blog-post.dto';
+import { CreateBlogPostDto, UpdateBlogPostDto, BlogPostQueryDto, BlogPostStatus } from '../dto/blog-post.dto';
 
 @ApiTags('Website Content - Blog')
 @Controller('admin/website-content/blog-posts')
@@ -91,6 +91,44 @@ export class BlogPostsController {
   @ApiResponse({ status: HttpStatus.OK, description: 'Blog post deleted successfully' })
   async remove(@Param('id') id: string) {
     return this.blogPostsService.remove(id);
+  }
+
+  /**
+   * Get published blog posts (admin filter view)
+   * GET /admin/website-content/blog-posts/published
+   */
+  @Get('published')
+  @ApiOperation({ summary: 'Get published blog posts (admin view)' })
+  @ApiResponse({ status: HttpStatus.OK, description: 'Published blog posts retrieved successfully' })
+  async findPublishedAdmin(@Query() query: BlogPostQueryDto) {
+    // Force status to published for this endpoint
+    return this.blogPostsService.findAll({ ...query, status: BlogPostStatus.PUBLISHED });
+  }
+
+  /**
+   * Publish a blog post
+   * POST /admin/website-content/blog-posts/:id/publish
+   */
+  @Post(':id/publish')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Publish a blog post' })
+  @ApiParam({ name: 'id', description: 'Blog post ID' })
+  @ApiResponse({ status: HttpStatus.OK, description: 'Blog post published successfully' })
+  async publish(@Param('id') id: string) {
+    return this.blogPostsService.publishPost(id);
+  }
+
+  /**
+   * Archive a blog post
+   * POST /admin/website-content/blog-posts/:id/archive
+   */
+  @Post(':id/archive')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Archive a blog post' })
+  @ApiParam({ name: 'id', description: 'Blog post ID' })
+  @ApiResponse({ status: HttpStatus.OK, description: 'Blog post archived successfully' })
+  async archive(@Param('id') id: string) {
+    return this.blogPostsService.archivePost(id);
   }
 }
 

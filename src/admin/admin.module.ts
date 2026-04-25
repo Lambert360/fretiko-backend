@@ -13,6 +13,7 @@ import { DashboardController } from './dashboard.controller';
 import { PartnershipsController } from '../partnerships/partnerships.controller';
 import { OrdersController } from './orders.controller';
 import { DisputesController } from './disputes.controller';
+import { AdminNotificationsController } from './admin-notifications.controller';
 import { AdminService } from './admin.service';
 import { AdminNotificationsGateway } from './admin-notifications.gateway';
 import { AdminNotificationsService } from './admin-notifications.service';
@@ -66,6 +67,7 @@ import { AuthModule } from '../auth/auth.module';
     PartnershipsController, // NEW: Partnership applications management
     OrdersController, 
     DisputesController,
+    AdminNotificationsController, // REST endpoints for admin notifications
   ],
   providers: [
     AdminService,

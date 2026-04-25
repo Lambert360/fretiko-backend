@@ -332,4 +332,97 @@ export class BackgroundProcessingService implements OnModuleInit {
     this.logger.log('🔍 Manual reconciliation triggered');
     return this.performDailyReconciliation();
   }
+
+  /**
+   * Get recent alerts with optional filtering
+   */
+  getAlerts(limit: number = 50, severity?: string, resolved?: boolean) {
+    const alerts = (this.monitoringCache.get('alerts') as any[]) || [];
+    
+    let filtered = alerts;
+    
+    if (severity) {
+      filtered = filtered.filter(a => a.data?.severity === severity || a.type?.includes(severity.toUpperCase()));
+    }
+    
+    if (resolved !== undefined) {
+      filtered = filtered.filter(a => a.resolved === resolved);
+    }
+    
+    // Sort by timestamp desc and limit
+    return filtered
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, limit)
+      .map((alert, index) => ({
+        id: alert.id || `alert-${Date.now()}-${index}`,
+        type: alert.type,
+        severity: alert.data?.severity || this.getSeverityFromType(alert.type),
+        message: alert.data?.message || alert.data?.error || alert.type,
+        data: alert.data,
+        timestamp: alert.timestamp,
+        resolved: alert.resolved || false,
+        resolvedAt: alert.resolvedAt,
+        resolvedBy: alert.resolvedBy,
+      }));
+  }
+
+  /**
+   * Dismiss an alert (mark as resolved)
+   */
+  dismissAlert(alertId: string, resolvedBy?: string) {
+    const alerts = (this.monitoringCache.get('alerts') as any[]) || [];
+    const alertIndex = alerts.findIndex(a => a.id === alertId || a.id === undefined && alerts.indexOf(a) === parseInt(alertId.split('-').pop() || '-1'));
+    
+    if (alertIndex === -1) {
+      // Try to find by generated ID pattern
+      const targetAlert = alerts.find((a, idx) => `alert-${Date.now()}-${idx}` === alertId || `alert-${new Date(a.timestamp).getTime()}-${idx}` === alertId);
+      if (!targetAlert) {
+        return { success: false, message: 'Alert not found' };
+      }
+    }
+    
+    // Mark as resolved
+    const alert = alerts[alertIndex];
+    alert.resolved = true;
+    alert.resolvedAt = new Date();
+    alert.resolvedBy = resolvedBy || 'system';
+    
+    this.monitoringCache.set('alerts', alerts);
+    
+    this.logger.log(`✅ Alert ${alertId} dismissed by ${resolvedBy || 'system'}`);
+    
+    return { success: true, message: 'Alert dismissed successfully' };
+  }
+
+  /**
+   * Resolve an alert with notes
+   */
+  resolveAlert(alertId: string, notes?: string, resolvedBy?: string) {
+    const result = this.dismissAlert(alertId, resolvedBy);
+    
+    if (result.success) {
+      const alerts = (this.monitoringCache.get('alerts') as any[]) || [];
+      const alert = alerts.find(a => a.id === alertId);
+      if (alert) {
+        alert.resolutionNotes = notes;
+      }
+      this.monitoringCache.set('alerts', alerts);
+      
+      return { success: true, message: 'Alert resolved successfully' };
+    }
+    
+    return result;
+  }
+
+  /**
+   * Get severity level from alert type
+   */
+  private getSeverityFromType(type: string): string {
+    const criticalTypes = ['RATE_UPDATE_FAILED', 'RECONCILIATION_FAILED', 'HIGH_FAILURE_RATE'];
+    const warningTypes = ['PROVIDER_DEGRADED', 'CACHE_MISS'];
+    
+    if (criticalTypes.includes(type)) return 'critical';
+    if (warningTypes.includes(type)) return 'medium';
+    return 'low';
+  }
 }
