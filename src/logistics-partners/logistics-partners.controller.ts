@@ -31,7 +31,6 @@ import {
 } from './dto/create-partner-application.dto';
 
 @Controller('logistics-partners')
-@UseGuards(StaffJwtAuthGuard)
 export class LogisticsPartnersController {
   constructor(private readonly logisticsPartnersService: LogisticsPartnersService) {}
 
@@ -127,6 +126,7 @@ export class LogisticsPartnersController {
    * Requires: view_partner_applications permission
    */
   @Get('applications')
+  @UseGuards(StaffJwtAuthGuard)
   async getApplications(
     @Query() filters: ApplicationFiltersDto,
     @Req() req: any,
