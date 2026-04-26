@@ -25,6 +25,7 @@ async function bootstrap() {
       'http://localhost:3001', 
       'http://localhost:3000',
       'https://fretiko.com',
+      'https://www.fretiko.com', // Add www subdomain
       'exp://*', // Expo development
       'https://fretiko-backend.onrender.com' // Render backend
     ],
