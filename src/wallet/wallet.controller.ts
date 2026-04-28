@@ -694,22 +694,38 @@ export class WalletController {
     let signatureValid = false;
     const isProduction = process.env.NODE_ENV === 'production';
     
-    // Check for Flutterwave's verif-hash header (direct webhook) or Svix signature
-    const flutterwaveSignature = Array.isArray(req.headers['verif-hash']) 
+    // Check for Flutterwave headers (verif-hash OR flutterwave-signature) or Svix signature
+    // Note: Flutterwave has used both header names in different API versions
+    const verifHash = Array.isArray(req.headers['verif-hash']) 
       ? req.headers['verif-hash'][0] 
       : req.headers['verif-hash'];
+    const flutterwaveSignatureHeader = Array.isArray(req.headers['flutterwave-signature']) 
+      ? req.headers['flutterwave-signature'][0] 
+      : req.headers['flutterwave-signature'];
+    const flutterwaveSignature = verifHash || flutterwaveSignatureHeader;
+    
     const svixSignature = Array.isArray(req.headers['svix-signature']) 
       ? req.headers['svix-signature'][0] 
       : req.headers['svix-signature'];
     const signature = flutterwaveSignature || svixSignature;
     
     console.log('🔍 WEBHOOK DEBUG:', {
-      hasFlutterwaveSignature: !!flutterwaveSignature,
+      hasVerifHash: !!verifHash,
+      hasFlutterwaveSignature: !!flutterwaveSignatureHeader,
       hasSvixSignature: !!svixSignature,
       signatureLength: signature?.length,
       rawBodyLength: rawBody?.length,
       isProduction,
       env: process.env.NODE_ENV
+    });
+    
+    // Temporary: Log all headers to diagnose header issues
+    console.log('🔍 ALL HEADERS:', JSON.stringify(req.headers, null, 2));
+    console.log('🔍 Signature value:', {
+      verifHash: verifHash?.substring(0, 50),
+      verifHashLength: verifHash?.length,
+      flutterwaveSignature: flutterwaveSignatureHeader?.substring(0, 50),
+      flutterwaveSignatureLength: flutterwaveSignatureHeader?.length
     });
     
     // Production: Use appropriate signature verification
@@ -719,19 +735,42 @@ export class WalletController {
       
       if (flutterwaveSignature) {
         // Direct Flutterwave webhook - use Flutterwave signature verification
+        // Official Flutterwave docs: uses 'flutterwave-signature' header with base64 encoding
+        // Alternative: some implementations use 'verif-hash' header with hex encoding
         console.log('🔍 Direct Flutterwave webhook detected');
         try {
-          const secretHash = this.configService.get<string>('FLUTTERWAVE_WEBHOOK_SECRET');
+          const secretHash = this.configService.get<string>('FLUTTERWAVE_WEBHOOK_SECRET') || 
+                            this.configService.get<string>('FLW_WEBHOOK_SECRET');
           if (!secretHash) {
-            console.error('❌ Missing Flutterwave webhook secret');
+            console.error('❌ Missing Flutterwave webhook secret (FLUTTERWAVE_WEBHOOK_SECRET or FLW_WEBHOOK_SECRET)');
             if (res) return res.status(401).json({ status: 'error', message: 'Missing webhook secret' });
             return;
           }
           
           // Create HMAC-SHA256 hash to verify Flutterwave signature
           const crypto = require('crypto');
-          const hash = crypto.createHmac('sha256', secretHash).update(rawBody).digest('hex');
-          signatureValid = hash === flutterwaveSignature;
+          
+          // Try base64 first (official Flutterwave docs format)
+          const hashBase64 = crypto.createHmac('sha256', secretHash).update(rawBody).digest('base64');
+          const validBase64 = hashBase64 === flutterwaveSignature;
+          
+          // Try hex as fallback (some implementations use this)
+          const hashHex = crypto.createHmac('sha256', secretHash).update(rawBody).digest('hex');
+          const validHex = hashHex.toLowerCase() === flutterwaveSignature.toLowerCase();
+          
+          signatureValid = validBase64 || validHex;
+          
+          console.log('🔍 Signature debug:', {
+            secretHashLength: secretHash.length,
+            receivedSignature: flutterwaveSignature,
+            receivedLength: flutterwaveSignature.length,
+            calculatedBase64: hashBase64,
+            calculatedHex: hashHex,
+            validBase64,
+            validHex,
+            rawBodyLength: rawBody.length,
+            rawBodyPreview: rawBody.substring(0, 100)
+          });
           
           if (!signatureValid) {
             console.error('❌ Invalid Flutterwave webhook signature');
