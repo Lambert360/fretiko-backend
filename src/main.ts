@@ -43,7 +43,8 @@ async function bootstrap() {
 
   // Configure raw body for Flutterwave webhook signature verification
   // This must be before other body parsers
-  app.use('/wallet/webhooks/flutterwave', express.raw({ type: 'application/json' }));
+  // Using '*/*' to handle any content-type Flutterwave might send
+  app.use('/wallet/webhooks/flutterwave', express.raw({ type: '*/*' }));
 
   // Global validation for inputs
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));

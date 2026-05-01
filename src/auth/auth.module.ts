@@ -39,7 +39,7 @@ import { SupabaseClientManager } from './supabase-client-manager.service';
     SocialAuthService, 
     EmailService, 
     TokenService,
-    SupabaseClientManager
+    SupabaseClientManager,
   ],
 })
 export class AuthModule {}

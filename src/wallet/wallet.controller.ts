@@ -630,33 +630,42 @@ export class WalletController {
    * 2. Process webhook asynchronously to avoid timeouts
    * 3. Use Svix signature verification (webhooks are forwarded from Svix)
    * 4. Always return 200 OK even on errors (Svix will retry if needed)
+   * 5. NO JWT auth - webhook uses signature verification instead
    */
   @Post('webhooks/flutterwave')
+  // Public endpoint - no JWT auth. Security via signature verification
   async handleFlutterwaveWebhook(
     @Req() req: RawBodyRequest<Request>,
     @Res() res?: Response,
   ) {
     const startTime = Date.now();
     
-    // Get raw body for signature verification - this is now available with rawBody: true
+    // Get raw body for signature verification
+    // Note: express.raw() middleware puts the Buffer in req.body for this route
+    let rawBodyBuffer: Buffer;
     let rawBody: string;
-    if (req.rawBody) {
-      // Handle different types of rawBody
-      if (req.rawBody instanceof Buffer) {
-        rawBody = req.rawBody.toString('utf8');
-      } else if (typeof req.rawBody === 'string') {
-        rawBody = req.rawBody;
-      } else if (req.rawBody && typeof req.rawBody === 'object' && 
-                 (req.rawBody as any).type === 'Buffer' && 
-                 Array.isArray((req.rawBody as any).data)) {
-        // Handle serialized Buffer object: {"type":"Buffer","data":[123,34,...]}
-        rawBody = Buffer.from((req.rawBody as any).data).toString('utf8');
-      } else {
-        rawBody = JSON.stringify(req.rawBody);
-      }
+    
+    // Check if express.raw() provided a Buffer in req.body
+    if (req.body instanceof Buffer) {
+      rawBodyBuffer = req.body;
+      rawBody = req.body.toString('utf8');
+    } else if (req.rawBody instanceof Buffer) {
+      // Fallback to NestJS rawBody if available
+      rawBodyBuffer = req.rawBody;
+      rawBody = req.rawBody.toString('utf8');
+    } else if (typeof req.rawBody === 'string') {
+      rawBody = req.rawBody;
+      rawBodyBuffer = Buffer.from(rawBody, 'utf8');
+    } else if (req.rawBody && typeof req.rawBody === 'object' && 
+               (req.rawBody as any).type === 'Buffer' && 
+               Array.isArray((req.rawBody as any).data)) {
+      // Handle serialized Buffer object: {"type":"Buffer","data":[123,34,...]}
+      rawBodyBuffer = Buffer.from((req.rawBody as any).data);
+      rawBody = rawBodyBuffer.toString('utf8');
     } else {
-      // Fallback - this shouldn't happen with rawBody: true
+      // Fallback - should not happen with proper middleware
       rawBody = JSON.stringify(req.body);
+      rawBodyBuffer = Buffer.from(rawBody, 'utf8');
     }
     
     // Parse the body from raw body
@@ -748,14 +757,15 @@ export class WalletController {
           }
           
           // Create HMAC-SHA256 hash to verify Flutterwave signature
+          // IMPORTANT: Use rawBodyBuffer for exact byte matching
           const crypto = require('crypto');
           
           // Try base64 first (official Flutterwave docs format)
-          const hashBase64 = crypto.createHmac('sha256', secretHash).update(rawBody).digest('base64');
+          const hashBase64 = crypto.createHmac('sha256', secretHash).update(rawBodyBuffer).digest('base64');
           const validBase64 = hashBase64 === flutterwaveSignature;
           
           // Try hex as fallback (some implementations use this)
-          const hashHex = crypto.createHmac('sha256', secretHash).update(rawBody).digest('hex');
+          const hashHex = crypto.createHmac('sha256', secretHash).update(rawBodyBuffer).digest('hex');
           const validHex = hashHex.toLowerCase() === flutterwaveSignature.toLowerCase();
           
           signatureValid = validBase64 || validHex;
