@@ -742,57 +742,64 @@ export class WalletController {
     if (isProduction) {
       console.log('🔒 PRODUCTION MODE: Verifying webhook signature');
       
-      if (flutterwaveSignature) {
-        // Direct Flutterwave webhook - use Flutterwave signature verification
-        // Official Flutterwave docs: uses 'flutterwave-signature' header with base64 encoding
-        // Alternative: some implementations use 'verif-hash' header with hex encoding
-        console.log('🔍 Direct Flutterwave webhook detected');
+      // Get webhook secret once
+      const secretHash = this.configService.get<string>('FLUTTERWAVE_WEBHOOK_SECRET') || 
+                        this.configService.get<string>('FLW_WEBHOOK_SECRET');
+      if (!secretHash) {
+        console.error('❌ Missing Flutterwave webhook secret (FLUTTERWAVE_WEBHOOK_SECRET or FLW_WEBHOOK_SECRET)');
+        if (res) return res.status(401).json({ status: 'error', message: 'Missing webhook secret' });
+        return;
+      }
+
+      if (flutterwaveSignatureHeader) {
+        // Modern Flutterwave: uses 'flutterwave-signature' header with HMAC-SHA256
+        // Support both base64 (standard) and hex (fallback) formats
+        console.log('🔍 Flutterwave signature header detected (HMAC mode)');
         try {
-          const secretHash = this.configService.get<string>('FLUTTERWAVE_WEBHOOK_SECRET') || 
-                            this.configService.get<string>('FLW_WEBHOOK_SECRET');
-          if (!secretHash) {
-            console.error('❌ Missing Flutterwave webhook secret (FLUTTERWAVE_WEBHOOK_SECRET or FLW_WEBHOOK_SECRET)');
-            if (res) return res.status(401).json({ status: 'error', message: 'Missing webhook secret' });
-            return;
-          }
-          
-          // Create HMAC-SHA256 hash to verify Flutterwave signature
-          // IMPORTANT: Use rawBodyBuffer for exact byte matching
           const crypto = require('crypto');
-          
-          // Try base64 first (official Flutterwave docs format)
           const hashBase64 = crypto.createHmac('sha256', secretHash).update(rawBodyBuffer).digest('base64');
-          const validBase64 = hashBase64 === flutterwaveSignature;
-          
-          // Try hex as fallback (some implementations use this)
           const hashHex = crypto.createHmac('sha256', secretHash).update(rawBodyBuffer).digest('hex');
-          const validHex = hashHex.toLowerCase() === flutterwaveSignature.toLowerCase();
           
-          signatureValid = validBase64 || validHex;
+          signatureValid = (
+            hashBase64 === flutterwaveSignatureHeader ||
+            hashHex.toLowerCase() === flutterwaveSignatureHeader.toLowerCase()
+          );
           
-          console.log('🔍 Signature debug:', {
-            secretHashLength: secretHash.length,
-            receivedSignature: flutterwaveSignature,
-            receivedLength: flutterwaveSignature.length,
+          console.log('🔍 HMAC signature debug:', {
+            receivedLength: flutterwaveSignatureHeader.length,
             calculatedBase64: hashBase64,
             calculatedHex: hashHex,
-            validBase64,
-            validHex,
-            rawBodyLength: rawBody.length,
-            rawBodyPreview: rawBody.substring(0, 100)
+            valid: signatureValid
           });
           
           if (!signatureValid) {
-            console.error('❌ Invalid Flutterwave webhook signature');
+            console.error('❌ Invalid Flutterwave HMAC signature (neither base64 nor hex matched)');
             if (res) return res.status(401).json({ status: 'error', message: 'Invalid webhook signature' });
             return;
           }
-          console.log('✅ Flutterwave webhook signature verified');
+          console.log('✅ Flutterwave HMAC signature verified');
         } catch (error) {
-          console.error('❌ Flutterwave webhook verification failed:', error);
+          console.error('❌ Flutterwave HMAC verification failed:', error);
           if (res) return res.status(401).json({ status: 'error', message: 'Webhook verification failed' });
           return;
         }
+      } else if (verifHash) {
+        // Legacy/test Flutterwave: uses 'verif-hash' header with direct secret match
+        console.log('🔍 Flutterwave verif-hash header detected (direct secret match mode)');
+        signatureValid = verifHash === secretHash;
+        
+        console.log('🔍 Direct secret debug:', {
+          receivedLength: verifHash.length,
+          secretLength: secretHash.length,
+          valid: signatureValid
+        });
+        
+        if (!signatureValid) {
+          console.error('❌ Invalid Flutterwave verif-hash');
+          if (res) return res.status(401).json({ status: 'error', message: 'Invalid webhook signature' });
+          return;
+        }
+        console.log('✅ Flutterwave verif-hash verified (direct match)');
       } else if (svixSignature) {
         // Svix webhook - use Svix signature verification
         console.log('🔍 Svix webhook detected');
@@ -808,7 +815,7 @@ export class WalletController {
           return;
         }
       } else {
-        console.error('❌ No webhook signature found (neither verif-hash nor svix-signature)');
+        console.error('❌ No webhook signature found (neither flutterwave-signature, verif-hash, nor svix-signature)');
         if (res) return res.status(401).json({ status: 'error', message: 'Missing webhook signature' });
         return;
       }
