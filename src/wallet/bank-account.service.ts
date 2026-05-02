@@ -7,6 +7,7 @@ import { Injectable, BadRequestException, NotFoundException, Logger } from '@nes
 import { ConfigService } from '@nestjs/config';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
+import axios from 'axios';
 
 export interface BankAccount {
   id: string;
@@ -63,6 +64,22 @@ export interface UpdateBankAccountDto {
 export class BankAccountService {
   private readonly logger = new Logger(BankAccountService.name);
   private readonly supabase: SupabaseClient;
+
+  // Countries where Flutterwave account resolution is reliable
+  // Tier 1: Fully supported for real-time verification
+  private readonly SUPPORTED_RESOLUTION_COUNTRIES = [
+    'NG', // Nigeria
+    'GH', // Ghana
+    'KE', // Kenya
+    'UG', // Uganda
+    'TZ', // Tanzania
+    'ZA', // South Africa
+    'RW', // Rwanda
+    'ZM', // Zambia
+    'MW', // Malawi
+    'BW', // Botswana
+    'MZ', // Mozambique
+  ];
 
   constructor(private readonly configService: ConfigService) {
     this.supabase = createServiceSupabaseClient(this.configService);
@@ -158,6 +175,18 @@ export class BankAccountService {
         );
       }
 
+      // Determine country for verification support check
+      const effectiveCountry = dto.country?.toUpperCase() || 'NG';
+
+      // Check if country supports real-time account verification
+      if (!this.SUPPORTED_RESOLUTION_COUNTRIES.includes(effectiveCountry)) {
+        throw new BadRequestException(
+          `Bank account verification is not yet available in your country (${effectiveCountry}). ` +
+          `We currently support: Nigeria, Ghana, Kenya, Uganda, Tanzania, South Africa, Rwanda, Zambia, Malawi, Botswana, and Mozambique. ` +
+          `Please contact support for assistance.`
+        );
+      }
+
       // Check if this is the first account (should be default)
       const existingAccounts = await this.getUserBankAccounts(userId);
       const isFirstAccount = existingAccounts.length === 0;
@@ -195,11 +224,29 @@ export class BankAccountService {
         }
       }
 
+      // First, verify the account with Flutterwave before saving
+      // This ensures only valid bank accounts are stored in our system
+      let resolvedAccountName: string;
+      try {
+        const resolvedAccount = await this.resolveAccountWithFlutterwave(
+          dto.accountNumber,
+          dto.bankCode,
+        );
+        resolvedAccountName = resolvedAccount.account_name;
+        this.logger.log(`✅ Account verified with Flutterwave: ${resolvedAccountName}`);
+      } catch (verifyError) {
+        this.logger.error(`❌ Account verification failed during creation:`, verifyError);
+        throw new BadRequestException(
+          'Bank account verification failed. Please check your account number and bank code.'
+        );
+      }
+
+      // Create bank account with verified data
       const { data, error } = await this.supabase
         .from('user_bank_accounts')
         .insert({
           user_id: userId,
-          account_name: dto.accountName,
+          account_name: resolvedAccountName, // Use the REAL name from Flutterwave
           bank_name: dto.bankName,
           bank_code: dto.bankCode,
           account_number: dto.accountNumber,
@@ -213,10 +260,9 @@ export class BankAccountService {
           branch_code: dto.branchCode,
           is_default: isFirstAccount ? true : (dto.isDefault || false),
           is_active: true,
-          // Auto-verify on creation since actual verification is not yet implemented
-          // TODO: Replace with actual bank account verification when implemented
+          // Only verified accounts are stored - verification happens above
           is_verified: true,
-          verification_method: 'auto_verified',
+          verification_method: 'flutterwave',
           verified_at: new Date().toISOString(),
         })
         .select()
@@ -227,10 +273,29 @@ export class BankAccountService {
         throw new BadRequestException('Failed to create bank account');
       }
 
-      this.logger.log(`✅ Bank account created for user ${userId}: ${data.id}`);
+      // AUDIT LOG: Bank account created with verification
+      this.logger.log(`✅ [AUDIT] Bank account created with Flutterwave verification`, {
+        timestamp: new Date().toISOString(),
+        action: 'bank_account_created',
+        userId,
+        accountId: data.id,
+        bankName: dto.bankName,
+        bankCode: dto.bankCode,
+        accountNumber: dto.accountNumber.substring(0, 4) + '****' + dto.accountNumber.slice(-4),
+        verificationMethod: 'flutterwave',
+        resolvedAccountName: resolvedAccountName,
+      });
+
       return this.mapToFrontend(data);
     } catch (error) {
-      this.logger.error(`Error creating bank account for user ${userId}:`, error);
+      // AUDIT LOG: Creation failed
+      this.logger.error(`❌ [AUDIT] Bank account creation failed`, {
+        timestamp: new Date().toISOString(),
+        action: 'bank_account_creation_failed',
+        userId,
+        bankCode: dto.bankCode,
+        error: error.message,
+      });
       throw error;
     }
   }
@@ -346,37 +411,177 @@ export class BankAccountService {
   }
 
   /**
-   * Verify bank account (placeholder for payment provider integration)
+   * Resolve bank account via Flutterwave to get verified account name
+   * This is the REAL verification - hits Flutterwave API to confirm account exists
    */
-  async verifyBankAccount(userId: string, accountId: string): Promise<{ success: boolean; message: string }> {
-    try {
-      // Verify ownership
-      await this.getBankAccount(userId, accountId);
+  async resolveAccountWithFlutterwave(
+    accountNumber: string,
+    bankCode: string,
+  ): Promise<{ account_name: string; account_number: string; bank_code: string }> {
+    // AUDIT CONTEXT: Declare outside try block for catch block access
+    const auditContext = {
+      timestamp: new Date().toISOString(),
+      action: 'account_resolution_attempt',
+      accountNumber: accountNumber.substring(0, 4) + '****' + accountNumber.slice(-4), // Masked for security
+      bankCode,
+      source: 'flutterwave_api',
+    };
 
-      // TODO: Implement actual verification with payment provider
-      // For now, mark as verified manually
+    try {
+      const secretKey = this.configService.get<string>('FLW_SECRET_KEY') || process.env.FLW_SECRET_KEY;
+      
+      if (!secretKey) {
+        throw new BadRequestException('Flutterwave configuration missing');
+      }
+
+      // AUDIT LOG: Account resolution attempt
+      this.logger.log(`🔍 [AUDIT] Account resolution initiated`, auditContext);
+
+      const response = await axios.post(
+        'https://api.flutterwave.com/v3/accounts/resolve',
+        {
+          account_number: accountNumber,
+          account_bank: bankCode,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${secretKey}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 30000,
+        },
+      );
+
+      const responseData = response.data;
+
+      if (responseData.status === 'success' && responseData.data) {
+        // AUDIT LOG: Successful resolution
+        this.logger.log(`✅ [AUDIT] Account resolved successfully`, {
+          ...auditContext,
+          action: 'account_resolution_success',
+          resolvedAccountName: responseData.data.account_name,
+          resolvedBankCode: responseData.data.bank_code,
+        });
+        return {
+          account_name: responseData.data.account_name,
+          account_number: responseData.data.account_number,
+          bank_code: responseData.data.bank_code,
+        };
+      } else {
+        // AUDIT LOG: API returned error
+        this.logger.warn(`⚠️ [AUDIT] Account resolution API error`, {
+          ...auditContext,
+          action: 'account_resolution_api_error',
+          apiMessage: responseData.message,
+        });
+        throw new BadRequestException(
+          responseData.message || 'Failed to resolve account'
+        );
+      }
+    } catch (error: any) {
+      // AUDIT LOG: Resolution failed
+      this.logger.error('❌ [AUDIT] Account resolution failed', {
+        ...auditContext,
+        action: 'account_resolution_failed',
+        errorMessage: error.message,
+        errorResponse: error.response?.data,
+        errorStatus: error.response?.status,
+      });
+
+      if (error.response?.data?.message?.includes('invalid account number')) {
+        throw new BadRequestException(
+          'Invalid account number. Please check your account number and bank code.'
+        );
+      }
+
+      if (error.response?.data?.message?.includes('invalid bank code')) {
+        throw new BadRequestException(
+          'Invalid bank code. Please select a valid bank from the list.'
+        );
+      }
+
+      throw new BadRequestException(
+        error.response?.data?.message || 'Failed to verify account with bank'
+      );
+    }
+  }
+
+  /**
+   * Verify bank account using Flutterwave account resolution
+   * This replaces the manual verification placeholder
+   */
+  async verifyBankAccount(userId: string, accountId: string): Promise<{ 
+    success: boolean; 
+    message: string;
+    accountName?: string;
+  }> {
+    try {
+      // Get bank account details
+      const bankAccount = await this.getBankAccount(userId, accountId);
+
+      if (!bankAccount.bankCode) {
+        throw new BadRequestException('Bank code is required for verification');
+      }
+
+      // Perform real verification with Flutterwave
+      const resolvedAccount = await this.resolveAccountWithFlutterwave(
+        bankAccount.accountNumber,
+        bankAccount.bankCode,
+      );
+
+      // Update bank account with verified information
       const { error } = await this.supabase
         .from('user_bank_accounts')
         .update({
+          account_name: resolvedAccount.account_name, // Store the REAL name from bank
           is_verified: true,
-          verification_method: 'manual',
+          verification_method: 'flutterwave',
           verified_at: new Date().toISOString(),
         })
         .eq('id', accountId)
         .eq('user_id', userId);
 
       if (error) {
-        this.logger.error(`Failed to verify bank account ${accountId}:`, error);
-        throw new BadRequestException('Failed to verify bank account');
+        this.logger.error(`Failed to save verified bank account ${accountId}:`, error);
+        throw new BadRequestException('Failed to save verified bank account');
       }
 
-      this.logger.log(`✅ Bank account verified: ${accountId}`);
+      this.logger.log(`✅ Bank account verified via Flutterwave: ${accountId}`);
       return {
         success: true,
         message: 'Bank account verified successfully',
+        accountName: resolvedAccount.account_name,
       };
     } catch (error) {
       this.logger.error(`Error verifying bank account ${accountId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Preview account name before creating bank account
+   * Allows users to verify the account details before saving
+   */
+  async previewAccountName(
+    accountNumber: string,
+    bankCode: string,
+  ): Promise<{ accountName: string; accountNumber: string; bankCode: string }> {
+    try {
+      this.logger.log(`🔍 Previewing account: ${accountNumber} with bank: ${bankCode}`);
+
+      // Resolve account with Flutterwave (read-only, doesn't save anything)
+      const resolvedAccount = await this.resolveAccountWithFlutterwave(
+        accountNumber,
+        bankCode,
+      );
+
+      return {
+        accountName: resolvedAccount.account_name,
+        accountNumber: resolvedAccount.account_number,
+        bankCode: resolvedAccount.bank_code,
+      };
+    } catch (error) {
+      this.logger.error(`Error previewing account ${accountNumber}:`, error);
       throw error;
     }
   }

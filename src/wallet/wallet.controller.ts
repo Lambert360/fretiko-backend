@@ -492,6 +492,40 @@ export class WalletController {
         return this.bankAccountService.verifyBankAccount(req.user.sub, id);
   }
 
+  /**
+   * Get list of banks from Flutterwave (live data)
+   * GET /wallet/banks/:country
+   */
+  @Get('banks/:country')
+  @UseGuards(JwtAuthGuard)
+  async getBanks(@Param('country') country: string) {
+    const banks = await this.flutterwaveService.getBanks(country.toUpperCase());
+    return {
+      status: 'success',
+      data: banks,
+      message: `Retrieved ${banks.length} banks for ${country.toUpperCase()}`,
+    };
+  }
+
+  /**
+   * Preview account name before adding bank account
+   * POST /wallet/bank-accounts/preview
+   * Body: { accountNumber: string, bankCode: string }
+   */
+  @Post('bank-accounts/preview')
+  @UseGuards(JwtAuthGuard)
+  async previewBankAccount(@Body() dto: { accountNumber: string; bankCode: string }) {
+    const preview = await this.bankAccountService.previewAccountName(
+      dto.accountNumber,
+      dto.bankCode,
+    );
+    return {
+      status: 'success',
+      data: preview,
+      message: 'Account verified with bank',
+    };
+  }
+
   // ================================
   // PIN ENDPOINTS
   // ================================
