@@ -2344,6 +2344,11 @@ export class WalletService {
 
 
 
+    // Validate bank account has currency set
+    if (!bankAccount.currency) {
+      throw new BadRequestException('Bank account currency is not set. Please contact support.');
+    }
+
     const localCurrency = bankAccount.currency; // Use bank account's currency
 
     
@@ -2502,11 +2507,13 @@ export class WalletService {
 
         accountNumber: bankAccount.accountNumber,
 
-        amount: dto.fretiAmount, // USD amount (FRETI = USD)
+        amount: estimatedLocalAmount, // Amount in the bank account's currency
 
-        currency: 'USD', // Source currency is always USD for FRETI
+        currency: localCurrency, // Bank account's currency (NGN, USD, GBP, etc.)
 
-        destinationCurrency: localCurrency, // Bank account's currency - Flutterwave will convert
+        debitCurrency: 'USD', // Debit from FRETI (USD-pegged) wallet
+
+        destinationCurrency: localCurrency, // Same as currency
 
         beneficiaryName: bankAccount.accountName,
 

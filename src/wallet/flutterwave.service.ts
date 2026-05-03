@@ -58,7 +58,8 @@ export interface InitiateTransferDto {
   accountBank: string;
   accountNumber: string;
   amount: number;
-  currency: string;
+  currency: string;           // Destination currency (what recipient gets)
+  debitCurrency?: string;     // Source currency (what wallet deducts) - defaults to 'USD' for FRETI
   destinationCurrency?: string;
   beneficiaryName: string;
   narration?: string;
@@ -586,12 +587,12 @@ export class FlutterwaveService {
         account_bank: dto.accountBank.trim(), // Ensure bank code is trimmed
         account_number: sanitizedAccountNumber, // Use sanitized account number
         amount: dto.amount,
-        currency: dto.currency, // Source currency (USD for FRETI)
+        currency: dto.currency, // Destination currency (what recipient gets)
         beneficiary_name: dto.beneficiaryName.trim(), // Trim beneficiary name
         narration: (dto.narration || 'Withdrawal from Fretiko wallet').substring(0, 150), // Ensure within limit
         reference: dto.reference,
         callback_url: dto.callbackUrl || `${this.configService.get<string>('API_URL')}/wallet/webhooks/flutterwave`,
-        debit_currency: dto.currency, // Source currency (USD for FRETI)
+        debit_currency: dto.debitCurrency || dto.currency, // Source currency (defaults to destination if not specified)
       };
 
       // Explicitly specify destination currency if different from source
