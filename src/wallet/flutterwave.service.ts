@@ -766,8 +766,17 @@ export class FlutterwaveService {
         throw new BadRequestException(response.message || 'Failed to fetch banks');
       }
     } catch (error: any) {
-      this.logger.error('Error fetching banks:', error);
-      throw new BadRequestException(error.message || 'Failed to fetch banks');
+      this.logger.error('Error fetching banks:', {
+        message: error.message,
+        code: error.code,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        stack: error.stack,
+      });
+      throw new BadRequestException(
+        error.response?.data?.message || error.message || 'Failed to fetch banks'
+      );
     }
   }
 
