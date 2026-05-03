@@ -745,34 +745,42 @@ export class FlutterwaveService {
 
   /**
    * Get list of supported banks
+   * Using direct HTTP API instead of SDK due to SDK bug with URL construction
    */
   async getBanks(country: string = 'NG'): Promise<Bank[]> {
-    if (!this.flw) {
-      throw new BadRequestException('Flutterwave is not configured. Please add FLW_PUBLIC_KEY and FLW_SECRET_KEY to your .env file');
+    const secretKey = this.configService.get<string>('FLW_SECRET_KEY');
+    if (!secretKey) {
+      throw new BadRequestException('Flutterwave is not configured. Please add FLW_SECRET_KEY to your .env file');
     }
 
     try {
       this.logger.log(`Fetching banks for country: ${country}`);
 
-      const response = await this.flw.Bank.country({ country });
+      const response = await axios.get(
+        `https://api.flutterwave.com/v3/banks/${country}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${secretKey}`,
+            'Content-Type': 'application/json',
+          },
+        }
+      );
 
-      if (response.status === 'success') {
-        return response.data.map((bank: any) => ({
+      if (response.data?.status === 'success') {
+        return response.data.data.map((bank: any) => ({
           id: bank.id,
           code: bank.code,
           name: bank.name,
         }));
       } else {
-        throw new BadRequestException(response.message || 'Failed to fetch banks');
+        throw new BadRequestException(response.data?.message || 'Failed to fetch banks');
       }
     } catch (error: any) {
       this.logger.error('Error fetching banks:', {
         message: error.message,
-        code: error.code,
         status: error.response?.status,
         statusText: error.response?.statusText,
         data: error.response?.data,
-        stack: error.stack,
       });
       throw new BadRequestException(
         error.response?.data?.message || error.message || 'Failed to fetch banks'
