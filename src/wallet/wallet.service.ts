@@ -2431,6 +2431,17 @@ export class WalletService {
     // Note: Balance validation happens atomically in createLedgerEntry via atomic_wallet_operation
     const userWallet = await this.getWallet(userId);
     
+    // 🔍 DEBUG: Log balance check values
+    this.logger.log('🔍 [DEBUG] Withdrawal balance check:', {
+      userId,
+      availableBalance: userWallet.availableBalance,
+      requestedFretiAmount: dto.fretiAmount,
+      localCurrency,
+      estimatedLocalAmount,
+      exchangeRate: estimatedExchangeRate,
+      comparison: `${userWallet.availableBalance} < ${dto.fretiAmount} = ${userWallet.availableBalance < dto.fretiAmount}`
+    });
+    
     // ✅ BUG FIX: Removed redundant balance check - atomic_wallet_operation validates atomically
     // This prevents race conditions where balance could change between check and operation
 
@@ -2507,11 +2518,9 @@ export class WalletService {
 
         accountNumber: bankAccount.accountNumber,
 
-        amount: estimatedLocalAmount, // Amount in the bank account's currency
+        amount: estimatedLocalAmount, // Amount in local currency (what user sees and receives)
 
         currency: localCurrency, // Bank account's currency (NGN, USD, GBP, etc.)
-
-        debitCurrency: 'USD', // Debit from FRETI (USD-pegged) wallet
 
         destinationCurrency: localCurrency, // Same as currency
 
