@@ -2518,9 +2518,11 @@ export class WalletService {
 
         accountNumber: bankAccount.accountNumber,
 
-        amount: estimatedLocalAmount, // Amount in local currency (what user sees and receives)
+        amount: dto.fretiAmount, // Amount in debit currency (USD/FRETI) when debitCurrency is specified
 
         currency: localCurrency, // Bank account's currency (NGN, USD, GBP, etc.)
+
+        debitCurrency: 'USD', // Debit from FRETI (USD-pegged) wallet
 
         destinationCurrency: localCurrency, // Same as currency
 
