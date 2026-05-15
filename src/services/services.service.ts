@@ -613,6 +613,43 @@ export class ServicesService {
     return { bookmarked, saveCount: newSaveCount };
   }
 
+  async getBookmarkedServices(userId: string, userToken?: string) {
+    // Use serviceSupabase to bypass RLS
+    const supabaseClient = this.serviceSupabase;
+
+    const { data: bookmarks, error } = await supabaseClient
+      .from('service_bookmarks')
+      .select(`
+        service:services(
+          *,
+          service_categories (
+            name,
+            icon_name,
+            color_hex
+          ),
+          user_profiles!services_user_id_fkey (
+            username,
+            avatar_url,
+            is_verified
+          )
+        )
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      throw new Error(`Failed to fetch bookmarked services: ${error.message}`);
+    }
+
+    // Extract services from bookmarks and add isBookmarked flag
+    const services = bookmarks?.map((bookmark: any) => ({
+      ...bookmark.service,
+      isBookmarked: true,
+    })) || [];
+
+    return services;
+  }
+
   async incrementShareCount(serviceId: string, userToken?: string) {
     // Use serviceSupabase to bypass RLS
     const supabaseClient = this.serviceSupabase;

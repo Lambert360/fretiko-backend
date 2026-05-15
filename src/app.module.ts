@@ -26,6 +26,7 @@ import { AuctionsModule } from './auctions/auctions.module';
 import { IkoModule } from './iko/iko.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { StoriesModule } from './stories/stories.module';
+import { PostsModule } from './posts/posts.module';
 import { WorkspaceModule } from './workspace/workspace.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { EscrowModule } from './escrow/escrow.module';
@@ -84,6 +85,7 @@ import { VideoProcessingModule } from './video-processing/video-processing.modul
     IkoModule,
     RealtimeModule,
     StoriesModule,
+    PostsModule,
     WorkspaceModule,
     AnalyticsModule,
     EscrowModule,

@@ -117,6 +117,12 @@ export class ServicesController {
     return this.servicesService.toggleBookmark(req.user.sub, id, req.supabaseToken);
   }
 
+  @Get('user/bookmarks/me')
+  @UseGuards(JwtAuthGuard)
+  async getMyBookmarkedServices(@Request() req) {
+    return this.servicesService.getBookmarkedServices(req.user.sub, req.supabaseToken);
+  }
+
   @Post(':id/share')
   @UseGuards(JwtAuthGuard)
   async shareService(@Request() req, @Param('id') id: string) {
