@@ -34,6 +34,20 @@ export class ProductsController {
     return this.productsService.getProducts(query);
   }
 
+  @Get('trending')
+  async getTrendingProducts(@Query('limit') limit?: string) {
+    const parsedLimit = limit ? parseInt(limit, 10) : 10;
+    console.log('📦 Fetching trending products, limit:', parsedLimit);
+    return this.productsService.getTrendingProducts(Number.isNaN(parsedLimit) ? 10 : parsedLimit);
+  }
+
+  @Get('seasonal')
+  async getSeasonalProducts(@Query('limit') limit?: string, @Query('region') region?: string) {
+    const parsedLimit = limit ? parseInt(limit, 10) : 12;
+    console.log('📦 Fetching seasonal products, limit:', parsedLimit, 'region:', region);
+    return this.productsService.getSeasonalProducts(Number.isNaN(parsedLimit) ? 12 : parsedLimit, region);
+  }
+
   @Get('my-products')
   @UseGuards(JwtAuthGuard)
   async getMyProducts(@Request() req) {

@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto, ProductResponseDto, ProductCategoryDto } from './dto/product.dto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { VideoProcessingHelper } from '../shared/video-processing.helper';
 import ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -169,6 +170,66 @@ export class ProductsService {
     return (data || []).map(this.mapToProductResponse);
   }
 
+  async getTrendingProducts(limit: number = 10): Promise<ProductResponseDto[]> {
+    // Use serviceSupabase to bypass RLS limitations for analytics view
+    const { data: trendingData, error: trendingError } = await this.serviceSupabase
+      .from('trending_products')
+      .select('product_id, trending_score')
+      .order('trending_score', { ascending: false })
+      .limit(limit);
+
+    if (trendingError) {
+      console.error('Error fetching trending products:', trendingError);
+      // Fallback: return newest products if trending view fails
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    if (!trendingData || trendingData.length === 0) {
+      // No trending data yet – fallback to newest products
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    const productIds: string[] = trendingData.map((row: any) => row.product_id).filter(Boolean);
+
+    if (productIds.length === 0) {
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    // Fetch full product records with vendor profile info
+    const { data, error } = await this.serviceSupabase
+      .from('products')
+      .select(`
+        *,
+        user_profiles!products_user_id_fkey (
+          username,
+          avatar_url,
+          is_verified
+        )
+      `)
+      .in('id', productIds)
+      .eq('status', 'active')
+      .is('deleted_at', null);
+
+    if (error) {
+      console.error('Error fetching products for trending list:', error);
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    const mapped = (data || []).map((product: any) => this.mapToProductResponse(product));
+
+    // Preserve order based on trending_score
+    const scoreById = new Map<string, number>();
+    for (const row of trendingData) {
+      if (row.product_id) {
+        scoreById.set(row.product_id, row.trending_score || 0);
+      }
+    }
+
+    return mapped
+      .filter(p => scoreById.has(p.id))
+      .sort((a, b) => (scoreById.get(b.id)! - scoreById.get(a.id)!));
+  }
+
   async getProduct(id: string): Promise<ProductResponseDto> {
     try {
       const { data, error } = await this.serviceSupabase
@@ -287,6 +348,114 @@ export class ProductsService {
     if (error) {
       throw new Error(`Failed to delete product: ${error.message}`);
     }
+  }
+
+  async getSeasonalProducts(limit: number = 12, region?: string): Promise<ProductResponseDto[]> {
+    // Basic seasonal implementation based on current date and product tags/categories.
+    // This keeps logic in code while still auto-selecting appropriate products.
+    const now = new Date();
+    const month = now.getUTCMonth() + 1; // 1-12
+    const day = now.getUTCDate();
+
+    // Determine a simple season / event label for filtering
+    const activeLabels: string[] = [];
+
+    // Global fixed seasons
+    if (month >= 3 && month <= 5) activeLabels.push('spring');
+    if (month >= 6 && month <= 8) activeLabels.push('summer');
+    if (month >= 9 && month <= 11) activeLabels.push('autumn', 'fall');
+    if (month === 12 || month <= 2) activeLabels.push('winter');
+
+    // Major global holidays
+    if (month === 2 && day >= 7 && day <= 16) activeLabels.push('valentine', 'valentines');
+    if (month === 12 && day >= 1 && day <= 26) activeLabels.push('christmas', 'holiday');
+    if (month === 11 && day >= 20 && day <= 30) activeLabels.push('black friday', 'sale', 'deal');
+
+    // Back to school (roughly late August to late September)
+    if ((month === 8 && day >= 15) || (month === 9 && day <= 20)) {
+      activeLabels.push('back to school', 'school');
+    }
+
+    // Regional hint: harmattan for West Africa (approx. Nov–Feb)
+    const normalizedRegion = (region || '').toLowerCase();
+    if ((normalizedRegion.includes('nigeria') || normalizedRegion.includes('west_africa')) &&
+        (month === 11 || month === 12 || month <= 2)) {
+      activeLabels.push('harmattan');
+    }
+
+    // Fetch a wider pool of active products to score in memory
+    const { data, error } = await this.serviceSupabase
+      .from('products')
+      .select(`
+        *,
+        user_profiles!products_user_id_fkey (
+          username,
+          avatar_url,
+          is_verified
+        )
+      `)
+      .eq('status', 'active')
+      .is('deleted_at', null)
+      .limit(200);
+
+    if (error) {
+      console.error('Error fetching products for seasonal list:', error);
+      // Fallback to trending if seasonal fails
+      return this.getTrendingProducts(limit);
+    }
+
+    const seasonalKeywords = activeLabels.map(l => l.toLowerCase());
+
+    const scored = (data || []).map((product: any) => {
+      let score = 0;
+
+      const tags: string[] = product.tags || [];
+      const name: string = (product.name || '').toLowerCase();
+      const description: string = (product.description || '').toLowerCase();
+
+      // Tag matches are strongest
+      for (const tag of tags) {
+        const lower = tag.toLowerCase();
+        if (seasonalKeywords.includes(lower)) {
+          score += 10;
+        }
+      }
+
+      // Keyword matches in name/description
+      for (const keyword of seasonalKeywords) {
+        if (!keyword) continue;
+        if (name.includes(keyword)) score += 5;
+        if (description.includes(keyword)) score += 3;
+      }
+
+      // Boost by rating and recent views/likes
+      const rating = product.average_rating || 0;
+      const reviews = product.review_count || 0;
+      const views = product.view_count || 0;
+      const likes = product.like_count || 0;
+
+      score += rating * 2;
+      score += Math.min(reviews, 50) * 0.2;
+      score += Math.min(views, 500) * 0.01;
+      score += Math.min(likes, 200) * 0.05;
+
+      return { product, score };
+    });
+
+    // Filter out products with very low seasonal relevance
+    const filtered = scored.filter(entry => entry.score > 0);
+
+    if (filtered.length === 0) {
+      // If nothing matches seasonal context, fall back to trending
+      return this.getTrendingProducts(limit);
+    }
+
+    const top = filtered
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map(entry => this.mapToProductResponse(entry.product));
+
+    return top;
   }
 
   async getProductReviews(productId: string) {
@@ -576,6 +745,15 @@ export class ProductsService {
       // Create product record
       const product = await this.createProduct(userId, createProductDto, userToken);
 
+      // Fire-and-forget video processing for incompatible codecs
+      if (videoUrls.length > 0) {
+        videoUrls.forEach((videoUrl: string, index: number) => {
+          VideoProcessingHelper.checkAndQueue(videoUrl, userId, 'product', product.id, index).catch(() => {
+            // Silent fail — original video still works
+          });
+        });
+      }
+
       return {
         ...product,
         message: 'Product uploaded successfully',
@@ -692,6 +870,8 @@ export class ProductsService {
       images: data.images || [],
       primary_image_url: data.primary_image_url,
       videos: data.videos || [],
+      processed_videos: data.processed_videos || [],
+      video_processing_status: data.video_processing_status || {},
       primary_video_url: data.primary_video_url,
       media_type: data.media_type || 'image',
       location: data.location,

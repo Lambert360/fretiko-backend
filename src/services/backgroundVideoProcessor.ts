@@ -4,12 +4,16 @@ import { Worker } from 'worker_threads';
 import path from 'path';
 import fs from 'fs';
 import { createClient } from '@supabase/supabase-js';
+import { EventEmitter } from 'events';
 
 export interface VideoProcessingJob {
   id: string;
   videoUrl: string;
   userId: string;
-  serviceId?: string;
+  entityType?: 'service' | 'product' | 'post_media' | 'chat';
+  entityId?: string;
+  postId?: string;
+  videoIndex?: number;
   platform?: 'android' | 'ios' | 'web';
   priority: 'low' | 'medium' | 'high';
   status: 'pending' | 'processing' | 'completed' | 'failed';
@@ -24,6 +28,7 @@ export interface VideoProcessingJob {
 }
 
 export class BackgroundVideoProcessor {
+  static eventEmitter = new EventEmitter();
   private processingQueue: Map<string, VideoProcessingJob> = new Map();
   private activeWorkers: Map<string, Worker> = new Map();
   private maxConcurrentJobs = 3;
@@ -52,7 +57,10 @@ export class BackgroundVideoProcessor {
    * Add video to processing queue
    */
   async addVideoToQueue(videoUrl: string, userId: string, options: {
-    serviceId?: string;
+    entityType?: 'service' | 'product' | 'post_media' | 'chat';
+    entityId?: string;
+    postId?: string;
+    videoIndex?: number;
     platform?: 'android' | 'ios' | 'web';
     priority?: 'low' | 'medium' | 'high';
   } = {}): Promise<string> {
@@ -62,7 +70,10 @@ export class BackgroundVideoProcessor {
       id: jobId,
       videoUrl,
       userId,
-      serviceId: options.serviceId,
+      entityType: options.entityType,
+      entityId: options.entityId,
+      postId: options.postId,
+      videoIndex: options.videoIndex ?? 0,
       platform: options.platform || 'android',
       priority: options.priority || 'medium',
       status: 'pending',
@@ -164,21 +175,34 @@ export class BackgroundVideoProcessor {
         job.completedAt = new Date();
         job.result = {
           processedVideoUrl: result.outputPath!,
-          metadata: result.metadata
+          metadata: result.metadata,
+          // Keep thumbnailUrl on the job for debugging/inspection
+          // (primary persistence happens in updateEntityVideo)
+          // @ts-ignore - extend result typing for runtime value
+          thumbnailUrl: (result as any).thumbnailUrl,
         };
         
         console.log(`✅ Video processing completed: ${job.id}`);
         
-        // Update service with processed video URL
-        if (job.serviceId) {
-          await this.updateServiceVideo(job.serviceId, result.outputPath!);
+        // Update the correct entity with processed video URL
+        if (job.entityId && job.entityType) {
+          await this.updateEntityVideo(
+            job.entityType,
+            job.entityId,
+            job.videoIndex ?? 0,
+            result.outputPath!,
+            job.postId,
+            // Pass through thumbnailUrl if generated
+            (result as any).thumbnailUrl,
+          );
         }
         
         // Notify user (optional)
         await this.notifyUser(job.userId, {
           type: 'video_processing_completed',
           jobId: job.id,
-          serviceId: job.serviceId
+          entityType: job.entityType,
+          entityId: job.entityId
         });
         
       } else {
@@ -228,38 +252,181 @@ export class BackgroundVideoProcessor {
   }
 
   /**
-   * Update service with processed video URL
+   * Update the correct entity table with the processed video URL
    */
-  private async updateServiceVideo(serviceId: string, processedVideoUrl: string): Promise<void> {
+  private async updateEntityVideo(
+    entityType: string,
+    entityId: string,
+    videoIndex: number,
+    processedVideoUrl: string,
+    postId?: string,
+    thumbnailUrl?: string,
+  ): Promise<void> {
     try {
-      console.log(`\ud83d\udcdd Updating chat file upload ${serviceId} with processed video: ${processedVideoUrl}`);
-      
-      // Update the chat_file_uploads table with the processed video URL
-      const { error } = await this.supabase
-        .from('chat_file_uploads')
-        .update({
-          public_url: processedVideoUrl,
-          metadata: {
-            videoProcessing: {
-              processing: false,
-              processed: true,
-              processedVideoUrl,
-              processedAt: new Date().toISOString()
-            }
-          }
-        })
-        .eq('message_id', serviceId)
-        .eq('file_type', 'video');
+      const now = new Date().toISOString();
 
-      if (error) {
-        console.error('Failed to update chat file upload:', error);
-        throw error;
+      if (entityType === 'service') {
+        // Update services.processed_videos, video_processing_status, and optionally thumbnails
+        const { data: service } = await this.supabase
+          .from('services')
+          .select('processed_videos, video_processing_status, images, primary_media_url')
+          .eq('id', entityId)
+          .single();
+
+        const processedVideos = service?.processed_videos || [];
+        processedVideos[videoIndex] = processedVideoUrl;
+
+        const statusMap = service?.video_processing_status || {};
+        statusMap[videoIndex.toString()] = {
+          status: 'completed',
+          processedUrl: processedVideoUrl,
+          processedAt: now,
+        };
+
+        // If no images exist yet and we have a generated thumbnail, use it as primary image
+        const existingImages: string[] = service?.images || [];
+        let updatedImages = existingImages;
+        let primaryMediaUrl = service?.primary_media_url || null;
+
+        if (thumbnailUrl && existingImages.length === 0) {
+          updatedImages = [thumbnailUrl];
+          primaryMediaUrl = primaryMediaUrl || thumbnailUrl;
+        }
+
+        const { error } = await this.supabase
+          .from('services')
+          .update({
+            processed_videos: processedVideos,
+            video_processing_status: statusMap,
+            images: updatedImages,
+            primary_media_url: primaryMediaUrl,
+          })
+          .eq('id', entityId);
+
+        if (error) throw error;
+        console.log(`✅ Updated service ${entityId} processed video[${videoIndex}]`);
+
+      } else if (entityType === 'product') {
+        const { data: product } = await this.supabase
+          .from('products')
+          .select('processed_videos, video_processing_status, images, primary_image_url')
+          .eq('id', entityId)
+          .single();
+
+        const processedVideos = product?.processed_videos || [];
+        processedVideos[videoIndex] = processedVideoUrl;
+
+        const statusMap = product?.video_processing_status || {};
+        statusMap[videoIndex.toString()] = {
+          status: 'completed',
+          processedUrl: processedVideoUrl,
+          processedAt: now,
+        };
+
+        const existingImages: string[] = product?.images || [];
+        let updatedImages = existingImages;
+        let primaryImageUrl = product?.primary_image_url || null;
+
+        if (thumbnailUrl && existingImages.length === 0) {
+          updatedImages = [thumbnailUrl];
+          primaryImageUrl = primaryImageUrl || thumbnailUrl;
+        }
+
+        const { error } = await this.supabase
+          .from('products')
+          .update({
+            processed_videos: processedVideos,
+            video_processing_status: statusMap,
+            images: updatedImages,
+            primary_image_url: primaryImageUrl,
+          })
+          .eq('id', entityId);
+
+        if (error) throw error;
+        console.log(`✅ Updated product ${entityId} processed video[${videoIndex}]`);
+
+      } else if (entityType === 'post_media') {
+        // post_media uses a single row per media item
+        const { data: existingMedia } = await this.supabase
+          .from('post_media')
+          .select('thumbnail_url')
+          .eq('id', entityId)
+          .single();
+
+        const updatePayload: any = {
+          processed_url: processedVideoUrl,
+          processing_status: 'completed',
+        };
+
+        // Only set thumbnail_url if none exists and we have a generated thumbnail
+        if (thumbnailUrl && !existingMedia?.thumbnail_url) {
+          updatePayload.thumbnail_url = thumbnailUrl;
+        }
+
+        const { error } = await this.supabase
+          .from('post_media')
+          .update(updatePayload)
+          .eq('id', entityId);
+
+        if (error) throw error;
+        console.log(`✅ Updated post_media ${entityId} processed_url`);
+
+        // Also sync into parent posts.processed_media_urls if postId is known
+        if (postId) {
+          const { data: post } = await this.supabase
+            .from('posts')
+            .select('processed_media_urls, media_urls')
+            .eq('id', postId)
+            .single();
+
+          if (post?.media_urls) {
+            const processedMediaUrls = post.processed_media_urls || [];
+            const mediaIndex = post.media_urls.indexOf(processedVideoUrl);
+            if (mediaIndex === -1) {
+              // Try to find by entityId via post_media (safer)
+              const { data: pm } = await this.supabase
+                .from('post_media')
+                .select('media_url, order_index')
+                .eq('id', entityId)
+                .single();
+              if (pm?.order_index !== undefined) {
+                processedMediaUrls[pm.order_index] = processedVideoUrl;
+              }
+            } else {
+              processedMediaUrls[mediaIndex] = processedVideoUrl;
+            }
+
+            await this.supabase
+              .from('posts')
+              .update({ processed_media_urls: processedMediaUrls })
+              .eq('id', postId);
+            console.log(`✅ Updated post ${postId} processed_media_urls`);
+          }
+        }
+
+      } else if (entityType === 'chat') {
+        // Legacy chat file upload support
+        const { error } = await this.supabase
+          .from('chat_file_uploads')
+          .update({
+            public_url: processedVideoUrl,
+            metadata: {
+              videoProcessing: {
+                processing: false,
+                processed: true,
+                processedVideoUrl,
+                processedAt: now,
+              },
+            },
+          })
+          .eq('message_id', entityId)
+          .eq('file_type', 'video');
+
+        if (error) throw error;
+        console.log(`✅ Updated chat file upload ${entityId}`);
       }
-      
-      console.log(`\u2705 Successfully updated chat file upload ${serviceId} with processed video`);
-      
     } catch (error) {
-      console.error('Failed to update service video:', error);
+      console.error(`Failed to update ${entityType} video:`, error);
     }
   }
 
@@ -269,18 +436,16 @@ export class BackgroundVideoProcessor {
   private async notifyUser(userId: string, notification: {
     type: string;
     jobId: string;
-    serviceId?: string;
+    entityType?: string;
+    entityId?: string;
+    postId?: string;
   }): Promise<void> {
     try {
-      // This would send a push notification or update user's notifications
       console.log(`📱 Notifying user ${userId} about ${notification.type} for job ${notification.jobId}`);
-      
-      // Example: await this.notificationService.send(userId, {
-      //   title: 'Video Processing Complete',
-      //   body: 'Your video has been optimized for better playback',
-      //   data: notification
-      // });
-      
+      BackgroundVideoProcessor.eventEmitter.emit('video_processing_completed', {
+        userId,
+        ...notification,
+      });
     } catch (error) {
       console.error('Failed to notify user:', error);
     }

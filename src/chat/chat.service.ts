@@ -270,8 +270,7 @@ export class ChatService {
       const allParticipants = [...new Set([userId, ...participantIds])].sort();
 
       // Generate participant hash using PostgreSQL function
-      // Use JWT-compatible function when user token is provided, otherwise use UUID version
-      const functionName = userToken ? 'generate_participant_hash_jwt' : 'generate_participant_hash_uuid';
+      const functionName = 'generate_participant_hash';
       const { data: hashResult, error: hashError } = await client
         .rpc(functionName, { participant_ids: allParticipants });
 

@@ -28,6 +28,7 @@ export interface Post {
   userId: string;
   content: string | null;
   mediaUrls: string[];
+  processedMediaUrls?: string[];
   mediaType: MediaType;
   privacyLevel: PrivacyLevel;
   likesCount: number;

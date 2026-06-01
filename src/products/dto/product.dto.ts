@@ -148,6 +148,8 @@ export class ProductResponseDto {
   images: string[];
   primary_image_url?: string;
   videos: string[];
+  processed_videos?: string[];
+  video_processing_status?: any;
   primary_video_url?: string;
   media_type: string;
   location?: string;

@@ -115,9 +115,11 @@ export class FileUploadService {
 
       this.logger.log(`File uploaded successfully: ${publicUrl}`);
 
-      // Check if this is a video that needs processing
+      // Check if this is a video that needs processing (fire-and-forget, must not block the upload response)
       if (fileMetadata.type === 'video') {
-        await this.checkAndProcessVideo(publicUrl, fileMetadata, userId, messageId);
+        this.checkAndProcessVideo(publicUrl, fileMetadata, userId, messageId).catch(err => {
+          this.logger.error('Background video processing error:', err);
+        });
       }
 
       return {
@@ -383,9 +385,10 @@ export class FileUploadService {
           
           // Add to background processing queue
           const jobId = await backgroundVideoProcessor.addVideoToQueue(videoUrl, userId, {
-            serviceId: messageId, // Use messageId as service identifier
+            entityType: 'chat', // Mark this job as belonging to a chat message
+            entityId: messageId, // Use messageId as the entity identifier
             platform: 'android', // Default to android for maximum compatibility
-            priority: 'medium'
+            priority: 'medium',
           });
           
           this.logger.log(`Video queued for processing with job ID: ${jobId}`);
@@ -419,19 +422,22 @@ export class FileUploadService {
     const https = require('https');
     const fs = require('fs');
     const path = require('path');
+    const os = require('os');
     
     return new Promise((resolve, reject) => {
       const fileName = `temp_video_check_${Date.now()}.mp4`;
-      const filePath = path.join('/tmp', fileName);
+      const filePath = path.join(os.tmpdir(), fileName);
       
       const file = fs.createWriteStream(filePath);
+      file.on('error', reject);
       
       https.get(url, (response: any) => {
         response.pipe(file);
-      }).on('error', reject).on('end', () => {
-        file.close();
-        resolve(filePath);
-      });
+        file.on('finish', () => {
+          file.close();
+          resolve(filePath);
+        });
+      }).on('error', reject);
     });
   }
 

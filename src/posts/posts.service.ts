@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { VideoProcessingHelper } from '../shared/video-processing.helper';
 import { Post, PostInteraction, PostMedia, UnifiedFeedItem, UserInfo, InteractionType, MediaType, PrivacyLevel, FeedItemType } from './interfaces/post.interface';
 import { CreatePostDto } from './dto/create-post.dto';
 import { UpdatePostDto } from './dto/update-post.dto';
@@ -46,11 +47,30 @@ export class PostsService {
         order_index: index,
       }));
 
-      const { error: mediaError } = await this.supabase
+      const { data: insertedMedia, error: mediaError } = await this.supabase
         .from('post_media')
-        .insert(mediaData);
+        .insert(mediaData)
+        .select('id, media_url, media_type');
 
       if (mediaError) throw mediaError;
+
+      // Fire-and-forget video processing for incompatible codecs
+      if (insertedMedia && insertedMedia.length > 0) {
+        insertedMedia.forEach((mediaItem: any, index: number) => {
+          if (mediaItem.media_type === 'video') {
+            VideoProcessingHelper.checkAndQueue(
+              mediaItem.media_url,
+              userId,
+              'post_media',
+              mediaItem.id,
+              index,
+              post.id,
+            ).catch(() => {
+              // Silent fail — original video still works
+            });
+          }
+        });
+      }
     }
 
     return this.mapToPost(post);
@@ -856,19 +876,61 @@ export class PostsService {
       .single();
 
     if (existing) {
-      // Remove bookmark
-      await this.supabase
-        .from('post_bookmarks')
-        .delete()
-        .eq('id', existing.id);
+      await this.supabase.from('post_bookmarks').delete().eq('id', existing.id);
       return false;
     } else {
-      // Add bookmark
-      await this.supabase
-        .from('post_bookmarks')
-        .insert({ post_id: postId, user_id: userId });
+      await this.supabase.from('post_bookmarks').insert({
+        post_id: postId,
+        user_id: userId,
+      });
       return true;
     }
+  }
+
+  // Get related posts (more from user + recommendations)
+  async getRelatedPosts(postId: string, currentUserId?: string, limit: number = 10): Promise<Post[]> {
+    // First get the post to find the user
+    const { data: post, error: postError } = await this.supabase
+      .from('posts')
+      .select('user_id')
+      .eq('id', postId)
+      .single();
+
+    if (postError || !post) {
+      throw new NotFoundException('Post not found');
+    }
+
+    // Get more posts from the same user (excluding current post)
+    const { data: userPosts, error: userPostsError } = await this.supabase
+      .from('posts')
+      .select(`
+        *,
+        user:user_profiles(id, username, avatar_url, is_verified)
+      `)
+      .eq('user_id', post.user_id)
+      .eq('is_deleted', false)
+      .neq('id', postId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (userPostsError) throw userPostsError;
+
+    // Map and enrich posts
+    const mappedPosts = await Promise.all(
+      userPosts.map(async (p) => {
+        const mapped = this.mapToPost(p);
+        if (p.user) mapped.user = this.mapToUserInfo(p.user);
+
+        if (currentUserId) {
+          mapped.isLiked = await this.hasUserLiked(p.id, currentUserId);
+          mapped.isBookmarked = await this.hasUserBookmarked(p.id, currentUserId);
+        }
+
+        return mapped;
+      })
+    );
+
+    return mappedPosts;
   }
 
   // Get user's bookmarked posts
@@ -962,6 +1024,7 @@ export class PostsService {
       userId: data.user_id,
       content: data.content,
       mediaUrls: data.media_urls || [],
+      processedMediaUrls: data.processed_media_urls || [],
       mediaType: data.media_type,
       privacyLevel: data.privacy_level,
       likesCount: data.likes_count || 0,

@@ -355,4 +355,27 @@ export class PostsController {
       message: 'Report submitted successfully',
     };
   }
+
+  // Get related posts (more from user)
+  @Get(':id/related')
+  @UseGuards(JwtAuthGuard)
+  async getRelatedPosts(
+    @Param('id') id: string,
+    @Query('limit') limit: number = 10,
+    @Request() req,
+  ) {
+    const relatedPosts = await this.postsService.getRelatedPosts(
+      id,
+      req.user.id,
+      limit,
+    );
+    return {
+      success: true,
+      data: relatedPosts,
+      meta: {
+        limit,
+        total: relatedPosts.length,
+      },
+    };
+  }
 }

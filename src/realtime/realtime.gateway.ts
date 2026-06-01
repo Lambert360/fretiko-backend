@@ -14,6 +14,7 @@ import { RealtimeService } from './realtime.service';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
+import { BackgroundVideoProcessor } from '../services/backgroundVideoProcessor';
 
 @WebSocketGateway({
   cors: {
@@ -44,6 +45,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
 
     // 🔥 DEBUG: Log the server state immediately
     this.logger.log(`🔍 Gateway afterInit - server=${!!server}`);
+
+    // Listen for video processing completion events and broadcast to user rooms
+    BackgroundVideoProcessor.eventEmitter.on('video_processing_completed', (payload: any) => {
+      try {
+        if (this.server && payload.userId) {
+          this.server.to(`user_${payload.userId}`).emit('video_processing_completed', payload);
+          this.logger.log(`📡 Broadcasted video_processing_completed to user_${payload.userId}`);
+        }
+      } catch (err) {
+        this.logger.error('Failed to broadcast video_processing_completed:', err);
+      }
+    });
 
     // Start heartbeat after a delay
     setTimeout(() => {

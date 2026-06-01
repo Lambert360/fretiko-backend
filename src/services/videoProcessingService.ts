@@ -39,6 +39,7 @@ export interface VideoProcessingResult {
 
 export class VideoProcessingService {
   private storageClient: StorageClient;
+  static isFfmpegAvailable = false;
 
   constructor() {
     this.storageClient = new StorageClient(
@@ -50,10 +51,34 @@ export class VideoProcessingService {
   }
 
   /**
+   * Check if FFmpeg is installed and available.
+   * Call this once at application startup.
+   */
+  static async checkFfmpegAvailability(): Promise<boolean> {
+    try {
+      const { exec } = require('child_process');
+      const { promisify } = require('util');
+      const execAsync = promisify(exec);
+      await execAsync('ffmpeg -version');
+      VideoProcessingService.isFfmpegAvailable = true;
+      console.log('✅ FFmpeg is available');
+      return true;
+    } catch {
+      VideoProcessingService.isFfmpegAvailable = false;
+      console.warn('⚠️ FFmpeg is NOT available. Video processing will be disabled.');
+      return false;
+    }
+  }
+
+  /**
    * Process video for optimal compatibility across all platforms
    */
   async processVideo(options: VideoProcessingOptions): Promise<VideoProcessingResult> {
     try {
+      if (!VideoProcessingService.isFfmpegAvailable) {
+        return { success: false, error: 'FFmpeg is not available. Video processing is disabled.' };
+      }
+
       console.log('🎥 Starting video processing:', options);
 
       // Validate input file exists

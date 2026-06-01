@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { CreateServiceDto, UpdateServiceDto } from './dto/service.dto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { VideoProcessingHelper } from '../shared/video-processing.helper';
 
 @Injectable()
 export class ServicesService {
@@ -97,6 +98,15 @@ export class ServicesService {
 
     if (error) {
       throw new Error(`Failed to create service: ${error.message}`);
+    }
+
+    // Fire-and-forget video processing for incompatible codecs
+    if (data.videos && data.videos.length > 0) {
+      data.videos.forEach((videoUrl: string, index: number) => {
+        VideoProcessingHelper.checkAndQueue(videoUrl, userId, 'service', data.id, index).catch(() => {
+          // Silent fail — original video still works
+        });
+      });
     }
 
     return data;
@@ -323,7 +333,7 @@ export class ServicesService {
         id: service.id,
         title: service.name,
         thumbnail: service.images?.[0] || null,
-        videoUri: service.videos?.[0] || null,
+        videoUri: service.processed_videos?.[0] || service.videos?.[0] || null,
         userId: service.user_id,
         username: service.user_profiles?.username || 'user',
         userAvatar: service.user_profiles?.avatar_url || null,
