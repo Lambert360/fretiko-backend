@@ -217,8 +217,8 @@ export class AuthService {
     // Adjust age if birthday hasn't occurred yet this year
     const actualAge = monthDifference < 0 || (monthDifference === 0 && today.getDate() < birthDate.getDate()) ? age - 1 : age;
     
-    if (actualAge < 18) {
-      throw new BadRequestException('You must be at least 18 years old to create an account');
+    if (actualAge < 13) {
+      throw new BadRequestException('You must be at least 13 years old to create an account');
     }
 
     // Check if user already exists in Supabase Auth
@@ -234,6 +234,7 @@ export class AuthService {
         throw new ConflictException('User with this email already exists');
       }
     } catch (error) {
+      if (error instanceof ConflictException) throw error;
       console.log('✅ User does not exist, proceeding with verification email...');
     }
 
@@ -525,6 +526,20 @@ export class AuthService {
       refreshToken: '',
       requiresEmailVerification: false,
     };
+  }
+
+  async checkUsernameAvailability(username: string): Promise<boolean> {
+    try {
+      const normalized = username.toLowerCase().trim();
+      const { data } = await this.serviceSupabase
+        .from('user_profiles')
+        .select('id')
+        .ilike('username', normalized)
+        .single();
+      return !data; // true = available
+    } catch {
+      return true; // no row found → available
+    }
   }
 
   async checkEmailAvailability(email: string): Promise<boolean> {

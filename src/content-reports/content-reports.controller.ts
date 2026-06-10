@@ -63,7 +63,7 @@ export class ContentReportsController {
   async getAllReports(
     @Req() req,
     @Query('status') status?: 'pending' | 'under_review' | 'approved' | 'action_taken' | 'dismissed',
-    @Query('category') category?: 'product' | 'service' | 'chat' | 'user',
+    @Query('category') category?: 'product' | 'service' | 'chat' | 'user' | 'post',
     @Query('search') search?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,

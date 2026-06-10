@@ -4,6 +4,8 @@ import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseCl
 import { CreateServiceDto, UpdateServiceDto } from './dto/service.dto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
+import { TagsService } from '../tags/tags.service';
+import { MentionsService } from '../mentions/mentions.service';
 
 @Injectable()
 export class ServicesService {
@@ -13,6 +15,8 @@ export class ServicesService {
   constructor(
     private configService: ConfigService,
     private supabaseClientManager: SupabaseClientManager,
+    private tagsService: TagsService,
+    private mentionsService: MentionsService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
@@ -107,6 +111,21 @@ export class ServicesService {
           // Silent fail — original video still works
         });
       });
+    }
+
+    // Sync tags and mentions based on description
+    const descriptionForSync = createServiceDto.description || '';
+
+    try {
+      await this.tagsService.syncTaggings(data.id, 'service', descriptionForSync);
+    } catch (e) {
+      console.error('Failed to sync tags for service', data.id, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, data.id, 'service', descriptionForSync);
+    } catch (e) {
+      console.error('Failed to create mentions for service', data.id, e);
     }
 
     return data;
@@ -444,6 +463,22 @@ export class ServicesService {
     if (error) {
       throw new Error(`Failed to update service: ${error.message}`);
     }
+    // Sync tags and mentions based on the final description
+    const descriptionForSync = updateServiceDto.description !== undefined
+      ? updateServiceDto.description
+      : data.description;
+
+    try {
+      await this.tagsService.syncTaggings(serviceId, 'service', descriptionForSync || '');
+    } catch (e) {
+      console.error('Failed to sync tags for updated service', serviceId, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, serviceId, 'service', descriptionForSync || '');
+    } catch (e) {
+      console.error('Failed to create mentions for updated service', serviceId, e);
+    }
 
     return data;
   }
@@ -477,6 +512,29 @@ export class ServicesService {
     }
 
     return { message: 'Service deleted successfully' };
+  }
+
+  async getServiceLikers(serviceId: string, limit: number = 50, offset: number = 0) {
+    const { data, error } = await this.serviceSupabase
+      .from('service_likes')
+      .select(`
+        user_id,
+        created_at,
+        user:user_profiles(id, username, avatar_url, is_verified)
+      `)
+      .eq('service_id', serviceId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) throw new Error(`Failed to fetch service likers: ${error.message}`);
+
+    return (data || []).map((row: any) => ({
+      id: row.user?.id,
+      username: row.user?.username,
+      avatarUrl: row.user?.avatar_url || null,
+      isVerified: row.user?.is_verified || false,
+      likedAt: row.created_at,
+    }));
   }
 
   async toggleLike(userId: string, serviceId: string, userToken?: string) {

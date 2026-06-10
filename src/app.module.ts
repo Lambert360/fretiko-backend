@@ -25,6 +25,8 @@ import { StoresModule } from './stores/stores.module';
 import { AuctionsModule } from './auctions/auctions.module';
 import { IkoModule } from './iko/iko.module';
 import { RealtimeModule } from './realtime/realtime.module';
+import { TagsModule } from './tags/tags.module';
+import { MentionsModule } from './mentions/mentions.module';
 import { StoriesModule } from './stories/stories.module';
 import { PostsModule } from './posts/posts.module';
 import { WorkspaceModule } from './workspace/workspace.module';
@@ -84,6 +86,8 @@ import { VideoProcessingModule } from './video-processing/video-processing.modul
     AuctionsModule,
     IkoModule,
     RealtimeModule,
+    TagsModule,
+    MentionsModule,
     StoriesModule,
     PostsModule,
     WorkspaceModule,

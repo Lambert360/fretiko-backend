@@ -549,17 +549,29 @@ export class CallsService {
         avatar_url?: string | null;
       } | null = null;
       if (eventType === 'incoming_call' && initiatorId) {
-        const { data: initiator } = await this.supabase
+        const { data: profile } = await this.supabase
           .from('user_profiles')
-          .select('id, username, avatar_url, full_name')
+          .select('id, username, avatar_url')
           .eq('id', initiatorId)
           .single();
 
-        initiatorData = initiator || {
-          id: initiatorId,
-          username: 'Unknown User',
-          full_name: 'Unknown User',
-        };
+        let fullName = profile?.username || 'Unknown User';
+
+        // Try to get first/last name from auth metadata (stored at signup)
+        try {
+          const { data: authUser } = await this.supabase.auth.admin.getUserById(initiatorId);
+          const meta = authUser?.user?.user_metadata;
+          if (meta) {
+            const name = [meta.firstName, meta.lastName].filter(Boolean).join(' ').trim();
+            if (name) fullName = name;
+          }
+        } catch (_) {
+          // auth.admin may not be available; fall back to username
+        }
+
+        initiatorData = profile
+          ? { ...profile, full_name: fullName }
+          : { id: initiatorId, username: 'Unknown User', full_name: 'Unknown User' };
       }
 
       // Broadcast call event via WebSocket to all participants in the conversation

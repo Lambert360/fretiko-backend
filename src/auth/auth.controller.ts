@@ -288,6 +288,35 @@ export class AuthController {
     }
   }
 
+  @Get('check-username-availability')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-cache')
+  async checkUsernameAvailability(@Req() req: Request) {
+    const username = req.query.username as string;
+
+    if (!username || !username.trim()) {
+      return {
+        success: false,
+        message: 'Username is required',
+      };
+    }
+
+    try {
+      const isAvailable = await this.authService.checkUsernameAvailability(username.trim());
+
+      return {
+        success: true,
+        available: isAvailable,
+        message: isAvailable ? 'Username is available' : 'Username is already taken',
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: 'Failed to check username availability',
+      };
+    }
+  }
+
   // =====================================================
   // SOCIAL AUTHENTICATION ENDPOINTS
   // =====================================================

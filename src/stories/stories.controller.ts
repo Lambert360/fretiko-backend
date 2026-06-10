@@ -131,6 +131,20 @@ export class StoriesController {
     );
   }
 
+  @Get(':id/likes')
+  async getStoryLikers(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    const likers = await this.storiesService.getStoryLikers(
+      id,
+      limit ? parseInt(limit) : 50,
+      offset ? parseInt(offset) : 0,
+    );
+    return { success: true, data: likers };
+  }
+
   @Post(':id/like')
   async toggleLike(@Request() req, @Param('id', ParseUUIDPipe) id: string) {
     return await this.storiesService.toggleLike(

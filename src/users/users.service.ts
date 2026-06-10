@@ -70,6 +70,37 @@ export class UsersService {
     };
   }
 
+  async getPublicProfileByUsername(username: string): Promise<PublicProfileResponse> {
+    // SECURITY: Use service role for public profile access (no sensitive data)
+    const { data, error } = await this.serviceSupabase
+      .from('user_profiles')
+      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at')
+      .ilike('username', username)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // SECURITY: Don't auto-create profiles in public read operations
+        // This prevents unauthorized profile creation
+        console.log('Public profile not found for username', username);
+        throw new NotFoundException('User profile not found');
+      }
+      throw new Error(`Database error: ${error.message}`);
+    }
+
+    return {
+      id: data.id,
+      username: data.username,
+      bio: data.bio,
+      avatarUrl: data.avatar_url,
+      bgPicUrl: data.bg_pic_url,
+      location: data.location,
+      isSeller: data.is_seller,
+      isRider: data.is_rider,
+      createdAt: data.created_at,
+    };
+  }
+
   async updateProfile(userId: string, updateData: UpdateProfileDto, userToken?: string): Promise<UserProfileResponse> {
     console.log('🔐 Using serviceSupabase for profile operations (bypasses RLS)');
     
@@ -116,13 +147,19 @@ export class UsersService {
       console.log('SECURITY: Creating new profile for authenticated user', userId);
     }
     
+    // Normalize username to lowercase before any checks or writes
+    if (updateData.username) {
+      updateData.username = updateData.username.toLowerCase().trim();
+    }
+
     // Check if username is taken (if username is being updated)
-    // Only check if username is provided and different from existing
-    if (updateData.username && (!profileCheck || profileCheck.length === 0 || updateData.username !== profileCheck[0].username)) {
+    // Only check if username is provided and different from existing (case-insensitive)
+    const currentUsername = profileCheck?.[0]?.username?.toLowerCase() || '';
+    if (updateData.username && (profileCheck?.length === 0 || updateData.username !== currentUsername)) {
       const { data: existingUser } = await this.serviceSupabase
         .from('user_profiles')
         .select('id')
-        .eq('username', updateData.username)
+        .ilike('username', updateData.username)
         .neq('id', userId)
         .single();
 
@@ -189,6 +226,9 @@ export class UsersService {
 
     if (error) {
       console.error('Profile upsert error:', error);
+      if (error.code === '23505' && error.message?.toLowerCase().includes('username')) {
+        throw new ConflictException('Username is already taken');
+      }
       throw new Error(`Database error: ${error.message}`);
     }
 

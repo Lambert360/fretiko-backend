@@ -1,6 +1,8 @@
 import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { TagsService } from '../tags/tags.service';
+import { MentionsService } from '../mentions/mentions.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
 import { Post, PostInteraction, PostMedia, UnifiedFeedItem, UserInfo, InteractionType, MediaType, PrivacyLevel, FeedItemType } from './interfaces/post.interface';
 import { CreatePostDto } from './dto/create-post.dto';
@@ -10,7 +12,11 @@ import { FeedQueryDto } from './dto/feed-query.dto';
 
 @Injectable()
 export class PostsService {
-  constructor(private configService: ConfigService) {}
+  constructor(
+    private configService: ConfigService,
+    private tagsService: TagsService,
+    private mentionsService: MentionsService,
+  ) {}
 
   private get supabase() {
     return createServiceSupabaseClient(this.configService);
@@ -73,7 +79,23 @@ export class PostsService {
       }
     }
 
-    return this.mapToPost(post);
+    const mapped = this.mapToPost(post);
+
+    // Sync tags and mentions (fire-and-forget style, but awaited here for consistency)
+    try {
+      await this.tagsService.syncTaggings(post.id, 'post', createPostDto.content || null);
+    } catch (e) {
+      // Do not block post creation on tag failures
+      console.error('Failed to sync tags for post', post.id, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, post.id, 'post', createPostDto.content || null);
+    } catch (e) {
+      console.error('Failed to create mentions for post', post.id, e);
+    }
+
+    return mapped;
   }
 
   // Upload media to Supabase storage
@@ -260,6 +282,20 @@ export class PostsService {
 
     if (error) throw error;
 
+    const contentForSync = updatePostDto.content !== undefined ? updatePostDto.content : updated.content;
+
+    try {
+      await this.tagsService.syncTaggings(id, 'post', contentForSync || null);
+    } catch (e) {
+      console.error('Failed to sync tags for updated post', id, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, id, 'post', contentForSync || null);
+    } catch (e) {
+      console.error('Failed to create mentions for updated post', id, e);
+    }
+
     return this.findById(id, userId);
   }
 
@@ -340,6 +376,21 @@ export class PostsService {
     }
 
     console.log('✅ Interaction created successfully:', interaction.id);
+    // If this interaction is a comment, sync tags and mentions based on its content
+    if (dto.interactionType === InteractionType.COMMENT && dto.content) {
+      try {
+        await this.tagsService.syncTaggings(interaction.id, 'comment', dto.content);
+      } catch (e) {
+        console.error('Failed to sync tags for comment', interaction.id, e);
+      }
+
+      try {
+        await this.mentionsService.createMentions(userId, interaction.id, 'comment', dto.content);
+      } catch (e) {
+        console.error('Failed to create mentions for comment', interaction.id, e);
+      }
+    }
+
     return this.mapToInteraction(interaction);
   }
 
@@ -959,6 +1010,76 @@ export class PostsService {
         return mapped;
       })
     );
+  }
+
+  // Get users who liked a post
+  async getPostLikers(postId: string, limit: number = 50, offset: number = 0) {
+    const { data, error } = await this.supabase
+      .from('post_interactions')
+      .select(`
+        user_id,
+        created_at,
+        user:user_profiles(id, username, avatar_url, is_verified)
+      `)
+      .eq('post_id', postId)
+      .eq('interaction_type', InteractionType.LIKE)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) throw error;
+
+    return (data || []).map((row: any) => ({
+      id: row.user?.id,
+      username: row.user?.username,
+      avatarUrl: row.user?.avatar_url || null,
+      isVerified: row.user?.is_verified || false,
+      likedAt: row.created_at,
+    }));
+  }
+
+  async getPostGifters(postId: string, limit: number = 50, offset: number = 0) {
+    const { data, error } = await this.supabase
+      .from('post_interactions')
+      .select(`
+        user_id,
+        created_at,
+        gift_id,
+        user:user_profiles(id, username, avatar_url, is_verified)
+      `)
+      .eq('post_id', postId)
+      .eq('interaction_type', InteractionType.GIFT)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) throw error;
+
+    // Group by user so a user who gifted multiple times appears only once
+    const byUser = new Map<string, { id: string; username: string; avatarUrl: string | null; isVerified: boolean; count: number; latestAt: string }>();
+
+    for (const row of (data || []) as any[]) {
+      const uid = row.user?.id;
+      if (!uid) continue;
+      if (byUser.has(uid)) {
+        byUser.get(uid)!.count += 1;
+      } else {
+        byUser.set(uid, {
+          id: uid,
+          username: row.user?.username || '',
+          avatarUrl: row.user?.avatar_url || null,
+          isVerified: row.user?.is_verified || false,
+          count: 1,
+          latestAt: row.created_at,
+        });
+      }
+    }
+
+    return Array.from(byUser.values()).map((u) => ({
+      id: u.id,
+      username: u.username,
+      avatarUrl: u.avatarUrl,
+      isVerified: u.isVerified,
+      subtitle: u.count > 1 ? `Gifted ${u.count} times` : undefined,
+    }));
   }
 
   // Helper methods

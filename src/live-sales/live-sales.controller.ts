@@ -196,6 +196,10 @@ export class LiveSalesController {
     }
 
     await this.liveSalesService.endStream(streamId, userId, accessToken);
+
+    // Broadcast status update so viewers and discovery feeds are updated in real-time
+    this.liveStreamGateway.broadcastStreamStatusUpdate(streamId, 'ended');
+
     return { success: true, message: 'Stream ended successfully' };
   }
 

@@ -105,6 +105,21 @@ export class ServicesController {
     return this.servicesService.deleteService(req.user.sub, id, req.supabaseToken);
   }
 
+  @Get(':id/likes')
+  @UseGuards(JwtAuthGuard)
+  async getServiceLikers(
+    @Param('id') id: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    const likers = await this.servicesService.getServiceLikers(
+      id,
+      limit ? parseInt(limit) : 50,
+      offset ? parseInt(offset) : 0,
+    );
+    return { success: true, data: likers };
+  }
+
   @Post(':id/like')
   @UseGuards(JwtAuthGuard)
   async toggleLike(@Request() req, @Param('id') id: string) {

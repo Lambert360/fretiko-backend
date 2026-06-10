@@ -171,6 +171,42 @@ export class PostsController {
     };
   }
 
+  // Get users who liked a post
+  @Get(':id/likes')
+  @UseGuards(JwtAuthGuard)
+  async getPostLikers(
+    @Param('id') id: string,
+    @Query() query: PaginationQueryDto,
+  ) {
+    const likers = await this.postsService.getPostLikers(
+      id,
+      query.limit,
+      query.offset,
+    );
+    return {
+      success: true,
+      data: likers,
+    };
+  }
+
+  // Get users who gifted a post
+  @Get(':id/gifts')
+  @UseGuards(JwtAuthGuard)
+  async getPostGifters(
+    @Param('id') id: string,
+    @Query() query: PaginationQueryDto,
+  ) {
+    const gifters = await this.postsService.getPostGifters(
+      id,
+      query.limit,
+      query.offset,
+    );
+    return {
+      success: true,
+      data: gifters,
+    };
+  }
+
   // Create interaction (like, comment, share, gift)
   @Post(':id/interact')
   @UseGuards(JwtAuthGuard)

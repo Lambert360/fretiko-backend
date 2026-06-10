@@ -34,6 +34,11 @@ export class UsersController {
     return this.usersService.getPublicProfile(id);
   }
 
+  @Get('profile/by-username/:username')
+  async getPublicProfileByUsername(@Param('username') username: string) {
+    return this.usersService.getPublicProfileByUsername(username);
+  }
+
   @Put('profile')
   @UseGuards(JwtAuthGuard)
   async updateProfile(@Request() req, @Body() updateData: UpdateProfileDto) {

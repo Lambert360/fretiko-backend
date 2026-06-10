@@ -4,6 +4,8 @@ import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseCl
 import { CreateProductDto, UpdateProductDto, ProductQueryDto, ProductResponseDto, ProductCategoryDto } from './dto/product.dto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
+import { TagsService } from '../tags/tags.service';
+import { MentionsService } from '../mentions/mentions.service';
 import ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -17,6 +19,8 @@ export class ProductsService {
   constructor(
     private configService: ConfigService,
     private supabaseClientManager: SupabaseClientManager,
+    private tagsService: TagsService,
+    private mentionsService: MentionsService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
@@ -104,6 +108,21 @@ export class ProductsService {
     if (error) {
       console.error('Product creation error:', error);
       throw new Error(`Failed to create product: ${error.message}`);
+    }
+
+    // Sync tags and mentions based on description
+    const descriptionForSync = createProductDto.description || '';
+
+    try {
+      await this.tagsService.syncTaggings(data.id, 'product', descriptionForSync);
+    } catch (e) {
+      console.error('Failed to sync tags for product', data.id, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, data.id, 'product', descriptionForSync);
+    } catch (e) {
+      console.error('Failed to create mentions for product', data.id, e);
     }
 
     return this.mapToProductResponse(data);
@@ -318,6 +337,22 @@ export class ProductsService {
 
     if (error) {
       throw new Error(`Failed to update product: ${error.message}`);
+    }
+
+    const descriptionForSync = updateProductDto.description !== undefined
+      ? updateProductDto.description
+      : data.description;
+
+    try {
+      await this.tagsService.syncTaggings(id, 'product', descriptionForSync || '');
+    } catch (e) {
+      console.error('Failed to sync tags for updated product', id, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, id, 'product', descriptionForSync || '');
+    } catch (e) {
+      console.error('Failed to create mentions for updated product', id, e);
     }
 
     return this.mapToProductResponse(data);

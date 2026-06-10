@@ -3,6 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { TagsService } from '../tags/tags.service';
+import { MentionsService } from '../mentions/mentions.service';
 import {
   CreateConversationDto,
   SendMessageDto,
@@ -25,10 +27,15 @@ export class ChatService {
     private configService: ConfigService,
     private notificationHelper: NotificationHelperService,
     @Inject(forwardRef(() => RealtimeGateway))
-    private realtimeGateway: RealtimeGateway
+    private realtimeGateway: RealtimeGateway,
+    private tagsService: TagsService,
+    private mentionsService: MentionsService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
+
+  // NOTE: sendMessage implementation is large; we only hook into the point
+  // where a chat message has been successfully created in the database.
 
   async getConversations(userId: string, query: GetConversationsDto, userToken?: string): Promise<ConversationResponseDto[]> {
     this.logger.log(`Fetching conversations for user: ${userId}`);
@@ -177,7 +184,9 @@ export class ChatService {
               .from('chat_messages')
               .select('*', { count: 'exact', head: true })
               .eq('conversation_id', convId)
-              .eq('is_deleted', false);
+              .eq('is_deleted', false)
+              // Only count messages sent by OTHER users as unread
+              .neq('sender_id', userId);
             
             // If last_read_at exists, only count messages created after it
             if (lastReadAt) {
@@ -628,6 +637,14 @@ export class ChatService {
       if (error) {
         this.logger.error('Failed to send message:', error);
         throw new Error(`Database error: ${error.message}`);
+      }
+
+      // Sync #tags for this chat message. @mentions in chat are not stored.
+      try {
+        await this.tagsService.syncTaggings(message.id, 'chat_message', sendMessageDto.content || null);
+      } catch (e) {
+        this.logger.error('Failed to sync tags for chat message', e);
+        // Do not fail the request if tag syncing fails
       }
 
       // Create message status for all participants
