@@ -266,6 +266,93 @@ export class ContentModerationController {
   }
 
   /**
+   * Get posts for moderation
+   * GET /admin/content/posts
+   * Requires: view_products permission
+   */
+  @Get('posts')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_products')
+  async getPostsForModeration(
+    @Req() req,
+    @Query('status') status?: string,
+    @Query('privacy') privacy?: string,
+    @Query('search') search?: string,
+    @Query('sortBy') sortBy?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.adminService.getPostsForModeration(req.user.sub, {
+      status,
+      privacy,
+      search,
+      sortBy,
+      page: page ? parseInt(page) : 1,
+      limit: limit ? parseInt(limit) : 20,
+    });
+  }
+
+  /**
+   * Get single post for moderation
+   * GET /admin/content/posts/:id
+   * Requires: view_products permission
+   */
+  @Get('posts/:id')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_products')
+  async getPostById(@Req() req, @Param('id') id: string) {
+    return this.adminService.getPostByIdForModeration(req.user.sub, id);
+  }
+
+  /**
+   * Hide a post
+   * POST /admin/content/posts/:id/hide
+   * Requires: remove_products permission
+   */
+  @Post('posts/:id/hide')
+  @UseGuards(PermissionsGuard)
+  @Permissions('remove_products')
+  async hidePost(@Req() req, @Param('id') id: string, @Body() body: { reason: string }) {
+    return this.adminService.adminHidePost(req.user.sub, id, body.reason);
+  }
+
+  /**
+   * Restore a hidden post
+   * POST /admin/content/posts/:id/restore
+   * Requires: remove_products permission
+   */
+  @Post('posts/:id/restore')
+  @UseGuards(PermissionsGuard)
+  @Permissions('remove_products')
+  async restorePost(@Req() req, @Param('id') id: string) {
+    return this.adminService.adminRestorePost(req.user.sub, id);
+  }
+
+  /**
+   * Pin a post
+   * POST /admin/content/posts/:id/pin
+   * Requires: approve_products permission
+   */
+  @Post('posts/:id/pin')
+  @UseGuards(PermissionsGuard)
+  @Permissions('approve_products')
+  async pinPost(@Req() req, @Param('id') id: string) {
+    return this.adminService.adminPinPost(req.user.sub, id);
+  }
+
+  /**
+   * Unpin a post
+   * POST /admin/content/posts/:id/unpin
+   * Requires: approve_products permission
+   */
+  @Post('posts/:id/unpin')
+  @UseGuards(PermissionsGuard)
+  @Permissions('approve_products')
+  async unpinPost(@Req() req, @Param('id') id: string) {
+    return this.adminService.adminUnpinPost(req.user.sub, id);
+  }
+
+  /**
    * Get content moderation statistics
    * GET /admin/content/stats
    * Requires: view_products permission
@@ -288,7 +375,7 @@ export class ContentModerationController {
   async getReportedContent(
     @Req() req,
     @Query('status') status?: 'pending' | 'under_review' | 'approved' | 'action_taken' | 'dismissed',
-    @Query('category') category?: 'product' | 'service' | 'chat' | 'user',
+    @Query('category') category?: 'product' | 'service' | 'chat' | 'user' | 'post',
     @Query('search') search?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,

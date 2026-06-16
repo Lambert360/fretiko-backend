@@ -1,12 +1,10 @@
-import { Controller, Get, Post, Param, Query, UseGuards, Req, Body, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, UseGuards, Req, Body, BadRequestException } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
 import { PermissionsGuard } from '../staff/guards/permissions.guard';
 import { Permissions } from '../staff/decorators/permissions.decorator';
 import { WalletReconciliationService } from '../wallet/wallet-reconciliation.service';
 import { GiftService } from '../gifts/gift.service';
-import { ConfigService } from '@nestjs/config';
-import { createServiceSupabaseClient } from '../shared/supabase.client';
 
 /**
  * Finance Controller (Staff)
@@ -16,16 +14,11 @@ import { createServiceSupabaseClient } from '../shared/supabase.client';
 @Controller('admin/finance')
 @UseGuards(StaffJwtAuthGuard)
 export class FinanceController {
-  private supabase;
-
   constructor(
     private readonly adminService: AdminService,
     private readonly walletReconciliationService: WalletReconciliationService,
     private readonly giftService: GiftService,
-    private readonly configService: ConfigService,
-  ) {
-    this.supabase = createServiceSupabaseClient(this.configService);
-  }
+  ) {}
 
   /**
    * Validate date string format (YYYY-MM-DD or YYYY-MM-DDTHH:mm:ss.sssZ)
@@ -424,42 +417,31 @@ export class FinanceController {
    * Returns platform wallet balances and recent transactions
    */
   @Get('platform-wallet')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
   async getPlatformWallet(@Req() req) {
-    // Check if user is super admin
-    const staff = req.user;
-    if (!staff?.isSuperAdmin) {
-      throw new ForbiddenException('Platform wallet access restricted to super administrators only');
-    }
+    return this.adminService.getPlatformWallet(req.user.sub);
+  }
 
-    // Get platform wallet data
-    const platformUserId = '00000000-0000-4000-8000-000000000002';
-    const { data: wallet, error: walletError } = await this.supabase
-      .from('wallets')
-      .select('available_balance, escrow_balance, total_balance, kyc_status, updated_at')
-      .eq('user_id', platformUserId)
-      .single();
-
-    if (walletError || !wallet) {
-      throw new NotFoundException('Platform wallet not found');
-    }
-
-    // Get recent platform transactions (last 10)
-    const { data: transactions, error: transactionsError } = await this.supabase
-      .from('wallet_transactions')
-      .select('id, amount, type, description, created_at, metadata')
-      .eq('wallet_id', platformUserId)
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    if (transactionsError) {
-      console.error('Error fetching platform transactions:', transactionsError);
-    }
-
-    return {
-      wallet,
-      transactions: transactions || [],
-      message: 'Platform wallet data retrieved successfully'
-    };
+  /**
+   * Get enhanced revenue summary
+   * GET /admin/finance/revenue-summary?period=monthly&startDate=2024-01-01&endDate=2024-12-31
+   * Requires: view_revenue permission
+   */
+  @Get('revenue-summary')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_revenue')
+  async getRevenueSummary(
+    @Req() req,
+    @Query('period') period: 'daily' | 'weekly' | 'monthly' | 'yearly' = 'monthly',
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+  ) {
+    return this.adminService.getRevenueSummaryForStaff(req.user.sub, {
+      period,
+      startDate,
+      endDate,
+    });
   }
 }
 

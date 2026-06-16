@@ -9,7 +9,7 @@ import { Permissions } from '../staff/decorators/permissions.decorator';
  * Handles dashboard overview endpoints for staff admin panel
  * Requires staff authentication
  */
-@Controller('dashboard')
+@Controller('admin/dashboard')
 @UseGuards(StaffJwtAuthGuard)
 export class DashboardController {
   constructor(private readonly adminService: AdminService) {}

@@ -48,6 +48,7 @@ export interface CreateBankAccountDto {
   branchName?: string;
   branchCode?: string;
   isDefault?: boolean;
+  preVerifiedAccountName?: string; // If set, skip Flutterwave re-verification (e.g. after admin panel preview)
 }
 
 export interface UpdateBankAccountDto {
@@ -224,21 +225,26 @@ export class BankAccountService {
         }
       }
 
-      // First, verify the account with Flutterwave before saving
-      // This ensures only valid bank accounts are stored in our system
+      // Verify the account before saving — either use a pre-verified name (already confirmed via
+      // the preview endpoint) or call Flutterwave directly.
       let resolvedAccountName: string;
-      try {
-        const resolvedAccount = await this.resolveAccountWithFlutterwave(
-          dto.accountNumber,
-          dto.bankCode,
-        );
-        resolvedAccountName = resolvedAccount.account_name;
-        this.logger.log(`✅ Account verified with Flutterwave: ${resolvedAccountName}`);
-      } catch (verifyError) {
-        this.logger.error(`❌ Account verification failed during creation:`, verifyError);
-        throw new BadRequestException(
-          'Bank account verification failed. Please check your account number and bank code.'
-        );
+      if (dto.preVerifiedAccountName?.trim()) {
+        resolvedAccountName = dto.preVerifiedAccountName.trim();
+        this.logger.log(`✅ Using pre-verified account name: ${resolvedAccountName}`);
+      } else {
+        try {
+          const resolvedAccount = await this.resolveAccountWithFlutterwave(
+            dto.accountNumber,
+            dto.bankCode,
+          );
+          resolvedAccountName = resolvedAccount.account_name;
+          this.logger.log(`✅ Account verified with Flutterwave: ${resolvedAccountName}`);
+        } catch (verifyError) {
+          this.logger.error(`❌ Account verification failed during creation:`, verifyError);
+          throw new BadRequestException(
+            'Bank account verification failed. Please check your account number and bank code.'
+          );
+        }
       }
 
       // Create bank account with verified data

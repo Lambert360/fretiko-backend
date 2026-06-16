@@ -10,7 +10,7 @@ import { RefundRequestDto } from './dto/refund.dto';
  * Handles order management endpoints for staff admin panel
  * Requires staff authentication and view_orders permission
  */
-@Controller('dashboard/orders')
+@Controller('admin/orders')
 @UseGuards(StaffJwtAuthGuard)
 export class OrdersController {
   constructor(private readonly adminService: AdminService) {}
