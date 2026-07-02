@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto, ProductResponseDto, ProductCategoryDto } from './dto/product.dto';
@@ -6,6 +6,7 @@ import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
 import { TagsService } from '../tags/tags.service';
 import { MentionsService } from '../mentions/mentions.service';
+import { EmbeddingService } from '../ai/core/embedding.service';
 import ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -15,12 +16,14 @@ import * as os from 'os';
 export class ProductsService {
   private supabase;
   private serviceSupabase;
+  private readonly logger = new Logger(ProductsService.name);
 
   constructor(
     private configService: ConfigService,
     private supabaseClientManager: SupabaseClientManager,
     private tagsService: TagsService,
     private mentionsService: MentionsService,
+    private embeddingService: EmbeddingService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
@@ -124,6 +127,11 @@ export class ProductsService {
     } catch (e) {
       console.error('Failed to create mentions for product', data.id, e);
     }
+
+    // Generate embedding for vector search (fire-and-forget, non-blocking)
+    this.generateAndSaveEmbedding(data.id, data).catch(err => {
+      this.logger.warn(`Failed to generate embedding for product ${data.id}: ${err.message}`);
+    });
 
     return this.mapToProductResponse(data);
   }
@@ -353,6 +361,13 @@ export class ProductsService {
       await this.mentionsService.createMentions(userId, id, 'product', descriptionForSync || '');
     } catch (e) {
       console.error('Failed to create mentions for updated product', id, e);
+    }
+
+    // Regenerate embedding if searchable fields changed (fire-and-forget)
+    if (updateProductDto.name !== undefined || updateProductDto.description !== undefined || updateProductDto.tags !== undefined || updateProductDto.price !== undefined) {
+      this.generateAndSaveEmbedding(id, data).catch(err => {
+        this.logger.warn(`Failed to regenerate embedding for product ${id}: ${err.message}`);
+      });
     }
 
     return this.mapToProductResponse(data);
@@ -877,6 +892,27 @@ export class ProductsService {
         resolve(null);
       }
     });
+  }
+
+  private async generateAndSaveEmbedding(productId: string, productData: any): Promise<void> {
+    const text = this.embeddingService.buildProductText(productData);
+    const { embedding } = await this.embeddingService.embed(text);
+    if (!embedding || embedding.length === 0) return;
+
+    const { error } = await this.serviceSupabase
+      .from('products')
+      .update({
+        embedding,
+        embedding_text: text,
+        embedding_updated_at: new Date().toISOString(),
+      })
+      .eq('id', productId);
+
+    if (error) {
+      this.logger.error(`Failed to save embedding for product ${productId}: ${error.message}`);
+    } else {
+      this.logger.debug(`Embedding generated for product ${productId}`);
+    }
   }
 
   private mapToProductResponse(data: any): ProductResponseDto {

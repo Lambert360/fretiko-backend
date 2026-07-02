@@ -1,18 +1,21 @@
-import { Injectable, NotFoundException, ConflictException, BadRequestException, ForbiddenException, UnauthorizedException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, BadRequestException, ForbiddenException, UnauthorizedException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { UpdateProfileDto, UserProfileResponse, PublicProfileResponse } from '../shared/dto/user-profile.dto';
 import * as crypto from 'crypto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { EmbeddingService } from '../ai/core/embedding.service';
 
 @Injectable()
 export class UsersService {
   private supabase;
   private serviceSupabase; // Service role client for operations that need to bypass RLS
+  private readonly logger = new Logger(UsersService.name);
 
   constructor(
     private configService: ConfigService,
     private clientManager: SupabaseClientManager,
+    private embeddingService: EmbeddingService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
     this.serviceSupabase = this.clientManager.getServiceClient();
@@ -241,6 +244,13 @@ export class UsersService {
     // SECURITY: Log successful profile creation for audit trail
     if (isNewProfile && process.env.NODE_ENV === 'production') {
       console.log('AUDIT: New profile created', { userId, timestamp: new Date().toISOString() });
+    }
+
+    // Generate embedding for vendor search if user is a seller (fire-and-forget)
+    if (data.is_seller) {
+      this.generateAndSaveVendorEmbedding(data.id, data).catch(err => {
+        this.logger.warn(`Failed to generate embedding for vendor ${data.id}: ${err.message}`);
+      });
     }
 
     return this.mapToProfileResponse(data);
@@ -645,6 +655,27 @@ export class UsersService {
             isDeleted: false,
           },
     };
+  }
+
+  private async generateAndSaveVendorEmbedding(vendorId: string, profileData: any): Promise<void> {
+    const text = this.embeddingService.buildVendorText(profileData);
+    const { embedding } = await this.embeddingService.embed(text);
+    if (!embedding || embedding.length === 0) return;
+
+    const { error } = await this.serviceSupabase
+      .from('user_profiles')
+      .update({
+        embedding,
+        embedding_text: text,
+        embedding_updated_at: new Date().toISOString(),
+      })
+      .eq('id', vendorId);
+
+    if (error) {
+      this.logger.error(`Failed to save embedding for vendor ${vendorId}: ${error.message}`);
+    } else {
+      this.logger.debug(`Embedding generated for vendor ${vendorId}`);
+    }
   }
 
   private mapToProfileResponse(data: any): UserProfileResponse {

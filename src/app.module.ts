@@ -53,6 +53,7 @@ import { PartnersModule } from './partners/partners.module';
 import { GeneralPartnershipsModule } from './general-partnerships/general-partnerships.module';
 import { WebsiteContentModule } from './website-content/website-content.module';
 import { VideoProcessingModule } from './video-processing/video-processing.module';
+import { AiModule } from './ai/ai.module';
 
 @Module({
   imports: [
@@ -109,6 +110,7 @@ import { VideoProcessingModule } from './video-processing/video-processing.modul
     GeneralPartnershipsModule,
     WebsiteContentModule,
     VideoProcessingModule,
+    AiModule,
   ],
   controllers: [AppController, ExchangeRateController, HealthController],
   providers: [
