@@ -39,17 +39,29 @@ export class LlmService {
       || this.configService.get<string>('LLM_MODEL') 
       || 'qwen2.5-7b-instruct';
 
-    const temperature = this.configService.get<number>(`LLM_${tierKey}_TEMPERATURE`) 
-      || this.configService.get<number>('LLM_TEMPERATURE') 
-      || 0.3;
+    const temperature = Number(
+      this.configService.get<string>(`LLM_${tierKey}_TEMPERATURE`) 
+      || this.configService.get<string>('LLM_TEMPERATURE') 
+      || 0.3
+    );
 
-    const maxTokens = this.configService.get<number>(`LLM_${tierKey}_MAX_TOKENS`) 
-      || this.configService.get<number>('LLM_MAX_TOKENS') 
-      || 1024;
+    const maxTokens = parseInt(
+      String(
+        this.configService.get<string>(`LLM_${tierKey}_MAX_TOKENS`) 
+        || this.configService.get<string>('LLM_MAX_TOKENS') 
+        || 1024
+      ),
+      10
+    );
 
-    const timeoutMs = this.configService.get<number>(`LLM_${tierKey}_TIMEOUT_MS`) 
-      || this.configService.get<number>('LLM_TIMEOUT_MS') 
-      || 30000;
+    const timeoutMs = parseInt(
+      String(
+        this.configService.get<string>(`LLM_${tierKey}_TIMEOUT_MS`) 
+        || this.configService.get<string>('LLM_TIMEOUT_MS') 
+        || 30000
+      ),
+      10
+    );
 
     const apiKey = this.configService.get<string>(`LLM_${tierKey}_API_KEY`) 
       || this.configService.get<string>('LLM_API_KEY') 

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { JwtModule } from '@nestjs/jwt';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { IkoModule } from '../iko/iko.module';
 import { ChatModule } from '../chat/chat.module';
 import { ProductsModule } from '../products/products.module';
@@ -38,6 +39,14 @@ import { PriceAlertService } from './price-alert.service';
     ProductsModule,
     StoresModule,
     SearchModule,
+    JwtModule.registerAsync({
+      imports: [ConfigModule],
+      useFactory: async (configService: ConfigService) => ({
+        secret: configService.get<string>('JWT_SECRET'),
+        signOptions: { expiresIn: '24h' },
+      }),
+      inject: [ConfigService],
+    }),
   ],
   controllers: [AiController],
   providers: [

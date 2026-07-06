@@ -60,7 +60,13 @@ User: "Compare iPhone 15 and Samsung S24"
 Response: {"intent":"comparison","confidence":0.9,"parameters":{"query":"iPhone 15 vs Samsung S24"},"entities":{"comparisonItems":["iPhone 15","Samsung S24"],"category":"electronics"}}
 
 User: "What's trending near me?"
-Response: {"intent":"trending","confidence":0.85,"parameters":{"query":"trending","location":"near me"},"entities":{"location":"near me"}}`;
+Response: {"intent":"trending","confidence":0.85,"parameters":{"query":"trending","location":"near me"},"entities":{"location":"near me"}}
+
+User: "Hi"
+Response: {"intent":"general_chat","confidence":0.95,"parameters":{},"entities":{}}
+
+User: "Thanks, that's helpful!"
+Response: {"intent":"general_chat","confidence":0.9,"parameters":{},"entities":{}}`;
 
   constructor(private llmService: LlmService) {}
 
@@ -147,12 +153,34 @@ Response: {"intent":"trending","confidence":0.85,"parameters":{"query":"trending
       };
     }
 
+    if (this.isGeneralChat(lower)) {
+      return {
+        ...base,
+        intent: AiIntent.GENERAL_CHAT,
+        confidence: 0.8,
+        entities: {},
+      };
+    }
+
     return {
       ...base,
       intent: AiIntent.PRODUCT_SEARCH,
       confidence: 0.5,
       entities: {},
     };
+  }
+
+  private isGeneralChat(lowerMessage: string): boolean {
+    const greetings = [
+      'hi', 'hello', 'hey', 'yo', 'sup', 'good morning', 'good afternoon',
+      'good evening', 'good night', 'how are you', 'whats up', "what's up",
+      'thanks', 'thank you', 'thx', 'ok', 'okay', 'bye', 'goodbye',
+      'who are you', 'what can you do', 'help',
+    ];
+    const trimmed = lowerMessage.trim().replace(/[!.?,]/g, '');
+    if (greetings.includes(trimmed)) return true;
+    // Very short, non-specific messages are more likely conversational than search queries
+    return trimmed.split(/\s+/).length <= 2 && greetings.some(g => trimmed.startsWith(g));
   }
 
   private extractComparisonItems(message: string): string[] {

@@ -141,6 +141,14 @@ export class ResponseGeneratorService {
   }
 
   private buildUserPrompt(userMessage: string, intent: ClassifiedIntent, data: any[]): string {
+    if (intent.intent === AiIntent.GENERAL_CHAT || intent.intent === AiIntent.UNKNOWN) {
+      return [
+        `User message: "${userMessage}"`,
+        `Intent: general conversation (no product search needed).`,
+        `\nReply naturally and conversationally, as a friendly shopping assistant would. Do not mention searches, products, or results unless the user asked about them. Keep it brief.`,
+      ].join('\n');
+    }
+
     const lines = [
       `User message: "${userMessage}"`,
       `Intent: ${intent.intent}`,
@@ -191,6 +199,10 @@ export class ResponseGeneratorService {
   }
 
   private generateFallback(intent: ClassifiedIntent, data: any[]): string {
+    if (intent.intent === AiIntent.GENERAL_CHAT || intent.intent === AiIntent.UNKNOWN) {
+      return "Hi! I'm Iko, your Fretiko shopping assistant. Ask me to find products, vendors, or deals whenever you're ready.";
+    }
+
     if (!data || data.length === 0) {
       return "I couldn't find anything matching that. Try a different keyword or category.";
     }
