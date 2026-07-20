@@ -16,6 +16,7 @@ import { FlutterwaveService } from '../wallet/flutterwave.service';
 import { WithdrawRequestDto } from '../wallet/dto/wallet.dto';
 import { RefundRequestDto } from './dto/refund.dto';
 import { EscrowService } from '../escrow/escrow.service';
+import { PartnersWalletService } from '../partners/partners-wallet.service';
 import { AdminForgotPasswordDto, AdminConfirmResetPasswordDto } from './dto/admin-forgot-password.dto';
 
 /**
@@ -41,6 +42,7 @@ export class AdminService {
     private flutterwaveService: FlutterwaveService,
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
+    private partnersWalletService: PartnersWalletService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -1942,6 +1944,220 @@ export class AdminService {
       completedDeliveries: completedDeliveries || 0,
       averageDeliveryTime: Math.round(averageDeliveryTime),
       onTimeDeliveryRate: Math.round(onTimeDeliveryRate * 10) / 10,
+    };
+  }
+
+  /**
+   * Get rider/delivery analytics for staff
+   */
+  async getLogisticsAnalyticsForStaff(staffId: string, timeRange: string) {
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`Staff ${staffId} fetching logistics analytics for ${timeRange}`);
+
+    const cutoff = new Date();
+    if (timeRange === '24h') {
+      cutoff.setHours(cutoff.getHours() - 24);
+    } else if (timeRange === '7d') {
+      cutoff.setDate(cutoff.getDate() - 7);
+    } else if (timeRange === '30d') {
+      cutoff.setDate(cutoff.getDate() - 30);
+    } else {
+      cutoff.setHours(cutoff.getHours() - 24);
+    }
+    const cutoffIso = cutoff.toISOString();
+
+    const { data: orders, error: ordersError } = await this.supabase
+      .from('orders')
+      .select('id, status, created_at, delivered_at, rider_id, updated_at, delivery_address')
+      .eq('delivery_type', 'delivery')
+      .gte('created_at', cutoffIso)
+      .order('created_at', { ascending: false });
+
+    if (ordersError) {
+      this.logger.error(`Failed to fetch analytics orders: ${ordersError.message}`);
+      throw new BadRequestException(`Failed to fetch analytics orders: ${ordersError.message}`);
+    }
+
+    const { data: riders, error: ridersError } = await this.supabase
+      .from('user_profiles')
+      .select('id, username, avatar_url, created_at, preferences')
+      .eq('is_rider', true);
+
+    if (ridersError) {
+      this.logger.error(`Failed to fetch analytics riders: ${ridersError.message}`);
+      throw new BadRequestException(`Failed to fetch analytics riders: ${ridersError.message}`);
+    }
+
+    const { data: riderProfiles } = await this.supabase
+      .from('rider_profiles')
+      .select('user_id, is_online, is_available');
+
+    const { data: trustScores } = await this.supabase
+      .from('trust_scores')
+      .select('user_id, rider_trust_score, completed_orders');
+
+    const { data: riderStates } = await this.supabase
+      .from('rider_verification_requests')
+      .select('user_id, state')
+      .eq('status', 'verified');
+
+    const allOrders = orders || [];
+    const allRiders = riders || [];
+    const orderCount = allOrders.length;
+    const completedOrders = allOrders.filter(o => o.status === 'delivered');
+    const cancelledOrders = allOrders.filter(o => o.status === 'cancelled');
+    const activeRiderCount = (riderProfiles || []).filter(rp => rp.is_online && rp.is_available).length;
+
+    const avgDeliveryTime = completedOrders.length > 0
+      ? completedOrders.reduce((sum, o) => {
+          if (!o.delivered_at || !o.created_at) return sum;
+          const created = new Date(o.created_at).getTime();
+          const delivered = new Date(o.delivered_at).getTime();
+          return sum + (delivered - created) / (1000 * 60);
+        }, 0) / completedOrders.length
+      : 0;
+
+    const avgAssignmentTime = allOrders.length > 0
+      ? allOrders.reduce((sum, o) => {
+          if (!o.updated_at || !o.created_at) return sum;
+          const created = new Date(o.created_at).getTime();
+          const updated = new Date(o.updated_at).getTime();
+          return sum + (updated - created) / (1000 * 60);
+        }, 0) / allOrders.length
+      : 0;
+
+    const dayFormatter = new Intl.DateTimeFormat('en-US', { weekday: 'short' });
+    const hourFormatter = new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false });
+
+    const dateGroup = (date: string) => {
+      const d = new Date(date);
+      return `${dayFormatter.format(d)} ${d.getMonth() + 1}/${d.getDate()}`;
+    };
+    const hourGroup = (date: string) => `${hourFormatter.format(new Date(date))}:00`;
+
+    const buildDailyStats = () => {
+      const groups: Record<string, { assignments: number; replacements: number; successes: number }> = {};
+      allOrders.forEach(o => {
+        const key = dateGroup(o.created_at);
+        if (!groups[key]) groups[key] = { assignments: 0, replacements: 0, successes: 0 };
+        groups[key].assignments += 1;
+        if (o.status === 'cancelled') groups[key].replacements += 1;
+        if (o.status === 'delivered') groups[key].successes += 1;
+      });
+      return Object.entries(groups).map(([date, val]) => ({
+        date,
+        assignments: val.assignments,
+        replacements: val.replacements,
+        successRate: val.assignments > 0 ? Math.round((val.successes / val.assignments) * 1000) / 10 : 0,
+      })).sort((a, b) => a.date.localeCompare(b.date));
+    };
+
+    const buildHourlyStats = () => {
+      const groups: Record<string, { assignments: number; replacements: number }> = {};
+      allOrders.forEach(o => {
+        const key = hourGroup(o.created_at);
+        if (!groups[key]) groups[key] = { assignments: 0, replacements: 0 };
+        groups[key].assignments += 1;
+        if (o.status === 'cancelled') groups[key].replacements += 1;
+      });
+      return Object.entries(groups).map(([hour, val]) => ({
+        hour,
+        assignments: val.assignments,
+        replacements: val.replacements,
+      })).sort((a, b) => parseInt(a.hour) - parseInt(b.hour));
+    };
+
+    const buildTopPerformers = () => {
+      const riderMap: Record<string, { riderId: string; riderName: string; assignments: number; successes: number; totalMinutes: number; deliveriesWithTime: number; rating: number }> = {};
+      allOrders.forEach(o => {
+        if (!o.rider_id) return;
+        if (!riderMap[o.rider_id]) {
+          const rider = allRiders.find(r => r.id === o.rider_id);
+          const trust = trustScores?.find(t => t.user_id === o.rider_id);
+          const name = rider?.preferences?.fullName || rider?.username || 'Unknown';
+          const rating = trust?.rider_trust_score ? Math.min(5, Math.max(0, (trust.rider_trust_score / 1000) * 5)) : 0;
+          riderMap[o.rider_id] = {
+            riderId: o.rider_id,
+            riderName: name,
+            assignments: 0,
+            successes: 0,
+            totalMinutes: 0,
+            deliveriesWithTime: 0,
+            rating: Math.round(rating * 10) / 10,
+          };
+        }
+        const entry = riderMap[o.rider_id];
+        entry.assignments += 1;
+        if (o.status === 'delivered') {
+          entry.successes += 1;
+          if (o.delivered_at && o.created_at) {
+            const created = new Date(o.created_at).getTime();
+            const delivered = new Date(o.delivered_at).getTime();
+            entry.totalMinutes += (delivered - created) / (1000 * 60);
+            entry.deliveriesWithTime += 1;
+          }
+        }
+      });
+      return Object.values(riderMap)
+        .map(r => ({
+          riderId: r.riderId,
+          riderName: r.riderName,
+          assignments: r.assignments,
+          successRate: r.assignments > 0 ? Math.round((r.successes / r.assignments) * 1000) / 10 : 0,
+          averageTime: r.deliveriesWithTime > 0 ? Math.round(r.totalMinutes / r.deliveriesWithTime * 10) / 10 : 0,
+          rating: r.rating,
+        }))
+        .sort((a, b) => b.assignments - a.assignments)
+        .slice(0, 10);
+    };
+
+    const buildStatusBreakdown = () => {
+      const counts: Record<string, number> = {};
+      allOrders.forEach(o => {
+        counts[o.status] = (counts[o.status] || 0) + 1;
+      });
+      const entries = Object.entries(counts);
+      return entries.map(([status, count]) => ({
+        status,
+        count,
+        percentage: orderCount > 0 ? Math.round((count / orderCount) * 1000) / 10 : 0,
+      })).sort((a, b) => b.count - a.count);
+    };
+
+    const buildGeography = () => {
+      const counts: Record<string, number> = {};
+      allOrders.forEach(o => {
+        if (!o.rider_id) return;
+        const state = riderStates?.find(r => r.user_id === o.rider_id)?.state;
+        if (!state) return;
+        counts[state] = (counts[state] || 0) + 1;
+      });
+      const entries = Object.entries(counts);
+      const total = entries.reduce((sum, [, count]) => sum + count, 0);
+      return entries.map(([region, count]) => ({
+        region,
+        count,
+        percentage: total > 0 ? Math.round((count / total) * 1000) / 10 : 0,
+      })).sort((a, b) => b.count - a.count);
+    };
+
+    return {
+      overview: {
+        totalRiders: allRiders.length,
+        activeRiders: activeRiderCount,
+        totalAssignments: orderCount,
+        successfulAssignments: completedOrders.length,
+        replacementRate: orderCount > 0 ? Math.round((cancelledOrders.length / orderCount) * 1000) / 10 : 0,
+        averageAssignmentTime: Math.round(avgAssignmentTime * 10) / 10,
+        averageDeliveryTime: Math.round(avgDeliveryTime * 10) / 10,
+        onTimeDeliveryRate: orderCount > 0 ? Math.round((completedOrders.length / orderCount) * 1000) / 10 : 0,
+      },
+      dailyStats: buildDailyStats(),
+      hourlyStats: buildHourlyStats(),
+      topPerformers: buildTopPerformers(),
+      statusBreakdown: buildStatusBreakdown(),
+      geography: buildGeography(),
     };
   }
 
@@ -5916,21 +6132,25 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       order.buyer_id,
       WalletTransactionType.ESCROW_REFUND,
       parseFloat(escrow.total_amount),
-      `Full refund for order ${order.order_number}`,
+      `Full refund for order ${order.order_number} (resolved by support)`,
       order.id,
       'order',
     );
 
     // Update escrow status
-    await this.supabase
+    const { error: escrowUpdateError } = await this.supabase
       .from('escrows')
       .update({
         status: 'refunded',
         refund_reason: reason,
-        refunded_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq('id', escrow.id);
+
+    if (escrowUpdateError) {
+      this.logger.error(`Failed to update escrow ${escrow.id} status to refunded: ${escrowUpdateError.message}`);
+      throw new Error(`Refund credited to buyer but escrow status update failed: ${escrowUpdateError.message}. Manual reconciliation required.`);
+    }
 
     // Update order status
     await this.supabase
@@ -5940,6 +6160,14 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         updated_at: new Date().toISOString(),
       })
       .eq('id', order.id);
+
+    // Notify buyer
+    await this.notificationHelper.notifyOrderRefunded(
+      order.buyer_id,
+      parseFloat(escrow.total_amount),
+      order.order_number,
+      reason,
+    );
   }
 
   /**
@@ -5985,7 +6213,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         order.buyer_id,
         WalletTransactionType.ESCROW_REFUND,
         buyerRefundAmount,
-        `Partial refund for order ${order.order_number}`,
+        `Partial refund for order ${order.order_number} (resolved by support)`,
         order.id,
         'order',
       );
@@ -5997,7 +6225,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         order.vendor_id,
         WalletTransactionType.ESCROW_RELEASE,
         vendorAmount,
-        `Partial payment for order ${order.order_number}`,
+        `Partial payment for order ${order.order_number} (resolved by support)`,
         order.id,
         'order',
       );
@@ -6005,14 +6233,23 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
 
     // Pay rider their earnings (only when a rider is actually assigned)
     if (effectiveRiderEarnings > 0 && order.rider_id) {
-      await this.walletService.processWalletTransaction(
+      const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
         order.rider_id,
-        WalletTransactionType.ESCROW_RELEASE,
         effectiveRiderEarnings,
         `Earnings for order ${order.order_number}`,
-        order.id,
-        'order',
       );
+
+      if (!partnerCredit.credited) {
+        // Independent rider — credit Freti wallet as before
+        await this.walletService.processWalletTransaction(
+          order.rider_id,
+          WalletTransactionType.DELIVERY_PAYMENT,
+          effectiveRiderEarnings,
+          `Earnings for order ${order.order_number} (resolved by support)`,
+          order.id,
+          'order',
+        );
+      }
     }
 
     // Credit platform fee to platform wallet
@@ -6027,16 +6264,44 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       );
     }
 
+    // The buyer's wallet holds the escrow balance for this order (credited via
+    // purchase_hold at checkout). ESCROW_RELEASE/DELIVERY_PAYMENT/PLATFORM_COMMISSION
+    // above only credit the vendor/rider/platform's own wallets — they never touch
+    // the buyer's escrow_balance. Debit the buyer's escrow_balance here for the
+    // portion that was released to other parties, so it doesn't stay stuck as
+    // phantom held funds.
+    const releasedAmount = vendorAmount + effectiveRiderEarnings + platformFeeAmount;
+    if (releasedAmount > 0) {
+      const escrowDebitResult = await this.walletService.processWalletTransaction(
+        order.buyer_id,
+        WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM,
+        releasedAmount,
+        `Escrow debit for released funds on order ${order.order_number} (resolved by support)`,
+        order.id,
+        'order',
+      );
+
+      if (!escrowDebitResult.success) {
+        this.logger.error(
+          `Failed to debit buyer escrow balance for order ${order.order_number}: ${escrowDebitResult.error}. Manual reconciliation required.`,
+        );
+      }
+    }
+
     // Update escrow status
-    await this.supabase
+    const { error: escrowUpdateError } = await this.supabase
       .from('escrows')
       .update({
         status: 'refunded',
         refund_reason: refundData.reason,
-        refunded_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq('id', escrow.id);
+
+    if (escrowUpdateError) {
+      this.logger.error(`Failed to update escrow ${escrow.id} status to refunded: ${escrowUpdateError.message}`);
+      throw new Error(`Partial refund processed but escrow status update failed: ${escrowUpdateError.message}. Manual reconciliation required.`);
+    }
 
     // Update order status
     await this.supabase
@@ -6046,6 +6311,32 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         updated_at: new Date().toISOString(),
       })
       .eq('id', order.id);
+
+    // Notify all affected parties
+    if (buyerRefundAmount > 0) {
+      await this.notificationHelper.notifyOrderRefunded(
+        order.buyer_id,
+        buyerRefundAmount,
+        order.order_number,
+        refundData.reason,
+      );
+    }
+
+    if (vendorAmount > 0 && order.vendor_id) {
+      await this.notificationHelper.notifyVendorEscrowReleased(
+        order.vendor_id,
+        vendorAmount,
+        order.order_number,
+      );
+    }
+
+    if (effectiveRiderEarnings > 0 && order.rider_id) {
+      await this.notificationHelper.notifyRiderPaymentReleased(
+        order.rider_id,
+        effectiveRiderEarnings,
+        order.order_number,
+      );
+    }
   }
 
   /**
@@ -6069,6 +6360,13 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
           updated_at: new Date().toISOString(),
         })
         .eq('id', order.id);
+
+      // Notify buyer — vendor/rider are already notified inside escrowService.releaseEscrow
+      await this.notificationHelper.notifyBuyerFundsReleasedByAdmin(
+        order.buyer_id,
+        order.order_number,
+        reason,
+      );
 
       this.logger.log(`✅ Admin ${staffId} successfully released funds and completed order ${order.id}`);
     } catch (error: any) {
@@ -7454,4 +7752,5 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     }
   }
 }
+
 

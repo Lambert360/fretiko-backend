@@ -120,6 +120,7 @@ export class AuthService {
       is_rider: is_rider || false,
       date_of_birth: signupData.dateOfBirth,
       gender: signupData.gender, // Add gender field
+      display_name: `${signupData.firstName} ${signupData.lastName}`.trim(),
       // Add terms acceptance tracking (using existing columns and original data)
       terms_accepted_at: originalTermsAcceptedAt, // Use original timestamp from signup
       terms_accepted_ip: ipAddress || null,
@@ -177,7 +178,8 @@ export class AuthService {
         user_role,
         is_seller,
         is_rider,
-        is_verified
+        is_verified,
+        display_name
       `)
       .eq('id', data.user.id)
       .single();
@@ -187,7 +189,7 @@ export class AuthService {
       email: data.user.email,
       firstName: data.user.user_metadata?.first_name || '',
       lastName: data.user.user_metadata?.last_name || '',
-      username: completeProfileData?.username,
+      username: completeProfileData?.username || completeProfileData?.display_name || null,
       avatar_url: completeProfileData?.avatar_url,
       user_role: completeProfileData?.user_role || 'citizen',
       is_seller: completeProfileData?.is_seller || false,
@@ -383,6 +385,7 @@ export class AuthService {
         is_seller,
         is_rider,
         is_verified,
+        display_name,
         preferences
       `)
       .eq('id', data.user.id)
@@ -411,7 +414,7 @@ export class AuthService {
       email: data.user.email,
       firstName: firstName,
       lastName: lastName,
-      username: profileData?.username,
+      username: profileData?.username || profileData?.display_name || null,
       avatar_url: profileData?.avatar_url,
       user_role: profileData?.user_role,
       is_seller: profileData?.is_seller,
@@ -702,7 +705,8 @@ export class AuthService {
             user_role,
             is_seller,
             is_rider,
-            is_verified
+            is_verified,
+            display_name
           `)
           .eq('id', signInData.user.id)
           .single();
@@ -712,7 +716,7 @@ export class AuthService {
           email: signInData.user.email,
           firstName: migratedProfileData?.first_name || signInData.user.user_metadata?.first_name,
           lastName: migratedProfileData?.last_name || signInData.user.user_metadata?.last_name,
-          username: migratedProfileData?.username,
+          username: migratedProfileData?.username || migratedProfileData?.display_name || null,
           avatar_url: migratedProfileData?.avatar_url,
           user_role: migratedProfileData?.user_role,
           is_seller: migratedProfileData?.is_seller,

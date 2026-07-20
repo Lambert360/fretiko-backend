@@ -36,8 +36,8 @@ export class DiscoveryAgentService {
     });
 
     const context = await this.contextBuilder.build(userId, userToken);
-    const systemPrompt = `You are Iko, Fretiko's AI assistant. Summarize trending products and vendors in a friendly, concise way. Use only the data provided. Currency: ₦.`;
-    const userPrompt = `User asked: "${message}"\n\nTrending products (${trending.products.length}):\n${trending.products.slice(0, 5).map((p: any, i: number) => `${i + 1}. ${p.title} — ₦${p.price}`).join('\n')}\n\nTrending vendors (${trending.vendors.length}):\n${trending.vendors.slice(0, 5).map((v: any, i: number) => `${i + 1}. ${v.username}`).join('\n')}\n\nWrite a brief response.`;
+    const systemPrompt = `You are Iko, Fretiko's AI assistant. Summarize trending products and vendors in a friendly, concise way. Use only the data provided. Currency: ₣.`;
+    const userPrompt = `User asked: "${message}"\n\nTrending products (${trending.products.length}):\n${trending.products.slice(0, 5).map((p: any, i: number) => `${i + 1}. ${p.title} — ₣${p.price}`).join('\n')}\n\nTrending vendors (${trending.vendors.length}):\n${trending.vendors.slice(0, 5).map((v: any, i: number) => `${i + 1}. ${v.username}`).join('\n')}\n\nWrite a brief response.`;
 
     try {
       const llmResponse = await this.llmService.chat(

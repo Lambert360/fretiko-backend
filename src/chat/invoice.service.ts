@@ -21,6 +21,40 @@ export class InvoiceService {
   }
 
   /**
+   * Upload an image for an invoice item and return its public URL.
+   * This is not tied to a chat message, so it uploads directly to storage.
+   */
+  async uploadInvoiceItemImage(userId: string, file: Express.Multer.File): Promise<string> {
+    if (!file) {
+      throw new BadRequestException('No file provided');
+    }
+
+    try {
+      const fileExt = file.originalname.split('.').pop() || 'jpg';
+      const uniqueFileName = `${userId}/invoice-items/${Date.now()}_${Math.random().toString(36).substring(2)}.${fileExt}`;
+
+      const { error } = await this.supabase.storage
+        .from('chat-media')
+        .upload(uniqueFileName, file.buffer, {
+          contentType: file.mimetype || `image/${fileExt}`,
+          upsert: false,
+        });
+
+      if (error) {
+        throw new BadRequestException(`Image upload failed: ${error.message}`);
+      }
+
+      const { data: urlData } = this.supabase.storage
+        .from('chat-media')
+        .getPublicUrl(uniqueFileName);
+
+      return urlData.publicUrl;
+    } catch (error) {
+      throw new BadRequestException(`Invoice image upload failed: ${error.message}`);
+    }
+  }
+
+  /**
    * Create a new invoice with items
    */
   async createInvoice(userId: string, createInvoiceDto: CreateInvoiceDto, userToken?: string): Promise<InvoiceResponseDto> {

@@ -144,7 +144,8 @@ export class ProductsService {
         user_profiles!products_user_id_fkey (
           username,
           avatar_url,
-          is_verified
+          is_verified,
+          display_name
         )
       `)
       .eq('status', 'active')
@@ -230,7 +231,8 @@ export class ProductsService {
         user_profiles!products_user_id_fkey (
           username,
           avatar_url,
-          is_verified
+          is_verified,
+          display_name
         )
       `)
       .in('id', productIds)
@@ -265,7 +267,8 @@ export class ProductsService {
           *,
           user_profiles!products_user_id_fkey (
             username,
-            avatar_url
+            avatar_url,
+            display_name
           )
         `)
         .eq('id', id)
@@ -441,7 +444,8 @@ export class ProductsService {
         user_profiles!products_user_id_fkey (
           username,
           avatar_url,
-          is_verified
+          is_verified,
+          display_name
         )
       `)
       .eq('status', 'active')
@@ -958,7 +962,7 @@ export class ProductsService {
       created_at: data.created_at,
       updated_at: data.updated_at,
       // Vendor info from joined user_profiles table
-      vendor_username: data.user_profiles?.username || 'Unknown Seller',
+      vendor_username: data.user_profiles?.username || data.user_profiles?.display_name || 'Unknown Seller',
       vendor_avatar: data.user_profiles?.avatar_url || null,
       vendor_verified: data.user_profiles?.is_verified || false,
     };

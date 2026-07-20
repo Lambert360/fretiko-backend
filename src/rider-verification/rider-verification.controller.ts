@@ -29,6 +29,22 @@ export class RiderVerificationController {
   constructor(private readonly riderVerificationService: RiderVerificationService) {}
 
   /**
+   * Claim a partner-created dormant rider account
+   * POST /rider-verification/claim
+   */
+  @Post('claim')
+  async claimRiderAccount(
+    @Body() body: { unique_rider_id: string; company_id: string },
+    @Req() req: any,
+  ): Promise<{ success: boolean; message: string }> {
+    return this.riderVerificationService.claimRiderAccount(
+      req.user.sub,
+      body.unique_rider_id,
+      body.company_id,
+    );
+  }
+
+  /**
    * Submit rider verification request
    * POST /rider-verification/apply
    */
@@ -80,16 +96,18 @@ export class RiderVerificationController {
 
   /**
    * Get verified companies for rider selection
-   * GET /rider-verification/companies
+   * GET /rider-verification/companies?state=Lagos
    */
   @Get('companies')
-  async getVerifiedCompanies(): Promise<{
+  async getVerifiedCompanies(
+    @Query('state') state?: string,
+  ): Promise<{
     success: boolean;
     companies?: Array<{ id: string; company_name: string }>;
     message?: string;
   }> {
     try {
-      const companies = await this.riderVerificationService.getVerifiedCompanies();
+      const companies = await this.riderVerificationService.getVerifiedCompanies(state);
       return {
         success: true,
         companies,

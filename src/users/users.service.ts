@@ -46,7 +46,7 @@ export class UsersService {
     // SECURITY: Use service role for public profile access (no sensitive data)
     const { data, error } = await this.serviceSupabase
       .from('user_profiles')
-      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at')
+      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name')
       .eq('id', userId)
       .single();
 
@@ -62,7 +62,7 @@ export class UsersService {
 
     return {
       id: data.id,
-      username: data.username,
+      username: data.username || data.display_name || 'Unknown',
       bio: data.bio,
       avatarUrl: data.avatar_url,
       bgPicUrl: data.bg_pic_url,
@@ -77,7 +77,7 @@ export class UsersService {
     // SECURITY: Use service role for public profile access (no sensitive data)
     const { data, error } = await this.serviceSupabase
       .from('user_profiles')
-      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at')
+      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name')
       .ilike('username', username)
       .single();
 
@@ -93,7 +93,7 @@ export class UsersService {
 
     return {
       id: data.id,
-      username: data.username,
+      username: data.username || data.display_name || 'Unknown',
       bio: data.bio,
       avatarUrl: data.avatar_url,
       bgPicUrl: data.bg_pic_url,
@@ -333,7 +333,7 @@ export class UsersService {
   async searchUsers(query: string, limit: number = 20): Promise<PublicProfileResponse[]> {
     const { data, error } = await this.serviceSupabase
       .from('user_profiles')
-      .select('id, username, bio, avatar_url, location, is_seller, created_at')
+      .select('id, username, bio, avatar_url, location, is_seller, created_at, display_name')
       .or(`username.ilike.%${query}%,bio.ilike.%${query}%`)
       .not('id', 'in', '("00000000-0000-4000-8000-000000000002","00000000-0000-4000-8000-000000000003")')
       .limit(limit)
@@ -345,7 +345,7 @@ export class UsersService {
 
     return data.map(user => ({
       id: user.id,
-      username: user.username,
+      username: user.username || user.display_name || 'Unknown',
       bio: user.bio,
       avatarUrl: user.avatar_url,
       location: user.location,
@@ -681,7 +681,7 @@ export class UsersService {
   private mapToProfileResponse(data: any): UserProfileResponse {
     return {
       id: data.id,
-      username: data.username,
+      username: data.username || data.display_name || null,
       bio: data.bio,
       avatarUrl: data.avatar_url,
       bgPicUrl: data.bg_pic_url,

@@ -30,6 +30,7 @@ import { EscrowModule } from '../escrow/escrow.module';
 import { PartnershipsModule } from '../partnerships/partnerships.module';
 import { WebsiteContentModule } from '../website-content/website-content.module';
 import { AuthModule } from '../auth/auth.module';
+import { PartnersModule } from '../partners/partners.module';
 
 @Module({
   imports: [
@@ -54,6 +55,7 @@ import { AuthModule } from '../auth/auth.module';
     EscrowModule, // For escrow release functionality in refunds
     PartnershipsModule, // For partnership applications management
     WebsiteContentModule, // For website content management
+    PartnersModule, // For partner (logistics company) wallet crediting in refunds
   ],
   controllers: [
     AdminController, 

@@ -501,12 +501,18 @@ export class RiderVerificationService {
   /**
    * Get verified companies for rider selection
    */
-  async getVerifiedCompanies(): Promise<Array<{ id: string; company_name: string }>> {
-    const { data: companies, error } = await this.supabase
+  async getVerifiedCompanies(state?: string): Promise<Array<{ id: string; company_name: string }>> {
+    let query = this.supabase
       .from('verified_logistics_partners')
       .select('id, company_name')
       .eq('partner_status', 'active')
       .order('company_name', { ascending: true });
+
+    if (state) {
+      query = query.contains('service_areas', [state]);
+    }
+
+    const { data: companies, error } = await query;
 
     if (error) {
       this.logger.error('Failed to fetch verified companies:', error);
@@ -514,6 +520,150 @@ export class RiderVerificationService {
     }
 
     return companies || [];
+  }
+
+  /**
+   * Claim a partner-created rider account using a unique rider ID
+   * This replaces the old self-apply flow for partner-affiliated riders
+   */
+  async claimRiderAccount(
+    userId: string,
+    uniqueRiderId: string,
+    companyId: string,
+  ): Promise<{ success: boolean; message: string }> {
+    this.logger.log(`Rider claim attempt: user=${userId} id=${uniqueRiderId} company=${companyId}`);
+
+    try {
+      // Check user doesn't already have an active verified_riders record
+      const { data: existingActive } = await this.supabase
+        .from('verified_riders')
+        .select('id, verification_status')
+        .eq('user_id', userId)
+        .single();
+
+      if (existingActive) {
+        return { success: false, message: 'You already have a verified rider account.' };
+      }
+
+      // Find the dormant record
+      const { data: dormant, error: findError } = await this.supabase
+        .from('verified_riders')
+        .select('id, verification_status, user_id, company_id, full_name')
+        .eq('unique_rider_id', uniqueRiderId.toLowerCase().trim())
+        .eq('company_id', companyId)
+        .single();
+
+      if (findError || !dormant) {
+        return { success: false, message: 'Invalid rider ID or company. Please check and try again.' };
+      }
+
+      if (dormant.verification_status === 'terminated') {
+        return { success: false, message: 'This rider account has been terminated. Contact your logistics company.' };
+      }
+
+      if (dormant.verification_status !== 'dormant') {
+        return { success: false, message: 'This rider ID is already claimed by another account.' };
+      }
+
+      if (dormant.user_id !== null) {
+        return { success: false, message: 'This rider ID is already claimed by another account.' };
+      }
+
+      // Activate the rider record
+      const { error: updateError } = await this.supabase
+        .from('verified_riders')
+        .update({
+          user_id: userId,
+          verification_status: 'active',
+          claimed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', dormant.id);
+
+      if (updateError) {
+        this.logger.error('Failed to claim rider account:', updateError);
+        return { success: false, message: 'Failed to activate account. Please try again.' };
+      }
+
+      // Mark user as a rider in their profile
+      await this.supabase
+        .from('user_profiles')
+        .update({ is_rider: true, updated_at: new Date().toISOString() })
+        .eq('id', userId);
+
+      // Seed rider_profiles with company pricing if configured
+      const { data: company } = await this.supabase
+        .from('verified_logistics_partners')
+        .select('pricing_config')
+        .eq('id', companyId)
+        .single();
+
+      if (company?.pricing_config && dormant.vehicle_type) {
+        const normalizeVehicleType = (type: string): string => {
+          const map: Record<string, string> = {
+            bicycle: 'bike', motorcycle: 'bike', tricycle: 'wheelbarrow',
+            wheelbarrow: 'wheelbarrow', car: 'car', van: 'van', truck: 'truck', bike: 'bike',
+          };
+          return map[type.toLowerCase().trim()] ?? type.toLowerCase().trim();
+        };
+        const rates = company.pricing_config[normalizeVehicleType(dormant.vehicle_type)];
+        if (rates?.base_price && rates?.per_km_rate) {
+          const categories = ['intracity', 'intercity', 'interstate', 'express', 'cargo'];
+          const servicePricing = Object.fromEntries(
+            categories.map((cat) => [
+              cat,
+              { enabled: true, base_price: rates.base_price, per_km_rate: rates.per_km_rate },
+            ])
+          );
+          // Upsert: create or update rider_profiles with company-set pricing
+          const { data: existingProfile } = await this.supabase
+            .from('rider_profiles')
+            .select('id')
+            .eq('user_id', userId)
+            .single();
+
+          if (existingProfile) {
+            await this.supabase
+              .from('rider_profiles')
+              .update({ service_pricing: servicePricing, updated_at: new Date().toISOString() })
+              .eq('user_id', userId);
+          } else {
+            await this.supabase
+              .from('rider_profiles')
+              .insert({
+                user_id: userId,
+                vehicle_type: dormant.vehicle_type,
+                service_pricing: servicePricing,
+                profile_status: 'active',
+              });
+          }
+        }
+      }
+
+      // Send notification email if possible
+      const { data: userProfile } = await this.supabase
+        .from('user_profiles')
+        .select('email')
+        .eq('id', userId)
+        .single();
+
+      if (userProfile?.email) {
+        try {
+          await this.notificationService.sendRiderVerified(userProfile.email, dormant.full_name);
+        } catch (e) {
+          this.logger.warn('Failed to send rider activation email:', e);
+        }
+      }
+
+      this.logger.log(`Rider account claimed: ${uniqueRiderId} by user ${userId}`);
+      return {
+        success: true,
+        message: `Welcome, ${dormant.full_name}! Your rider account is now active and you can start accepting deliveries.`,
+      };
+    } catch (error) {
+      this.logger.error('Error claiming rider account:', error);
+      return { success: false, message: 'Failed to process claim. Please try again.' };
+    }
   }
 
   /**

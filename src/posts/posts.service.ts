@@ -137,7 +137,7 @@ export class PostsService {
       .from('posts')
       .select(`
         *,
-        user:user_profiles(id, username, avatar_url, is_verified)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
       `)
       .eq('id', id)
       .eq('is_deleted', false)
@@ -169,7 +169,7 @@ export class PostsService {
       .from('posts')
       .select(`
         *,
-        user:user_profiles(id, username, avatar_url, is_verified)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
       `)
       .eq('user_id', userId)
       .eq('is_deleted', false)
@@ -200,7 +200,7 @@ export class PostsService {
       .from('posts')
       .select(`
         *,
-        user:user_profiles(id, username, avatar_url, is_verified)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
       `)
       .eq('is_deleted', false)
       .eq('privacy_level', PrivacyLevel.PUBLIC)
@@ -412,7 +412,7 @@ export class PostsService {
       .from('post_interactions')
       .select(`
         *,
-        user:user_profiles(id, username, avatar_url, is_verified)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
       `)
       .eq('post_id', postId)
       .eq('interaction_type', InteractionType.COMMENT)
@@ -441,7 +441,7 @@ export class PostsService {
       .from('post_interactions')
       .select(`
         *,
-        user:user_profiles(id, username, avatar_url, is_verified)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
       `)
       .eq('post_id', postId)
       .eq('interaction_type', InteractionType.COMMENT)
@@ -956,7 +956,7 @@ export class PostsService {
       .from('posts')
       .select(`
         *,
-        user:user_profiles(id, username, avatar_url, is_verified)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
       `)
       .eq('user_id', post.user_id)
       .eq('is_deleted', false)
@@ -991,7 +991,7 @@ export class PostsService {
       .select(`
         post:posts(
           *,
-          user:user_profiles(id, username, avatar_url, is_verified)
+          user:user_profiles(id, username, avatar_url, is_verified, display_name)
         )
       `)
       .eq('user_id', userId)
@@ -1019,7 +1019,7 @@ export class PostsService {
       .select(`
         user_id,
         created_at,
-        user:user_profiles(id, username, avatar_url, is_verified)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
       `)
       .eq('post_id', postId)
       .eq('interaction_type', InteractionType.LIKE)
@@ -1030,7 +1030,7 @@ export class PostsService {
 
     return (data || []).map((row: any) => ({
       id: row.user?.id,
-      username: row.user?.username,
+      username: row.user?.username || row.user?.display_name || 'Unknown',
       avatarUrl: row.user?.avatar_url || null,
       isVerified: row.user?.is_verified || false,
       likedAt: row.created_at,
@@ -1044,7 +1044,7 @@ export class PostsService {
         user_id,
         created_at,
         gift_id,
-        user:user_profiles(id, username, avatar_url, is_verified)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
       `)
       .eq('post_id', postId)
       .eq('interaction_type', InteractionType.GIFT)
@@ -1064,7 +1064,7 @@ export class PostsService {
       } else {
         byUser.set(uid, {
           id: uid,
-          username: row.user?.username || '',
+          username: row.user?.username || row.user?.display_name || '',
           avatarUrl: row.user?.avatar_url || null,
           isVerified: row.user?.is_verified || false,
           count: 1,
@@ -1175,7 +1175,7 @@ export class PostsService {
   private mapToUserInfo(data: any): UserInfo {
     return {
       id: data.id,
-      username: data.username,
+      username: data.username || data.display_name || 'Unknown',
       avatarUrl: data.avatar_url,
       isVerified: data.is_verified || false,
     };

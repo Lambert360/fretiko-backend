@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, IsOptional, MinLength, MaxLength, Matches, IsEmail } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, MinLength, MaxLength, Matches, IsEmail, IsIn, IsArray, IsObject } from 'class-validator';
 
 export class PartnerLoginDto {
   @IsString()
@@ -69,4 +69,39 @@ export class PartnerProfileUpdateDto {
   @IsOptional()
   @MaxLength(1000, { message: 'Address cannot exceed 1000 characters' })
   headquartersAddress?: string;
+
+  @IsString()
+  @IsOptional()
+  @IsIn(['NGN','USD','GBP','EUR','GHS','KES','ZAR','EGP','ETB','TZS','UGX','RWF','XOF','XAF','CAD','AUD','INR','AED'], {
+    message: 'Invalid currency code'
+  })
+  preferredCurrency?: string;
+
+  @IsArray()
+  @IsOptional()
+  serviceAreas?: string[];
+
+  @IsArray()
+  @IsOptional()
+  serviceCategories?: string[];
+
+  @IsObject()
+  @IsOptional()
+  vehicleFleet?: Record<string, { count: number; photos?: string[] }>;
+
+  @IsString()
+  @IsOptional()
+  companyLogoUrl?: string;
+
+  @IsArray()
+  @IsOptional()
+  registrationDocumentUrls?: string[];
+
+  @IsArray()
+  @IsOptional()
+  insuranceDocumentUrls?: string[];
+
+  @IsArray()
+  @IsOptional()
+  fleetDocumentUrls?: string[];
 }

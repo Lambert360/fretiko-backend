@@ -102,6 +102,7 @@ export class SocialAuthService {
           is_seller,
           is_rider,
           is_verified,
+          display_name,
           preferences
         `)
         .eq('id', data.user.id)
@@ -115,7 +116,7 @@ export class SocialAuthService {
         email: data.user.email,
         firstName: data.user.user_metadata?.full_name?.split(' ')[0] || data.user.user_metadata?.name || '',
         lastName: data.user.user_metadata?.full_name?.split(' ').slice(1).join(' ') || '',
-        username: profileData?.username,
+        username: profileData?.username || profileData?.display_name || null,
         avatar_url: profileData?.avatar_url || data.user.user_metadata?.avatar_url,
         user_role: profileData?.user_role || 'citizen',
         is_seller: profileData?.is_seller || false,
@@ -167,6 +168,7 @@ export class SocialAuthService {
           is_seller,
           is_rider,
           is_verified,
+          display_name,
           preferences
         `)
         .eq('id', data.user.id)
@@ -181,7 +183,7 @@ export class SocialAuthService {
         email: data.user.email,
         firstName: data.user.user_metadata?.full_name?.split(' ')[0] || '',
         lastName: data.user.user_metadata?.full_name?.split(' ').slice(1).join(' ') || '',
-        username: profileData?.username,
+        username: profileData?.username || profileData?.display_name || null,
         avatar_url: profileData?.avatar_url,
         user_role: profileData?.user_role || 'citizen',
         is_seller: profileData?.is_seller || false,

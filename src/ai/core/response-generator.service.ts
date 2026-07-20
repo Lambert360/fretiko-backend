@@ -120,7 +120,7 @@ export class ResponseGeneratorService {
     const lines = [
       `You are Iko, Fretiko's AI shopping assistant. You help users find products and vendors on a Nigerian marketplace.`,
       `Tone: ${context.preferences.communicationStyle}.`,
-      `Currency: Nigerian Naira (₦).`,
+      `Currency: Freti (₣).`,
       `Current date: ${new Date().toISOString().split('T')[0]}.`,
       `You are replying to ${context.username}.`,
     ];
@@ -155,7 +155,7 @@ export class ResponseGeneratorService {
     ];
 
     if (intent.entities?.budget) {
-      lines.push(`Budget: up to ₦${intent.entities.budget}`);
+      lines.push(`Budget: up to ₣${intent.entities.budget}`);
     }
 
     if (intent.entities?.location) {
@@ -178,7 +178,7 @@ export class ResponseGeneratorService {
 
   private formatItem(item: any): string {
     if (item.title && item.price !== undefined) {
-      return `${item.title} — ₦${item.price}${item.originalPrice ? ` (was ₦${item.originalPrice})` : ''}, rated ${item.rating || 'N/A'}/5 by ${item.reviewCount || 0} reviews, sold by ${item.seller?.name || item.sellerName || 'unknown vendor'}`;
+      return `${item.title} — ₣${item.price}${item.originalPrice ? ` (was ₣${item.originalPrice})` : ''}, rated ${item.rating || 'N/A'}/5 by ${item.reviewCount || 0} reviews, sold by ${item.seller?.name || item.sellerName || 'unknown vendor'}`;
     }
     if (item.username) {
       return `${item.username}${item.is_verified ? ' (verified)' : ''} — rating ${item.store_rating || 'N/A'}/5, ${item.product_count || 0} products, ${item.service_count || 0} services`;
@@ -209,7 +209,7 @@ export class ResponseGeneratorService {
 
     const first = data[0];
     if (intent.intent === AiIntent.PRODUCT_SEARCH && first.title) {
-      return `I found ${data.length} products. The top match is ${first.title} at ₦${first.price} from ${first.seller?.name || 'a vendor'}.`;
+      return `I found ${data.length} products. The top match is ${first.title} at ₣${first.price} from ${first.seller?.name || 'a vendor'}.`;
     }
     if (intent.intent === AiIntent.VENDOR_SEARCH && first.username) {
       return `I found ${data.length} vendors. ${first.username} is a verified seller with ${first.product_count || 0} products.`;

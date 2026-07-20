@@ -36,7 +36,7 @@ Classify the user's message into exactly one of these intents:
 Also extract these entities when present:
 - category: product category (electronics, fashion, beauty, etc.)
 - location: city or area (Lagos, Abuja, Ikeja, etc.)
-- budget: maximum price in Naira (as a number)
+- budget: maximum price in Freti (as a number)
 - product: product name or type
 - vendor: vendor/store name or type
 - comparisonItems: array of items being compared
@@ -50,7 +50,7 @@ Return ONLY valid JSON in this exact format:
 }
 
 Examples:
-User: "Find me affordable sneakers under ₦50k"
+User: "Find me affordable sneakers under ₣50k"
 Response: {"intent":"product_search","confidence":0.95,"parameters":{"query":"sneakers","maxPrice":50000},"entities":{"category":"fashion","budget":50000,"product":"sneakers"}}
 
 User: "Show me trusted vendors selling phones"

@@ -49,7 +49,8 @@ export class WishlistService {
           status,
           user_id,
           user_profiles (
-            username
+            username,
+            display_name
           ),
           product_categories (
             name
@@ -81,7 +82,7 @@ export class WishlistService {
         productImage: item.products?.images?.[0] || item.products?.primary_image_url || 'https://via.placeholder.com/150',
         price: item.products?.price || 0,
         sellerId: item.products?.user_id,
-        sellerName: item.products?.user_profiles?.username || 'Unknown Seller',
+        sellerName: item.products?.user_profiles?.username || item.products?.user_profiles?.display_name || 'Unknown Seller',
         category: item.products?.product_categories?.name || 'Uncategorized',
         createdAt: item.created_at,
         isAvailable: item.products?.status === 'active',
@@ -375,20 +376,20 @@ export class WishlistService {
       // Get owner's profile for username
       const { data: ownerProfile } = await client
         .from('user_profiles')
-        .select('username')
+        .select('username, display_name')
         .eq('id', ownerId)
         .single();
 
-      const ownerName = ownerProfile?.username || 'Unknown User';
+      const ownerName = ownerProfile?.username || ownerProfile?.display_name || 'Unknown User';
 
       // Get recipient's profile for reference
       const { data: recipientProfile } = await client
         .from('user_profiles')
-        .select('username')
+        .select('username, display_name')
         .eq('id', friendId)
         .single();
 
-      const recipientName = recipientProfile?.username || 'Unknown User';
+      const recipientName = recipientProfile?.username || recipientProfile?.display_name || 'Unknown User';
 
       // Get preview items for the card
       const previewItems = await this.getWishlistPreviewItems(ownerId, selectedItemIds, 3, userToken);
@@ -1123,6 +1124,7 @@ export class WishlistService {
       address: string;
       city: string;
       state: string;
+      country?: string;
       postalCode: string;
     },
     giftMessage?: string,
@@ -1361,6 +1363,7 @@ export class WishlistService {
           address: deliveryAddress.address,
           city: deliveryAddress.city,
           state: deliveryAddress.state,
+          country: deliveryAddress.country,
           postalCode: deliveryAddress.postalCode,
         },
         delivery_instructions: giftMessage ? `Gift from ${giverUser.username}: ${giftMessage}` : `Gift from ${giverUser.username}`,
@@ -1821,8 +1824,8 @@ export class WishlistService {
       })
       .select(`
         *,
-        giver:user_profiles!gift_giver_id (username),
-        recipient:user_profiles!gift_recipient_id (username)
+        giver:user_profiles!gift_giver_id (username, display_name),
+        recipient:user_profiles!gift_recipient_id (username, display_name)
       `)
       .single();
 
@@ -1935,7 +1938,7 @@ export class WishlistService {
       .select(`
         *,
         giver:user_profiles!gift_giver_id (
-          username, avatar_url
+          username, avatar_url, display_name
         ),
         order:orders (
           order_number, status, total_amount
@@ -1963,7 +1966,7 @@ export class WishlistService {
       .select(`
         *,
         recipient:user_profiles!gift_recipient_id (
-          username, avatar_url
+          username, avatar_url, display_name
         ),
         order:orders (
           order_number, status, total_amount
@@ -2168,7 +2171,7 @@ export class WishlistService {
           status
         ),
         user_profiles!wishlist_user_id_fkey (
-          username
+          username, display_name
         )
       `)
       .eq('id', wishlistItemId)
@@ -2238,8 +2241,8 @@ export class WishlistService {
       },
       recipientInfo: {
         id: wishlistItem.user_id,
-        username: wishlistItem.user_profiles?.username,
-        fullName: wishlistItem.user_profiles?.username
+        username: wishlistItem.user_profiles?.username || wishlistItem.user_profiles?.display_name || 'Unknown User',
+        fullName: wishlistItem.user_profiles?.username || wishlistItem.user_profiles?.display_name || 'Unknown User'
       }
     };
   }

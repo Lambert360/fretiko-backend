@@ -83,7 +83,7 @@ export class WorkspaceService {
       if (buyerIds.length > 0) {
         const { data: profiles } = await supabaseClient
           .from('user_profiles')
-          .select('id, username, avatar_url')
+          .select('id, username, avatar_url, display_name')
           .in('id', buyerIds);
         
         profiles?.forEach(p => {
@@ -98,7 +98,7 @@ export class WorkspaceService {
           id: order.id,
           orderNumber: order.order_number,
           status: order.status,
-        customerName: buyerProfiles[order.buyer_id]?.username || 'Unknown Customer',
+        customerName: buyerProfiles[order.buyer_id]?.username || buyerProfiles[order.buyer_id]?.display_name || 'Unknown Customer',
         customerId: order.buyer_id,
         itemCount: order.order_items?.length || 0,
         total: order.total_amount,
@@ -629,7 +629,7 @@ export class WorkspaceService {
         .from('orders')
         .select(`
           *,
-          customer:user_profiles!orders_buyer_id_fkey(id, username, phone, avatar_url),
+          customer:user_profiles!orders_buyer_id_fkey(id, username, phone, avatar_url, display_name),
           order_items(
             id,
             product_id,
@@ -664,12 +664,12 @@ export class WorkspaceService {
 
       // ✅ Fetch vendor location and details
       let vendorLocation: { address: string; coordinates?: { latitude: number; longitude: number } } | null = null;
-      let vendorInfo: { id: string; name: string; phone: string | null } | null = null;
+      let vendorInfo: { id: string; name: string; phone: string | null; avatar: string | null } | null = null;
       if (order.vendor_id) {
         try {
           const { data: vendorProfile } = await supabaseClient
             .from('user_profiles')
-            .select('username, phone, location')
+            .select('username, phone, avatar_url, location')
             .eq('id', order.vendor_id)
             .single();
           
@@ -679,6 +679,7 @@ export class WorkspaceService {
               id: order.vendor_id,
               name: vendorProfile.username || 'Vendor',
               phone: vendorProfile.phone || null,
+              avatar: vendorProfile.avatar_url || null,
             };
             
             // Extract vendor location
@@ -714,6 +715,30 @@ export class WorkspaceService {
         }
       }
 
+      // ✅ Fetch rider info (name, phone, avatar) - so the vendor can identify/contact
+      // the assigned rider once one is available on the order.
+      let riderInfo: { id: string; name: string; phone: string | null; avatar: string | null } | null = null;
+      if (order.rider_id) {
+        try {
+          const { data: riderProfile } = await supabaseClient
+            .from('user_profiles')
+            .select('username, phone, avatar_url')
+            .eq('id', order.rider_id)
+            .single();
+
+          if (riderProfile) {
+            riderInfo = {
+              id: order.rider_id,
+              name: riderProfile.username || 'Rider',
+              phone: riderProfile.phone || null,
+              avatar: riderProfile.avatar_url || null,
+            };
+          }
+        } catch (error) {
+          console.error('Error fetching rider info:', error);
+        }
+      }
+
       // ✅ Fetch rider location (if rider is assigned and order is in transit)
       let riderLocation: { latitude: number; longitude: number; timestamp: string } | null = null;
       if (order.rider_id && (order.status === 'out_for_delivery' || order.status === 'ready_for_pickup')) {
@@ -737,9 +762,17 @@ export class WorkspaceService {
       }
 
       // ✅ Extract coordinates from delivery_address (can be string or JSONB object)
+      // ✅ Build the FULL formatted address (street, city, state, postal code, country)
+      // instead of just the bare street line - vendors/riders need the complete address.
       let deliveryAddress = order.delivery_address;
       let deliveryCoordinates: { latitude: number; longitude: number } | null = null;
-      
+
+      const buildFullAddress = (addr: any): string => {
+        if (!addr || typeof addr !== 'object') return addr;
+        const parts = [addr.address, addr.city, addr.state, addr.postalCode, addr.country].filter(Boolean);
+        return parts.length > 0 ? parts.join(', ') : (addr.fullName || JSON.stringify(addr));
+      };
+
       if (order.delivery_address) {
         // Handle both string and JSONB object formats
         if (typeof order.delivery_address === 'string') {
@@ -750,8 +783,8 @@ export class WorkspaceService {
                 latitude: parsed.latitude,
                 longitude: parsed.longitude,
               };
-              deliveryAddress = parsed.address || parsed.fullName || order.delivery_address;
             }
+            deliveryAddress = buildFullAddress(parsed);
           } catch {
             // Not JSON, treat as plain string
             deliveryAddress = order.delivery_address;
@@ -764,9 +797,7 @@ export class WorkspaceService {
               longitude: order.delivery_address.longitude,
             };
           }
-          deliveryAddress = order.delivery_address.address 
-            || order.delivery_address.fullName 
-            || JSON.stringify(order.delivery_address);
+          deliveryAddress = buildFullAddress(order.delivery_address);
         }
       }
 
@@ -787,15 +818,24 @@ export class WorkspaceService {
         });
       }
 
+      // ✅ Strip raw PIN columns from the spread order object - never leak them unscoped.
+      // Scoped, role-safe versions are set explicitly below.
+      const { pickup_pin, delivery_pin, ...safeOrder } = order;
+
       return {
-        ...order,
+        ...safeOrder,
         orderNumber: order.order_number,
-        customerName: order.customer?.username || 'Unknown Customer',
+        customerName: order.customer?.username || order.customer?.display_name || 'Unknown Customer',
         // ✅ Include delivery type to distinguish pickup vs delivery
         deliveryType: order.delivery_type || 'delivery',
-        // ✅ Include PINs for handoff verification
-        pickupPin: order.pickup_pin,
-        deliveryPin: order.delivery_pin,
+        // ✅ Include PINs for handoff verification - STRICTLY scoped by role:
+        // - Vendor should NEVER see either PIN (they verify by asking the rider/buyer
+        //   to state their PIN and entering it via confirmPickupWithPin / confirmSelfPickupWithPin)
+        // - Rider should ONLY see their own pickupPin (shown to vendor at pickup),
+        //   never the buyer's deliveryPin (they verify it by asking the buyer and
+        //   entering it via markDelivered)
+        pickupPin: order.rider_id === userId ? pickup_pin : null,
+        deliveryPin: null,
         pickupPinVerifiedAt: order.pickup_pin_verified_at,
         deliveryPinVerifiedAt: order.delivery_pin_verified_at,
         items: order.order_items?.map(item => ({
@@ -823,7 +863,8 @@ export class WorkspaceService {
           instructions: order.delivery_instructions,
         },
         vendorLocation, // ✅ Add vendor location with address and coordinates
-        vendorInfo, // ✅ Add vendor info (name, phone)
+        vendorInfo, // ✅ Add vendor info (name, phone, avatar)
+        riderInfo, // ✅ Add rider info (name, phone, avatar) once a rider is assigned
         riderLocation, // ✅ Add rider location (if assigned and in transit)
         timeline,
       };
@@ -1822,7 +1863,7 @@ export class WorkspaceService {
           item_count,
           created_at,
           delivery_address,
-          customer_name:user_profiles!customer_id(username)
+          customer_name:user_profiles!customer_id(username, display_name)
         `)
         .eq('status', status)
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
@@ -1836,7 +1877,7 @@ export class WorkspaceService {
         id: order.id,
         orderNumber: order.order_number,
         status: order.status,
-        customerName: order.customer_name?.username || 'Unknown Customer',
+        customerName: order.customer_name?.username || order.customer_name?.display_name || 'Unknown Customer',
         itemCount: order.item_count,
         total: order.total,
         deliveryAddress: order.delivery_address,
@@ -1912,7 +1953,7 @@ export class WorkspaceService {
       if (buyerIds.length > 0) {
         const { data: profiles } = await supabaseClient
           .from('user_profiles')
-          .select('id, username, avatar_url')
+          .select('id, username, avatar_url, display_name')
           .in('id', buyerIds);
         
         profiles?.forEach(p => {
@@ -1924,7 +1965,7 @@ export class WorkspaceService {
         id: order.id,
         orderNumber: order.order_number,
         status: order.status,
-        customerName: buyerProfiles[order.buyer_id]?.username || 'Unknown Customer',
+        customerName: buyerProfiles[order.buyer_id]?.username || buyerProfiles[order.buyer_id]?.display_name || 'Unknown Customer',
         customerId: order.buyer_id,
         itemCount: order.order_items?.length || 0,
         total: order.total_amount,

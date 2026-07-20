@@ -8,6 +8,7 @@ import { EscrowService } from '../escrow/escrow.service';
 import { RewardsService } from '../rewards/rewards.service';
 import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
+import { PartnersWalletService } from '../partners/partners-wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 
 @Injectable()
@@ -24,6 +25,7 @@ export class OrdersService {
     @Inject(forwardRef(() => RewardsService))
     private rewardsService: RewardsService,
     private walletService: WalletService,
+    private partnersWalletService: PartnersWalletService,
     private realtimeGateway: RealtimeGateway,
   ) {}
 
@@ -280,6 +282,16 @@ export class OrdersService {
     }
 
     // Transform data to match frontend interface
+    const interstateMeta = data.metadata?.interstate_delivery;
+    const isInterstate = data.delivery_type === 'interstate_delivery' || !!interstateMeta;
+    const isInternational = !!interstateMeta?.isInternational;
+    const interstateCompany = isInterstate && interstateMeta ? {
+      companyId: interstateMeta.companyId,
+      companyName: interstateMeta.companyName,
+      deliveryPrice: interstateMeta.deliveryPrice,
+      estimatedDeliveryDays: interstateMeta.estimatedDeliveryDays,
+    } : undefined;
+
     return {
       id: data.id,
       orderNumber: data.order_number,
@@ -304,6 +316,9 @@ export class OrdersService {
       buyerId: data.buyer_id,
       vendorId: data.vendor_id,
       riderId: data.rider_id,
+      isInterstate,
+      isInternational,
+      interstateCompany,
       vendorInfo, // ✅ Include vendor info for self-pickup orders
       vendorLocation, // ✅ Include vendor location for self-pickup orders
       metadata: data.metadata,
@@ -1331,22 +1346,31 @@ export class OrdersService {
         throw refundError;
       }
 
-      // Pay rider their delivery fee (they did their job)
+      // Pay rider / partner their delivery fee
       if (order.rider_id && order.delivery_fee && parseFloat(order.delivery_fee) > 0) {
         try {
-          const riderPaymentResult = await this.walletService.processWalletTransaction(
+          const deliveryAmount = parseFloat(order.delivery_fee);
+          const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
             order.rider_id,
-            WalletTransactionType.DELIVERY_PAYMENT,
-            parseFloat(order.delivery_fee),
+            deliveryAmount,
             `Delivery fee for order ${order.order_number}`,
-            orderId,
-            'order',
           );
 
-          if (!riderPaymentResult.success) {
-            console.error('Failed to pay rider (non-critical):', riderPaymentResult.error);
-          } else {
-            console.log(`✅ Paid rider ${order.rider_id} delivery fee: ₣${order.delivery_fee}`);
+          if (!partnerCredit.credited) {
+            // Independent rider — credit Freti wallet as before
+            const riderPaymentResult = await this.walletService.processWalletTransaction(
+              order.rider_id,
+              WalletTransactionType.DELIVERY_PAYMENT,
+              deliveryAmount,
+              `Delivery fee for order ${order.order_number}`,
+              orderId,
+              'order',
+            );
+            if (!riderPaymentResult.success) {
+              console.error('Failed to pay rider (non-critical):', riderPaymentResult.error);
+            } else {
+              console.log(`✅ Paid rider ${order.rider_id} delivery fee: ₣${order.delivery_fee}`);
+            }
           }
         } catch (riderPaymentError) {
           console.error('Rider payment error (non-critical):', riderPaymentError);

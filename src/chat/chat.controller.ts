@@ -1006,6 +1006,34 @@ export class ChatController {
   // INVOICE ENDPOINTS
   // =============================================================================
 
+  @Post('invoices/upload-image')
+  @UseInterceptors(FileInterceptor('image'))
+  async uploadInvoiceItemImage(
+    @UploadedFile() file: Express.Multer.File,
+    @Headers('authorization') authHeader: string,
+  ) {
+    this.logger.log('POST /chat/invoices/upload-image');
+
+    const userId = this.getUserIdFromToken(authHeader);
+
+    if (!file) {
+      throw new BadRequestException('No image file provided');
+    }
+
+    try {
+      const imageUrl = await this.invoiceService.uploadInvoiceItemImage(userId, file);
+
+      return {
+        success: true,
+        data: { imageUrl },
+        message: 'Image uploaded successfully',
+      };
+    } catch (error) {
+      this.logger.error('Error uploading invoice item image:', error);
+      throw error;
+    }
+  }
+
   @Post('invoices')
   async createInvoice(
     @Body() createInvoiceDto: CreateInvoiceDto,

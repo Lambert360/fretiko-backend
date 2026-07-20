@@ -60,6 +60,9 @@ export class RiderOptimizationService {
           latitude: farthestVendor.location.latitude,
           longitude: farthestVendor.location.longitude,
           address: farthestVendor.location.address || 'Vendor Location',
+          state: farthestVendor.location.state,
+          country: farthestVendor.location.country,
+          city: farthestVendor.location.city,
         },
         deliveryLocation: {
           latitude: buyerLocation.latitude,
@@ -207,7 +210,14 @@ export class RiderOptimizationService {
     return data.map(vendor => ({
       id: vendor.id,
       name: vendor.username,
-      location: vendor.location || { latitude: 6.5244, longitude: 3.3792 }, // Default Lagos
+      location: {
+        latitude: vendor.location?.latitude ?? 6.5244,
+        longitude: vendor.location?.longitude ?? 3.3792,
+        address: vendor.location?.address,
+        state: vendor.location?.state,
+        country: vendor.location?.country,
+        city: vendor.location?.city,
+      },
     }));
   }
 

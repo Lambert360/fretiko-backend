@@ -181,7 +181,8 @@ export class LiveSalesService {
             id,
             username,
             avatar_url,
-            is_verified
+            is_verified,
+            display_name
           )
         `)
         .eq('status', 'live')
@@ -226,7 +227,8 @@ export class LiveSalesService {
             id,
             username,
             avatar_url,
-            is_verified
+            is_verified,
+            display_name
           )
         `)
         .eq('status', StreamStatus.LIVE);
@@ -286,7 +288,8 @@ export class LiveSalesService {
             id,
             username,
             avatar_url,
-            is_verified
+            is_verified,
+            display_name
           )
         `)
         .eq('id', streamId)
@@ -786,7 +789,8 @@ export class LiveSalesService {
           user:user_profiles!user_id (
             id,
             username,
-            avatar_url
+            avatar_url,
+            display_name
           )
         `)
         .single();
@@ -824,7 +828,8 @@ export class LiveSalesService {
           user:user_profiles!user_id (
             id,
             username,
-            avatar_url
+            avatar_url,
+            display_name
           )
         `)
         .eq('stream_id', streamId)
@@ -1857,7 +1862,7 @@ export class LiveSalesService {
           // Get vendor profile for notifications (use product owner, not stream owner)
           const { data: vendorProfile } = await this.supabase
             .from('user_profiles')
-            .select('username')
+            .select('username, display_name')
             .eq('id', productVendorId)
             .single();
 
@@ -1884,7 +1889,7 @@ export class LiveSalesService {
               id: order.id,
               orderNumber: order.order_number,
               deliveryPin: deliveryPin,
-              vendorName: vendorProfile?.username,
+              vendorName: vendorProfile?.username || vendorProfile?.display_name,
             });
             this.logEvent('log', 'pickup_pin_sent_to_buyer', {
               orderId: order.id,
@@ -1899,7 +1904,7 @@ export class LiveSalesService {
                 id: order.id,
                 orderNumber: order.order_number,
                 pickupPin: pickupPin,
-                vendorName: vendorProfile?.username,
+                vendorName: vendorProfile?.username || vendorProfile?.display_name,
               });
               this.logEvent('log', 'pickup_pin_sent_to_rider', {
                 orderId: order.id,
@@ -4292,7 +4297,7 @@ export class LiveSalesService {
           id,
           message,
           created_at,
-          user:user_profiles!user_id(username, avatar_url)
+          user:user_profiles!user_id(username, avatar_url, display_name)
         `)
         .eq('stream_id', streamId)
         .order('created_at', { ascending: false })
@@ -4305,7 +4310,7 @@ export class LiveSalesService {
           id,
           gift_type,
           created_at,
-          sender:user_profiles!sender_id(username, avatar_url)
+          sender:user_profiles!sender_id(username, avatar_url, display_name)
         `)
         .eq('stream_id', streamId)
         .order('created_at', { ascending: false })
@@ -4319,7 +4324,7 @@ export class LiveSalesService {
           order_number,
           total_amount,
           created_at,
-          buyer:user_profiles!buyer_id(username)
+          buyer:user_profiles!buyer_id(username, display_name)
         `)
         .eq('source', 'live_stream')
         .eq('status', 'paid')
@@ -4896,13 +4901,13 @@ export class LiveSalesService {
           // Get vendor and buyer profiles for notifications
           const { data: vendorProfile } = await this.supabase
             .from('user_profiles')
-            .select('username')
+            .select('username, display_name')
             .eq('id', stream.vendor_id)
             .single();
 
           const { data: buyerProfile } = await this.supabase
             .from('user_profiles')
-            .select('username')
+            .select('username, display_name')
             .eq('id', userId)
             .single();
 
@@ -4914,7 +4919,7 @@ export class LiveSalesService {
             id: order.id,
             orderNumber: order.order_number,
             deliveryPin: deliveryPin,
-            buyerName: buyerProfile?.username || 'Portfolio Customer',
+            buyerName: buyerProfile?.username || buyerProfile?.display_name || 'Portfolio Customer',
           });
           this.logEvent('log', 'pickup_pin_sent_to_vendor', {
             orderId: order.id,
@@ -4926,7 +4931,7 @@ export class LiveSalesService {
             id: order.id,
             orderNumber: order.order_number,
             deliveryPin: deliveryPin,
-            vendorName: vendorProfile?.username,
+            vendorName: vendorProfile?.username || vendorProfile?.display_name,
           });
           this.logEvent('log', 'pickup_pin_sent_to_buyer', {
             orderId: order.id,

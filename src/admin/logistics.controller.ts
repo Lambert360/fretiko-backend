@@ -27,6 +27,21 @@ export class LogisticsController {
   }
 
   /**
+   * Get rider/delivery analytics
+   * GET /admin/logistics/analytics?timeRange=24h|7d|30d
+   * Requires: view_riders permission
+   */
+  @Get('analytics')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_riders')
+  async getLogisticsAnalytics(
+    @Req() req,
+    @Query('timeRange') timeRange?: string,
+  ) {
+    return this.adminService.getLogisticsAnalyticsForStaff(req.user.sub, timeRange || '24h');
+  }
+
+  /**
    * Get all riders
    * GET /admin/logistics/riders
    * Requires: view_riders permission

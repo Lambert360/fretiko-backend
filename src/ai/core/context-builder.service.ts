@@ -74,7 +74,7 @@ export class ContextBuilderService {
 
     if (Object.keys(context.preferences.budgetRanges).length > 0) {
       const budgets = Object.entries(context.preferences.budgetRanges)
-        .map(([cat, amount]) => `${cat}: ₦${amount}`)
+        .map(([cat, amount]) => `${cat}: ₣${amount}`)
         .join(', ');
       lines.push(`Known budget ranges: ${budgets}.`);
     }
@@ -86,7 +86,7 @@ export class ContextBuilderService {
     lines.push(`Current date: ${new Date().toISOString().split('T')[0]}.`);
     lines.push(`You must only use information provided by the backend tools. Never invent products, prices, or vendors.`);
     lines.push(`Keep responses helpful and concise. When showing results, explain why each is relevant in 1-2 sentences.`);
-    lines.push(`Currency: Nigerian Naira (₦).`);
+    lines.push(`Currency: Freti (₣).`);
 
     return lines.join('\n');
   }

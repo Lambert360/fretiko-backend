@@ -665,6 +665,33 @@ export class NotificationHelperService {
   }
 
   /**
+   * Notify buyer that a staff member released their held escrow funds to the
+   * vendor/rider/platform (e.g. after a dispute investigation), without a refund.
+   */
+  async notifyBuyerFundsReleasedByAdmin(buyerId: string, orderNumber: string, reason: string): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.PAYMENT,
+        title: 'Order Resolved by Support ✅',
+        message: `Your held funds for order #${orderNumber} have been released following a support review.`,
+        priority: NotificationPriority.HIGH,
+        badge: 'RESOLVED',
+        data: {
+          order_number: orderNumber,
+          reason: reason,
+          transaction_type: 'escrow_release_admin'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified buyer ${buyerId} of admin fund release`);
+    } catch (error) {
+      this.logger.error('Failed to notify buyer of admin fund release:', error);
+    }
+  }
+
+  /**
    * Notify buyer that order has been accepted by vendor
    */
   async notifyOrderAccepted(buyerId: string, orderData: any): Promise<void> {
@@ -852,15 +879,18 @@ export class NotificationHelperService {
   }
 
   /**
-   * Notify vendor with self-pickup PIN (for verification when buyer arrives)
+   * Notify vendor that a buyer will collect their order via self-pickup.
+   * ⚠️ The vendor must NEVER be told the PIN itself - they verify pickup by
+   * asking the buyer for their PIN and entering it in the app (confirmSelfPickupWithPin),
+   * which is validated server-side against the stored PIN.
    */
-  async notifyVendorSelfPickupPin(vendorId: string, orderData: { id: string; orderNumber: string; deliveryPin: string; buyerName?: string }): Promise<void> {
+  async notifyVendorSelfPickupPin(vendorId: string, orderData: { id: string; orderNumber: string; deliveryPin?: string; buyerName?: string }): Promise<void> {
     try {
       const notification: CreateNotificationDto = {
         user_id: vendorId,
         type: NotificationType.ORDER,
-        title: '🔐 Self-Pickup PIN for Order',
-        message: `Pickup PIN for order #${orderData.orderNumber}: ${orderData.deliveryPin}. Ask the buyer to provide this PIN when they arrive to collect the order.`,
+        title: '📦 Buyer Collecting Order',
+        message: `Order #${orderData.orderNumber} is ready for self-pickup. Ask the buyer for their PIN and enter it in the app to confirm the handoff.`,
         priority: NotificationPriority.HIGH,
         badge: 'PICKUP_PIN',
         has_actions: true,
@@ -871,16 +901,16 @@ export class NotificationHelperService {
         data: {
           order_id: orderData.id,
           order_number: orderData.orderNumber,
-          delivery_pin: orderData.deliveryPin,
           buyer_name: orderData.buyerName,
           delivery_type: 'pickup'
+          // ⚠️ Never include delivery_pin here - vendor must never learn the PIN in advance
         }
       };
 
       await this.createAndSendNotification(notification);
-      this.logger.log(`Sent self-pickup PIN to vendor ${vendorId} for order ${orderData.orderNumber}`);
+      this.logger.log(`Notified vendor ${vendorId} of self-pickup for order ${orderData.orderNumber} (PIN withheld)`);
     } catch (error) {
-      this.logger.error('Failed to send self-pickup PIN to vendor:', error);
+      this.logger.error('Failed to notify vendor of self-pickup:', error);
     }
   }
 

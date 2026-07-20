@@ -43,6 +43,7 @@
     "bcrypt": "^6.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.2",
+    "country-state-city": "^3.2.1",
     "exceljs": "^4.4.0",
     "expo-server-sdk": "^4.0.0",
     "fluent-ffmpeg": "^2.1.3",

@@ -173,7 +173,8 @@ export class ServicesService {
         user_profiles!services_user_id_fkey (
           username,
           avatar_url,
-          is_verified
+          is_verified,
+          display_name
         )
       `)
       .eq('status', 'active');
@@ -221,7 +222,7 @@ export class ServicesService {
         // Add price field (frontend expects 'price', not 'base_price')
         price: service.base_price,
         // Flatten user_profiles data to provider fields
-        provider_name: service.user_profiles?.username || 'Unknown Provider',
+        provider_name: service.user_profiles?.username || service.user_profiles?.display_name || 'Unknown Rider',
         provider_avatar: service.user_profiles?.avatar_url || null,
         provider_verified: service.user_profiles?.is_verified || false,
         provider_id: service.user_id,
@@ -258,7 +259,8 @@ export class ServicesService {
         ),
         user_profiles!services_user_id_fkey (
           username,
-          avatar_url
+          avatar_url,
+          display_name
         )
       `)
       .eq('status', 'active')
@@ -342,7 +344,7 @@ export class ServicesService {
         booking_count: service.booking_count,
         average_rating: service.average_rating,
         user_id: service.user_id,
-        username: service.user_profiles?.username,
+        username: service.user_profiles?.username || service.user_profiles?.display_name || null,
         isLiked,
         isBookmarked,
         commentCount,
@@ -354,7 +356,7 @@ export class ServicesService {
         thumbnail: service.images?.[0] || null,
         videoUri: service.processed_videos?.[0] || service.videos?.[0] || null,
         userId: service.user_id,
-        username: service.user_profiles?.username || 'user',
+        username: service.user_profiles?.username || service.user_profiles?.display_name || 'user',
         userAvatar: service.user_profiles?.avatar_url || null,
         description: service.description || '',
         likes: (service.like_count || 0).toString(),
@@ -363,7 +365,7 @@ export class ServicesService {
         price: parseFloat(service.base_price) || 0,
         originalPrice: null, // No original price concept for services yet
         location: service.location || 'Location not set',
-        serviceProvider: service.user_profiles?.username || 'Unknown Provider',
+        serviceProvider: service.user_profiles?.username || service.user_profiles?.display_name || 'Unknown Rider',
         rating: parseFloat(service.average_rating) || 4.5, // Default to 4.5 if no rating yet
         completedJobs: (service.booking_count || 0).toString(),
         isLiked: isLiked, // User-specific like status from service_likes table
@@ -391,7 +393,8 @@ export class ServicesService {
         ),
         user_profiles!services_user_id_fkey (
           username,
-          avatar_url
+          avatar_url,
+          display_name
         )
       `)
       .eq('id', id)
@@ -520,7 +523,7 @@ export class ServicesService {
       .select(`
         user_id,
         created_at,
-        user:user_profiles(id, username, avatar_url, is_verified)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
       `)
       .eq('service_id', serviceId)
       .order('created_at', { ascending: false })
@@ -530,7 +533,7 @@ export class ServicesService {
 
     return (data || []).map((row: any) => ({
       id: row.user?.id,
-      username: row.user?.username,
+      username: row.user?.username || row.user?.display_name || 'Unknown',
       avatarUrl: row.user?.avatar_url || null,
       isVerified: row.user?.is_verified || false,
       likedAt: row.created_at,
@@ -698,7 +701,8 @@ export class ServicesService {
           user_profiles!services_user_id_fkey (
             username,
             avatar_url,
-            is_verified
+            is_verified,
+            display_name
           )
         )
       `)
@@ -775,7 +779,7 @@ export class ServicesService {
     return comments?.map(comment => ({
       id: comment.id,
       userId: comment.user_profiles?.id || '',
-      userName: comment.user_profiles?.username || 'Unknown User',
+      userName: comment.user_profiles?.username || comment.user_profiles?.display_name || 'Unknown User',
       userAvatar: comment.user_profiles?.avatar_url || null,
       comment: comment.content,
       createdAt: comment.created_at,
@@ -815,7 +819,7 @@ export class ServicesService {
     return {
       id: comment.id,
       userId: comment.user_profiles?.id || '',
-      userName: comment.user_profiles?.username || 'Unknown User',
+      userName: comment.user_profiles?.username || comment.user_profiles?.display_name || 'Unknown User',
       userAvatar: comment.user_profiles?.avatar_url || null,
       comment: comment.content,
       createdAt: comment.created_at,

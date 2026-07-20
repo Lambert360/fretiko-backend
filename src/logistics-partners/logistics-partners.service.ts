@@ -55,8 +55,14 @@ export interface VerifiedPartner {
   company_logo_url?: string;
   contact_email: string;
   contact_phone?: string;
+  company_website?: string;
   headquarters_address: string;
   service_areas: string[];
+  service_categories?: string[];
+  vehicle_fleet?: Record<string, { count: number; photos?: string[] }>;
+  registration_document_urls?: string[];
+  insurance_document_urls?: string[];
+  fleet_document_urls?: string[];
   partner_status: 'active' | 'suspended' | 'terminated';
   total_riders: number;
   active_riders: number;
@@ -541,8 +547,14 @@ export class LogisticsPartnersService {
           company_logo_url: application.company_logo_url,
           contact_email: application.contact_email,
           contact_phone: application.contact_phone,
+          company_website: application.company_website,
           headquarters_address: application.headquarters_address,
           service_areas: application.service_areas,
+          service_categories: application.service_categories || [],
+          vehicle_fleet: application.vehicle_fleet || {},
+          registration_document_urls: application.registration_document_urls || [],
+          insurance_document_urls: application.insurance_document_urls || [],
+          fleet_document_urls: application.fleet_document_urls || [],
           verified_by: adminId,
           verification_notes: data.notes,
         })

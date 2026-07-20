@@ -117,7 +117,7 @@ export class EmbeddingService {
       product.description || '',
       product.condition || '',
       Array.isArray(product.tags) ? product.tags.join(', ') : '',
-      `Price: ${product.price || 0} NGN`,
+      `Price: ${product.price || 0} FRT`,
     ];
     return parts.filter(p => p).join(' | ');
   }

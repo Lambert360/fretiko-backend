@@ -173,6 +173,7 @@ export class AuthService {
           is_seller: false,
           is_rider: false,
           is_verified: false,
+          display_name: `${firstName} ${lastName}`.trim(),
           preferences: {
             fullName: `${firstName} ${lastName}`.trim(),
             dateOfBirth,
