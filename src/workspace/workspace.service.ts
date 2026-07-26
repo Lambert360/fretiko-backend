@@ -848,7 +848,9 @@ export class WorkspaceService {
           totalPrice: item.total_price,
           category: item.product_metadata?.category || null,
           isService: item.product_metadata?.is_service || false,
-          notes: item.product_metadata?.notes || null,
+          scheduledDate: item.scheduled_date || null,
+          scheduledTime: item.scheduled_time || null,
+          notes: item.service_notes || item.product_metadata?.notes || null,
         })) || [],
         customer: {
           id: order.customer?.id,

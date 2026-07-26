@@ -1,7 +1,7 @@
 import { Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
-import { CreateProductDto, UpdateProductDto, ProductQueryDto, ProductResponseDto, ProductCategoryDto } from './dto/product.dto';
+import { CreateProductDto, UpdateProductDto, ProductQueryDto, ProductResponseDto, ProductCategoryDto, RankedProductsQueryDto, RecordProductEventDto } from './dto/product.dto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
 import { TagsService } from '../tags/tags.service';
@@ -257,6 +257,396 @@ export class ProductsService {
     return mapped
       .filter(p => scoreById.has(p.id))
       .sort((a, b) => (scoreById.get(b.id)! - scoreById.get(a.id)!));
+  }
+
+  // ================================
+  // RANKED PRODUCT FEED (v1 ranking algorithm)
+  // ================================
+
+  /**
+   * Location-aware, engagement/trust-weighted ranked product feed for the
+   * HomeScreen product tab. Same-state sellers are heavily preferred, then
+   * same-country, then everyone else — but within each tier, ranking is
+   * driven by engagement, trust, recency, and business signals so the
+   * "best in category" naturally floats to the top.
+   */
+  async getRankedProducts(userId: string | null, query: RankedProductsQueryDto): Promise<ProductResponseDto[]> {
+    const limit = query.limit || 20;
+    const offset = query.offset || 0;
+    const candidatePoolSize = Math.max(200, (offset + limit) * 3);
+
+    const userLocation = await this.getUserLocationForRanking(userId);
+
+    let queryBuilder = this.serviceSupabase
+      .from('products')
+      .select(`
+        *,
+        user_profiles!products_user_id_fkey (
+          id,
+          username,
+          avatar_url,
+          is_verified,
+          display_name,
+          location
+        )
+      `)
+      .eq('status', 'active')
+      .gt('quantity', 0)
+      .is('deleted_at', null);
+
+    if (query.category_id) {
+      queryBuilder = queryBuilder.eq('category_id', query.category_id);
+    }
+    if (query.search) {
+      queryBuilder = queryBuilder.textSearch('search_vector', query.search);
+    }
+    if (query.price_min !== undefined) {
+      queryBuilder = queryBuilder.gte('price', query.price_min);
+    }
+    if (query.price_max !== undefined) {
+      queryBuilder = queryBuilder.lte('price', query.price_max);
+    }
+    if (query.condition) {
+      queryBuilder = queryBuilder.eq('condition', query.condition);
+    }
+
+    const { data: candidates, error } = await queryBuilder
+      .order('created_at', { ascending: false })
+      .limit(candidatePoolSize);
+
+    if (error) {
+      throw new Error(`Database error: ${error.message}`);
+    }
+
+    if (!candidates || candidates.length === 0) {
+      return [];
+    }
+
+    const sellerIds: string[] = [...new Set<string>(candidates.map((p: any) => p.user_id).filter(Boolean))];
+    const productIds: string[] = candidates.map((p: any) => p.id);
+    const categoryIds: string[] = [...new Set<string>(candidates.map((p: any) => p.category_id).filter(Boolean))];
+
+    const [sellerStatsMap, trendingMap, categoryAvgPriceMap] = await Promise.all([
+      this.getSellerStatsMap(sellerIds),
+      this.getTrendingScoreMap(productIds),
+      this.getCategoryAveragePriceMap(categoryIds),
+    ]);
+
+    const now = Date.now();
+
+    let scored = candidates.map((product: any) => {
+      const sellerStats = sellerStatsMap.get(product.user_id);
+      const trendingScore = trendingMap.get(product.id) || 0;
+      const categoryAvgPrice = categoryAvgPriceMap.get(product.category_id);
+
+      const baseScore = this.computeProductBaseScore(product, sellerStats, trendingScore, categoryAvgPrice, now);
+      const productLocation = this.parseProductLocationText(product.location) || {
+        state: product.user_profiles?.location?.state,
+        country: product.user_profiles?.location?.country,
+        city: product.user_profiles?.location?.city,
+      };
+      const locationBonus = this.computeLocationBonus(productLocation, userLocation);
+
+      return {
+        product,
+        score: baseScore + locationBonus,
+      };
+    });
+
+    // Soft-downrank products the user has already seen recently/repeatedly
+    scored = await this.applyProductSeenPenalty(userId, scored);
+
+    // Small randomized jitter so near-equal-score items reorder slightly on refresh
+    scored = scored.map((entry) => ({
+      ...entry,
+      score: entry.score * (0.96 + Math.random() * 0.08),
+    }));
+
+    scored.sort((a, b) => b.score - a.score);
+
+    // Seller-diversity re-rank: avoid the same seller appearing back-to-back
+    const diversified = this.applySellerDiversity(scored);
+
+    const page = diversified.slice(offset, offset + limit).map((entry) => entry.product);
+
+    // Fire-and-forget: record impressions for ranking feedback loop
+    if (page.length > 0) {
+      this.recordProductImpressions(userId, page.map((p: any) => p.id)).catch((e) =>
+        this.logger.warn(`Failed to record product impressions: ${e.message}`),
+      );
+    }
+
+    return page.map((product: any) => this.mapToProductResponse(product));
+  }
+
+  /**
+   * Record a single product engagement event (impression, click, cart_add, etc.)
+   * for use in ranking's seen-penalty and engagement counters.
+   */
+  async recordProductEvent(userId: string | null, dto: RecordProductEventDto): Promise<{ success: boolean }> {
+    const { error } = await this.serviceSupabase.from('product_events').insert({
+      user_id: userId || null,
+      product_id: dto.productId,
+      event_type: dto.eventType,
+      source: dto.source || null,
+    });
+
+    if (error) {
+      this.logger.warn(`Failed to record product event: ${error.message}`);
+      return { success: false };
+    }
+    return { success: true };
+  }
+
+  // Fetch the user's location for ranking: default delivery address first,
+  // falling back to their profile location.
+  private async getUserLocationForRanking(userId: string | null): Promise<{ state?: string; country?: string; city?: string }> {
+    if (!userId) return {};
+
+    const { data: address } = await this.serviceSupabase
+      .from('delivery_addresses')
+      .select('state, country, city')
+      .eq('user_id', userId)
+      .eq('is_default', true)
+      .single();
+
+    if (address && (address.state || address.country)) {
+      return { state: address.state, country: address.country, city: address.city };
+    }
+
+    const { data: profile } = await this.serviceSupabase
+      .from('user_profiles')
+      .select('location')
+      .eq('id', userId)
+      .single();
+
+    return {
+      state: profile?.location?.state,
+      country: profile?.location?.country,
+      city: profile?.location?.city,
+    };
+  }
+
+  // Parse a free-text "City, State, Country" style product.location field
+  private parseProductLocationText(location?: string | null): { state?: string; country?: string; city?: string } | null {
+    if (!location || typeof location !== 'string') return null;
+    const parts = location.split(',').map((p) => p.trim()).filter(Boolean);
+    if (parts.length === 0) return null;
+    if (parts.length >= 3) {
+      return { city: parts[0], state: parts[1], country: parts[parts.length - 1] };
+    }
+    if (parts.length === 2) {
+      return { state: parts[0], country: parts[1] };
+    }
+    return { state: parts[0] };
+  }
+
+  // Location bonus dominates the ranking so same-state sellers are always
+  // preferred, while ordering within a tier still follows the base score.
+  private computeLocationBonus(
+    productLocation: { state?: string; country?: string; city?: string },
+    userLocation: { state?: string; country?: string; city?: string },
+  ): number {
+    const norm = (v?: string) => (v || '').trim().toLowerCase();
+    const pState = norm(productLocation.state);
+    const pCountry = norm(productLocation.country);
+    const pCity = norm(productLocation.city);
+    const uState = norm(userLocation.state);
+    const uCountry = norm(userLocation.country);
+    const uCity = norm(userLocation.city);
+
+    let bonus = 0;
+    if (pState && uState && pState === uState) {
+      bonus += 500;
+      if (pCity && uCity && pCity === uCity) {
+        bonus += 50;
+      }
+    } else if (pCountry && uCountry && pCountry === uCountry) {
+      bonus += 100;
+    }
+    return bonus;
+  }
+
+  // Core v1 scoring: engagement + trust + recency + value + business rules.
+  // Kept in the 0-150 range so the location bonus above can dominate ordering
+  // across location tiers while still ranking "best in category" within a tier.
+  private computeProductBaseScore(
+    product: any,
+    sellerStats: any | undefined,
+    trendingScore: number,
+    categoryAvgPrice: number | undefined,
+    now: number,
+  ): number {
+    // Engagement (log-dampened so high-volume listings don't dominate forever)
+    const engagement =
+      Math.log1p(product.view_count || 0) * 1.0 +
+      Math.log1p(product.like_count || 0) * 2.0 +
+      Math.log1p(product.click_count || 0) * 1.5 +
+      Math.log1p(product.cart_add_count || 0) * 3.0 +
+      Math.log1p(product.sold_count || 0) * 4.0 +
+      Math.log1p(product.save_count || 0) * 1.5;
+
+    // Trust: product rating + seller track record
+    const productRatingScore = (product.average_rating || 0) * Math.log1p(product.review_count || 0) * 2;
+    const sellerRatingScore = (sellerStats?.avg_seller_rating || 0) * Math.log1p(sellerStats?.rating_count || 0);
+    const refundPenalty = (sellerStats?.refund_rate || 0) * 40;
+    const disputePenalty = (sellerStats?.dispute_rate || 0) * 50;
+    const verifiedBonus = product.user_profiles?.is_verified ? 8 : 0;
+    const trust = productRatingScore + sellerRatingScore - refundPenalty - disputePenalty + verifiedBonus;
+
+    // Recency: decay over ~14 days half-life; recent sales also add freshness signal
+    const createdAgeDays = (now - new Date(product.created_at).getTime()) / (1000 * 60 * 60 * 24);
+    const recency = 20 * Math.exp(-createdAgeDays / 14);
+    const lastSoldAgeDays = product.last_sold_at
+      ? (now - new Date(product.last_sold_at).getTime()) / (1000 * 60 * 60 * 24)
+      : null;
+    const salesFreshness = lastSoldAgeDays !== null ? 10 * Math.exp(-lastSoldAgeDays / 7) : 0;
+
+    // Value: mild bonus for being priced below the category average
+    let value = 0;
+    if (categoryAvgPrice && categoryAvgPrice > 0 && product.price) {
+      const ratio = product.price / categoryAvgPrice;
+      if (ratio < 1) value = Math.min(10, (1 - ratio) * 10);
+    }
+
+    // Business rules: featured listings + cold-start boost for brand-new items
+    const featured = product.is_featured ? 15 : 0;
+    const totalEngagementSignals =
+      (product.view_count || 0) + (product.like_count || 0) + (product.click_count || 0) + (product.sold_count || 0);
+    const coldStart = createdAgeDays < 3 && totalEngagementSignals < 5 ? 10 : 0;
+
+    const trending = Math.min(trendingScore, 30);
+
+    return engagement + trust + recency + salesFreshness + value + featured + coldStart + trending;
+  }
+
+  private async getSellerStatsMap(sellerIds: string[]): Promise<Map<string, any>> {
+    const map = new Map<string, any>();
+    if (sellerIds.length === 0) return map;
+
+    const { data, error } = await this.serviceSupabase
+      .from('seller_stats')
+      .select('user_id, avg_seller_rating, rating_count, refund_rate, dispute_rate, completed_orders')
+      .in('user_id', sellerIds);
+
+    if (error || !data) return map;
+    data.forEach((row: any) => map.set(row.user_id, row));
+    return map;
+  }
+
+  private async getTrendingScoreMap(productIds: string[]): Promise<Map<string, number>> {
+    const map = new Map<string, number>();
+    if (productIds.length === 0) return map;
+
+    const { data, error } = await this.serviceSupabase
+      .from('trending_products')
+      .select('product_id, trending_score')
+      .in('product_id', productIds);
+
+    if (error || !data) return map;
+    data.forEach((row: any) => {
+      if (row.product_id) map.set(row.product_id, row.trending_score || 0);
+    });
+    return map;
+  }
+
+  private async getCategoryAveragePriceMap(categoryIds: string[]): Promise<Map<string, number>> {
+    const map = new Map<string, number>();
+    if (categoryIds.length === 0) return map;
+
+    const { data, error } = await this.serviceSupabase
+      .from('products')
+      .select('category_id, price')
+      .in('category_id', categoryIds)
+      .eq('status', 'active')
+      .is('deleted_at', null);
+
+    if (error || !data) return map;
+
+    const sums = new Map<string, { total: number; count: number }>();
+    data.forEach((row: any) => {
+      const entry = sums.get(row.category_id) || { total: 0, count: 0 };
+      entry.total += parseFloat(row.price) || 0;
+      entry.count += 1;
+      sums.set(row.category_id, entry);
+    });
+    sums.forEach((v, k) => map.set(k, v.count > 0 ? v.total / v.count : 0));
+    return map;
+  }
+
+  // Downrank products the user has already seen recently/repeatedly, mirroring
+  // the seen-penalty approach used in the unified posts/services feed.
+  private async applyProductSeenPenalty(
+    userId: string | null,
+    scored: { product: any; score: number }[],
+  ): Promise<{ product: any; score: number }[]> {
+    if (!userId || scored.length === 0) return scored;
+
+    const productIds = scored.map((s) => s.product.id);
+    const { data: events, error } = await this.serviceSupabase
+      .from('product_events')
+      .select('product_id, created_at')
+      .eq('user_id', userId)
+      .eq('event_type', 'impression')
+      .in('product_id', productIds);
+
+    if (error || !events || events.length === 0) return scored;
+
+    const seenMap = new Map<string, { count: number; lastSeenAt: number }>();
+    events.forEach((row: any) => {
+      const existing = seenMap.get(row.product_id);
+      const seenAt = new Date(row.created_at).getTime();
+      if (existing) {
+        existing.count += 1;
+        existing.lastSeenAt = Math.max(existing.lastSeenAt, seenAt);
+      } else {
+        seenMap.set(row.product_id, { count: 1, lastSeenAt: seenAt });
+      }
+    });
+
+    const now = Date.now();
+    return scored.map((entry) => {
+      const seen = seenMap.get(entry.product.id);
+      if (!seen) return entry;
+
+      const hoursSinceSeen = (now - seen.lastSeenAt) / (1000 * 60 * 60);
+      const recoveryFactor = Math.min(1, hoursSinceSeen / 48);
+      const repeatPenalty = Math.min(0.7, seen.count * 0.15);
+      const penalty = repeatPenalty * (1 - recoveryFactor);
+
+      return { ...entry, score: entry.score * (1 - penalty) };
+    });
+  }
+
+  // Prevent the same seller from appearing back-to-back in the final feed
+  private applySellerDiversity(scored: { product: any; score: number }[]): { product: any; score: number }[] {
+    const result: { product: any; score: number }[] = [];
+    const remaining = [...scored];
+
+    while (remaining.length > 0) {
+      const lastSellerId = result.length > 0 ? result[result.length - 1].product.user_id : null;
+      let pickIndex = remaining.findIndex((entry) => entry.product.user_id !== lastSellerId);
+      if (pickIndex === -1) pickIndex = 0;
+
+      result.push(remaining[pickIndex]);
+      remaining.splice(pickIndex, 1);
+    }
+
+    return result;
+  }
+
+  // Fire-and-forget batch insert of impression events for ranking feedback
+  private async recordProductImpressions(userId: string | null, productIds: string[]): Promise<void> {
+    if (productIds.length === 0) return;
+
+    const rows = productIds.map((productId) => ({
+      user_id: userId || null,
+      product_id: productId,
+      event_type: 'impression',
+      source: 'home_feed',
+    }));
+
+    await this.serviceSupabase.from('product_events').insert(rows);
   }
 
   async getProduct(id: string): Promise<ProductResponseDto> {

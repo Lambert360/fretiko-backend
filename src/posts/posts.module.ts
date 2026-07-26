@@ -3,6 +3,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TagsModule } from '../tags/tags.module';
 import { MentionsModule } from '../mentions/mentions.module';
+import { ServicesModule } from '../services/services.module';
 import { PostsController } from './posts.controller';
 import { PostsService } from './posts.service';
 import { PostOwnershipGuard } from './guards/post-ownership.guard';
@@ -12,6 +13,7 @@ import { PostOwnershipGuard } from './guards/post-ownership.guard';
     ConfigModule,
     TagsModule,
     MentionsModule,
+    ServicesModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       useFactory: async (configService: ConfigService) => ({

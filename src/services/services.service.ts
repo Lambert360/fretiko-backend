@@ -362,6 +362,8 @@ export class ServicesService {
         likes: (service.like_count || 0).toString(),
         comments: commentCount.toString(),
         shares: (service.share_count || 0).toString(),
+        saves: (service.save_count || 0).toString(),
+        viewCount: service.view_count || 0,
         price: parseFloat(service.base_price) || 0,
         originalPrice: null, // No original price concept for services yet
         location: service.location || 'Location not set',
@@ -370,6 +372,7 @@ export class ServicesService {
         completedJobs: (service.booking_count || 0).toString(),
         isLiked: isLiked, // User-specific like status from service_likes table
         isBookmarked: isBookmarked, // User-specific bookmark status from service_bookmarks table
+        createdAt: service.created_at, // Used by unified feed for recency scoring
       };
     }) || [];
 

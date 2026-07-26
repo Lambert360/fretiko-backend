@@ -136,6 +136,57 @@ export class ProductQueryDto {
   offset?: number = 0;
 }
 
+export class RankedProductsQueryDto {
+  @IsOptional()
+  @IsUUID()
+  category_id?: string;
+
+  @IsOptional()
+  @IsString()
+  search?: string;
+
+  @IsOptional()
+  @Transform(({ value }) => parseFloat(value))
+  @IsNumber()
+  @Min(0)
+  price_min?: number;
+
+  @IsOptional()
+  @Transform(({ value }) => parseFloat(value))
+  @IsNumber()
+  @Min(0)
+  price_max?: number;
+
+  @IsOptional()
+  @IsEnum(['new', 'like-new', 'good', 'fair'])
+  condition?: string;
+
+  @IsOptional()
+  @Transform(({ value }) => parseInt(value))
+  @IsNumber()
+  @Min(1)
+  @Max(100)
+  limit?: number = 20;
+
+  @IsOptional()
+  @Transform(({ value }) => parseInt(value))
+  @IsNumber()
+  @Min(0)
+  offset?: number = 0;
+}
+
+export class RecordProductEventDto {
+  @IsUUID()
+  productId: string;
+
+  @IsEnum(['impression', 'click', 'view', 'cart_add', 'wishlist_add'])
+  eventType: string;
+
+  @IsOptional()
+  @IsString()
+  source?: string;
+}
+
 export class ProductResponseDto {
   id: string;
   user_id: string;

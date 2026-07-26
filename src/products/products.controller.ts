@@ -15,8 +15,9 @@ import {
 import { FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 // import { Public } from '../auth/public.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { OptionalJwtAuthGuard } from '../auth/optional-jwt-auth.guard';
 import { ProductsService } from './products.service';
-import { CreateProductDto, UpdateProductDto, ProductQueryDto } from './dto/product.dto';
+import { CreateProductDto, UpdateProductDto, ProductQueryDto, RankedProductsQueryDto, RecordProductEventDto } from './dto/product.dto';
 
 @Controller('products')
 export class ProductsController {
@@ -46,6 +47,24 @@ export class ProductsController {
     const parsedLimit = limit ? parseInt(limit, 10) : 12;
     console.log('📦 Fetching seasonal products, limit:', parsedLimit, 'region:', region);
     return this.productsService.getSeasonalProducts(Number.isNaN(parsedLimit) ? 12 : parsedLimit, region);
+  }
+
+  // Location-aware, engagement/trust-ranked product feed for the HomeScreen product tab.
+  // Works for both authenticated and guest users (personalization is applied when logged in).
+  @Get('ranked')
+  @UseGuards(OptionalJwtAuthGuard)
+  async getRankedProducts(@Query() query: RankedProductsQueryDto, @Request() req) {
+    const userId = req.user?.sub || null;
+    console.log('📦 Fetching ranked products for user:', userId, 'query:', query);
+    return this.productsService.getRankedProducts(userId, query);
+  }
+
+  // Record a product engagement event (impression, click, cart_add, etc.) for ranking feedback.
+  @Post('events')
+  @UseGuards(OptionalJwtAuthGuard)
+  async recordProductEvent(@Body() dto: RecordProductEventDto, @Request() req) {
+    const userId = req.user?.sub || null;
+    return this.productsService.recordProductEvent(userId, dto);
   }
 
   @Get('my-products')

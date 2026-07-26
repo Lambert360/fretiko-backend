@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { TagsService } from '../tags/tags.service';
 import { MentionsService } from '../mentions/mentions.service';
+import { ServicesService } from '../services/services.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
 import { Post, PostInteraction, PostMedia, UnifiedFeedItem, UserInfo, InteractionType, MediaType, PrivacyLevel, FeedItemType } from './interfaces/post.interface';
 import { CreatePostDto } from './dto/create-post.dto';
@@ -16,6 +17,7 @@ export class PostsService {
     private configService: ConfigService,
     private tagsService: TagsService,
     private mentionsService: MentionsService,
+    private servicesService: ServicesService,
   ) {}
 
   private get supabase() {
@@ -45,7 +47,7 @@ export class PostsService {
         media_type: m.mediaType,
         media_url: m.mediaUrl,
         thumbnail_url: m.thumbnailUrl || null,
-        duration: m.duration || null,
+        duration: m.duration != null ? Math.round(m.duration) : null,
         width: m.width || null,
         height: m.height || null,
         mime_type: m.mimeType || null,
@@ -195,6 +197,11 @@ export class PostsService {
   async getFeed(userId: string, query: FeedQueryDto): Promise<UnifiedFeedItem[]> {
     const { limit = 20, offset = 0 } = query;
 
+    // Candidate pool must grow with the requested offset, otherwise deep pages
+    // keep re-slicing the same fixed-size window and pagination dead-ends
+    // long before the database is actually exhausted.
+    const candidatePoolSize = offset + limit * 2;
+
     // Get posts for feed
     const { data: posts, error: postsError } = await this.supabase
       .from('posts')
@@ -205,13 +212,15 @@ export class PostsService {
       .eq('is_deleted', false)
       .eq('privacy_level', PrivacyLevel.PUBLIC)
       .order('created_at', { ascending: false })
-      .range(0, limit * 2); // Get more to mix with services
+      .range(0, candidatePoolSize); // Get more to mix with services
 
     if (postsError) throw postsError;
 
-    // Get services (this would come from services module in real implementation)
-    // For now, we'll just return posts
-    const feedItems: UnifiedFeedItem[] = await Promise.all(
+    // Bulk-fetch bookmark counts for candidate posts (avoids N+1 count queries)
+    const postIds = (posts || []).map((p) => p.id);
+    const bookmarkCountsByPost = await this.getBookmarkCountsForPosts(postIds);
+
+    const postFeedItems: UnifiedFeedItem[] = await Promise.all(
       posts.map(async (post) => {
         const mappedPost = this.mapToPost(post);
         if (post.user) mappedPost.user = this.mapToUserInfo(post.user);
@@ -222,7 +231,7 @@ export class PostsService {
           id: post.id,
           type: FeedItemType.POST,
           itemId: post.id,
-          score: this.calculatePostScore(mappedPost),
+          score: this.calculatePostScore(mappedPost, bookmarkCountsByPost.get(post.id) || 0),
           isSeen: false,
           createdAt: new Date(post.created_at),
           postData: mappedPost,
@@ -230,9 +239,186 @@ export class PostsService {
       })
     );
 
-    // Sort by score and apply pagination
+    // Get service videos to mix into the unified feed (fetch extra candidates, same as posts above)
+    let serviceFeedItems: UnifiedFeedItem[] = [];
+    try {
+      const services = await this.servicesService.getVideoFeed(userId, { limit: candidatePoolSize, offset: 0 });
+      serviceFeedItems = services.map((service: any) => ({
+        id: `service-${service.id}`,
+        type: FeedItemType.SERVICE,
+        itemId: service.id,
+        score: this.calculateServiceScore(service),
+        isSeen: false,
+        createdAt: service.createdAt ? new Date(service.createdAt) : new Date(),
+        serviceData: service,
+      }));
+    } catch (serviceError) {
+      // Service videos are non-critical to the feed; log and continue with posts only
+      console.error('Failed to load service videos for unified feed:', serviceError);
+    }
+
+    // Merge candidates from both sources — no fixed ratio between posts and services
+    let feedItems: UnifiedFeedItem[] = [...postFeedItems, ...serviceFeedItems];
+
+    // Soft-downrank items the user has already seen recently/repeatedly, so
+    // unseen/fresh content is prioritized (Facebook-style "unread bump")
+    feedItems = await this.applySeenPenalty(userId, feedItems);
+
+    // Small jitter so near-equal-score items don't always sort in the exact
+    // same order, without breaking the overall ranking. This MUST be
+    // deterministic per item (not Math.random()) — otherwise the relative
+    // order of the candidate pool changes on every single request, which
+    // breaks offset-based pagination: slicing a differently-shuffled array
+    // on each call causes deep pages to re-return items already sent on
+    // earlier pages (they get deduped client-side and the feed appears to
+    // stop loading / infinite scroll dead-ends).
+    feedItems = feedItems.map((item) => ({
+      ...item,
+      score: item.score * (0.94 + this.seededJitter(item.id) * 0.12),
+    }));
+
     feedItems.sort((a, b) => b.score - a.score);
-    return feedItems.slice(offset, offset + limit);
+
+    // Author-diversity re-rank: avoid the same author/creator appearing twice
+    // in a row (TikTok/Facebook-style anti-repetition rule)
+    feedItems = this.applyAuthorDiversity(feedItems);
+
+    const page = feedItems.slice(offset, offset + limit);
+
+    // Fire-and-forget: record impressions for the items being returned
+    this.recordImpressions(userId, page).catch((e) =>
+      console.error('Failed to record feed impressions:', e),
+    );
+
+    return page;
+  }
+
+  // Bulk-fetch bookmark counts for a set of post IDs in a single query
+  private async getBookmarkCountsForPosts(postIds: string[]): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    if (postIds.length === 0) return counts;
+
+    const { data, error } = await this.supabase
+      .from('post_bookmarks')
+      .select('post_id')
+      .in('post_id', postIds);
+
+    if (error || !data) return counts;
+
+    data.forEach((row: { post_id: string }) => {
+      counts.set(row.post_id, (counts.get(row.post_id) || 0) + 1);
+    });
+    return counts;
+  }
+
+  // Downrank items the user has already seen, scaled by how many times seen
+  // and how recently. Items seen long ago (>24h) recover most of their score,
+  // mirroring how X/Facebook/TikTok resurface content after enough time passes.
+  private async applySeenPenalty(userId: string, items: UnifiedFeedItem[]): Promise<UnifiedFeedItem[]> {
+    if (items.length === 0) return items;
+
+    const { data: impressions, error } = await this.supabase
+      .from('user_feed_impressions')
+      .select('item_type, item_id, seen_count, last_seen_at')
+      .eq('user_id', userId)
+      .in('item_id', items.map((i) => i.itemId));
+
+    if (error || !impressions || impressions.length === 0) return items;
+
+    const impressionMap = new Map<string, { seenCount: number; lastSeenAt: Date }>();
+    impressions.forEach((imp: any) => {
+      impressionMap.set(`${imp.item_type}-${imp.item_id}`, {
+        seenCount: imp.seen_count,
+        lastSeenAt: new Date(imp.last_seen_at),
+      });
+    });
+
+    return items.map((item) => {
+      const impression = impressionMap.get(`${item.type}-${item.itemId}`);
+      if (!impression) {
+        item.isSeen = false;
+        return item;
+      }
+
+      const hoursSinceSeen = (Date.now() - impression.lastSeenAt.getTime()) / (1000 * 60 * 60);
+      // Recovers fully after ~48h; heavier repeat views decay score more
+      const recoveryFactor = Math.min(1, hoursSinceSeen / 48);
+      const repeatPenalty = Math.min(0.85, impression.seenCount * 0.2);
+      const penalty = repeatPenalty * (1 - recoveryFactor);
+
+      item.isSeen = true;
+      item.score = item.score * (1 - penalty);
+      return item;
+    });
+  }
+
+  // Deterministic pseudo-random value in [0, 1) derived from an item's id.
+  // Used instead of Math.random() for score jitter so that the relative
+  // ordering of a given candidate pool stays stable across paginated
+  // requests within the same feed pool (see comment at call site).
+  private seededJitter(id: string): number {
+    let hash = 0;
+    for (let i = 0; i < id.length; i++) {
+      hash = (hash << 5) - hash + id.charCodeAt(i);
+      hash |= 0;
+    }
+    return (hash >>> 0) / 4294967295;
+  }
+
+  // Ensure the same author/creator doesn't appear twice in a row in the final feed
+  private applyAuthorDiversity(items: UnifiedFeedItem[]): UnifiedFeedItem[] {
+    const result: UnifiedFeedItem[] = [];
+    const remaining = [...items];
+
+    while (remaining.length > 0) {
+      const lastAuthorId = result.length > 0 ? this.getAuthorId(result[result.length - 1]) : null;
+
+      let pickIndex = remaining.findIndex((item) => this.getAuthorId(item) !== lastAuthorId);
+      if (pickIndex === -1) pickIndex = 0; // No alternative available; take the next best item
+
+      result.push(remaining[pickIndex]);
+      remaining.splice(pickIndex, 1);
+    }
+
+    return result;
+  }
+
+  private getAuthorId(item: UnifiedFeedItem): string | null {
+    if (item.type === FeedItemType.POST) return item.postData?.userId || null;
+    return item.serviceData?.userId || null;
+  }
+
+  // Fire-and-forget upsert of feed impressions for items shown to the user
+  private async recordImpressions(userId: string, items: UnifiedFeedItem[]): Promise<void> {
+    if (items.length === 0) return;
+
+    const { data: existing } = await this.supabase
+      .from('user_feed_impressions')
+      .select('item_type, item_id, seen_count')
+      .eq('user_id', userId)
+      .in('item_id', items.map((i) => i.itemId));
+
+    const existingMap = new Map<string, number>();
+    (existing || []).forEach((row: any) => {
+      existingMap.set(`${row.item_type}-${row.item_id}`, row.seen_count);
+    });
+
+    const now = new Date().toISOString();
+    const rows = items.map((item) => {
+      const key = `${item.type}-${item.itemId}`;
+      const previousCount = existingMap.get(key) || 0;
+      return {
+        user_id: userId,
+        item_type: item.type,
+        item_id: item.itemId,
+        seen_count: previousCount + 1,
+        last_seen_at: now,
+      };
+    });
+
+    await this.supabase
+      .from('user_feed_impressions')
+      .upsert(rows, { onConflict: 'user_id,item_type,item_id' });
   }
 
   // Update post
@@ -262,7 +448,7 @@ export class PostsService {
         media_type: m.mediaType,
         media_url: m.mediaUrl,
         thumbnail_url: m.thumbnailUrl || null,
-        duration: m.duration || null,
+        duration: m.duration != null ? Math.round(m.duration) : null,
         width: m.width || null,
         height: m.height || null,
         mime_type: m.mimeType || null,
@@ -1118,23 +1304,60 @@ export class PostsService {
     return hasVideos ? MediaType.VIDEO : MediaType.IMAGE;
   }
 
-  private calculatePostScore(post: Post): number {
+  // Cold-start test window (hours): brand-new items get a flat visibility
+  // boost regardless of engagement, mirroring TikTok's initial test-audience batch
+  private static readonly COLD_START_WINDOW_HOURS = 2;
+  private static readonly COLD_START_BOOST = 40;
+
+  private calculatePostScore(post: Post, bookmarksCount: number = 0): number {
     let score = 0;
-    
+
     // Time decay (newer = higher score)
     const hoursOld = (Date.now() - new Date(post.createdAt).getTime()) / (1000 * 60 * 60);
     score += Math.max(0, 100 - hoursOld * 2);
-    
-    // Engagement weighting
-    score += (post.likesCount || 0) * 10;
-    score += (post.commentsCount || 0) * 20;
-    score += (post.sharesCount || 0) * 30;
+
+    // Engagement weighting — comments/shares weighted higher than likes
+    // (mirrors X/Facebook: deeper interactions predict more time-on-app)
+    score += (post.likesCount || 0) * 5;
+    score += bookmarksCount * 15;
+    score += (post.commentsCount || 0) * 25;
+    score += (post.sharesCount || 0) * 35;
     score += (post.giftsCount || 0) * 50;
-    
+
     // Media type boost
     if (post.mediaType === 'video') score *= 1.2;
     if (post.mediaType === 'mixed') score *= 1.1;
-    
+
+    if (hoursOld <= PostsService.COLD_START_WINDOW_HOURS) {
+      score += PostsService.COLD_START_BOOST;
+    }
+
+    return score;
+  }
+
+  private calculateServiceScore(service: any): number {
+    let score = 0;
+
+    // Time decay (newer = higher score)
+    const hoursOld = service.createdAt
+      ? (Date.now() - new Date(service.createdAt).getTime()) / (1000 * 60 * 60)
+      : 0;
+    score += Math.max(0, 100 - hoursOld * 2);
+
+    // Engagement weighting (service fields are stringified counts)
+    score += (parseInt(service.likes, 10) || 0) * 5;
+    score += (parseInt(service.saves, 10) || 0) * 15;
+    score += (parseInt(service.comments, 10) || 0) * 25;
+    score += (parseInt(service.shares, 10) || 0) * 35;
+    score += Math.min(service.viewCount || 0, 500) * 1; // passive signal, capped
+
+    // All service feed items are video — same boost posts get for video media
+    score *= 1.2;
+
+    if (hoursOld <= PostsService.COLD_START_WINDOW_HOURS) {
+      score += PostsService.COLD_START_BOOST;
+    }
+
     return score;
   }
 
