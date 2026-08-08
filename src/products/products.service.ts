@@ -99,6 +99,7 @@ export class ProductsService {
       shipping_options: createProductDto.shipping_options || { pickup: false, delivery: false, shipping: false },
       tags: createProductDto.tags || [],
       status: 'active',
+      is_multi_item: createProductDto.is_multi_item || false,
     };
 
     // Use serviceSupabase for product insert - user tokens can't be used for DB operations
@@ -288,6 +289,14 @@ export class ProductsService {
           is_verified,
           display_name,
           location
+        ),
+        product_variants (
+          id,
+          name,
+          price,
+          media_url,
+          media_type,
+          sort_order
         )
       `)
       .eq('status', 'active')
@@ -659,6 +668,14 @@ export class ProductsService {
             username,
             avatar_url,
             display_name
+          ),
+          product_variants (
+            id,
+            name,
+            price,
+            media_url,
+            media_type,
+            sort_order
           )
         `)
         .eq('id', id)
@@ -1049,7 +1066,8 @@ export class ProductsService {
     imageFiles: Express.Multer.File[],
     videoFiles: Express.Multer.File[],
     productData: CreateProductDto,
-    userToken?: string
+    userToken?: string,
+    variantMediaFiles: Express.Multer.File[] = [],
   ): Promise<any> {
     try {
       if ((!imageFiles || imageFiles.length === 0) && (!videoFiles || videoFiles.length === 0)) {
@@ -1174,20 +1192,110 @@ export class ProductsService {
       }
 
       // Determine media type (video takes precedence for product display)
-      const media_type = videoUrls.length > 0 ? 'video' : 'image';
+      let media_type: 'video' | 'image' = videoUrls.length > 0 ? 'video' : 'image';
+
+      // Validate and upload variant media (only relevant for multi-item products)
+      let variantMediaUrls: string[] = [];
+      if (productData.is_multi_item && variantMediaFiles && variantMediaFiles.length > 0) {
+        const allowedImageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+        const allowedVideoTypes = ['video/mp4', 'video/quicktime', 'video/x-msvideo'];
+        const maxImageSize = 10 * 1024 * 1024;
+        const maxVideoSize = 50 * 1024 * 1024;
+
+        for (const file of variantMediaFiles) {
+          const isImage = allowedImageTypes.includes(file.mimetype);
+          const isVideo = allowedVideoTypes.includes(file.mimetype);
+          if (!isImage && !isVideo) {
+            throw new BadRequestException('Invalid variant media file type.');
+          }
+          if (isImage && file.size > maxImageSize) {
+            throw new BadRequestException('Variant image too large. Maximum size is 10MB.');
+          }
+          if (isVideo && file.size > maxVideoSize) {
+            throw new BadRequestException('Variant video too large. Maximum size is 50MB.');
+          }
+        }
+
+        const variantUploadPromises = variantMediaFiles.map(async (file, index) => {
+          const fileExtension = file.originalname.split('.').pop() || (allowedVideoTypes.includes(file.mimetype) ? 'mp4' : 'jpg');
+          const timestamp = Date.now();
+          const uniqueFileName = `${userId}/${timestamp}-${index}-variant-media.${fileExtension}`;
+
+          const { error: uploadError } = await supabaseClient.storage
+            .from('media')
+            .upload(uniqueFileName, file.buffer, {
+              contentType: file.mimetype,
+              upsert: false,
+            });
+
+          if (uploadError) {
+            throw new BadRequestException(`Variant media upload failed: ${uploadError.message}`);
+          }
+
+          const { data: urlData } = supabaseClient.storage
+            .from('media')
+            .getPublicUrl(uniqueFileName);
+
+          return urlData.publicUrl;
+        });
+
+        variantMediaUrls = await Promise.all(variantUploadPromises);
+      }
+
+      // For multi-item products, the first variant's media may be the primary showcase
+      let primaryMediaUrl: string | undefined;
+      const variants = productData.variants ?? [];
+      if (productData.is_multi_item && variantMediaUrls.length > 0 && variants.length > 0) {
+        const primaryVariant = variants[0];
+        primaryMediaUrl = variantMediaUrls[primaryVariant.mediaIndex];
+        if (primaryMediaUrl) {
+          media_type = primaryVariant.mediaType === 'video' ? 'video' : 'image';
+        }
+      }
+
+      // Use first variant's media as the product primary showcase when no separate product media exists
+      const productPrimaryVideo = videoUrls.length > 0 ? videoUrls[0] : (media_type === 'video' ? primaryMediaUrl : undefined);
+      const productPrimaryImage = imageUrls.length > 0 ? imageUrls[0] : (media_type === 'image' ? primaryMediaUrl : undefined);
 
       // Create product with uploaded media URLs
       const createProductDto: CreateProductDto = {
         ...productData,
         images: imageUrls,
-        primary_image_url: imageUrls.length > 0 ? imageUrls[0] : undefined,
+        primary_image_url: productPrimaryImage,
         videos: videoUrls,
-        primary_video_url: videoUrls.length > 0 ? videoUrls[0] : undefined,
+        primary_video_url: productPrimaryVideo,
         media_type,
       };
 
       // Create product record
       const product = await this.createProduct(userId, createProductDto, userToken);
+
+      // Create variant rows for multi-item products
+      if (productData.is_multi_item && productData.variants && productData.variants.length > 0) {
+        const variantRows = productData.variants.map((variant, index) => {
+          const mediaUrl = variantMediaUrls[variant.mediaIndex];
+          if (!mediaUrl) {
+            throw new BadRequestException(`Missing media for variant "${variant.name}"`);
+          }
+          return {
+            product_id: product.id,
+            name: variant.name,
+            price: variant.price,
+            media_url: mediaUrl,
+            media_type: variant.mediaType,
+            sort_order: index,
+          };
+        });
+
+        const { error: variantError } = await this.serviceSupabase
+          .from('product_variants')
+          .insert(variantRows);
+
+        if (variantError) {
+          console.error('Failed to create product variants:', variantError);
+          throw new BadRequestException(`Failed to save product variants: ${variantError.message}`);
+        }
+      }
 
       // Fire-and-forget video processing for incompatible codecs
       if (videoUrls.length > 0) {
@@ -1198,8 +1306,35 @@ export class ProductsService {
         });
       }
 
+      let finalProduct = product;
+      if (productData.is_multi_item) {
+        const { data: refetched } = await this.serviceSupabase
+          .from('products')
+          .select(`
+            *,
+            user_profiles!products_user_id_fkey (
+              username,
+              avatar_url,
+              display_name
+            ),
+            product_variants (
+              id,
+              name,
+              price,
+              media_url,
+              media_type,
+              sort_order
+            )
+          `)
+          .eq('id', product.id)
+          .single();
+        if (refetched) {
+          finalProduct = this.mapToProductResponse(refetched);
+        }
+      }
+
       return {
-        ...product,
+        ...finalProduct,
         message: 'Product uploaded successfully',
       };
 
@@ -1343,6 +1478,19 @@ export class ProductsService {
       shipping_options: data.shipping_options,
       tags: data.tags || [],
       status: data.status,
+      is_multi_item: data.is_multi_item || false,
+      variants: Array.isArray(data.product_variants)
+        ? [...data.product_variants]
+            .sort((a: any, b: any) => (a.sort_order || 0) - (b.sort_order || 0))
+            .map((v: any) => ({
+              id: v.id,
+              name: v.name,
+              price: parseFloat(v.price) || 0,
+              media_url: v.media_url,
+              media_type: v.media_type,
+              sort_order: v.sort_order || 0,
+            }))
+        : undefined,
       is_featured: data.is_featured,
       view_count: data.view_count,
       like_count: data.like_count,

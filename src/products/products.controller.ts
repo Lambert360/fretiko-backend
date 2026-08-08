@@ -155,17 +155,19 @@ export class ProductsController {
     FileFieldsInterceptor([
       { name: 'images', maxCount: 10 },
       { name: 'videos', maxCount: 2 },
+      { name: 'variant_media', maxCount: 20 },
     ]),
   )
   async uploadProduct(
     @Request() req,
-    @UploadedFiles() files: { images?: Express.Multer.File[]; videos?: Express.Multer.File[] },
+    @UploadedFiles() files: { images?: Express.Multer.File[]; videos?: Express.Multer.File[]; variant_media?: Express.Multer.File[] },
     @Body() body: any, // Use any for FormData parsing
   ) {
     console.log('📦 Uploading product with files for user:', req.user.sub);
     console.log('📝 Raw FormData body:', body);
     console.log('📸 Images count:', files?.images?.length || 0);
     console.log('🎥 Videos count:', files?.videos?.length || 0);
+    console.log('🧩 Variant media count:', files?.variant_media?.length || 0);
 
     // Parse FormData fields manually
     const productData: CreateProductDto = {
@@ -180,6 +182,8 @@ export class ProductsController {
       videos: [], // Will be populated by the service
       tags: body.tags ? JSON.parse(body.tags) : [],
       shipping_options: body.shipping_options ? JSON.parse(body.shipping_options) : undefined,
+      is_multi_item: body.is_multi_item === 'true' || body.is_multi_item === true,
+      variants: body.variants ? JSON.parse(body.variants) : undefined,
     };
 
     console.log('📦 Parsed product data:', productData);
@@ -190,6 +194,7 @@ export class ProductsController {
       files?.videos || [],
       productData,
       req.supabaseToken,
+      files?.variant_media || [],
     );
   }
 }

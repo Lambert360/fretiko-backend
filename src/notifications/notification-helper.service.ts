@@ -53,7 +53,9 @@ export class NotificationHelperService {
         data: {
           order_id: orderData.id,
           order_number: orderData.order_number,
-          total_amount: orderData.total_amount
+          total_amount: orderData.total_amount,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         }
       };
 
@@ -61,6 +63,120 @@ export class NotificationHelperService {
       this.logger.log(`Created order confirmation notification for user ${userId}`);
     } catch (error) {
       this.logger.error('Failed to create order notification:', error);
+    }
+  }
+
+  /**
+   * Notify vendor that an order they're fulfilling has changed status
+   * (confirmed/processing/shipped/cancelled etc. - vendor-facing wording)
+   */
+  async notifyVendorOrderStatusChanged(vendorId: string, orderData: { id: string; orderNumber: string }, status: string): Promise<void> {
+    try {
+      const statusMessages: Record<string, { title: string; message: string; badge: string }> = {
+        confirmed: { title: 'Order Confirmed ✅', message: `Order #${orderData.orderNumber} has been confirmed and is awaiting processing.`, badge: 'CONFIRMED' },
+        processing: { title: 'Order Processing ⚙️', message: `Order #${orderData.orderNumber} is now being processed.`, badge: 'PROCESSING' },
+        shipped: { title: 'Order Shipped 📦', message: `Order #${orderData.orderNumber} has been shipped to the customer.`, badge: 'SHIPPED' },
+        cancelled: { title: 'Order Cancelled ❌', message: `Order #${orderData.orderNumber} has been cancelled.`, badge: 'CANCELLED' },
+      };
+
+      const content = statusMessages[status] || { title: 'Order Update', message: `Order #${orderData.orderNumber} status changed to ${status}.`, badge: status.toUpperCase() };
+
+      const notification: CreateNotificationDto = {
+        user_id: vendorId,
+        type: NotificationType.ORDER,
+        title: content.title,
+        message: content.message,
+        priority: NotificationPriority.MEDIUM,
+        badge: content.badge,
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          recipient_role: 'vendor',
+          target_screen: 'VendorOrderDetails'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified vendor ${vendorId} of order status change (${status}) for order ${orderData.orderNumber}`);
+    } catch (error) {
+      this.logger.error('Failed to notify vendor of order status change:', error);
+    }
+  }
+
+  /**
+   * Notify rider that an order assigned to them has changed status
+   * (ready_for_pickup/picked_up/out_for_delivery/delivered/cancelled - rider-facing wording)
+   */
+  async notifyRiderOrderStatusChanged(riderId: string, orderData: { id: string; orderNumber: string }, status: string): Promise<void> {
+    try {
+      const statusMessages: Record<string, { title: string; message: string; badge: string }> = {
+        ready_for_pickup: { title: 'Order Ready for Pickup 📦', message: `Order #${orderData.orderNumber} is ready for you to pick up.`, badge: 'READY_FOR_PICKUP' },
+        picked_up: { title: 'Pickup Confirmed 🚴', message: `You've picked up order #${orderData.orderNumber}. Please proceed to the delivery address.`, badge: 'PICKED_UP' },
+        out_for_delivery: { title: 'Out for Delivery 🚴', message: `Order #${orderData.orderNumber} is out for delivery. Safe travels!`, badge: 'OUT_FOR_DELIVERY' },
+        delivered: { title: 'Delivery Completed 🎉', message: `Order #${orderData.orderNumber} has been marked as delivered. Great job!`, badge: 'DELIVERED' },
+        cancelled: { title: 'Order Cancelled ❌', message: `Order #${orderData.orderNumber} has been cancelled.`, badge: 'CANCELLED' },
+      };
+
+      const content = statusMessages[status] || { title: 'Order Update', message: `Order #${orderData.orderNumber} status changed to ${status}.`, badge: status.toUpperCase() };
+
+      const notification: CreateNotificationDto = {
+        user_id: riderId,
+        type: NotificationType.DELIVERY,
+        title: content.title,
+        message: content.message,
+        priority: NotificationPriority.HIGH,
+        badge: content.badge,
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          recipient_role: 'rider',
+          target_screen: 'Workspace'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified rider ${riderId} of order status change (${status}) for order ${orderData.orderNumber}`);
+    } catch (error) {
+      this.logger.error('Failed to notify rider of order status change:', error);
+    }
+  }
+
+  /**
+   * Notify buyer that their order was cancelled
+   */
+  async notifyOrderCancelled(buyerId: string, orderData: { id: string; orderNumber: string }): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.ORDER,
+        title: 'Order Cancelled ❌',
+        message: `Your order #${orderData.orderNumber} has been cancelled.`,
+        priority: NotificationPriority.HIGH,
+        badge: 'CANCELLED',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: orderData.id,
+          order_number: orderData.orderNumber,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Notified buyer ${buyerId} that order ${orderData.orderNumber} was cancelled`);
+    } catch (error) {
+      this.logger.error('Failed to notify buyer of order cancellation:', error);
     }
   }
 
@@ -87,7 +203,9 @@ export class NotificationHelperService {
           order_id: orderData.id,
           order_number: orderData.order_number,
           tracking_number: trackingData?.tracking_number,
-          estimated_delivery: trackingData?.estimated_delivery
+          estimated_delivery: trackingData?.estimated_delivery,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         }
       };
 
@@ -187,7 +305,9 @@ export class NotificationHelperService {
           rider_name: riderData.name,
           rider_phone: riderData.phone,
           order_id: orderData.id,
-          estimated_arrival: riderData.estimated_arrival_mins
+          estimated_arrival: riderData.estimated_arrival_mins,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         },
         avatar_url: riderData.avatar_url
       };
@@ -1058,7 +1178,9 @@ export class NotificationHelperService {
         data: {
           order_id: orderData.id,
           order_number: orderData.orderNumber,
-          total_amount: orderData.totalAmount
+          total_amount: orderData.totalAmount,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         }
       };
 
@@ -1078,7 +1200,9 @@ export class NotificationHelperService {
         ],
         data: {
           order_id: orderData.id,
-          order_number: orderData.orderNumber
+          order_number: orderData.orderNumber,
+          recipient_role: 'vendor',
+          target_screen: 'VendorOrderDetails'
         }
       };
 

@@ -6,6 +6,13 @@ import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
 import { TagsService } from '../tags/tags.service';
 import { MentionsService } from '../mentions/mentions.service';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+const execAsync = promisify(exec);
 
 @Injectable()
 export class ServicesService {
@@ -264,7 +271,7 @@ export class ServicesService {
         )
       `)
       .eq('status', 'active')
-      .not('videos', 'eq', '{}')  // Only services with videos
+      .or('videos.not.eq.{},images.not.eq.{}')  // Services with videos or images
       .order('created_at', { ascending: false })  // Most recent first
       .limit(options.limit || 10);
 
@@ -353,8 +360,12 @@ export class ServicesService {
       return {
         id: service.id,
         title: service.name,
-        thumbnail: service.images?.[0] || null,
+        thumbnail: service.images?.[0] || service.primary_media_url || null,
         videoUri: service.processed_videos?.[0] || service.videos?.[0] || null,
+        mediaUrls: service.videos || [],
+        processedMediaUrls: service.processed_videos || [],
+        images: service.images || [],
+        mediaType: service.media_type || 'video',
         userId: service.user_id,
         username: service.user_profiles?.username || service.user_profiles?.display_name || 'user',
         userAvatar: service.user_profiles?.avatar_url || null,
@@ -963,8 +974,26 @@ export class ServicesService {
       });
 
       const mediaFiles = await Promise.all(uploadPromises);
-      const imageUrls = mediaFiles.filter(m => m.type === 'image').map(m => m.url);
+      let imageUrls = mediaFiles.filter(m => m.type === 'image').map(m => m.url);
       const videoUrls = mediaFiles.filter(m => m.type === 'video').map(m => m.url);
+
+      // Generate thumbnail for the first video if no images were provided
+      if (imageUrls.length === 0 && videoUrls.length > 0) {
+        const firstVideoFile = files.find(f => f.mimetype?.startsWith('video/'));
+        if (firstVideoFile) {
+          console.log('📸 No images provided, generating thumbnail from video...');
+          try {
+            const thumbnailUrl = await this.generateVideoThumbnail(firstVideoFile, userId, supabaseClient);
+            if (thumbnailUrl) {
+              imageUrls = [thumbnailUrl];
+              console.log('✅ Thumbnail generated successfully:', thumbnailUrl);
+            }
+          } catch (error) {
+            console.error('⚠️ Failed to generate video thumbnail:', error);
+            // Continue without thumbnail - service will use video placeholder
+          }
+        }
+      }
 
       // Create service with uploaded media URLs
       const createServiceDto: CreateServiceDto = {
@@ -986,5 +1015,68 @@ export class ServicesService {
       console.error('Service upload error:', error);
       throw error;
     }
+  }
+
+  /**
+   * Generate a thumbnail from a video file using ffmpeg
+   */
+  private async generateVideoThumbnail(
+    videoFile: Express.Multer.File,
+    userId: string,
+    supabaseClient: any
+  ): Promise<string | null> {
+    return new Promise((resolve, reject) => {
+      const tempDir = os.tmpdir();
+      const timestamp = Date.now();
+      const videoPath = path.join(tempDir, `service-video-${timestamp}.mp4`);
+      const thumbnailPath = path.join(tempDir, `service-thumb-${timestamp}.jpg`);
+
+      try {
+        fs.writeFileSync(videoPath, videoFile.buffer);
+
+        const ffmpegCommand = `ffmpeg -i "${videoPath}" -ss 00:00:01 -vframes 1 -vf "scale=640:-1" -y "${thumbnailPath}"`;
+        execAsync(ffmpegCommand)
+          .then(async () => {
+            try {
+              const thumbnailBuffer = fs.readFileSync(thumbnailPath);
+              const uniqueFileName = `${userId}/service/${timestamp}-video-thumbnail.jpg`;
+
+              const { data, error } = await supabaseClient.storage
+                .from('media')
+                .upload(uniqueFileName, thumbnailBuffer, {
+                  contentType: 'image/jpeg',
+                  upsert: false,
+                });
+
+              if (error) {
+                console.error('Thumbnail upload error:', error);
+                resolve(null);
+              } else {
+                const { data: urlData } = supabaseClient.storage
+                  .from('media')
+                  .getPublicUrl(data.path);
+
+                fs.unlinkSync(videoPath);
+                fs.unlinkSync(thumbnailPath);
+                resolve(urlData.publicUrl);
+              }
+            } catch (error) {
+              console.error('Error processing thumbnail:', error);
+              if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+              if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+              resolve(null);
+            }
+          })
+          .catch((error) => {
+            console.error('FFmpeg thumbnail error:', error);
+            if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+            if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+            resolve(null);
+          });
+      } catch (error) {
+        console.error('Error writing video for thumbnail:', error);
+        resolve(null);
+      }
+    });
   }
 }

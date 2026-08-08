@@ -82,7 +82,7 @@ export class AuthController {
         accessToken: result.accessToken,
         refreshToken: result.refreshToken,
       };
-    } catch (error) {
+    } catch (error: any) {
       throw error; // Let the error filter handle the response format
     }
   }
@@ -117,7 +117,7 @@ export class AuthController {
         accessToken: result.accessToken,
         refreshToken: result.refreshToken,
       };
-    } catch (error) {
+    } catch (error: any) {
       throw error; // Let the error filter handle the response format
     }
   }
@@ -153,7 +153,7 @@ export class AuthController {
         email: signUpDto.email,
         requiresEmailVerification: result.requiresEmailVerification,
       };
-    } catch (error) {
+    } catch (error: any) {
       throw error; // Let the error filter handle the response format
     }
   }
@@ -186,7 +186,7 @@ export class AuthController {
         message: 'Account created successfully! Welcome to Fretiko.',
         user: result.user,
       };
-    } catch (error) {
+    } catch (error: any) {
       throw error; // Let the error filter handle the response format
     }
   }
@@ -207,7 +207,7 @@ export class AuthController {
         success: result.success,
         message: result.message,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: error.message || 'Failed to process password reset request',
@@ -225,7 +225,7 @@ export class AuthController {
         valid: result.valid,
         message: result.message,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         valid: false,
         message: error.message || 'Failed to verify reset token',
@@ -251,7 +251,7 @@ export class AuthController {
         success: result.success,
         message: result.message,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: error.message || 'Failed to reset password',
@@ -280,7 +280,7 @@ export class AuthController {
         available: isAvailable,
         message: isAvailable ? 'Email is available' : 'Email is already registered',
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: 'Failed to check email availability',
@@ -309,7 +309,7 @@ export class AuthController {
         available: isAvailable,
         message: isAvailable ? 'Username is available' : 'Username is already taken',
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: 'Failed to check username availability',
@@ -323,8 +323,12 @@ export class AuthController {
 
   @Post('social/signin')
   async socialSignIn(@Body() socialAuthDto: SocialAuthDto, @Req() req: Request) {
+    // Use the validated body; fall back to the raw req.body when @Body() binds a function
+    const payload = (socialAuthDto && typeof socialAuthDto === 'object' ? socialAuthDto : req.body) as SocialAuthDto;
+    console.log('🔍 [social/signin] req.body:', req.body);
+    console.log('🔍 [social/signin] socialAuthDto:', socialAuthDto);
     return this.socialAuthService.authenticateWithSocialProvider(
-      socialAuthDto,
+      payload,
       req.ip,
       req.get('User-Agent')
     );
@@ -353,7 +357,7 @@ export class AuthController {
       }
 
       return this.socialAuthService.linkSocialAccount(data.user.id, linkDto);
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: 'Authentication failed',
@@ -384,7 +388,7 @@ export class AuthController {
       }
 
       return this.socialAuthService.unlinkSocialAccount(data.user.id, unlinkDto.provider);
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: 'Authentication failed',
@@ -453,7 +457,7 @@ export class AuthController {
         accessToken: result.accessToken,
         refreshToken: result.refreshToken,
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ [PROD DEBUG] Verification failed:');
       console.error('❌ [PROD DEBUG] Error message:', error.message);
       console.error('❌ [PROD DEBUG] Error stack:', error.stack);
@@ -497,7 +501,7 @@ export class AuthController {
         success: true,
         message: result.message,
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ [PROD DEBUG] Resend failed:');
       console.error('❌ [PROD DEBUG] Error message:', error.message);
       console.error('❌ [PROD DEBUG] Error stack:', error.stack);
@@ -542,7 +546,7 @@ export class AuthController {
         refreshToken: result.refreshToken,
         userId: result.userId,
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ Token refresh failed:', error.message);
       
       return {
@@ -581,7 +585,7 @@ export class AuthController {
         success: true,
         message: 'Logged out successfully',
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ Logout failed:', error.message);
       
       return {
@@ -620,7 +624,7 @@ export class AuthController {
         success: true,
         message: 'Logged out from all devices successfully',
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ Logout all failed:', error.message);
       
       return {

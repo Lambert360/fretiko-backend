@@ -88,8 +88,14 @@ export class ChatService {
         .in('id', userConversationIds)
         .order('last_message_at', { ascending: false });
 
-      // Apply filters
-      if (query.chatType) {
+      // When filtering by human role (vendor/rider/friend), the stored chat_type is no longer
+      // reliable because it is per-viewer. We fetch the user's active conversations and derive
+      // the effective chatType after mapping, then paginate in memory.
+      const humanChatTypes = ['vendor', 'rider', 'friend'];
+      const filterByRole = query.chatType && humanChatTypes.includes(query.chatType);
+      const isStaticChatType = query.chatType && ['ai', 'support'].includes(query.chatType);
+
+      if (isStaticChatType) {
         conversationsQuery = conversationsQuery.eq('chat_type', query.chatType);
       }
 
@@ -103,11 +109,13 @@ export class ChatService {
       // Note: For now, we'll filter archived conversations in the response mapping
       // since we're using outer join for AI conversations
 
-      // Apply pagination
+      // Apply pagination (DB-level for static types, in-memory for role-derived types)
       const page = query.page || 1;
       const limit = query.limit || 20;
       const offset = (page - 1) * limit;
-      conversationsQuery = conversationsQuery.range(offset, offset + limit - 1);
+      if (!filterByRole) {
+        conversationsQuery = conversationsQuery.range(offset, offset + limit - 1);
+      }
 
       const { data: conversations, error } = await conversationsQuery;
 
@@ -247,7 +255,7 @@ export class ChatService {
       if (validUserIds.length > 0) {
         const { data: profiles, error: profilesError } = await client
           .from('user_profiles')
-          .select('id, username, avatar_url')
+          .select('id, username, avatar_url, is_seller, is_rider')
           .in('id', validUserIds);
 
         if (profilesError) {
@@ -260,9 +268,16 @@ export class ChatService {
       }
 
       // Transform and return data
-      return conversations.map(conv =>
+      const mapped = conversations.map(conv =>
         this.mapConversationResponse(conv, lastMessages || [], unreadCountByConversationId, userProfiles, userId)
       );
+
+      if (filterByRole) {
+        const filtered = mapped.filter(conv => conv.chatType === query.chatType);
+        return filtered.slice(offset, offset + limit);
+      }
+
+      return mapped;
     } catch (error) {
       this.logger.error('Error fetching conversations:', error);
       throw error;
@@ -291,10 +306,10 @@ export class ChatService {
       const participantHash = hashResult;
       this.logger.log(`Generated participant hash: ${participantHash}`);
 
-      // ✅ FIX: Search by participant_hash AND chat_type to match the unique constraint
-      // The database has UNIQUE(participant_hash, chat_type), so we should search by both
-      // This ensures we find the correct conversation type (friend, vendor, etc.)
-      this.logger.log(`Looking for conversation with hash: ${participantHash}, type: ${chatType}`);
+      // For 1:1 conversations the badge is derived per-viewer, so the stored chat_type is
+      // no longer the source of truth. Search by participant_hash only to avoid creating
+      // multiple conversations for the same pair of users from different entry points.
+      this.logger.log(`Looking for conversation with hash: ${participantHash}`);
 
       const { data: existingConversations, error: queryError } = await client
         .from('chat_conversations')
@@ -312,7 +327,6 @@ export class ChatService {
           participant_hash
         `)
         .eq('participant_hash', participantHash)
-        .eq('chat_type', chatType) // ✅ Include chat_type in search
         .eq('is_active', true)
         .order('created_at', { ascending: false }); // Get most recent first
 
@@ -390,6 +404,27 @@ export class ChatService {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     try {
+      const allParticipants = [...new Set([userId, ...createConversationDto.participantIds])].sort();
+      let participantHash: string | undefined;
+
+      // Generate hash for all conversations; for 1:1 also reuse any existing row.
+      const { data: hashResult } = await client
+        .rpc('generate_participant_hash', { participant_ids: allParticipants });
+      participantHash = hashResult || undefined;
+
+      if (!createConversationDto.isGroup && allParticipants.length === 2 && participantHash) {
+        const { data: existing } = await client
+          .from('chat_conversations')
+          .select('id')
+          .eq('participant_hash', participantHash)
+          .eq('is_active', true)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (existing && existing.length > 0) {
+          return this.getConversationById(existing[0].id, userId, userToken);
+        }
+      }
+
       // Create conversation
       const { data: conversation, error: convError } = await client
         .from('chat_conversations')
@@ -401,6 +436,7 @@ export class ChatService {
           is_group: createConversationDto.isGroup || false,
           created_by: userId,
           metadata: createConversationDto.metadata || {},
+          participant_hash: participantHash,
         })
         .select()
         .single();
@@ -411,7 +447,6 @@ export class ChatService {
       }
 
       // Add participants (including creator)
-      const allParticipants = [...new Set([userId, ...createConversationDto.participantIds])];
       const participantInserts = allParticipants.map(participantId => ({
         conversation_id: conversation.id,
         user_id: participantId,
@@ -470,6 +505,7 @@ export class ChatService {
           updated_at,
           edited_at,
           is_deleted,
+          reactions,
           reply_to_id,
           metadata,
           reply_to:chat_messages!reply_to_id (
@@ -522,6 +558,44 @@ export class ChatService {
         })}`);
       }
 
+      // Resolve reply-to parent messages explicitly (the Supabase self-join is unreliable here)
+      const replyToIds = [...new Set(messages.map(msg => msg.reply_to_id).filter(Boolean))] as string[];
+      const replyToMap: Record<string, any> = {};
+      if (replyToIds.length > 0) {
+        const { data: replyMessages } = await client
+          .from('chat_messages')
+          .select(`
+            id,
+            conversation_id,
+            sender_id,
+            message_type,
+            content,
+            media_url,
+            file_metadata,
+            created_at,
+            updated_at,
+            edited_at,
+            is_deleted,
+            reactions,
+            reply_to_id,
+            metadata,
+            user_profiles!sender_id(id, username, avatar_url)
+          `)
+          .in('id', replyToIds);
+
+        if (replyMessages) {
+          for (const replyMsg of replyMessages) {
+            replyToMap[replyMsg.id] = replyMsg;
+          }
+        }
+      }
+
+      for (const msg of messages) {
+        if (msg.reply_to_id && replyToMap[msg.reply_to_id]) {
+          msg.reply_to = replyToMap[msg.reply_to_id];
+        }
+      }
+
       // Get message status for current user
       const messageIds = messages.map(msg => msg.id);
       const { data: messageStatuses } = await client
@@ -536,10 +610,14 @@ export class ChatService {
       }, {}) || {};
 
       // Get user profiles for message senders and reply senders (including actual senders from metadata)
-      const senderIds = messages.flatMap(msg => [
-        msg.metadata?.actualSenderId || msg.sender_id, // Use actual sender if available
-        ...(msg.reply_to ? [msg.reply_to.metadata?.actualSenderId || msg.reply_to.sender_id] : [])
-      ]);
+      const senderIds = messages.flatMap(msg => {
+        const mainSender = msg.metadata?.actualSenderId || msg.sender_id;
+        const replyToRow = Array.isArray(msg.reply_to) ? msg.reply_to[0] : msg.reply_to;
+        const replyToSender = replyToRow
+          ? (replyToRow.metadata?.actualSenderId || replyToRow.sender_id)
+          : undefined;
+        return replyToSender ? [mainSender, replyToSender] : [mainSender];
+      });
       const userIds = [...new Set(senderIds)];
 
       let userProfiles = [];
@@ -980,7 +1058,7 @@ export class ChatService {
     if (userIds.length > 0) {
       const { data: profiles } = await client
         .from('user_profiles')
-        .select('id, username, avatar_url')
+        .select('id, username, avatar_url, is_seller, is_rider')
         .in('id', userIds);
       userProfiles = profiles || [];
     }
@@ -1000,6 +1078,25 @@ export class ChatService {
 
     // Determine if this is an AI conversation
     const isAI = conversation.chat_type === 'ai';
+    const isStaticTyped = isAI || conversation.chat_type === 'support';
+
+    // Per-viewer chatType: for 1:1 human chats, derive from the other participant's role.
+    // This makes the badge reflect the relationship from the current user's perspective and
+    // updates automatically when the other user's role changes.
+    let effectiveChatType = conversation.chat_type;
+    if (!isStaticTyped && !conversation.is_group && conversation.chat_participants && currentUserId) {
+      const otherParticipant = conversation.chat_participants.find(p => p.user_id !== currentUserId);
+      if (otherParticipant) {
+        const otherProfile = userProfiles.find(profile => profile.id === otherParticipant.user_id);
+        if (otherProfile?.is_rider) {
+          effectiveChatType = 'rider';
+        } else if (otherProfile?.is_seller) {
+          effectiveChatType = 'vendor';
+        } else {
+          effectiveChatType = 'friend';
+        }
+      }
+    }
 
     // 🔍 DEBUG: Log input data
     this.logger.debug(`🔍 mapConversationResponse INPUT - conversationId: ${conversation.id}`);
@@ -1050,7 +1147,7 @@ export class ChatService {
 
     return {
       id: conversation.id,
-      chatType: conversation.chat_type,
+      chatType: effectiveChatType,
       name: conversationName,
       description: conversation.description,
       avatarUrl: conversationAvatar,
@@ -1099,6 +1196,9 @@ export class ChatService {
                          message.user_profiles || // Fallback to message.user_profiles if exists
                          { id: actualSenderId, username: 'Unknown User', avatar_url: null };
 
+    // Resolve the replied-to message (Supabase may return an array, a single object, or null)
+    const replyToRow = Array.isArray(message.reply_to) ? message.reply_to[0] : message.reply_to;
+
     const response: any = {
       id: message.id,
       conversationId: message.conversation_id,
@@ -1111,8 +1211,11 @@ export class ChatService {
       updatedAt: message.updated_at,
       editedAt: message.edited_at,
       isDeleted: message.is_deleted,
-      replyToId: message.reply_to_id,
-      replyTo: message.reply_to ? this.mapMessageResponse(message.reply_to, undefined, userProfiles) : undefined,
+      reactions: message.reactions,
+      replyToId: message.reply_to_id || undefined,
+      replyTo: message.reply_to_id && replyToRow && replyToRow.id
+        ? this.mapMessageResponse(replyToRow, undefined, userProfiles)
+        : undefined,
       sender: {
         id: senderProfile.id,
         username: senderProfile.username,

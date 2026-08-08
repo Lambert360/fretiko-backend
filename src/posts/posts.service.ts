@@ -10,6 +10,13 @@ import { CreatePostDto } from './dto/create-post.dto';
 import { UpdatePostDto } from './dto/update-post.dto';
 import { CreateInteractionDto } from './dto/interaction.dto';
 import { FeedQueryDto } from './dto/feed-query.dto';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+const execAsync = promisify(exec);
 
 @Injectable()
 export class PostsService {
@@ -41,6 +48,7 @@ export class PostsService {
     if (error) throw error;
 
     // Insert media metadata if provided
+    let insertedMedia: any[] | null = null;
     if (createPostDto.media && createPostDto.media.length > 0) {
       const mediaData = createPostDto.media.map((m, index) => ({
         post_id: post.id,
@@ -55,10 +63,11 @@ export class PostsService {
         order_index: index,
       }));
 
-      const { data: insertedMedia, error: mediaError } = await this.supabase
+      const { data: mediaResult, error: mediaError } = await this.supabase
         .from('post_media')
         .insert(mediaData)
-        .select('id, media_url, media_type');
+        .select('id, media_url, media_type, thumbnail_url, order_index');
+      insertedMedia = mediaResult;
 
       if (mediaError) throw mediaError;
 
@@ -81,6 +90,9 @@ export class PostsService {
       }
     }
 
+    // Attach media metadata so mapToPost can include thumbnail URLs
+    post.post_media = insertedMedia || [];
+
     const mapped = this.mapToPost(post);
 
     // Sync tags and mentions (fire-and-forget style, but awaited here for consistency)
@@ -101,7 +113,7 @@ export class PostsService {
   }
 
   // Upload media to Supabase storage
-  async uploadMedia(userId: string, file: Express.Multer.File): Promise<{ url: string; path: string }> {
+  async uploadMedia(userId: string, file: Express.Multer.File): Promise<{ url: string; path: string; thumbnailUrl?: string }> {
     try {
       const fileExt = file.originalname.split('.').pop() || 'jpg';
       const fileName = `${userId}/posts/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
@@ -123,13 +135,70 @@ export class PostsService {
         .from('posts-media')
         .getPublicUrl(data.path);
 
+      // Generate a JPG thumbnail for videos at the 1-second mark
+      let thumbnailUrl: string | undefined;
+      if (file.mimetype?.startsWith('video/')) {
+        thumbnailUrl = await this.generateVideoThumbnail(file.buffer, userId);
+      }
+
       return {
         url: publicUrlData.publicUrl,
         path: data.path,
+        thumbnailUrl,
       };
     } catch (error) {
       console.error('Media upload error:', error);
       throw error;
+    }
+  }
+
+  // Generate a thumbnail from a video file using ffmpeg
+  private async generateVideoThumbnail(videoBuffer: Buffer, userId: string): Promise<string | undefined> {
+    const tempDir = os.tmpdir();
+    const timestamp = Date.now();
+    const videoPath = path.join(tempDir, `post-video-${timestamp}.mp4`);
+    const thumbnailPath = path.join(tempDir, `post-thumb-${timestamp}.jpg`);
+
+    try {
+      fs.writeFileSync(videoPath, videoBuffer);
+      const ffmpegCommand = `ffmpeg -i "${videoPath}" -ss 00:00:01 -vframes 1 -vf "scale=640:-1" -y "${thumbnailPath}"`;
+      await execAsync(ffmpegCommand);
+
+      if (!fs.existsSync(thumbnailPath)) {
+        console.warn('⚠️ Thumbnail file not generated');
+        return undefined;
+      }
+
+      const thumbnailBuffer = fs.readFileSync(thumbnailPath);
+      const uniqueFileName = `${userId}/posts/${timestamp}-thumb.jpg`;
+      const { data, error } = await this.supabase.storage
+        .from('posts-media')
+        .upload(uniqueFileName, thumbnailBuffer, {
+          contentType: 'image/jpeg',
+          cacheControl: '3600',
+          upsert: false,
+        });
+
+      if (error) {
+        console.warn('⚠️ Thumbnail upload failed:', error.message);
+        return undefined;
+      }
+
+      const { data: publicUrlData } = this.supabase.storage
+        .from('posts-media')
+        .getPublicUrl(data.path);
+
+      return publicUrlData.publicUrl;
+    } catch (error) {
+      console.error('⚠️ Failed to generate post video thumbnail:', error);
+      return undefined;
+    } finally {
+      try {
+        if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+        if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+      } catch {
+        // ignore cleanup errors
+      }
     }
   }
 
@@ -148,6 +217,17 @@ export class PostsService {
     if (error || !post) {
       throw new NotFoundException('Post not found');
     }
+
+    // Load per-media metadata so mapToPost can build thumbnailUrls
+    const { data: postMedia, error: postMediaError } = await this.supabase
+      .from('post_media')
+      .select('id, media_url, media_type, thumbnail_url, order_index')
+      .eq('post_id', id)
+      .order('order_index');
+    if (postMediaError) {
+      console.error('Failed to fetch post media:', postMediaError);
+    }
+    post.post_media = postMedia || [];
 
     const mappedPost = this.mapToPost(post);
     
@@ -171,7 +251,8 @@ export class PostsService {
       .from('posts')
       .select(`
         *,
-        user:user_profiles(id, username, avatar_url, is_verified, display_name)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name),
+        post_media(id, media_url, media_type, thumbnail_url, order_index)
       `)
       .eq('user_id', userId)
       .eq('is_deleted', false)
@@ -207,7 +288,8 @@ export class PostsService {
       .from('posts')
       .select(`
         *,
-        user:user_profiles(id, username, avatar_url, is_verified, display_name)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name),
+        post_media(id, media_url, media_type, thumbnail_url, order_index)
       `)
       .eq('is_deleted', false)
       .eq('privacy_level', PrivacyLevel.PUBLIC)
@@ -1142,7 +1224,8 @@ export class PostsService {
       .from('posts')
       .select(`
         *,
-        user:user_profiles(id, username, avatar_url, is_verified, display_name)
+        user:user_profiles(id, username, avatar_url, is_verified, display_name),
+        post_media(id, media_url, media_type, thumbnail_url, order_index)
       `)
       .eq('user_id', post.user_id)
       .eq('is_deleted', false)
@@ -1177,7 +1260,8 @@ export class PostsService {
       .select(`
         post:posts(
           *,
-          user:user_profiles(id, username, avatar_url, is_verified, display_name)
+          user:user_profiles(id, username, avatar_url, is_verified, display_name),
+          post_media(id, media_url, media_type, thumbnail_url, order_index)
         )
       `)
       .eq('user_id', userId)
@@ -1369,6 +1453,9 @@ export class PostsService {
       content: data.content,
       mediaUrls: data.media_urls || [],
       processedMediaUrls: data.processed_media_urls || [],
+      thumbnailUrls: [...(data.post_media || [])]
+        .sort((a: any, b: any) => (a.order_index ?? 0) - (b.order_index ?? 0))
+        .map((m: any) => m.thumbnail_url || m.media_url),
       mediaType: data.media_type,
       privacyLevel: data.privacy_level,
       likesCount: data.likes_count || 0,

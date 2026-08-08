@@ -15,6 +15,8 @@ export interface VideoProcessingJob {
   postId?: string;
   videoIndex?: number;
   platform?: 'android' | 'ios' | 'web';
+  trimStart?: number;
+  trimEnd?: number;
   priority: 'low' | 'medium' | 'high';
   status: 'pending' | 'processing' | 'completed' | 'failed';
   createdAt: Date;
@@ -62,6 +64,8 @@ export class BackgroundVideoProcessor {
     postId?: string;
     videoIndex?: number;
     platform?: 'android' | 'ios' | 'web';
+    trimStart?: number;
+    trimEnd?: number;
     priority?: 'low' | 'medium' | 'high';
   } = {}): Promise<string> {
     const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(7)}`;
@@ -75,6 +79,8 @@ export class BackgroundVideoProcessor {
       postId: options.postId,
       videoIndex: options.videoIndex ?? 0,
       platform: options.platform || 'android',
+      trimStart: options.trimStart,
+      trimEnd: options.trimEnd,
       priority: options.priority || 'medium',
       status: 'pending',
       createdAt: new Date()
@@ -166,7 +172,10 @@ export class BackgroundVideoProcessor {
       const result = await videoProcessingService.processVideo({
         inputPath,
         platform: job.platform,
-        quality: 'medium'
+        quality: 'medium',
+        thumbnailOnly: job.entityType === 'chat' && job.trimStart === undefined,
+        trimStart: job.trimStart,
+        trimEnd: job.trimEnd,
       });
 
       // Update job with result
@@ -174,7 +183,7 @@ export class BackgroundVideoProcessor {
         job.status = 'completed';
         job.completedAt = new Date();
         job.result = {
-          processedVideoUrl: result.outputPath!,
+          processedVideoUrl: result.outputPath || '',
           metadata: result.metadata,
           // Keep thumbnailUrl on the job for debugging/inspection
           // (primary persistence happens in updateEntityVideo)
@@ -190,7 +199,7 @@ export class BackgroundVideoProcessor {
             job.entityType,
             job.entityId,
             job.videoIndex ?? 0,
-            result.outputPath!,
+            result.outputPath,
             job.postId,
             // Pass through thumbnailUrl if generated
             (result as any).thumbnailUrl,
@@ -235,19 +244,37 @@ export class BackgroundVideoProcessor {
     const https = require('https');
     const fs = require('fs');
     const path = require('path');
+    const os = require('os');
     
     return new Promise((resolve, reject) => {
       const fileName = `temp_${Date.now()}_${Math.random().toString(36).substring(7)}.mp4`;
-      const filePath = path.join('/tmp', fileName);
+      const tmpDir = os.tmpdir();
+      const filePath = path.join(tmpDir, fileName);
+
+      // Ensure the temp directory exists before writing
+      if (!fs.existsSync(tmpDir)) {
+        fs.mkdirSync(tmpDir, { recursive: true });
+      }
       
       const file = fs.createWriteStream(filePath);
-      
-      https.get(url, (response: any) => {
-        response.pipe(file);
-      }).on('error', reject).on('end', () => {
+
+      file.on('error', (err: any) => {
+        file.destroy();
+        reject(err);
+      });
+
+      file.on('finish', () => {
         file.close();
         resolve(filePath);
       });
+      
+      https.get(url, (response: any) => {
+        if (response.statusCode !== 200) {
+          reject(new Error(`Failed to download video: HTTP ${response.statusCode}`));
+          return;
+        }
+        response.pipe(file);
+      }).on('error', reject);
     });
   }
 
@@ -258,7 +285,7 @@ export class BackgroundVideoProcessor {
     entityType: string,
     entityId: string,
     videoIndex: number,
-    processedVideoUrl: string,
+    processedVideoUrl?: string,
     postId?: string,
     thumbnailUrl?: string,
   ): Promise<void> {
@@ -405,25 +432,40 @@ export class BackgroundVideoProcessor {
         }
 
       } else if (entityType === 'chat') {
-        // Legacy chat file upload support
+        const { data: existingMessage, error: fetchError } = await this.supabase
+          .from('chat_messages')
+          .select('metadata')
+          .eq('id', entityId)
+          .single();
+
+        if (fetchError) {
+          console.error(`Failed to fetch chat message ${entityId}:`, fetchError);
+          return;
+        }
+
+        const existingMetadata = (existingMessage as any)?.metadata || {};
+        const newMetadata: any = {
+          ...existingMetadata,
+          thumbnailUrl,
+          thumbnailGeneratedAt: now,
+        };
+
+        if (processedVideoUrl) {
+          newMetadata.processedVideoUrl = processedVideoUrl;
+        }
+
+        const updatePayload: any = { metadata: newMetadata };
+        if (processedVideoUrl) {
+          updatePayload.media_url = processedVideoUrl;
+        }
+
         const { error } = await this.supabase
-          .from('chat_file_uploads')
-          .update({
-            public_url: processedVideoUrl,
-            metadata: {
-              videoProcessing: {
-                processing: false,
-                processed: true,
-                processedVideoUrl,
-                processedAt: now,
-              },
-            },
-          })
-          .eq('message_id', entityId)
-          .eq('file_type', 'video');
+          .from('chat_messages')
+          .update(updatePayload)
+          .eq('id', entityId);
 
         if (error) throw error;
-        console.log(`✅ Updated chat file upload ${entityId}`);
+        console.log(`✅ Updated chat message ${entityId}`);
       }
     } catch (error) {
       console.error(`Failed to update ${entityType} video:`, error);

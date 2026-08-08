@@ -36,7 +36,7 @@ export class CartController {
   }
 
   @Post()
-  async addToCart(@Request() req, @Body() cartData: { productId: string; quantity: number; price: number }) {
+  async addToCart(@Request() req, @Body() cartData: { productId: string; quantity: number; price: number; variantId?: string; variantName?: string }) {
     console.log('🛒 Adding to cart for user:', req.user.sub, cartData);
     return this.cartService.addToCart(req.user.sub, cartData, req.supabaseToken);
   }

@@ -146,7 +146,9 @@ export class CartService {
         return {
           id: item.id,
           productId: item.product_id,
-          productName: item.products?.name || 'Unknown Product',
+          productName: item.variant_name ? `${item.products?.name || 'Unknown Product'} - ${item.variant_name}` : (item.products?.name || 'Unknown Product'),
+          variantId: item.variant_id || null,
+          variantName: item.variant_name || null,
           productImage: item.products?.images?.[0] || item.products?.primary_image_url || 'https://via.placeholder.com/150',
           price: item.price_at_add,
           originalPrice: item.products?.price || null,
@@ -205,7 +207,7 @@ export class CartService {
     return { count: count || 0 };
   }
 
-  async addToCart(userId: string, cartData: { productId: string; quantity: number; price: number }, userToken?: string) {
+  async addToCart(userId: string, cartData: { productId: string; quantity: number; price: number; variantId?: string; variantName?: string }, userToken?: string) {
     // Check if product exists and get its info
     const { data: product, error: productError } = await this.serviceSupabase
       .from('products')
@@ -218,13 +220,37 @@ export class CartService {
       throw new NotFoundException('Product not found or not available');
     }
 
-    // Check if item already exists in cart
-    const { data: existingItem } = await this.serviceSupabase
+    let variantName = cartData.variantName;
+    let variantPrice = cartData.price;
+
+    if (cartData.variantId) {
+      const { data: variant, error: variantError } = await this.serviceSupabase
+        .from('product_variants')
+        .select('id, name, price')
+        .eq('id', cartData.variantId)
+        .eq('product_id', cartData.productId)
+        .single();
+
+      if (variantError || !variant) {
+        throw new NotFoundException('Selected item not found or not available');
+      }
+
+      variantName = variant.name;
+      variantPrice = cartData.price || variant.price;
+    }
+
+    // Check if this exact product + variant combination already exists in cart
+    let existingItemQuery = this.serviceSupabase
       .from('cart_items')
       .select('id, quantity')
       .eq('user_id', userId)
-      .eq('product_id', cartData.productId)
-      .single();
+      .eq('product_id', cartData.productId);
+
+    existingItemQuery = cartData.variantId
+      ? existingItemQuery.eq('variant_id', cartData.variantId)
+      : existingItemQuery.is('variant_id', null);
+
+    const { data: existingItem } = await existingItemQuery.single();
 
     if (existingItem) {
       // Update existing item quantity
@@ -238,7 +264,7 @@ export class CartService {
         .from('cart_items')
         .update({ 
           quantity: newQuantity,
-          price_at_add: cartData.price || product.price // Update price in case it changed
+          price_at_add: variantPrice || product.price // Update price in case it changed
         })
         .eq('id', existingItem.id);
 
@@ -259,7 +285,9 @@ export class CartService {
           user_id: userId,
           product_id: cartData.productId,
           quantity: cartData.quantity,
-          price_at_add: cartData.price || product.price,
+          price_at_add: variantPrice || product.price,
+          variant_id: cartData.variantId || null,
+          variant_name: variantName || null,
         });
 
       if (insertError) {

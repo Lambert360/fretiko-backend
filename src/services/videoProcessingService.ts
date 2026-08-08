@@ -14,6 +14,9 @@ export interface VideoProcessingOptions {
   generateHLS?: boolean;
   generateThumbnail?: boolean;
   maxDuration?: number; // in seconds
+  thumbnailOnly?: boolean;
+  trimStart?: number; // in seconds
+  trimEnd?: number; // in seconds
 }
 
 export interface VideoProcessingResult {
@@ -103,13 +106,17 @@ export class VideoProcessingService {
         metadata
       };
 
-      // Generate thumbnail if requested
-      if (options.generateThumbnail !== false) {
-        console.log('🖼️ Generating thumbnail...');
-        const thumbnailResult = await this.generateThumbnail(options.inputPath, outputDir, videoId);
-        if (thumbnailResult.success) {
-          result.thumbnailUrl = thumbnailResult.thumbnailUrl;
+      // Thumbnail-only mode skips all video conversion; thumbnail from the original input
+      if (options.thumbnailOnly) {
+        if (options.generateThumbnail !== false) {
+          console.log('🖼️ Generating thumbnail...');
+          const thumbnailResult = await this.generateThumbnail(options.inputPath, outputDir, videoId);
+          if (thumbnailResult.success) {
+            result.thumbnailUrl = thumbnailResult.thumbnailUrl;
+          }
         }
+        console.log('✅ Thumbnail-only processing completed');
+        return result;
       }
 
       // Generate HLS if requested (production approach)
@@ -122,13 +129,23 @@ export class VideoProcessingService {
           return hlsResult; // Return HLS error as main error
         }
       } else {
-        // Fallback to single MP4 conversion
+        // Convert/trim to a single MP4 first
         console.log('🔄 Converting to MP4...');
         const conversionResult = await this.convertToH264MP4(options, outputDir, videoId);
         if (!conversionResult.success) {
           return conversionResult;
         }
         result.outputPath = conversionResult.outputPath;
+        result.metadata = conversionResult.metadata;
+      }
+
+      // Generate thumbnail from the final output (trimmed/converted video)
+      if (options.generateThumbnail !== false && result.outputPath) {
+        console.log('🖼️ Generating thumbnail...');
+        const thumbnailResult = await this.generateThumbnail(result.outputPath, outputDir, videoId);
+        if (thumbnailResult.success) {
+          result.thumbnailUrl = thumbnailResult.thumbnailUrl;
+        }
       }
 
       console.log('✅ Video processing completed successfully');
@@ -539,8 +556,15 @@ export class VideoProcessingService {
         '-y'
       ];
 
-      // Add duration limit if specified
-      if (options.maxDuration) {
+      // Add trim start/end if specified
+      if (options.trimStart !== undefined && options.trimEnd !== undefined && options.trimEnd > options.trimStart) {
+        const trimDuration = options.trimEnd - options.trimStart;
+        ffmpegCommand.splice(ffmpegCommand.indexOf('-i') + 2, 0, '-t', trimDuration.toString());
+        ffmpegCommand.splice(ffmpegCommand.indexOf('-i'), 0, '-ss', options.trimStart.toString());
+      }
+
+      // Add duration limit if specified (only if no trim is set)
+      if (options.maxDuration && options.trimStart === undefined) {
         ffmpegCommand.splice(ffmpegCommand.indexOf('-i') + 2, 0, '-t', options.maxDuration.toString());
       }
       

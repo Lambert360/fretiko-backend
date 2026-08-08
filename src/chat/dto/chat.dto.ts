@@ -489,6 +489,7 @@ export class MessageResponseDto {
   isDeleted: boolean;
   replyToId?: string;
   replyTo?: MessageResponseDto;
+  reactions?: any;
   sender: {
     id: string;
     username: string;

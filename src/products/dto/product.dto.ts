@@ -1,5 +1,21 @@
-import { IsString, IsNumber, IsOptional, IsArray, IsBoolean, IsEnum, Min, Max, IsUUID } from 'class-validator';
-import { Transform } from 'class-transformer';
+import { IsString, IsNumber, IsOptional, IsArray, IsBoolean, IsEnum, Min, Max, IsUUID, ValidateNested } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+
+export class ProductVariantDto {
+  @IsString()
+  name: string;
+
+  @IsNumber()
+  @Min(0)
+  price: number;
+
+  // Index into the uploaded variant_media files array for this variant's media
+  @IsNumber()
+  mediaIndex: number;
+
+  @IsEnum(['image', 'video'])
+  mediaType: string;
+}
 
 export class CreateProductDto {
   @IsString()
@@ -58,6 +74,16 @@ export class CreateProductDto {
   @IsArray()
   @IsString({ each: true })
   tags?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  is_multi_item?: boolean;
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ProductVariantDto)
+  variants?: ProductVariantDto[];
 }
 
 export class UpdateProductDto {
@@ -207,6 +233,15 @@ export class ProductResponseDto {
   shipping_options: any;
   tags: string[];
   status: string;
+  is_multi_item?: boolean;
+  variants?: {
+    id: string;
+    name: string;
+    price: number;
+    media_url: string;
+    media_type: string;
+    sort_order: number;
+  }[];
   is_featured: boolean;
   view_count: number;
   like_count: number;

@@ -1010,7 +1010,7 @@ export class OrdersService {
     // ✅ FETCH ORDER ITEMS WITH CATEGORIES
     const { data: orderItems } = await supabase
       .from('order_items')
-      .select('category')
+      .select('category, service_id')
       .eq('order_id', orderId);
 
     const categories = orderItems?.map(item => item.category).filter(Boolean) || ['General'];
@@ -1087,6 +1087,31 @@ export class OrdersService {
           })
           .eq('order_id', orderId);
         console.log(`✅ Service booking updated to completed`);
+
+        // Increment completed jobs count on the linked service(s)
+        const serviceIds = (orderItems || [])
+          .filter(item => item.service_id)
+          .map(item => item.service_id as string);
+
+        for (const serviceId of serviceIds) {
+          try {
+            const { data: svc } = await supabase
+              .from('services')
+              .select('booking_count')
+              .eq('id', serviceId)
+              .single();
+
+            const currentCount = Number(svc?.booking_count ?? 0);
+            await supabase
+              .from('services')
+              .update({ booking_count: currentCount + 1 })
+              .eq('id', serviceId);
+
+            console.log(`✅ Incremented booking_count for service ${serviceId}`);
+          } catch (incrementError) {
+            console.error('⚠️ Failed to increment service booking_count:', incrementError);
+          }
+        }
       } catch (bookingError) {
         console.error('Failed to update service_bookings (non-critical):', bookingError);
       }
@@ -1756,38 +1781,54 @@ export class OrdersService {
         total_amount: fullOrder.total
       };
 
-      // Send notifications based on status
+      // Send notifications based on status - each relevant party (buyer, vendor, rider)
+      // receives a role-appropriate, personalized notification.
+      const vendorId = fullOrder.seller_id;
+      const riderId = fullOrder.rider_id;
+      const orderIdentity = { id: fullOrder.id, orderNumber: fullOrder.order_number };
+
       switch (status) {
         case 'confirmed':
         case 'processing':
-          // Notify buyer that order is confirmed/being processed
+          // Notify buyer that their order is confirmed/being processed
           if (fullOrder.buyer_id) {
             await this.notificationHelper.notifyOrderCreated(fullOrder.buyer_id, orderForNotification);
+          }
+          // Notify vendor of the same status change
+          if (vendorId) {
+            await this.notificationHelper.notifyVendorOrderStatusChanged(vendorId, orderIdentity, status);
           }
           break;
 
         case 'ready_for_pickup':
-          // Notify rider that order is ready for pickup
-          if (fullOrder.rider_id) {
-            await this.notificationHelper.notifyRiderOnTheWay(fullOrder.buyer_id, {
-              id: fullOrder.rider_id,
-              name: (fullOrder.rider_profile as any)?.username || 'Your rider',
-              avatar_url: (fullOrder.rider_profile as any)?.avatar_url,
-              estimated_arrival_mins: '15-20'
-            }, orderForNotification);
+          // Notify rider that the order is ready for pickup
+          if (riderId) {
+            await this.notificationHelper.notifyRiderOrderStatusChanged(riderId, orderIdentity, status);
+          }
+          // Keep vendor informed
+          if (vendorId) {
+            await this.notificationHelper.notifyVendorOrderStatusChanged(vendorId, orderIdentity, status);
           }
           break;
 
         case 'picked_up':
         case 'out_for_delivery':
-          // Notify buyer that order is on the way
-          if (fullOrder.rider_id && fullOrder.buyer_id) {
+          // Notify buyer that their delivery is on the way
+          if (riderId && fullOrder.buyer_id) {
             await this.notificationHelper.notifyRiderOnTheWay(fullOrder.buyer_id, {
-              id: fullOrder.rider_id,
+              id: riderId,
               name: (fullOrder.rider_profile as any)?.username || 'Your rider',
               avatar_url: (fullOrder.rider_profile as any)?.avatar_url,
               estimated_arrival_mins: '10-15'
             }, orderForNotification);
+          }
+          // Notify rider of their own status update
+          if (riderId) {
+            await this.notificationHelper.notifyRiderOrderStatusChanged(riderId, orderIdentity, status);
+          }
+          // Notify vendor
+          if (vendorId) {
+            await this.notificationHelper.notifyVendorOrderStatusChanged(vendorId, orderIdentity, status);
           }
           break;
 
@@ -1801,14 +1842,18 @@ export class OrdersService {
             
             await this.notificationHelper.notifyOrderShipped(fullOrder.buyer_id, orderForNotification, trackingData);
           }
+          // Notify vendor
+          if (vendorId) {
+            await this.notificationHelper.notifyVendorOrderStatusChanged(vendorId, orderIdentity, status);
+          }
           break;
 
         case 'delivered':
           // Notify buyer and vendor that order has been delivered
-          if (fullOrder.buyer_id && fullOrder.seller_id) {
+          if (fullOrder.buyer_id && vendorId) {
             await this.notificationHelper.notifyOrderDelivered(
               fullOrder.buyer_id,
-              fullOrder.seller_id,
+              vendorId,
               {
                 id: fullOrder.id,
                 orderNumber: fullOrder.order_number,
@@ -1816,11 +1861,23 @@ export class OrdersService {
               }
             );
           }
+          // Notify rider that delivery was completed
+          if (riderId) {
+            await this.notificationHelper.notifyRiderOrderStatusChanged(riderId, orderIdentity, status);
+          }
           break;
 
         case 'cancelled':
-          // Could add cancellation notifications here
-          console.log(`Order ${orderId} was cancelled - notifications could be sent here`);
+          // Notify buyer, vendor, and rider (if assigned) that the order was cancelled
+          if (fullOrder.buyer_id) {
+            await this.notificationHelper.notifyOrderCancelled(fullOrder.buyer_id, orderIdentity);
+          }
+          if (vendorId) {
+            await this.notificationHelper.notifyVendorOrderStatusChanged(vendorId, orderIdentity, status);
+          }
+          if (riderId) {
+            await this.notificationHelper.notifyRiderOrderStatusChanged(riderId, orderIdentity, status);
+          }
           break;
 
         default:
