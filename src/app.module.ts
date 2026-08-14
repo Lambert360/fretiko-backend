@@ -42,6 +42,8 @@ import { ReportsModule } from './reports/reports.module';
 import { AuditModule } from './audit/audit.module';
 import { GiftModule } from './gifts/gift.module';
 import { LoggerModule } from './logger/logger.module';
+import { VideoProcessingModule } from './video-processing/video-processing.module';
+import { RssFeedsModule } from './rss-feeds/rss-feeds.module';
 
 @Module({
   imports: [
@@ -89,6 +91,8 @@ import { LoggerModule } from './logger/logger.module';
     ReportsModule,
     AuditModule,
     GiftModule,
+    VideoProcessingModule,
+    RssFeedsModule,
   ],
   controllers: [AppController, ExchangeRateController],
   providers: [

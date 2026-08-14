@@ -1,0 +1,214 @@
+{
+  "feeds": {
+    "science_technology": [
+      {
+        "name": "TechCrunch",
+        "url": "https://techcrunch.com/feed/",
+        "category": "Technology",
+        "active": true
+      },
+      {
+        "name": "MIT Technology Review",
+        "url": "https://www.technologyreview.com/feed/",
+        "category": "Science & Technology",
+        "active": true
+      },
+      {
+        "name": "Wired",
+        "url": "https://www.wired.com/feed/rss",
+        "category": "Technology",
+        "active": true
+      },
+      {
+        "name": "The Verge",
+        "url": "https://www.theverge.com/rss/index.xml",
+        "category": "Technology",
+        "active": true
+      },
+      {
+        "name": "ScienceDaily",
+        "url": "https://www.sciencedaily.com/rss/all.xml",
+        "category": "Science",
+        "active": true
+      }
+    ],
+    "ai": [
+      {
+        "name": "OpenAI Blog",
+        "url": "https://openai.com/blog/rss.xml",
+        "category": "AI",
+        "active": true
+      },
+      {
+        "name": "MIT News - Artificial Intelligence",
+        "url": "https://news.mit.edu/topic/mitartificial-intelligence2-rss.xml",
+        "category": "AI",
+        "active": true
+      },
+      {
+        "name": "AI News",
+        "url": "https://www.artificialintelligence-news.com/feed/",
+        "category": "AI",
+        "active": true
+      },
+      {
+        "name": "VentureBeat AI",
+        "url": "https://venturebeat.com/category/ai/feed/",
+        "category": "AI",
+        "active": true
+      }
+    ],
+    "space": [
+      {
+        "name": "NASA Breaking News",
+        "url": "https://www.nasa.gov/rss/dyn/breaking_news.rss",
+        "category": "Space",
+        "active": true
+      },
+      {
+        "name": "Space.com",
+        "url": "https://www.space.com/feeds/all",
+        "category": "Space",
+        "active": true
+      },
+      {
+        "name": "SpaceX News",
+        "url": "https://www.spacex.com/news.xml",
+        "category": "Space",
+        "active": false,
+        "note": "May not be available"
+      },
+      {
+        "name": "Universe Today",
+        "url": "https://www.universetoday.com/feed/",
+        "category": "Space",
+        "active": true
+      }
+    ],
+    "gadgets": [
+      {
+        "name": "Engadget",
+        "url": "https://www.engadget.com/rss.xml",
+        "category": "Gadgets",
+        "active": true
+      },
+      {
+        "name": "Gizmodo",
+        "url": "https://gizmodo.com/rss",
+        "category": "Gadgets",
+        "active": true
+      },
+      {
+        "name": "CNET",
+        "url": "https://www.cnet.com/rss/news/",
+        "category": "Gadgets",
+        "active": true
+      },
+      {
+        "name": "Android Authority",
+        "url": "https://www.androidauthority.com/feed/",
+        "category": "Gadgets",
+        "active": true
+      }
+    ],
+    "fashion_lifestyle": [
+      {
+        "name": "Vogue",
+        "url": "https://www.vogue.com/feed/rss",
+        "category": "Fashion",
+        "active": true
+      },
+      {
+        "name": "Fashionista",
+        "url": "https://fashionista.com/feed",
+        "category": "Fashion",
+        "active": true
+      },
+      {
+        "name": "Refinery29 Fashion",
+        "url": "https://www.refinery29.com/fashion/rss.xml",
+        "category": "Fashion",
+        "active": true
+      },
+      {
+        "name": "Who What Wear",
+        "url": "https://www.whowhatwear.com/rss",
+        "category": "Fashion",
+        "active": true
+      },
+      {
+        "name": "Apartment Therapy",
+        "url": "https://www.apartmenttherapy.com/main.rss",
+        "category": "Lifestyle",
+        "active": true
+      }
+    ],
+    "nature": [
+      {
+        "name": "National Geographic",
+        "url": "https://www.nationalgeographic.com/pages/topic/latest-stories/_jcr_content.feed",
+        "category": "Nature",
+        "active": true
+      },
+      {
+        "name": "Nature.com News",
+        "url": "https://www.nature.com/nature.rss",
+        "category": "Nature",
+        "active": true
+      },
+      {
+        "name": "Earth.com",
+        "url": "https://www.earth.com/news/feed/",
+        "category": "Nature",
+        "active": true
+      },
+      {
+        "name": "BBC Earth",
+        "url": "http://feeds.bbci.co.uk/earth/rss.xml",
+        "category": "Nature",
+        "active": true
+      }
+    ],
+    "animals": [
+      {
+        "name": "National Geographic Animals",
+        "url": "https://www.nationalgeographic.com/animals/rss",
+        "category": "Animals",
+        "active": true
+      },
+      {
+        "name": "Animal Wellness Magazine",
+        "url": "https://animalwellnessmagazine.com/feed/",
+        "category": "Animals",
+        "active": true
+      },
+      {
+        "name": "ZooBorns",
+        "url": "https://www.zooborns.com/zooborns/atom.xml",
+        "category": "Animals",
+        "active": true
+      },
+      {
+        "name": "The Dodo",
+        "url": "https://www.thedodo.com/feed",
+        "category": "Animals",
+        "active": true
+      }
+    ]
+  },
+  "settings": {
+    "fetch_interval_minutes": 60,
+    "max_items_per_fetch": 5,
+    "post_interval_minutes": 30,
+    "enable_auto_posting": true,
+    "categories_enabled": [
+      "science_technology",
+      "ai",
+      "space",
+      "gadgets",
+      "fashion_lifestyle",
+      "nature",
+      "animals"
+    ]
+  }
+}
