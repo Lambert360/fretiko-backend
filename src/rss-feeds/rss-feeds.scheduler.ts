@@ -1,7 +1,8 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { RssFeedsService } from './rss-feeds.service';
-import { SupabaseService } from '../shared/supabase.service';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 
 @Injectable()
 export class RssFeedsScheduler implements OnModuleInit {
@@ -10,11 +11,14 @@ export class RssFeedsScheduler implements OnModuleInit {
   private isProcessing = false;
   private postQueue: any[] = [];
   private lastPostTime: Date = new Date(0);
+  private supabaseClient: any;
 
   constructor(
     private readonly rssFeedsService: RssFeedsService,
-    private readonly supabaseService: SupabaseService,
-  ) {}
+    private readonly configService: ConfigService,
+  ) {
+    this.supabaseClient = createServiceSupabaseClient(this.configService);
+  }
 
   async onModuleInit() {
     await this.initializeBotUser();
@@ -23,7 +27,7 @@ export class RssFeedsScheduler implements OnModuleInit {
 
   private async initializeBotUser(): Promise<void> {
     try {
-      const { data: botUser, error } = await this.supabaseService.client
+      const { data: botUser, error } = await this.supabaseClient
         .from('users')
         .select('id')
         .eq('email', 'rss-bot@fretiko.com')
@@ -31,7 +35,7 @@ export class RssFeedsScheduler implements OnModuleInit {
 
       if (error || !botUser) {
         this.logger.log('Creating RSS bot user...');
-        const { data: newBot, error: createError } = await this.supabaseService.client
+        const { data: newBot, error: createError } = await this.supabaseClient
           .from('users')
           .insert({
             email: 'rss-bot@fretiko.com',

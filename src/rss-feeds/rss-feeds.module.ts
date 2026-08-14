@@ -1,11 +1,11 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { RssFeedsService } from './rss-feeds.service';
 import { RssFeedsScheduler } from './rss-feeds.scheduler';
 import { RssFeedsController } from './rss-feeds.controller';
-import { SharedModule } from '../shared/shared.module';
 
 @Module({
-  imports: [SharedModule],
+  imports: [ConfigModule],
   controllers: [RssFeedsController],
   providers: [RssFeedsService, RssFeedsScheduler],
   exports: [RssFeedsService, RssFeedsScheduler],
