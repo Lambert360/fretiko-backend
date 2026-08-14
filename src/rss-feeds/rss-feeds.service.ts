@@ -1,10 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import Parser from 'rss-parser';
 import * as fs from 'fs';
 import * as path from 'path';
-import { SupabaseService } from '../shared/supabase.service';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 
-interface RssFeed {
+export interface RssFeed {
   name: string;
   url: string;
   category: string;
@@ -12,7 +13,7 @@ interface RssFeed {
   note?: string;
 }
 
-interface RssConfig {
+export interface RssConfig {
   feeds: Record<string, RssFeed[]>;
   settings: {
     fetch_interval_minutes: number;
@@ -23,7 +24,7 @@ interface RssConfig {
   };
 }
 
-interface ParsedFeedItem {
+export interface ParsedFeedItem {
   title: string;
   content: string;
   link: string;
@@ -41,8 +42,10 @@ export class RssFeedsService {
   private config: RssConfig;
   private configPath: string;
   private processedItems: Set<string> = new Set();
+  private supabaseClient: any;
 
-  constructor(private readonly supabaseService: SupabaseService) {
+  constructor(private readonly configService: ConfigService) {
+    this.supabaseClient = createServiceSupabaseClient(this.configService);
     this.parser = new Parser({
       customFields: {
         item: [
@@ -182,7 +185,7 @@ export class RssFeedsService {
     return newItems;
   }
 
-  async markItemAsProcessed(item: ParsedFeedItem): void {
+  async markItemAsProcessed(item: ParsedFeedItem): Promise<void> {
     const itemId = `${item.link}-${item.title}`;
     this.processedItems.add(itemId);
     
@@ -193,7 +196,7 @@ export class RssFeedsService {
 
   async createPostFromRssItem(item: ParsedFeedItem, botUserId: string): Promise<any> {
     try {
-      const { data: post, error } = await this.supabaseService.client
+      const { data: post, error } = await this.supabaseClient
         .from('posts')
         .insert({
           user_id: botUserId,
