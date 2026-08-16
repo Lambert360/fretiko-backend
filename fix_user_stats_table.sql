@@ -90,27 +90,27 @@ BEGIN
         INSERT INTO public.user_stats (id, plugs_count, clients_count, connection_requests_count)
         SELECT
             u.id,
+            -- Plugs: people I plugged into (I am requester)
             COALESCE(plugs.count, 0) as plugs_count,
+            -- Clients: people plugged into me (I am addressee)
             COALESCE(clients.count, 0) as clients_count,
             COALESCE(connection_requests.count, 0) as connection_requests_count
         FROM public.user_profiles u
         LEFT JOIN (
             SELECT
-                user_id,
+                requester_id as user_id,
                 COUNT(*) as count
-            FROM (
-                SELECT requester_id as user_id FROM public.user_connections WHERE status = 'accepted'
-                UNION ALL
-                SELECT addressee_id as user_id FROM public.user_connections WHERE status = 'accepted'
-            ) accepted_connections
-            GROUP BY user_id
+            FROM public.user_connections
+            WHERE status = 'accepted'
+            GROUP BY requester_id
         ) plugs ON plugs.user_id = u.id
         LEFT JOIN (
             SELECT
-                provider_id as user_id,
-                COUNT(DISTINCT client_id) as count
-            FROM public.client_relationships
-            GROUP BY provider_id
+                addressee_id as user_id,
+                COUNT(*) as count
+            FROM public.user_connections
+            WHERE status = 'accepted'
+            GROUP BY addressee_id
         ) clients ON clients.user_id = u.id
         LEFT JOIN (
             SELECT
@@ -131,27 +131,27 @@ BEGIN
         INSERT INTO public.user_stats (id, plugs_count, clients_count, connection_requests_count)
         SELECT
             u.id,
+            -- Plugs: people I plugged into (I am requester)
             COALESCE(plugs.count, 0) as plugs_count,
+            -- Clients: people plugged into me (I am addressee)
             COALESCE(clients.count, 0) as clients_count,
             COALESCE(connection_requests.count, 0) as connection_requests_count
         FROM public.user_profiles u
         LEFT JOIN (
             SELECT
-                user_id,
+                requester_id as user_id,
                 COUNT(*) as count
-            FROM (
-                SELECT requester_id as user_id FROM public.user_connections WHERE status = 'accepted'
-                UNION ALL
-                SELECT addressee_id as user_id FROM public.user_connections WHERE status = 'accepted'
-            ) accepted_connections
-            GROUP BY user_id
+            FROM public.user_connections
+            WHERE status = 'accepted'
+            GROUP BY requester_id
         ) plugs ON plugs.user_id = u.id
         LEFT JOIN (
             SELECT
-                provider_id as user_id,
-                COUNT(DISTINCT client_id) as count
-            FROM public.client_relationships
-            GROUP BY provider_id
+                addressee_id as user_id,
+                COUNT(*) as count
+            FROM public.user_connections
+            WHERE status = 'accepted'
+            GROUP BY addressee_id
         ) clients ON clients.user_id = u.id
         LEFT JOIN (
             SELECT

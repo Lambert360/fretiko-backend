@@ -418,37 +418,57 @@ export class ConnectionsService {
     const connectedClientIds = new Set(connections.map(c => c.requester_id));
     const unconnectedBusinessClients: any[] = [];
 
-    if (businessRelations) {
-      for (const rel of businessRelations) {
-        if (!connectedClientIds.has(rel.client_id)) {
-          // This person bought from us but is not connected
-          // Fetch their profile
-          const { data: clientProfile } = await this.serviceSupabase
-            .from('user_profiles')
-            .select('id, username, bio, avatar_url, is_seller, is_rider')
-            .eq('id', rel.client_id)
-            .single();
+    if (businessRelations && businessRelations.length > 0) {
+      // Filter to relations where the client is not already socially connected
+      const unconnectedRelations = businessRelations.filter(rel => !connectedClientIds.has(rel.client_id));
 
-          if (clientProfile) {
-            unconnectedBusinessClients.push({
-              id: rel.id,
-              providerId: rel.provider_id,
-              clientId: rel.client_id,
-              relationshipType: rel.relationship_type,
-              totalOrders: rel.total_orders,
-              totalSpent: rel.total_spent,
-              lastInteraction: rel.last_interaction,
-              createdAt: rel.created_at,
-              client: {
-                id: clientProfile.id,
-                username: clientProfile.username,
-                bio: clientProfile.bio,
-                avatarUrl: clientProfile.avatar_url,
-                isSeller: clientProfile.is_seller,
-                isRider: clientProfile.is_rider,
-              },
-            });
+      if (unconnectedRelations.length > 0) {
+        // Batch-load all needed user profiles in a single query to avoid N+1
+        const clientIds = unconnectedRelations.map(rel => rel.client_id);
+
+        const { data: clientProfiles, error: profilesError } = await this.serviceSupabase
+          .from('user_profiles')
+          .select('id, username, bio, avatar_url, is_seller, is_rider')
+          .in('id', clientIds);
+
+        if (profilesError) {
+          // Preserve previous behavior: don't fail the whole call if profiles can't be loaded
+          console.error('Error fetching client profiles for business relationships:', profilesError);
+        }
+
+        const profileMap = new Map<string, any>();
+        if (clientProfiles) {
+          clientProfiles.forEach(profile => {
+            profileMap.set(profile.id, profile);
+          });
+        }
+
+        // Build unconnected business clients list using the loaded profiles
+        for (const rel of unconnectedRelations) {
+          const clientProfile = profileMap.get(rel.client_id);
+          if (!clientProfile) {
+            // If a specific profile is missing, just skip it as before
+            continue;
           }
+
+          unconnectedBusinessClients.push({
+            id: rel.id,
+            providerId: rel.provider_id,
+            clientId: rel.client_id,
+            relationshipType: rel.relationship_type,
+            totalOrders: rel.total_orders,
+            totalSpent: rel.total_spent,
+            lastInteraction: rel.last_interaction,
+            createdAt: rel.created_at,
+            client: {
+              id: clientProfile.id,
+              username: clientProfile.username,
+              bio: clientProfile.bio,
+              avatarUrl: clientProfile.avatar_url,
+              isSeller: clientProfile.is_seller,
+              isRider: clientProfile.is_rider,
+            },
+          });
         }
       }
     }

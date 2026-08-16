@@ -1,7 +1,9 @@
 import { Controller, Post, Get, Body, Param, UseGuards, Request } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { VideoProcessingService } from '../services/videoProcessingService';
 import { BackgroundVideoProcessor } from '../services/backgroundVideoProcessor';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 
 @Controller('api/video-processing')
 @UseGuards(JwtAuthGuard)
@@ -9,6 +11,7 @@ export class VideoProcessingController {
   constructor(
     private readonly videoProcessingService: VideoProcessingService,
     private readonly backgroundVideoProcessor: BackgroundVideoProcessor,
+    private readonly configService: ConfigService,
   ) {}
 
   // Process single video for compatibility
@@ -165,6 +168,53 @@ export class VideoProcessingController {
         success: false,
         error: 'Failed to get user jobs'
       };
+    }
+  }
+
+  // Get processing status for a specific entity (service/product/post_media)
+  @Get('entity-status/:entityType/:entityId')
+  async getEntityStatus(
+    @Param('entityType') entityType: string,
+    @Param('entityId') entityId: string,
+    @Request() req,
+  ) {
+    try {
+      const supabase = createServiceSupabaseClient(this.configService);
+
+      if (entityType === 'service') {
+        const { data, error } = await supabase
+          .from('services')
+          .select('videos, processed_videos, video_processing_status')
+          .eq('id', entityId)
+          .single();
+        if (error) throw error;
+        return { success: true, data };
+      }
+
+      if (entityType === 'product') {
+        const { data, error } = await supabase
+          .from('products')
+          .select('videos, processed_videos, video_processing_status')
+          .eq('id', entityId)
+          .single();
+        if (error) throw error;
+        return { success: true, data };
+      }
+
+      if (entityType === 'post_media') {
+        const { data, error } = await supabase
+          .from('post_media')
+          .select('media_url, processed_url, processing_status')
+          .eq('id', entityId)
+          .single();
+        if (error) throw error;
+        return { success: true, data };
+      }
+
+      return { success: false, error: 'Invalid entity type' };
+    } catch (error) {
+      console.error('Get entity status error:', error);
+      return { success: false, error: 'Failed to get entity processing status' };
     }
   }
 

@@ -1,8 +1,12 @@
-import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
-import { CreateProductDto, UpdateProductDto, ProductQueryDto, ProductResponseDto, ProductCategoryDto } from './dto/product.dto';
+import { CreateProductDto, UpdateProductDto, ProductQueryDto, ProductResponseDto, ProductCategoryDto, RankedProductsQueryDto, RecordProductEventDto } from './dto/product.dto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { VideoProcessingHelper } from '../shared/video-processing.helper';
+import { TagsService } from '../tags/tags.service';
+import { MentionsService } from '../mentions/mentions.service';
+import { EmbeddingService } from '../ai/core/embedding.service';
 import ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -12,10 +16,14 @@ import * as os from 'os';
 export class ProductsService {
   private supabase;
   private serviceSupabase;
+  private readonly logger = new Logger(ProductsService.name);
 
   constructor(
     private configService: ConfigService,
     private supabaseClientManager: SupabaseClientManager,
+    private tagsService: TagsService,
+    private mentionsService: MentionsService,
+    private embeddingService: EmbeddingService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
@@ -91,6 +99,7 @@ export class ProductsService {
       shipping_options: createProductDto.shipping_options || { pickup: false, delivery: false, shipping: false },
       tags: createProductDto.tags || [],
       status: 'active',
+      is_multi_item: createProductDto.is_multi_item || false,
     };
 
     // Use serviceSupabase for product insert - user tokens can't be used for DB operations
@@ -105,6 +114,26 @@ export class ProductsService {
       throw new Error(`Failed to create product: ${error.message}`);
     }
 
+    // Sync tags and mentions based on description
+    const descriptionForSync = createProductDto.description || '';
+
+    try {
+      await this.tagsService.syncTaggings(data.id, 'product', descriptionForSync);
+    } catch (e) {
+      console.error('Failed to sync tags for product', data.id, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, data.id, 'product', descriptionForSync);
+    } catch (e) {
+      console.error('Failed to create mentions for product', data.id, e);
+    }
+
+    // Generate embedding for vector search (fire-and-forget, non-blocking)
+    this.generateAndSaveEmbedding(data.id, data).catch(err => {
+      this.logger.warn(`Failed to generate embedding for product ${data.id}: ${err.message}`);
+    });
+
     return this.mapToProductResponse(data);
   }
 
@@ -116,7 +145,8 @@ export class ProductsService {
         user_profiles!products_user_id_fkey (
           username,
           avatar_url,
-          is_verified
+          is_verified,
+          display_name
         )
       `)
       .eq('status', 'active')
@@ -169,6 +199,465 @@ export class ProductsService {
     return (data || []).map(this.mapToProductResponse);
   }
 
+  async getTrendingProducts(limit: number = 10): Promise<ProductResponseDto[]> {
+    // Use serviceSupabase to bypass RLS limitations for analytics view
+    const { data: trendingData, error: trendingError } = await this.serviceSupabase
+      .from('trending_products')
+      .select('product_id, trending_score')
+      .order('trending_score', { ascending: false })
+      .limit(limit);
+
+    if (trendingError) {
+      console.error('Error fetching trending products:', trendingError);
+      // Fallback: return newest products if trending view fails
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    if (!trendingData || trendingData.length === 0) {
+      // No trending data yet – fallback to newest products
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    const productIds: string[] = trendingData.map((row: any) => row.product_id).filter(Boolean);
+
+    if (productIds.length === 0) {
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    // Fetch full product records with vendor profile info
+    const { data, error } = await this.serviceSupabase
+      .from('products')
+      .select(`
+        *,
+        user_profiles!products_user_id_fkey (
+          username,
+          avatar_url,
+          is_verified,
+          display_name
+        )
+      `)
+      .in('id', productIds)
+      .eq('status', 'active')
+      .is('deleted_at', null);
+
+    if (error) {
+      console.error('Error fetching products for trending list:', error);
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    const mapped = (data || []).map((product: any) => this.mapToProductResponse(product));
+
+    // Preserve order based on trending_score
+    const scoreById = new Map<string, number>();
+    for (const row of trendingData) {
+      if (row.product_id) {
+        scoreById.set(row.product_id, row.trending_score || 0);
+      }
+    }
+
+    return mapped
+      .filter(p => scoreById.has(p.id))
+      .sort((a, b) => (scoreById.get(b.id)! - scoreById.get(a.id)!));
+  }
+
+  // ================================
+  // RANKED PRODUCT FEED (v1 ranking algorithm)
+  // ================================
+
+  /**
+   * Location-aware, engagement/trust-weighted ranked product feed for the
+   * HomeScreen product tab. Same-state sellers are heavily preferred, then
+   * same-country, then everyone else — but within each tier, ranking is
+   * driven by engagement, trust, recency, and business signals so the
+   * "best in category" naturally floats to the top.
+   */
+  async getRankedProducts(userId: string | null, query: RankedProductsQueryDto): Promise<ProductResponseDto[]> {
+    const limit = query.limit || 20;
+    const offset = query.offset || 0;
+    const candidatePoolSize = Math.max(200, (offset + limit) * 3);
+
+    const userLocation = await this.getUserLocationForRanking(userId);
+
+    let queryBuilder = this.serviceSupabase
+      .from('products')
+      .select(`
+        *,
+        user_profiles!products_user_id_fkey (
+          id,
+          username,
+          avatar_url,
+          is_verified,
+          display_name,
+          location
+        ),
+        product_variants (
+          id,
+          name,
+          price,
+          media_url,
+          media_type,
+          sort_order
+        )
+      `)
+      .eq('status', 'active')
+      .gt('quantity', 0)
+      .is('deleted_at', null);
+
+    if (query.category_id) {
+      queryBuilder = queryBuilder.eq('category_id', query.category_id);
+    }
+    if (query.search) {
+      queryBuilder = queryBuilder.textSearch('search_vector', query.search);
+    }
+    if (query.price_min !== undefined) {
+      queryBuilder = queryBuilder.gte('price', query.price_min);
+    }
+    if (query.price_max !== undefined) {
+      queryBuilder = queryBuilder.lte('price', query.price_max);
+    }
+    if (query.condition) {
+      queryBuilder = queryBuilder.eq('condition', query.condition);
+    }
+
+    const { data: candidates, error } = await queryBuilder
+      .order('created_at', { ascending: false })
+      .limit(candidatePoolSize);
+
+    if (error) {
+      throw new Error(`Database error: ${error.message}`);
+    }
+
+    if (!candidates || candidates.length === 0) {
+      return [];
+    }
+
+    const sellerIds: string[] = [...new Set<string>(candidates.map((p: any) => p.user_id).filter(Boolean))];
+    const productIds: string[] = candidates.map((p: any) => p.id);
+    const categoryIds: string[] = [...new Set<string>(candidates.map((p: any) => p.category_id).filter(Boolean))];
+
+    const [sellerStatsMap, trendingMap, categoryAvgPriceMap] = await Promise.all([
+      this.getSellerStatsMap(sellerIds),
+      this.getTrendingScoreMap(productIds),
+      this.getCategoryAveragePriceMap(categoryIds),
+    ]);
+
+    const now = Date.now();
+
+    let scored = candidates.map((product: any) => {
+      const sellerStats = sellerStatsMap.get(product.user_id);
+      const trendingScore = trendingMap.get(product.id) || 0;
+      const categoryAvgPrice = categoryAvgPriceMap.get(product.category_id);
+
+      const baseScore = this.computeProductBaseScore(product, sellerStats, trendingScore, categoryAvgPrice, now);
+      const productLocation = this.parseProductLocationText(product.location) || {
+        state: product.user_profiles?.location?.state,
+        country: product.user_profiles?.location?.country,
+        city: product.user_profiles?.location?.city,
+      };
+      const locationBonus = this.computeLocationBonus(productLocation, userLocation);
+
+      return {
+        product,
+        score: baseScore + locationBonus,
+      };
+    });
+
+    // Soft-downrank products the user has already seen recently/repeatedly
+    scored = await this.applyProductSeenPenalty(userId, scored);
+
+    // Small randomized jitter so near-equal-score items reorder slightly on refresh
+    scored = scored.map((entry) => ({
+      ...entry,
+      score: entry.score * (0.96 + Math.random() * 0.08),
+    }));
+
+    scored.sort((a, b) => b.score - a.score);
+
+    // Seller-diversity re-rank: avoid the same seller appearing back-to-back
+    const diversified = this.applySellerDiversity(scored);
+
+    const page = diversified.slice(offset, offset + limit).map((entry) => entry.product);
+
+    // Fire-and-forget: record impressions for ranking feedback loop
+    if (page.length > 0) {
+      this.recordProductImpressions(userId, page.map((p: any) => p.id)).catch((e) =>
+        this.logger.warn(`Failed to record product impressions: ${e.message}`),
+      );
+    }
+
+    return page.map((product: any) => this.mapToProductResponse(product));
+  }
+
+  /**
+   * Record a single product engagement event (impression, click, cart_add, etc.)
+   * for use in ranking's seen-penalty and engagement counters.
+   */
+  async recordProductEvent(userId: string | null, dto: RecordProductEventDto): Promise<{ success: boolean }> {
+    const { error } = await this.serviceSupabase.from('product_events').insert({
+      user_id: userId || null,
+      product_id: dto.productId,
+      event_type: dto.eventType,
+      source: dto.source || null,
+    });
+
+    if (error) {
+      this.logger.warn(`Failed to record product event: ${error.message}`);
+      return { success: false };
+    }
+    return { success: true };
+  }
+
+  // Fetch the user's location for ranking: default delivery address first,
+  // falling back to their profile location.
+  private async getUserLocationForRanking(userId: string | null): Promise<{ state?: string; country?: string; city?: string }> {
+    if (!userId) return {};
+
+    const { data: address } = await this.serviceSupabase
+      .from('delivery_addresses')
+      .select('state, country, city')
+      .eq('user_id', userId)
+      .eq('is_default', true)
+      .single();
+
+    if (address && (address.state || address.country)) {
+      return { state: address.state, country: address.country, city: address.city };
+    }
+
+    const { data: profile } = await this.serviceSupabase
+      .from('user_profiles')
+      .select('location')
+      .eq('id', userId)
+      .single();
+
+    return {
+      state: profile?.location?.state,
+      country: profile?.location?.country,
+      city: profile?.location?.city,
+    };
+  }
+
+  // Parse a free-text "City, State, Country" style product.location field
+  private parseProductLocationText(location?: string | null): { state?: string; country?: string; city?: string } | null {
+    if (!location || typeof location !== 'string') return null;
+    const parts = location.split(',').map((p) => p.trim()).filter(Boolean);
+    if (parts.length === 0) return null;
+    if (parts.length >= 3) {
+      return { city: parts[0], state: parts[1], country: parts[parts.length - 1] };
+    }
+    if (parts.length === 2) {
+      return { state: parts[0], country: parts[1] };
+    }
+    return { state: parts[0] };
+  }
+
+  // Location bonus dominates the ranking so same-state sellers are always
+  // preferred, while ordering within a tier still follows the base score.
+  private computeLocationBonus(
+    productLocation: { state?: string; country?: string; city?: string },
+    userLocation: { state?: string; country?: string; city?: string },
+  ): number {
+    const norm = (v?: string) => (v || '').trim().toLowerCase();
+    const pState = norm(productLocation.state);
+    const pCountry = norm(productLocation.country);
+    const pCity = norm(productLocation.city);
+    const uState = norm(userLocation.state);
+    const uCountry = norm(userLocation.country);
+    const uCity = norm(userLocation.city);
+
+    let bonus = 0;
+    if (pState && uState && pState === uState) {
+      bonus += 500;
+      if (pCity && uCity && pCity === uCity) {
+        bonus += 50;
+      }
+    } else if (pCountry && uCountry && pCountry === uCountry) {
+      bonus += 100;
+    }
+    return bonus;
+  }
+
+  // Core v1 scoring: engagement + trust + recency + value + business rules.
+  // Kept in the 0-150 range so the location bonus above can dominate ordering
+  // across location tiers while still ranking "best in category" within a tier.
+  private computeProductBaseScore(
+    product: any,
+    sellerStats: any | undefined,
+    trendingScore: number,
+    categoryAvgPrice: number | undefined,
+    now: number,
+  ): number {
+    // Engagement (log-dampened so high-volume listings don't dominate forever)
+    const engagement =
+      Math.log1p(product.view_count || 0) * 1.0 +
+      Math.log1p(product.like_count || 0) * 2.0 +
+      Math.log1p(product.click_count || 0) * 1.5 +
+      Math.log1p(product.cart_add_count || 0) * 3.0 +
+      Math.log1p(product.sold_count || 0) * 4.0 +
+      Math.log1p(product.save_count || 0) * 1.5;
+
+    // Trust: product rating + seller track record
+    const productRatingScore = (product.average_rating || 0) * Math.log1p(product.review_count || 0) * 2;
+    const sellerRatingScore = (sellerStats?.avg_seller_rating || 0) * Math.log1p(sellerStats?.rating_count || 0);
+    const refundPenalty = (sellerStats?.refund_rate || 0) * 40;
+    const disputePenalty = (sellerStats?.dispute_rate || 0) * 50;
+    const verifiedBonus = product.user_profiles?.is_verified ? 8 : 0;
+    const trust = productRatingScore + sellerRatingScore - refundPenalty - disputePenalty + verifiedBonus;
+
+    // Recency: decay over ~14 days half-life; recent sales also add freshness signal
+    const createdAgeDays = (now - new Date(product.created_at).getTime()) / (1000 * 60 * 60 * 24);
+    const recency = 20 * Math.exp(-createdAgeDays / 14);
+    const lastSoldAgeDays = product.last_sold_at
+      ? (now - new Date(product.last_sold_at).getTime()) / (1000 * 60 * 60 * 24)
+      : null;
+    const salesFreshness = lastSoldAgeDays !== null ? 10 * Math.exp(-lastSoldAgeDays / 7) : 0;
+
+    // Value: mild bonus for being priced below the category average
+    let value = 0;
+    if (categoryAvgPrice && categoryAvgPrice > 0 && product.price) {
+      const ratio = product.price / categoryAvgPrice;
+      if (ratio < 1) value = Math.min(10, (1 - ratio) * 10);
+    }
+
+    // Business rules: featured listings + cold-start boost for brand-new items
+    const featured = product.is_featured ? 15 : 0;
+    const totalEngagementSignals =
+      (product.view_count || 0) + (product.like_count || 0) + (product.click_count || 0) + (product.sold_count || 0);
+    const coldStart = createdAgeDays < 3 && totalEngagementSignals < 5 ? 10 : 0;
+
+    const trending = Math.min(trendingScore, 30);
+
+    return engagement + trust + recency + salesFreshness + value + featured + coldStart + trending;
+  }
+
+  private async getSellerStatsMap(sellerIds: string[]): Promise<Map<string, any>> {
+    const map = new Map<string, any>();
+    if (sellerIds.length === 0) return map;
+
+    const { data, error } = await this.serviceSupabase
+      .from('seller_stats')
+      .select('user_id, avg_seller_rating, rating_count, refund_rate, dispute_rate, completed_orders')
+      .in('user_id', sellerIds);
+
+    if (error || !data) return map;
+    data.forEach((row: any) => map.set(row.user_id, row));
+    return map;
+  }
+
+  private async getTrendingScoreMap(productIds: string[]): Promise<Map<string, number>> {
+    const map = new Map<string, number>();
+    if (productIds.length === 0) return map;
+
+    const { data, error } = await this.serviceSupabase
+      .from('trending_products')
+      .select('product_id, trending_score')
+      .in('product_id', productIds);
+
+    if (error || !data) return map;
+    data.forEach((row: any) => {
+      if (row.product_id) map.set(row.product_id, row.trending_score || 0);
+    });
+    return map;
+  }
+
+  private async getCategoryAveragePriceMap(categoryIds: string[]): Promise<Map<string, number>> {
+    const map = new Map<string, number>();
+    if (categoryIds.length === 0) return map;
+
+    const { data, error } = await this.serviceSupabase
+      .from('products')
+      .select('category_id, price')
+      .in('category_id', categoryIds)
+      .eq('status', 'active')
+      .is('deleted_at', null);
+
+    if (error || !data) return map;
+
+    const sums = new Map<string, { total: number; count: number }>();
+    data.forEach((row: any) => {
+      const entry = sums.get(row.category_id) || { total: 0, count: 0 };
+      entry.total += parseFloat(row.price) || 0;
+      entry.count += 1;
+      sums.set(row.category_id, entry);
+    });
+    sums.forEach((v, k) => map.set(k, v.count > 0 ? v.total / v.count : 0));
+    return map;
+  }
+
+  // Downrank products the user has already seen recently/repeatedly, mirroring
+  // the seen-penalty approach used in the unified posts/services feed.
+  private async applyProductSeenPenalty(
+    userId: string | null,
+    scored: { product: any; score: number }[],
+  ): Promise<{ product: any; score: number }[]> {
+    if (!userId || scored.length === 0) return scored;
+
+    const productIds = scored.map((s) => s.product.id);
+    const { data: events, error } = await this.serviceSupabase
+      .from('product_events')
+      .select('product_id, created_at')
+      .eq('user_id', userId)
+      .eq('event_type', 'impression')
+      .in('product_id', productIds);
+
+    if (error || !events || events.length === 0) return scored;
+
+    const seenMap = new Map<string, { count: number; lastSeenAt: number }>();
+    events.forEach((row: any) => {
+      const existing = seenMap.get(row.product_id);
+      const seenAt = new Date(row.created_at).getTime();
+      if (existing) {
+        existing.count += 1;
+        existing.lastSeenAt = Math.max(existing.lastSeenAt, seenAt);
+      } else {
+        seenMap.set(row.product_id, { count: 1, lastSeenAt: seenAt });
+      }
+    });
+
+    const now = Date.now();
+    return scored.map((entry) => {
+      const seen = seenMap.get(entry.product.id);
+      if (!seen) return entry;
+
+      const hoursSinceSeen = (now - seen.lastSeenAt) / (1000 * 60 * 60);
+      const recoveryFactor = Math.min(1, hoursSinceSeen / 48);
+      const repeatPenalty = Math.min(0.7, seen.count * 0.15);
+      const penalty = repeatPenalty * (1 - recoveryFactor);
+
+      return { ...entry, score: entry.score * (1 - penalty) };
+    });
+  }
+
+  // Prevent the same seller from appearing back-to-back in the final feed
+  private applySellerDiversity(scored: { product: any; score: number }[]): { product: any; score: number }[] {
+    const result: { product: any; score: number }[] = [];
+    const remaining = [...scored];
+
+    while (remaining.length > 0) {
+      const lastSellerId = result.length > 0 ? result[result.length - 1].product.user_id : null;
+      let pickIndex = remaining.findIndex((entry) => entry.product.user_id !== lastSellerId);
+      if (pickIndex === -1) pickIndex = 0;
+
+      result.push(remaining[pickIndex]);
+      remaining.splice(pickIndex, 1);
+    }
+
+    return result;
+  }
+
+  // Fire-and-forget batch insert of impression events for ranking feedback
+  private async recordProductImpressions(userId: string | null, productIds: string[]): Promise<void> {
+    if (productIds.length === 0) return;
+
+    const rows = productIds.map((productId) => ({
+      user_id: userId || null,
+      product_id: productId,
+      event_type: 'impression',
+      source: 'home_feed',
+    }));
+
+    await this.serviceSupabase.from('product_events').insert(rows);
+  }
+
   async getProduct(id: string): Promise<ProductResponseDto> {
     try {
       const { data, error } = await this.serviceSupabase
@@ -177,7 +666,16 @@ export class ProductsService {
           *,
           user_profiles!products_user_id_fkey (
             username,
-            avatar_url
+            avatar_url,
+            display_name
+          ),
+          product_variants (
+            id,
+            name,
+            price,
+            media_url,
+            media_type,
+            sort_order
           )
         `)
         .eq('id', id)
@@ -259,6 +757,29 @@ export class ProductsService {
       throw new Error(`Failed to update product: ${error.message}`);
     }
 
+    const descriptionForSync = updateProductDto.description !== undefined
+      ? updateProductDto.description
+      : data.description;
+
+    try {
+      await this.tagsService.syncTaggings(id, 'product', descriptionForSync || '');
+    } catch (e) {
+      console.error('Failed to sync tags for updated product', id, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, id, 'product', descriptionForSync || '');
+    } catch (e) {
+      console.error('Failed to create mentions for updated product', id, e);
+    }
+
+    // Regenerate embedding if searchable fields changed (fire-and-forget)
+    if (updateProductDto.name !== undefined || updateProductDto.description !== undefined || updateProductDto.tags !== undefined || updateProductDto.price !== undefined) {
+      this.generateAndSaveEmbedding(id, data).catch(err => {
+        this.logger.warn(`Failed to regenerate embedding for product ${id}: ${err.message}`);
+      });
+    }
+
     return this.mapToProductResponse(data);
   }
 
@@ -287,6 +808,115 @@ export class ProductsService {
     if (error) {
       throw new Error(`Failed to delete product: ${error.message}`);
     }
+  }
+
+  async getSeasonalProducts(limit: number = 12, region?: string): Promise<ProductResponseDto[]> {
+    // Basic seasonal implementation based on current date and product tags/categories.
+    // This keeps logic in code while still auto-selecting appropriate products.
+    const now = new Date();
+    const month = now.getUTCMonth() + 1; // 1-12
+    const day = now.getUTCDate();
+
+    // Determine a simple season / event label for filtering
+    const activeLabels: string[] = [];
+
+    // Global fixed seasons
+    if (month >= 3 && month <= 5) activeLabels.push('spring');
+    if (month >= 6 && month <= 8) activeLabels.push('summer');
+    if (month >= 9 && month <= 11) activeLabels.push('autumn', 'fall');
+    if (month === 12 || month <= 2) activeLabels.push('winter');
+
+    // Major global holidays
+    if (month === 2 && day >= 7 && day <= 16) activeLabels.push('valentine', 'valentines');
+    if (month === 12 && day >= 1 && day <= 26) activeLabels.push('christmas', 'holiday');
+    if (month === 11 && day >= 20 && day <= 30) activeLabels.push('black friday', 'sale', 'deal');
+
+    // Back to school (roughly late August to late September)
+    if ((month === 8 && day >= 15) || (month === 9 && day <= 20)) {
+      activeLabels.push('back to school', 'school');
+    }
+
+    // Regional hint: harmattan for West Africa (approx. Nov–Feb)
+    const normalizedRegion = (region || '').toLowerCase();
+    if ((normalizedRegion.includes('nigeria') || normalizedRegion.includes('west_africa')) &&
+        (month === 11 || month === 12 || month <= 2)) {
+      activeLabels.push('harmattan');
+    }
+
+    // Fetch a wider pool of active products to score in memory
+    const { data, error } = await this.serviceSupabase
+      .from('products')
+      .select(`
+        *,
+        user_profiles!products_user_id_fkey (
+          username,
+          avatar_url,
+          is_verified,
+          display_name
+        )
+      `)
+      .eq('status', 'active')
+      .is('deleted_at', null)
+      .limit(200);
+
+    if (error) {
+      console.error('Error fetching products for seasonal list:', error);
+      // Fallback to trending if seasonal fails
+      return this.getTrendingProducts(limit);
+    }
+
+    const seasonalKeywords = activeLabels.map(l => l.toLowerCase());
+
+    const scored = (data || []).map((product: any) => {
+      let score = 0;
+
+      const tags: string[] = product.tags || [];
+      const name: string = (product.name || '').toLowerCase();
+      const description: string = (product.description || '').toLowerCase();
+
+      // Tag matches are strongest
+      for (const tag of tags) {
+        const lower = tag.toLowerCase();
+        if (seasonalKeywords.includes(lower)) {
+          score += 10;
+        }
+      }
+
+      // Keyword matches in name/description
+      for (const keyword of seasonalKeywords) {
+        if (!keyword) continue;
+        if (name.includes(keyword)) score += 5;
+        if (description.includes(keyword)) score += 3;
+      }
+
+      // Boost by rating and recent views/likes
+      const rating = product.average_rating || 0;
+      const reviews = product.review_count || 0;
+      const views = product.view_count || 0;
+      const likes = product.like_count || 0;
+
+      score += rating * 2;
+      score += Math.min(reviews, 50) * 0.2;
+      score += Math.min(views, 500) * 0.01;
+      score += Math.min(likes, 200) * 0.05;
+
+      return { product, score };
+    });
+
+    // Filter out products with very low seasonal relevance
+    const filtered = scored.filter(entry => entry.score > 0);
+
+    if (filtered.length === 0) {
+      // If nothing matches seasonal context, fall back to trending
+      return this.getTrendingProducts(limit);
+    }
+
+    const top = filtered
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map(entry => this.mapToProductResponse(entry.product));
+
+    return top;
   }
 
   async getProductReviews(productId: string) {
@@ -436,7 +1066,8 @@ export class ProductsService {
     imageFiles: Express.Multer.File[],
     videoFiles: Express.Multer.File[],
     productData: CreateProductDto,
-    userToken?: string
+    userToken?: string,
+    variantMediaFiles: Express.Multer.File[] = [],
   ): Promise<any> {
     try {
       if ((!imageFiles || imageFiles.length === 0) && (!videoFiles || videoFiles.length === 0)) {
@@ -561,23 +1192,149 @@ export class ProductsService {
       }
 
       // Determine media type (video takes precedence for product display)
-      const media_type = videoUrls.length > 0 ? 'video' : 'image';
+      let media_type: 'video' | 'image' = videoUrls.length > 0 ? 'video' : 'image';
+
+      // Validate and upload variant media (only relevant for multi-item products)
+      let variantMediaUrls: string[] = [];
+      if (productData.is_multi_item && variantMediaFiles && variantMediaFiles.length > 0) {
+        const allowedImageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+        const allowedVideoTypes = ['video/mp4', 'video/quicktime', 'video/x-msvideo'];
+        const maxImageSize = 10 * 1024 * 1024;
+        const maxVideoSize = 50 * 1024 * 1024;
+
+        for (const file of variantMediaFiles) {
+          const isImage = allowedImageTypes.includes(file.mimetype);
+          const isVideo = allowedVideoTypes.includes(file.mimetype);
+          if (!isImage && !isVideo) {
+            throw new BadRequestException('Invalid variant media file type.');
+          }
+          if (isImage && file.size > maxImageSize) {
+            throw new BadRequestException('Variant image too large. Maximum size is 10MB.');
+          }
+          if (isVideo && file.size > maxVideoSize) {
+            throw new BadRequestException('Variant video too large. Maximum size is 50MB.');
+          }
+        }
+
+        const variantUploadPromises = variantMediaFiles.map(async (file, index) => {
+          const fileExtension = file.originalname.split('.').pop() || (allowedVideoTypes.includes(file.mimetype) ? 'mp4' : 'jpg');
+          const timestamp = Date.now();
+          const uniqueFileName = `${userId}/${timestamp}-${index}-variant-media.${fileExtension}`;
+
+          const { error: uploadError } = await supabaseClient.storage
+            .from('media')
+            .upload(uniqueFileName, file.buffer, {
+              contentType: file.mimetype,
+              upsert: false,
+            });
+
+          if (uploadError) {
+            throw new BadRequestException(`Variant media upload failed: ${uploadError.message}`);
+          }
+
+          const { data: urlData } = supabaseClient.storage
+            .from('media')
+            .getPublicUrl(uniqueFileName);
+
+          return urlData.publicUrl;
+        });
+
+        variantMediaUrls = await Promise.all(variantUploadPromises);
+      }
+
+      // For multi-item products, the first variant's media may be the primary showcase
+      let primaryMediaUrl: string | undefined;
+      const variants = productData.variants ?? [];
+      if (productData.is_multi_item && variantMediaUrls.length > 0 && variants.length > 0) {
+        const primaryVariant = variants[0];
+        primaryMediaUrl = variantMediaUrls[primaryVariant.mediaIndex];
+        if (primaryMediaUrl) {
+          media_type = primaryVariant.mediaType === 'video' ? 'video' : 'image';
+        }
+      }
+
+      // Use first variant's media as the product primary showcase when no separate product media exists
+      const productPrimaryVideo = videoUrls.length > 0 ? videoUrls[0] : (media_type === 'video' ? primaryMediaUrl : undefined);
+      const productPrimaryImage = imageUrls.length > 0 ? imageUrls[0] : (media_type === 'image' ? primaryMediaUrl : undefined);
 
       // Create product with uploaded media URLs
       const createProductDto: CreateProductDto = {
         ...productData,
         images: imageUrls,
-        primary_image_url: imageUrls.length > 0 ? imageUrls[0] : undefined,
+        primary_image_url: productPrimaryImage,
         videos: videoUrls,
-        primary_video_url: videoUrls.length > 0 ? videoUrls[0] : undefined,
+        primary_video_url: productPrimaryVideo,
         media_type,
       };
 
       // Create product record
       const product = await this.createProduct(userId, createProductDto, userToken);
 
+      // Create variant rows for multi-item products
+      if (productData.is_multi_item && productData.variants && productData.variants.length > 0) {
+        const variantRows = productData.variants.map((variant, index) => {
+          const mediaUrl = variantMediaUrls[variant.mediaIndex];
+          if (!mediaUrl) {
+            throw new BadRequestException(`Missing media for variant "${variant.name}"`);
+          }
+          return {
+            product_id: product.id,
+            name: variant.name,
+            price: variant.price,
+            media_url: mediaUrl,
+            media_type: variant.mediaType,
+            sort_order: index,
+          };
+        });
+
+        const { error: variantError } = await this.serviceSupabase
+          .from('product_variants')
+          .insert(variantRows);
+
+        if (variantError) {
+          console.error('Failed to create product variants:', variantError);
+          throw new BadRequestException(`Failed to save product variants: ${variantError.message}`);
+        }
+      }
+
+      // Fire-and-forget video processing for incompatible codecs
+      if (videoUrls.length > 0) {
+        videoUrls.forEach((videoUrl: string, index: number) => {
+          VideoProcessingHelper.checkAndQueue(videoUrl, userId, 'product', product.id, index).catch(() => {
+            // Silent fail — original video still works
+          });
+        });
+      }
+
+      let finalProduct = product;
+      if (productData.is_multi_item) {
+        const { data: refetched } = await this.serviceSupabase
+          .from('products')
+          .select(`
+            *,
+            user_profiles!products_user_id_fkey (
+              username,
+              avatar_url,
+              display_name
+            ),
+            product_variants (
+              id,
+              name,
+              price,
+              media_url,
+              media_type,
+              sort_order
+            )
+          `)
+          .eq('id', product.id)
+          .single();
+        if (refetched) {
+          finalProduct = this.mapToProductResponse(refetched);
+        }
+      }
+
       return {
-        ...product,
+        ...finalProduct,
         message: 'Product uploaded successfully',
       };
 
@@ -666,6 +1423,27 @@ export class ProductsService {
     });
   }
 
+  private async generateAndSaveEmbedding(productId: string, productData: any): Promise<void> {
+    const text = this.embeddingService.buildProductText(productData);
+    const { embedding } = await this.embeddingService.embed(text);
+    if (!embedding || embedding.length === 0) return;
+
+    const { error } = await this.serviceSupabase
+      .from('products')
+      .update({
+        embedding,
+        embedding_text: text,
+        embedding_updated_at: new Date().toISOString(),
+      })
+      .eq('id', productId);
+
+    if (error) {
+      this.logger.error(`Failed to save embedding for product ${productId}: ${error.message}`);
+    } else {
+      this.logger.debug(`Embedding generated for product ${productId}`);
+    }
+  }
+
   private mapToProductResponse(data: any): ProductResponseDto {
     console.log('🗺️ Mapping product response:', {
       id: data.id,
@@ -692,12 +1470,27 @@ export class ProductsService {
       images: data.images || [],
       primary_image_url: data.primary_image_url,
       videos: data.videos || [],
+      processed_videos: data.processed_videos || [],
+      video_processing_status: data.video_processing_status || {},
       primary_video_url: data.primary_video_url,
       media_type: data.media_type || 'image',
       location: data.location,
       shipping_options: data.shipping_options,
       tags: data.tags || [],
       status: data.status,
+      is_multi_item: data.is_multi_item || false,
+      variants: Array.isArray(data.product_variants)
+        ? [...data.product_variants]
+            .sort((a: any, b: any) => (a.sort_order || 0) - (b.sort_order || 0))
+            .map((v: any) => ({
+              id: v.id,
+              name: v.name,
+              price: parseFloat(v.price) || 0,
+              media_url: v.media_url,
+              media_type: v.media_type,
+              sort_order: v.sort_order || 0,
+            }))
+        : undefined,
       is_featured: data.is_featured,
       view_count: data.view_count,
       like_count: data.like_count,
@@ -707,7 +1500,7 @@ export class ProductsService {
       created_at: data.created_at,
       updated_at: data.updated_at,
       // Vendor info from joined user_profiles table
-      vendor_username: data.user_profiles?.username || 'Unknown Seller',
+      vendor_username: data.user_profiles?.username || data.user_profiles?.display_name || 'Unknown Seller',
       vendor_avatar: data.user_profiles?.avatar_url || null,
       vendor_verified: data.user_profiles?.is_verified || false,
     };

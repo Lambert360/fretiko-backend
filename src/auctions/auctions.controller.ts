@@ -49,7 +49,7 @@ export class AuctionsController {
    */
   @Get()
   async getAuctions(
-    @Query(ValidationPipe) filters: AuctionFilterDto,
+    @Query(new ValidationPipe({ transform: true, whitelist: true })) filters: AuctionFilterDto,
     @Request() req?: any,
   ) {
     const userId = req?.user?.sub; // Optional user ID for personalization
@@ -92,7 +92,7 @@ export class AuctionsController {
   @Get('category/:categorySlug')
   async getAuctionsByCategory(
     @Param('categorySlug') categorySlug: string,
-    @Query(ValidationPipe) filters: AuctionFilterDto,
+    @Query(new ValidationPipe({ transform: true, whitelist: true })) filters: AuctionFilterDto,
     @Request() req?: any,
   ) {
     const userId = req?.user?.sub;

@@ -9,12 +9,16 @@ import { InvoiceCronService } from './invoice-cron.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { EscrowModule } from '../escrow/escrow.module';
+import { TagsModule } from '../tags/tags.module';
+import { MentionsModule } from '../mentions/mentions.module';
 
 @Module({
   imports: [
     NotificationsModule,
     forwardRef(() => RealtimeModule),
-    forwardRef(() => EscrowModule)
+    forwardRef(() => EscrowModule),
+    TagsModule,
+    MentionsModule,
   ],
   controllers: [ChatController],
   providers: [

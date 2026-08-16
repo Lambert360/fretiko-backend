@@ -26,9 +26,11 @@ export class CartService {
           price,
           images,
           quantity,
+          location,
           user_id,
           user_profiles (
-            username
+            username,
+            location
           ),
           product_categories (
             name
@@ -38,9 +40,11 @@ export class CartService {
           name,
           base_price,
           images,
+          location,
           user_id,
           user_profiles (
-            username
+            username,
+            location
           ),
           service_categories (
             name
@@ -61,9 +65,59 @@ export class CartService {
       userId
     });
 
+    // Helpers for location parsing and interstate detection
+    const parseItemLocation = (location?: string | null): { state?: string; country?: string; city?: string } | null => {
+      if (!location || typeof location !== 'string') return null;
+      const parts = location.split(',').map(p => p.trim());
+      if (parts.length >= 3) return { city: parts[0], state: parts[1], country: parts[2] };
+      if (parts.length === 2) return { state: parts[0], country: parts[1] };
+      if (parts.length === 1) return { state: parts[0] };
+      return null;
+    };
+
+    const detectInterstate = (
+      sellerLocation: { state?: string; country?: string; city?: string } | null | undefined,
+      buyerState?: string,
+      buyerCountry?: string,
+    ) => {
+      if (!sellerLocation || (!sellerLocation.state && !sellerLocation.country)) {
+        return { isOutOfState: false, isOutOfCountry: false };
+      }
+      const sellerCountry = (sellerLocation.country || '').trim().toLowerCase();
+      const sellerState = (sellerLocation.state || '').trim().toLowerCase();
+      const bCountry = (buyerCountry || '').trim().toLowerCase();
+      const bState = (buyerState || '').trim().toLowerCase();
+
+      const isOutOfCountry =
+        sellerCountry !== '' && bCountry !== '' && sellerCountry !== bCountry;
+      const isOutOfState =
+        !isOutOfCountry &&
+        sellerState !== '' &&
+        bState !== '' &&
+        sellerState !== bState;
+
+      return { isOutOfState, isOutOfCountry };
+    };
+
+    // Fetch buyer's default delivery address for interstate detection
+    const { data: buyerDefaultAddress } = await this.serviceSupabase
+      .from('delivery_addresses')
+      .select('state, country')
+      .eq('user_id', userId)
+      .eq('is_default', true)
+      .maybeSingle();
+
+    const buyerState = buyerDefaultAddress?.state || undefined;
+    const buyerCountry = buyerDefaultAddress?.country || undefined;
+
     // Transform data to match frontend expectations
-    return data?.map(item => {
+    return (data || []).map(item => {
       const isService = !!item.service_id;
+
+      const productLoc = isService
+        ? parseItemLocation(item.services?.location) || item.services?.user_profiles?.location
+        : parseItemLocation(item.products?.location) || item.products?.user_profiles?.location;
+      const { isOutOfState, isOutOfCountry } = detectInterstate(productLoc, buyerState, buyerCountry);
 
       if (isService) {
         // Service item
@@ -75,10 +129,13 @@ export class CartService {
           price: item.price_at_add,
           originalPrice: item.services?.base_price || null,
           quantity: item.quantity,
-          maxQuantity: 1, // Services are typically non-stackable
+          maxQuantity: 1,
           sellerId: item.services?.user_id,
           sellerName: item.services?.user_profiles?.username || 'Unknown Provider',
           category: item.services?.service_categories?.name || 'Services',
+          sellerLocation: productLoc,
+          isOutOfState,
+          isOutOfCountry,
           serviceDate: item.scheduled_date,
           serviceTime: item.scheduled_time,
           serviceNotes: item.service_notes,
@@ -89,7 +146,9 @@ export class CartService {
         return {
           id: item.id,
           productId: item.product_id,
-          productName: item.products?.name || 'Unknown Product',
+          productName: item.variant_name ? `${item.products?.name || 'Unknown Product'} - ${item.variant_name}` : (item.products?.name || 'Unknown Product'),
+          variantId: item.variant_id || null,
+          variantName: item.variant_name || null,
           productImage: item.products?.images?.[0] || item.products?.primary_image_url || 'https://via.placeholder.com/150',
           price: item.price_at_add,
           originalPrice: item.products?.price || null,
@@ -98,10 +157,13 @@ export class CartService {
           sellerId: item.products?.user_id,
           sellerName: item.products?.user_profiles?.username || 'Unknown Seller',
           category: item.products?.product_categories?.name || 'Uncategorized',
+          sellerLocation: productLoc,
+          isOutOfState,
+          isOutOfCountry,
           createdAt: item.created_at,
         };
       }
-    }) || [];
+    });
   }
 
   async getCartSummary(userId: string, userToken?: string) {
@@ -145,7 +207,7 @@ export class CartService {
     return { count: count || 0 };
   }
 
-  async addToCart(userId: string, cartData: { productId: string; quantity: number; price: number }, userToken?: string) {
+  async addToCart(userId: string, cartData: { productId: string; quantity: number; price: number; variantId?: string; variantName?: string }, userToken?: string) {
     // Check if product exists and get its info
     const { data: product, error: productError } = await this.serviceSupabase
       .from('products')
@@ -158,13 +220,37 @@ export class CartService {
       throw new NotFoundException('Product not found or not available');
     }
 
-    // Check if item already exists in cart
-    const { data: existingItem } = await this.serviceSupabase
+    let variantName = cartData.variantName;
+    let variantPrice = cartData.price;
+
+    if (cartData.variantId) {
+      const { data: variant, error: variantError } = await this.serviceSupabase
+        .from('product_variants')
+        .select('id, name, price')
+        .eq('id', cartData.variantId)
+        .eq('product_id', cartData.productId)
+        .single();
+
+      if (variantError || !variant) {
+        throw new NotFoundException('Selected item not found or not available');
+      }
+
+      variantName = variant.name;
+      variantPrice = cartData.price || variant.price;
+    }
+
+    // Check if this exact product + variant combination already exists in cart
+    let existingItemQuery = this.serviceSupabase
       .from('cart_items')
       .select('id, quantity')
       .eq('user_id', userId)
-      .eq('product_id', cartData.productId)
-      .single();
+      .eq('product_id', cartData.productId);
+
+    existingItemQuery = cartData.variantId
+      ? existingItemQuery.eq('variant_id', cartData.variantId)
+      : existingItemQuery.is('variant_id', null);
+
+    const { data: existingItem } = await existingItemQuery.single();
 
     if (existingItem) {
       // Update existing item quantity
@@ -178,7 +264,7 @@ export class CartService {
         .from('cart_items')
         .update({ 
           quantity: newQuantity,
-          price_at_add: cartData.price || product.price // Update price in case it changed
+          price_at_add: variantPrice || product.price // Update price in case it changed
         })
         .eq('id', existingItem.id);
 
@@ -199,7 +285,9 @@ export class CartService {
           user_id: userId,
           product_id: cartData.productId,
           quantity: cartData.quantity,
-          price_at_add: cartData.price || product.price,
+          price_at_add: variantPrice || product.price,
+          variant_id: cartData.variantId || null,
+          variant_name: variantName || null,
         });
 
       if (insertError) {

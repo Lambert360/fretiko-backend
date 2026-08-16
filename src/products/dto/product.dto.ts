@@ -1,5 +1,21 @@
-import { IsString, IsNumber, IsOptional, IsArray, IsBoolean, IsEnum, Min, Max, IsUUID } from 'class-validator';
-import { Transform } from 'class-transformer';
+import { IsString, IsNumber, IsOptional, IsArray, IsBoolean, IsEnum, Min, Max, IsUUID, ValidateNested } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+
+export class ProductVariantDto {
+  @IsString()
+  name: string;
+
+  @IsNumber()
+  @Min(0)
+  price: number;
+
+  // Index into the uploaded variant_media files array for this variant's media
+  @IsNumber()
+  mediaIndex: number;
+
+  @IsEnum(['image', 'video'])
+  mediaType: string;
+}
 
 export class CreateProductDto {
   @IsString()
@@ -58,6 +74,16 @@ export class CreateProductDto {
   @IsArray()
   @IsString({ each: true })
   tags?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  is_multi_item?: boolean;
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ProductVariantDto)
+  variants?: ProductVariantDto[];
 }
 
 export class UpdateProductDto {
@@ -136,6 +162,57 @@ export class ProductQueryDto {
   offset?: number = 0;
 }
 
+export class RankedProductsQueryDto {
+  @IsOptional()
+  @IsUUID()
+  category_id?: string;
+
+  @IsOptional()
+  @IsString()
+  search?: string;
+
+  @IsOptional()
+  @Transform(({ value }) => parseFloat(value))
+  @IsNumber()
+  @Min(0)
+  price_min?: number;
+
+  @IsOptional()
+  @Transform(({ value }) => parseFloat(value))
+  @IsNumber()
+  @Min(0)
+  price_max?: number;
+
+  @IsOptional()
+  @IsEnum(['new', 'like-new', 'good', 'fair'])
+  condition?: string;
+
+  @IsOptional()
+  @Transform(({ value }) => parseInt(value))
+  @IsNumber()
+  @Min(1)
+  @Max(100)
+  limit?: number = 20;
+
+  @IsOptional()
+  @Transform(({ value }) => parseInt(value))
+  @IsNumber()
+  @Min(0)
+  offset?: number = 0;
+}
+
+export class RecordProductEventDto {
+  @IsUUID()
+  productId: string;
+
+  @IsEnum(['impression', 'click', 'view', 'cart_add', 'wishlist_add'])
+  eventType: string;
+
+  @IsOptional()
+  @IsString()
+  source?: string;
+}
+
 export class ProductResponseDto {
   id: string;
   user_id: string;
@@ -148,12 +225,23 @@ export class ProductResponseDto {
   images: string[];
   primary_image_url?: string;
   videos: string[];
+  processed_videos?: string[];
+  video_processing_status?: any;
   primary_video_url?: string;
   media_type: string;
   location?: string;
   shipping_options: any;
   tags: string[];
   status: string;
+  is_multi_item?: boolean;
+  variants?: {
+    id: string;
+    name: string;
+    price: number;
+    media_url: string;
+    media_type: string;
+    sort_order: number;
+  }[];
   is_featured: boolean;
   view_count: number;
   like_count: number;

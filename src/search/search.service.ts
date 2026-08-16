@@ -39,7 +39,14 @@ export class SearchService {
     try {
       // Sanitize search query
       const sanitizedQuery = this.sanitizeSearchQuery(searchQuery.query);
-      const searchParams = { ...searchQuery, query: sanitizedQuery };
+
+      // Treat leading '#' as hashtag search by stripping the hash for underlying services
+      let effectiveQuery = sanitizedQuery;
+      if (effectiveQuery && effectiveQuery.startsWith('#')) {
+        effectiveQuery = effectiveQuery.slice(1);
+      }
+
+      const searchParams = { ...searchQuery, query: effectiveQuery };
 
       // If no specific type, search all categories
       if (searchQuery.type === SearchType.ALL || !searchQuery.type) {

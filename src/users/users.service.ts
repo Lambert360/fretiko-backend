@@ -1,18 +1,21 @@
-import { Injectable, NotFoundException, ConflictException, BadRequestException, ForbiddenException, UnauthorizedException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, BadRequestException, ForbiddenException, UnauthorizedException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { UpdateProfileDto, UserProfileResponse, PublicProfileResponse } from '../shared/dto/user-profile.dto';
 import * as crypto from 'crypto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { EmbeddingService } from '../ai/core/embedding.service';
 
 @Injectable()
 export class UsersService {
   private supabase;
   private serviceSupabase; // Service role client for operations that need to bypass RLS
+  private readonly logger = new Logger(UsersService.name);
 
   constructor(
     private configService: ConfigService,
     private clientManager: SupabaseClientManager,
+    private embeddingService: EmbeddingService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
     this.serviceSupabase = this.clientManager.getServiceClient();
@@ -43,7 +46,7 @@ export class UsersService {
     // SECURITY: Use service role for public profile access (no sensitive data)
     const { data, error } = await this.serviceSupabase
       .from('user_profiles')
-      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at')
+      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name')
       .eq('id', userId)
       .single();
 
@@ -59,7 +62,38 @@ export class UsersService {
 
     return {
       id: data.id,
-      username: data.username,
+      username: data.username || data.display_name || 'Unknown',
+      bio: data.bio,
+      avatarUrl: data.avatar_url,
+      bgPicUrl: data.bg_pic_url,
+      location: data.location,
+      isSeller: data.is_seller,
+      isRider: data.is_rider,
+      createdAt: data.created_at,
+    };
+  }
+
+  async getPublicProfileByUsername(username: string): Promise<PublicProfileResponse> {
+    // SECURITY: Use service role for public profile access (no sensitive data)
+    const { data, error } = await this.serviceSupabase
+      .from('user_profiles')
+      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name')
+      .ilike('username', username)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // SECURITY: Don't auto-create profiles in public read operations
+        // This prevents unauthorized profile creation
+        console.log('Public profile not found for username', username);
+        throw new NotFoundException('User profile not found');
+      }
+      throw new Error(`Database error: ${error.message}`);
+    }
+
+    return {
+      id: data.id,
+      username: data.username || data.display_name || 'Unknown',
       bio: data.bio,
       avatarUrl: data.avatar_url,
       bgPicUrl: data.bg_pic_url,
@@ -116,13 +150,19 @@ export class UsersService {
       console.log('SECURITY: Creating new profile for authenticated user', userId);
     }
     
+    // Normalize username to lowercase before any checks or writes
+    if (updateData.username) {
+      updateData.username = updateData.username.toLowerCase().trim();
+    }
+
     // Check if username is taken (if username is being updated)
-    // Only check if username is provided and different from existing
-    if (updateData.username && (!profileCheck || profileCheck.length === 0 || updateData.username !== profileCheck[0].username)) {
+    // Only check if username is provided and different from existing (case-insensitive)
+    const currentUsername = profileCheck?.[0]?.username?.toLowerCase() || '';
+    if (updateData.username && (profileCheck?.length === 0 || updateData.username !== currentUsername)) {
       const { data: existingUser } = await this.serviceSupabase
         .from('user_profiles')
         .select('id')
-        .eq('username', updateData.username)
+        .ilike('username', updateData.username)
         .neq('id', userId)
         .single();
 
@@ -189,6 +229,9 @@ export class UsersService {
 
     if (error) {
       console.error('Profile upsert error:', error);
+      if (error.code === '23505' && error.message?.toLowerCase().includes('username')) {
+        throw new ConflictException('Username is already taken');
+      }
       throw new Error(`Database error: ${error.message}`);
     }
 
@@ -201,6 +244,13 @@ export class UsersService {
     // SECURITY: Log successful profile creation for audit trail
     if (isNewProfile && process.env.NODE_ENV === 'production') {
       console.log('AUDIT: New profile created', { userId, timestamp: new Date().toISOString() });
+    }
+
+    // Generate embedding for vendor search if user is a seller (fire-and-forget)
+    if (data.is_seller) {
+      this.generateAndSaveVendorEmbedding(data.id, data).catch(err => {
+        this.logger.warn(`Failed to generate embedding for vendor ${data.id}: ${err.message}`);
+      });
     }
 
     return this.mapToProfileResponse(data);
@@ -283,7 +333,7 @@ export class UsersService {
   async searchUsers(query: string, limit: number = 20): Promise<PublicProfileResponse[]> {
     const { data, error } = await this.serviceSupabase
       .from('user_profiles')
-      .select('id, username, bio, avatar_url, location, is_seller, created_at')
+      .select('id, username, bio, avatar_url, location, is_seller, created_at, display_name')
       .or(`username.ilike.%${query}%,bio.ilike.%${query}%`)
       .not('id', 'in', '("00000000-0000-4000-8000-000000000002","00000000-0000-4000-8000-000000000003")')
       .limit(limit)
@@ -295,7 +345,7 @@ export class UsersService {
 
     return data.map(user => ({
       id: user.id,
-      username: user.username,
+      username: user.username || user.display_name || 'Unknown',
       bio: user.bio,
       avatarUrl: user.avatar_url,
       location: user.location,
@@ -607,10 +657,31 @@ export class UsersService {
     };
   }
 
+  private async generateAndSaveVendorEmbedding(vendorId: string, profileData: any): Promise<void> {
+    const text = this.embeddingService.buildVendorText(profileData);
+    const { embedding } = await this.embeddingService.embed(text);
+    if (!embedding || embedding.length === 0) return;
+
+    const { error } = await this.serviceSupabase
+      .from('user_profiles')
+      .update({
+        embedding,
+        embedding_text: text,
+        embedding_updated_at: new Date().toISOString(),
+      })
+      .eq('id', vendorId);
+
+    if (error) {
+      this.logger.error(`Failed to save embedding for vendor ${vendorId}: ${error.message}`);
+    } else {
+      this.logger.debug(`Embedding generated for vendor ${vendorId}`);
+    }
+  }
+
   private mapToProfileResponse(data: any): UserProfileResponse {
     return {
       id: data.id,
-      username: data.username,
+      username: data.username || data.display_name || null,
       bio: data.bio,
       avatarUrl: data.avatar_url,
       bgPicUrl: data.bg_pic_url,

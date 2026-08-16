@@ -617,25 +617,39 @@ export class GiftService {
     const giftName = result.gift_name || 'Gift';
     const giftEmoji = result.gift_emoji || '🎁';
 
-    this.logger.log(`[GiftService] ✅ Gift sent successfully: ${dto.quantity}x ${giftEmoji} ${giftName} from ${senderId} to ${dto.recipient_id}`);
+    // Resolve the sender's display name for a personalized notification
+    let senderName = 'a user';
+    try {
+      const { data: senderProfile } = await this.supabase
+        .from('user_profiles')
+        .select('username, display_name')
+        .eq('id', senderId)
+        .single();
+      senderName = senderProfile?.username || senderProfile?.display_name || 'a user';
+    } catch (profileError) {
+      this.logger.warn(`[GiftService] ⚠️ Could not resolve sender name for ${senderId}:`, profileError);
+    }
+
+    this.logger.log(`[GiftService] ✅ Gift sent successfully: ${dto.quantity}x ${giftEmoji} ${giftName} from ${senderName} (${senderId}) to ${dto.recipient_id}`);
 
     // Send notification to recipient
     try {
       await this.notificationHelper.notifySystemUpdate(
         dto.recipient_id,
         'Gift Received! 🎁',
-        `You received ${dto.quantity}x ${giftEmoji} ${giftName} from a user!`,
+        `You received ${dto.quantity}x ${giftEmoji} ${giftName} from ${senderName}!`,
         {
           giftId: dto.gift_id,
           giftName: giftName,
           quantity: dto.quantity,
           senderId: senderId,
+          senderName,
           sessionType: dto.session_type,
           sessionId: dto.session_id,
         },
       );
       this.logger.log(`[GiftService] ✅ Notification sent to recipient ${dto.recipient_id}`);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.warn(`[GiftService] ⚠️ Failed to send gift received notification: ${error.message}`);
       // Don't throw - gift was sent successfully, notification failure is non-critical
     }
@@ -697,13 +711,13 @@ export class GiftService {
             } else {
               this.logger.warn(`[GiftService] ⚠️ Could not find conversation_id for call session ${dto.session_id}`);
             }
-          } catch (callError) {
+          } catch (callError: any) {
             this.logger.warn(`[GiftService] ⚠️ Failed to emit gift animation for call: ${callError.message}`);
             // Don't throw - gift was sent successfully, animation event failure is non-critical
           }
         }
       }
-    } catch (error) {
+    } catch (error: any) {
       this.logger.warn(`[GiftService] ⚠️ Failed to emit real-time gift events: ${error.message}`);
       // Don't throw - gift was sent successfully, real-time event failure is non-critical
     }

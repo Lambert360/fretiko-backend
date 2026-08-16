@@ -10,6 +10,7 @@ import { RewardsModule } from '../rewards/rewards.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { AuthModule } from '../auth/auth.module';
+import { PartnersModule } from '../partners/partners.module';
 
 @Module({
   imports: [
@@ -21,6 +22,7 @@ import { AuthModule } from '../auth/auth.module';
     forwardRef(() => EscrowModule),
     forwardRef(() => RewardsModule),
     WalletModule,
+    PartnersModule,
     RealtimeModule, // For WebSocket real-time order status updates
   ],
   controllers: [OrdersController],

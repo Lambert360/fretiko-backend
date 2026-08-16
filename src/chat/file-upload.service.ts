@@ -115,9 +115,11 @@ export class FileUploadService {
 
       this.logger.log(`File uploaded successfully: ${publicUrl}`);
 
-      // Check if this is a video that needs processing
+      // Check if this is a video that needs processing (fire-and-forget, must not block the upload response)
       if (fileMetadata.type === 'video') {
-        await this.checkAndProcessVideo(publicUrl, fileMetadata, userId, messageId);
+        this.checkAndProcessVideo(publicUrl, fileMetadata, userId, messageId).catch(err => {
+          this.logger.error('Background video processing error:', err);
+        });
       }
 
       return {
@@ -367,47 +369,38 @@ export class FileUploadService {
     messageId: string
   ): Promise<void> {
     try {
-      this.logger.log(`Checking video codec for: ${videoUrl}`);
-      
-      // Download video temporarily to check codec
-      const tempPath = await this.downloadVideoTemporarily(videoUrl);
-      
+      // Check for manual trim settings stored in the message metadata
+      let trimStart: number | undefined;
+      let trimEnd: number | undefined;
       try {
-        // Get video codec using FFprobe
-        const codec = await this.getVideoCodec(tempPath);
-        this.logger.log(`Detected video codec: ${codec}`);
-        
-        // Check if codec needs processing (HEVC/H.265)
-        if (this.needsVideoProcessing(codec)) {
-          this.logger.log(`Video ${videoUrl} uses incompatible codec ${codec}, queuing for processing`);
-          
-          // Add to background processing queue
-          const jobId = await backgroundVideoProcessor.addVideoToQueue(videoUrl, userId, {
-            serviceId: messageId, // Use messageId as service identifier
-            platform: 'android', // Default to android for maximum compatibility
-            priority: 'medium'
-          });
-          
-          this.logger.log(`Video queued for processing with job ID: ${jobId}`);
-          
-          // Update database to indicate processing is in progress
-          await this.updateVideoProcessingStatus(messageId, {
-            processing: true,
-            jobId,
-            originalCodec: codec,
-            processingStartedAt: new Date().toISOString()
-          });
-        } else {
-          this.logger.log(`Video ${videoUrl} uses compatible codec ${codec}, no processing needed`);
+        const { data: message } = await this.supabase
+          .from('chat_messages')
+          .select('metadata')
+          .eq('id', messageId)
+          .single();
+        if (message?.metadata) {
+          trimStart = message.metadata.trimStart;
+          trimEnd = message.metadata.trimEnd;
         }
-      } finally {
-        // Clean up temp file
-        if (tempPath && require('fs').existsSync(tempPath)) {
-          require('fs').unlinkSync(tempPath);
-        }
+      } catch (err) {
+        this.logger.warn(`Could not fetch message metadata for trim: ${messageId}`, err instanceof Error ? err.message : String(err));
       }
+
+      this.logger.log(`Queueing chat video for processing: ${videoUrl}`);
+
+      // Add to background processing queue for thumbnail/trimming
+      const jobId = await backgroundVideoProcessor.addVideoToQueue(videoUrl, userId, {
+        entityType: 'chat', // Mark this job as belonging to a chat message
+        entityId: messageId, // Use messageId as the entity identifier
+        platform: 'android', // Default to android for maximum compatibility
+        trimStart,
+        trimEnd,
+        priority: 'medium',
+      });
+
+      this.logger.log(`Chat video queued with job ID: ${jobId}`);
     } catch (error) {
-      this.logger.error('Error checking video codec:', error);
+      this.logger.error('Error queueing chat video thumbnail:', error);
       // Don't fail the upload, just log the error
     }
   }
@@ -419,19 +412,22 @@ export class FileUploadService {
     const https = require('https');
     const fs = require('fs');
     const path = require('path');
+    const os = require('os');
     
     return new Promise((resolve, reject) => {
       const fileName = `temp_video_check_${Date.now()}.mp4`;
-      const filePath = path.join('/tmp', fileName);
+      const filePath = path.join(os.tmpdir(), fileName);
       
       const file = fs.createWriteStream(filePath);
+      file.on('error', reject);
       
       https.get(url, (response: any) => {
         response.pipe(file);
-      }).on('error', reject).on('end', () => {
-        file.close();
-        resolve(filePath);
-      });
+        file.on('finish', () => {
+          file.close();
+          resolve(filePath);
+        });
+      }).on('error', reject);
     });
   }
 

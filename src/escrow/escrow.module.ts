@@ -8,6 +8,7 @@ import { RealtimeModule } from '../realtime/realtime.module';
 import { ConnectionsModule } from '../connections/connections.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { AuthModule } from '../auth/auth.module';
+import { PartnersModule } from '../partners/partners.module';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { AuthModule } from '../auth/auth.module';
     ConfigModule,
     NotificationsModule,
     WalletModule,
+    PartnersModule,
     forwardRef(() => RealtimeModule),
     forwardRef(() => ConnectionsModule),
   ],

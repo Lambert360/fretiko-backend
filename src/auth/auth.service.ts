@@ -120,6 +120,7 @@ export class AuthService {
       is_rider: is_rider || false,
       date_of_birth: signupData.dateOfBirth,
       gender: signupData.gender, // Add gender field
+      display_name: `${signupData.firstName} ${signupData.lastName}`.trim(),
       // Add terms acceptance tracking (using existing columns and original data)
       terms_accepted_at: originalTermsAcceptedAt, // Use original timestamp from signup
       terms_accepted_ip: ipAddress || null,
@@ -177,7 +178,8 @@ export class AuthService {
         user_role,
         is_seller,
         is_rider,
-        is_verified
+        is_verified,
+        display_name
       `)
       .eq('id', data.user.id)
       .single();
@@ -187,7 +189,7 @@ export class AuthService {
       email: data.user.email,
       firstName: data.user.user_metadata?.first_name || '',
       lastName: data.user.user_metadata?.last_name || '',
-      username: completeProfileData?.username,
+      username: completeProfileData?.username || completeProfileData?.display_name || null,
       avatar_url: completeProfileData?.avatar_url,
       user_role: completeProfileData?.user_role || 'citizen',
       is_seller: completeProfileData?.is_seller || false,
@@ -217,8 +219,8 @@ export class AuthService {
     // Adjust age if birthday hasn't occurred yet this year
     const actualAge = monthDifference < 0 || (monthDifference === 0 && today.getDate() < birthDate.getDate()) ? age - 1 : age;
     
-    if (actualAge < 18) {
-      throw new BadRequestException('You must be at least 18 years old to create an account');
+    if (actualAge < 13) {
+      throw new BadRequestException('You must be at least 13 years old to create an account');
     }
 
     // Check if user already exists in Supabase Auth
@@ -234,6 +236,7 @@ export class AuthService {
         throw new ConflictException('User with this email already exists');
       }
     } catch (error) {
+      if (error instanceof ConflictException) throw error;
       console.log('✅ User does not exist, proceeding with verification email...');
     }
 
@@ -382,6 +385,7 @@ export class AuthService {
         is_seller,
         is_rider,
         is_verified,
+        display_name,
         preferences
       `)
       .eq('id', data.user.id)
@@ -410,7 +414,7 @@ export class AuthService {
       email: data.user.email,
       firstName: firstName,
       lastName: lastName,
-      username: profileData?.username,
+      username: profileData?.username || profileData?.display_name || null,
       avatar_url: profileData?.avatar_url,
       user_role: profileData?.user_role,
       is_seller: profileData?.is_seller,
@@ -525,6 +529,20 @@ export class AuthService {
       refreshToken: '',
       requiresEmailVerification: false,
     };
+  }
+
+  async checkUsernameAvailability(username: string): Promise<boolean> {
+    try {
+      const normalized = username.toLowerCase().trim();
+      const { data } = await this.serviceSupabase
+        .from('user_profiles')
+        .select('id')
+        .ilike('username', normalized)
+        .single();
+      return !data; // true = available
+    } catch {
+      return true; // no row found → available
+    }
   }
 
   async checkEmailAvailability(email: string): Promise<boolean> {
@@ -687,7 +705,8 @@ export class AuthService {
             user_role,
             is_seller,
             is_rider,
-            is_verified
+            is_verified,
+            display_name
           `)
           .eq('id', signInData.user.id)
           .single();
@@ -697,7 +716,7 @@ export class AuthService {
           email: signInData.user.email,
           firstName: migratedProfileData?.first_name || signInData.user.user_metadata?.first_name,
           lastName: migratedProfileData?.last_name || signInData.user.user_metadata?.last_name,
-          username: migratedProfileData?.username,
+          username: migratedProfileData?.username || migratedProfileData?.display_name || null,
           avatar_url: migratedProfileData?.avatar_url,
           user_role: migratedProfileData?.user_role,
           is_seller: migratedProfileData?.is_seller,

@@ -12,9 +12,11 @@ import { WalletTransactionType } from '../wallet/constants/transaction-types';
 import { EmailService as AuthEmailService } from '../auth/email.service';
 import { EmailService as SharedEmailService } from '../shared/email.service';
 import { BankAccountService, CreateBankAccountDto, UpdateBankAccountDto } from '../wallet/bank-account.service';
+import { FlutterwaveService } from '../wallet/flutterwave.service';
 import { WithdrawRequestDto } from '../wallet/dto/wallet.dto';
 import { RefundRequestDto } from './dto/refund.dto';
 import { EscrowService } from '../escrow/escrow.service';
+import { PartnersWalletService } from '../partners/partners-wallet.service';
 import { AdminForgotPasswordDto, AdminConfirmResetPasswordDto } from './dto/admin-forgot-password.dto';
 
 /**
@@ -37,8 +39,10 @@ export class AdminService {
     private authEmailService: AuthEmailService, // For password reset emails
     private sharedEmailService: SharedEmailService, // For appeal emails
     private bankAccountService: BankAccountService,
+    private flutterwaveService: FlutterwaveService,
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
+    private partnersWalletService: PartnersWalletService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -1944,6 +1948,220 @@ export class AdminService {
   }
 
   /**
+   * Get rider/delivery analytics for staff
+   */
+  async getLogisticsAnalyticsForStaff(staffId: string, timeRange: string) {
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`Staff ${staffId} fetching logistics analytics for ${timeRange}`);
+
+    const cutoff = new Date();
+    if (timeRange === '24h') {
+      cutoff.setHours(cutoff.getHours() - 24);
+    } else if (timeRange === '7d') {
+      cutoff.setDate(cutoff.getDate() - 7);
+    } else if (timeRange === '30d') {
+      cutoff.setDate(cutoff.getDate() - 30);
+    } else {
+      cutoff.setHours(cutoff.getHours() - 24);
+    }
+    const cutoffIso = cutoff.toISOString();
+
+    const { data: orders, error: ordersError } = await this.supabase
+      .from('orders')
+      .select('id, status, created_at, delivered_at, rider_id, updated_at, delivery_address')
+      .eq('delivery_type', 'delivery')
+      .gte('created_at', cutoffIso)
+      .order('created_at', { ascending: false });
+
+    if (ordersError) {
+      this.logger.error(`Failed to fetch analytics orders: ${ordersError.message}`);
+      throw new BadRequestException(`Failed to fetch analytics orders: ${ordersError.message}`);
+    }
+
+    const { data: riders, error: ridersError } = await this.supabase
+      .from('user_profiles')
+      .select('id, username, avatar_url, created_at, preferences')
+      .eq('is_rider', true);
+
+    if (ridersError) {
+      this.logger.error(`Failed to fetch analytics riders: ${ridersError.message}`);
+      throw new BadRequestException(`Failed to fetch analytics riders: ${ridersError.message}`);
+    }
+
+    const { data: riderProfiles } = await this.supabase
+      .from('rider_profiles')
+      .select('user_id, is_online, is_available');
+
+    const { data: trustScores } = await this.supabase
+      .from('trust_scores')
+      .select('user_id, rider_trust_score, completed_orders');
+
+    const { data: riderStates } = await this.supabase
+      .from('rider_verification_requests')
+      .select('user_id, state')
+      .eq('status', 'verified');
+
+    const allOrders = orders || [];
+    const allRiders = riders || [];
+    const orderCount = allOrders.length;
+    const completedOrders = allOrders.filter(o => o.status === 'delivered');
+    const cancelledOrders = allOrders.filter(o => o.status === 'cancelled');
+    const activeRiderCount = (riderProfiles || []).filter(rp => rp.is_online && rp.is_available).length;
+
+    const avgDeliveryTime = completedOrders.length > 0
+      ? completedOrders.reduce((sum, o) => {
+          if (!o.delivered_at || !o.created_at) return sum;
+          const created = new Date(o.created_at).getTime();
+          const delivered = new Date(o.delivered_at).getTime();
+          return sum + (delivered - created) / (1000 * 60);
+        }, 0) / completedOrders.length
+      : 0;
+
+    const avgAssignmentTime = allOrders.length > 0
+      ? allOrders.reduce((sum, o) => {
+          if (!o.updated_at || !o.created_at) return sum;
+          const created = new Date(o.created_at).getTime();
+          const updated = new Date(o.updated_at).getTime();
+          return sum + (updated - created) / (1000 * 60);
+        }, 0) / allOrders.length
+      : 0;
+
+    const dayFormatter = new Intl.DateTimeFormat('en-US', { weekday: 'short' });
+    const hourFormatter = new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false });
+
+    const dateGroup = (date: string) => {
+      const d = new Date(date);
+      return `${dayFormatter.format(d)} ${d.getMonth() + 1}/${d.getDate()}`;
+    };
+    const hourGroup = (date: string) => `${hourFormatter.format(new Date(date))}:00`;
+
+    const buildDailyStats = () => {
+      const groups: Record<string, { assignments: number; replacements: number; successes: number }> = {};
+      allOrders.forEach(o => {
+        const key = dateGroup(o.created_at);
+        if (!groups[key]) groups[key] = { assignments: 0, replacements: 0, successes: 0 };
+        groups[key].assignments += 1;
+        if (o.status === 'cancelled') groups[key].replacements += 1;
+        if (o.status === 'delivered') groups[key].successes += 1;
+      });
+      return Object.entries(groups).map(([date, val]) => ({
+        date,
+        assignments: val.assignments,
+        replacements: val.replacements,
+        successRate: val.assignments > 0 ? Math.round((val.successes / val.assignments) * 1000) / 10 : 0,
+      })).sort((a, b) => a.date.localeCompare(b.date));
+    };
+
+    const buildHourlyStats = () => {
+      const groups: Record<string, { assignments: number; replacements: number }> = {};
+      allOrders.forEach(o => {
+        const key = hourGroup(o.created_at);
+        if (!groups[key]) groups[key] = { assignments: 0, replacements: 0 };
+        groups[key].assignments += 1;
+        if (o.status === 'cancelled') groups[key].replacements += 1;
+      });
+      return Object.entries(groups).map(([hour, val]) => ({
+        hour,
+        assignments: val.assignments,
+        replacements: val.replacements,
+      })).sort((a, b) => parseInt(a.hour) - parseInt(b.hour));
+    };
+
+    const buildTopPerformers = () => {
+      const riderMap: Record<string, { riderId: string; riderName: string; assignments: number; successes: number; totalMinutes: number; deliveriesWithTime: number; rating: number }> = {};
+      allOrders.forEach(o => {
+        if (!o.rider_id) return;
+        if (!riderMap[o.rider_id]) {
+          const rider = allRiders.find(r => r.id === o.rider_id);
+          const trust = trustScores?.find(t => t.user_id === o.rider_id);
+          const name = rider?.preferences?.fullName || rider?.username || 'Unknown';
+          const rating = trust?.rider_trust_score ? Math.min(5, Math.max(0, (trust.rider_trust_score / 1000) * 5)) : 0;
+          riderMap[o.rider_id] = {
+            riderId: o.rider_id,
+            riderName: name,
+            assignments: 0,
+            successes: 0,
+            totalMinutes: 0,
+            deliveriesWithTime: 0,
+            rating: Math.round(rating * 10) / 10,
+          };
+        }
+        const entry = riderMap[o.rider_id];
+        entry.assignments += 1;
+        if (o.status === 'delivered') {
+          entry.successes += 1;
+          if (o.delivered_at && o.created_at) {
+            const created = new Date(o.created_at).getTime();
+            const delivered = new Date(o.delivered_at).getTime();
+            entry.totalMinutes += (delivered - created) / (1000 * 60);
+            entry.deliveriesWithTime += 1;
+          }
+        }
+      });
+      return Object.values(riderMap)
+        .map(r => ({
+          riderId: r.riderId,
+          riderName: r.riderName,
+          assignments: r.assignments,
+          successRate: r.assignments > 0 ? Math.round((r.successes / r.assignments) * 1000) / 10 : 0,
+          averageTime: r.deliveriesWithTime > 0 ? Math.round(r.totalMinutes / r.deliveriesWithTime * 10) / 10 : 0,
+          rating: r.rating,
+        }))
+        .sort((a, b) => b.assignments - a.assignments)
+        .slice(0, 10);
+    };
+
+    const buildStatusBreakdown = () => {
+      const counts: Record<string, number> = {};
+      allOrders.forEach(o => {
+        counts[o.status] = (counts[o.status] || 0) + 1;
+      });
+      const entries = Object.entries(counts);
+      return entries.map(([status, count]) => ({
+        status,
+        count,
+        percentage: orderCount > 0 ? Math.round((count / orderCount) * 1000) / 10 : 0,
+      })).sort((a, b) => b.count - a.count);
+    };
+
+    const buildGeography = () => {
+      const counts: Record<string, number> = {};
+      allOrders.forEach(o => {
+        if (!o.rider_id) return;
+        const state = riderStates?.find(r => r.user_id === o.rider_id)?.state;
+        if (!state) return;
+        counts[state] = (counts[state] || 0) + 1;
+      });
+      const entries = Object.entries(counts);
+      const total = entries.reduce((sum, [, count]) => sum + count, 0);
+      return entries.map(([region, count]) => ({
+        region,
+        count,
+        percentage: total > 0 ? Math.round((count / total) * 1000) / 10 : 0,
+      })).sort((a, b) => b.count - a.count);
+    };
+
+    return {
+      overview: {
+        totalRiders: allRiders.length,
+        activeRiders: activeRiderCount,
+        totalAssignments: orderCount,
+        successfulAssignments: completedOrders.length,
+        replacementRate: orderCount > 0 ? Math.round((cancelledOrders.length / orderCount) * 1000) / 10 : 0,
+        averageAssignmentTime: Math.round(avgAssignmentTime * 10) / 10,
+        averageDeliveryTime: Math.round(avgDeliveryTime * 10) / 10,
+        onTimeDeliveryRate: orderCount > 0 ? Math.round((completedOrders.length / orderCount) * 1000) / 10 : 0,
+      },
+      dailyStats: buildDailyStats(),
+      hourlyStats: buildHourlyStats(),
+      topPerformers: buildTopPerformers(),
+      statusBreakdown: buildStatusBreakdown(),
+      geography: buildGeography(),
+    };
+  }
+
+  /**
    * Get riders for staff
    */
   async getRidersForStaff(
@@ -3417,7 +3635,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     staffId: string,
     filters?: {
       role?: 'citizen' | 'vendor' | 'rider';
-      status?: 'active' | 'suspended';
+      status?: 'active' | 'suspended' | 'deleted';
       search?: string;
       page?: number;
       limit?: number;
@@ -4154,7 +4372,8 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         department:departments(
           id,
           name,
-          slug
+          slug,
+          permissions
         )
       `)
       .eq('id', staffId)
@@ -4172,10 +4391,14 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
 
     // Check if staff is in finance department or has finance-related role
     const departmentSlug = (staff.department as any)?.slug || '';
+    const departmentPermissions: string[] = (staff.department as any)?.permissions || [];
     const isFinanceDepartment = departmentSlug === 'finance' || departmentSlug === 'financial';
     const isFinanceRole = staff.role === 'finance_manager' || staff.role === 'financial_analyst' || staff.role === 'super_admin';
+    const hasFinancePermission = ['view_revenue', 'view_wallet_transactions', 'process_payouts'].some(
+      permission => departmentPermissions.includes(permission),
+    );
 
-    if (!isFinanceDepartment && !isFinanceRole) {
+    if (!isFinanceDepartment && !isFinanceRole && !hasFinancePermission) {
       this.logger.warn(`Finance staff verification failed: Staff ${staffId} (role: ${staff.role}, dept: ${departmentSlug}) does not have finance permissions`);
       throw new UnauthorizedException('Finance department access required');
     }
@@ -4692,16 +4915,17 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     await this.verifyContentModerator(staffId);
 
     // Get counts for each content type
-    const [productsCount, servicesCount, storiesCount, streamsCount, auctionsCount] = await Promise.all([
+    const [productsCount, servicesCount, storiesCount, streamsCount, auctionsCount, postsCount] = await Promise.all([
       this.supabase.from('products').select('*', { count: 'exact', head: true }),
       this.supabase.from('services').select('*', { count: 'exact', head: true }),
       this.supabase.from('stories').select('*', { count: 'exact', head: true }),
       this.supabase.from('live_streams').select('*', { count: 'exact', head: true }),
       this.supabase.from('auctions').select('*', { count: 'exact', head: true }),
+      this.supabase.from('posts').select('*', { count: 'exact', head: true }).eq('is_deleted', false),
     ]);
 
     // Get pending/flagged counts (draft status for products/services)
-    const [pendingProducts, pendingServices, activeStories, liveStreams, scheduledAuctions, activeAuctions, endedAuctions] = await Promise.all([
+    const [pendingProducts, pendingServices, activeStories, liveStreams, scheduledAuctions, activeAuctions, endedAuctions, hiddenPosts, reportedPosts] = await Promise.all([
       this.supabase.from('products').select('*', { count: 'exact', head: true }).eq('status', 'draft'),
       this.supabase.from('services').select('*', { count: 'exact', head: true }).eq('status', 'draft'),
       this.supabase.from('stories').select('*', { count: 'exact', head: true }).eq('is_active', true),
@@ -4709,6 +4933,8 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       this.supabase.from('auctions').select('*', { count: 'exact', head: true }).eq('status', 'scheduled'),
       this.supabase.from('auctions').select('*', { count: 'exact', head: true }).eq('status', 'active'),
       this.supabase.from('auctions').select('*', { count: 'exact', head: true }).eq('status', 'ended'),
+      this.supabase.from('posts').select('*', { count: 'exact', head: true }).eq('is_deleted', true),
+      this.supabase.from('content_reports').select('*', { count: 'exact', head: true }).eq('report_category', 'post').eq('status', 'pending'),
     ]);
 
     return {
@@ -4739,7 +4965,237 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         active: activeAuctions.count || 0,
         ended: endedAuctions.count || 0,
       },
+      posts: {
+        total: postsCount.count || 0,
+        hidden: hiddenPosts.count || 0,
+        reported: reportedPosts.count || 0,
+      },
     };
+  }
+
+  /**
+   * Get posts for moderation (admin bypass of RLS)
+   */
+  async getPostsForModeration(
+    staffId: string,
+    filters: { status?: string; privacy?: string; search?: string; sortBy?: string; page?: number; limit?: number },
+  ) {
+    await this.verifyContentModerator(staffId);
+
+    let query = this.supabase
+      .from('posts')
+      .select(`
+        id,
+        content,
+        media_urls,
+        media_type,
+        privacy_level,
+        likes_count,
+        comments_count,
+        shares_count,
+        gifts_count,
+        is_pinned,
+        is_deleted,
+        created_at,
+        updated_at,
+        user:user_profiles!user_id(id, username, avatar_url, is_verified, preferences)
+      `);
+
+    if (filters.status === 'active') {
+      query = query.eq('is_deleted', false);
+    } else if (filters.status === 'hidden') {
+      query = query.eq('is_deleted', true);
+    } else if (filters.status === 'pinned') {
+      query = query.eq('is_pinned', true).eq('is_deleted', false);
+    }
+
+    if (filters.privacy && filters.privacy !== 'all') {
+      query = query.eq('privacy_level', filters.privacy);
+    }
+
+    if (filters.search) {
+      query = query.ilike('content', `%${filters.search}%`);
+    }
+
+    const sortBy = filters.sortBy || 'newest';
+    if (sortBy === 'most_engagement') {
+      query = query.order('likes_count', { ascending: false });
+    } else {
+      query = query.order('created_at', { ascending: false });
+    }
+
+    const page = filters.page || 1;
+    const limit = filters.limit || 20;
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+    query = query.range(from, to);
+
+    const { data: posts, error } = await query;
+
+    if (error) {
+      this.logger.error(`Failed to fetch posts for moderation: ${error.message}`);
+      throw new Error(`Failed to fetch posts: ${error.message}`);
+    }
+
+    const postIds = (posts || []).map((p) => p.id);
+    const reportCounts: Record<string, number> = {};
+
+    if (postIds.length > 0) {
+      const { data: reports } = await this.supabase
+        .from('content_reports')
+        .select('post_id')
+        .eq('report_category', 'post')
+        .in('post_id', postIds);
+      (reports || []).forEach((r) => {
+        if (r.post_id) reportCounts[r.post_id] = (reportCounts[r.post_id] || 0) + 1;
+      });
+    }
+
+    let postsWithReports = (posts || []).map((p) => ({
+      ...p,
+      reportCount: reportCounts[p.id] || 0,
+    }));
+
+    if (filters.status === 'reported') {
+      postsWithReports = postsWithReports.filter((p) => p.reportCount > 0);
+    }
+
+    const { count } = await this.supabase.from('posts').select('*', { count: 'exact', head: true });
+
+    return {
+      posts: postsWithReports,
+      pagination: {
+        page,
+        limit,
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit),
+      },
+    };
+  }
+
+  /**
+   * Get a single post for moderation (includes media items + report count)
+   */
+  async getPostByIdForModeration(staffId: string, postId: string) {
+    await this.verifyContentModerator(staffId);
+
+    const { data: post, error } = await this.supabase
+      .from('posts')
+      .select(`
+        id,
+        content,
+        media_urls,
+        media_type,
+        privacy_level,
+        likes_count,
+        comments_count,
+        shares_count,
+        gifts_count,
+        is_pinned,
+        is_deleted,
+        created_at,
+        updated_at,
+        user:user_profiles!user_id(id, username, avatar_url, is_verified, preferences)
+      `)
+      .eq('id', postId)
+      .single();
+
+    if (error || !post) {
+      throw new NotFoundException('Post not found');
+    }
+
+    const [mediaResult, reportCountResult] = await Promise.all([
+      this.supabase.from('post_media').select('*').eq('post_id', postId).order('order_index'),
+      this.supabase
+        .from('content_reports')
+        .select('*', { count: 'exact', head: true })
+        .eq('post_id', postId)
+        .eq('report_category', 'post'),
+    ]);
+
+    return {
+      ...post,
+      mediaItems: mediaResult.data || [],
+      reportCount: reportCountResult.count || 0,
+    };
+  }
+
+  /**
+   * Admin: hide (soft-delete) a post
+   */
+  async adminHidePost(staffId: string, postId: string, reason: string) {
+    await this.verifyContentModerator(staffId);
+
+    const { error } = await this.supabase
+      .from('posts')
+      .update({ is_deleted: true })
+      .eq('id', postId);
+
+    if (error) {
+      this.logger.error(`Failed to hide post ${postId}: ${error.message}`);
+      throw new Error(`Failed to hide post: ${error.message}`);
+    }
+
+    this.logger.log(`Staff ${staffId} hid post ${postId}. Reason: ${reason}`);
+    return { message: 'Post hidden successfully' };
+  }
+
+  /**
+   * Admin: restore a hidden post
+   */
+  async adminRestorePost(staffId: string, postId: string) {
+    await this.verifyContentModerator(staffId);
+
+    const { error } = await this.supabase
+      .from('posts')
+      .update({ is_deleted: false })
+      .eq('id', postId);
+
+    if (error) {
+      this.logger.error(`Failed to restore post ${postId}: ${error.message}`);
+      throw new Error(`Failed to restore post: ${error.message}`);
+    }
+
+    this.logger.log(`Staff ${staffId} restored post ${postId}`);
+    return { message: 'Post restored successfully' };
+  }
+
+  /**
+   * Admin: pin a post
+   */
+  async adminPinPost(staffId: string, postId: string) {
+    await this.verifyContentModerator(staffId);
+
+    const { error } = await this.supabase
+      .from('posts')
+      .update({ is_pinned: true })
+      .eq('id', postId);
+
+    if (error) {
+      this.logger.error(`Failed to pin post ${postId}: ${error.message}`);
+      throw new Error(`Failed to pin post: ${error.message}`);
+    }
+
+    return { message: 'Post pinned successfully' };
+  }
+
+  /**
+   * Admin: unpin a post
+   */
+  async adminUnpinPost(staffId: string, postId: string) {
+    await this.verifyContentModerator(staffId);
+
+    const { error } = await this.supabase
+      .from('posts')
+      .update({ is_pinned: false })
+      .eq('id', postId);
+
+    if (error) {
+      this.logger.error(`Failed to unpin post ${postId}: ${error.message}`);
+      throw new Error(`Failed to unpin post: ${error.message}`);
+    }
+
+    return { message: 'Post unpinned successfully' };
   }
 
   /**
@@ -5676,21 +6132,25 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       order.buyer_id,
       WalletTransactionType.ESCROW_REFUND,
       parseFloat(escrow.total_amount),
-      `Full refund for order ${order.order_number}`,
+      `Full refund for order ${order.order_number} (resolved by support)`,
       order.id,
       'order',
     );
 
     // Update escrow status
-    await this.supabase
+    const { error: escrowUpdateError } = await this.supabase
       .from('escrows')
       .update({
         status: 'refunded',
         refund_reason: reason,
-        refunded_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq('id', escrow.id);
+
+    if (escrowUpdateError) {
+      this.logger.error(`Failed to update escrow ${escrow.id} status to refunded: ${escrowUpdateError.message}`);
+      throw new Error(`Refund credited to buyer but escrow status update failed: ${escrowUpdateError.message}. Manual reconciliation required.`);
+    }
 
     // Update order status
     await this.supabase
@@ -5700,6 +6160,14 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         updated_at: new Date().toISOString(),
       })
       .eq('id', order.id);
+
+    // Notify buyer
+    await this.notificationHelper.notifyOrderRefunded(
+      order.buyer_id,
+      parseFloat(escrow.total_amount),
+      order.order_number,
+      reason,
+    );
   }
 
   /**
@@ -5711,9 +6179,33 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     refundData: RefundRequestDto,
     staffId: string
   ) {
-    const riderEarnings = refundData.riderEarnings || 0;
+    const requestedRiderEarnings = refundData.riderEarnings || 0;
     const vendorAmount = refundData.vendorAmount || 0;
-    const buyerRefundAmount = parseFloat(escrow.total_amount) - riderEarnings - vendorAmount;
+    const platformFeeAmount = refundData.platformFee || 0;
+    const escrowTotal = parseFloat(escrow.total_amount);
+
+    // Only apply rider earnings if this order actually has a rider assigned.
+    // If no rider exists, those funds must NOT be silently removed from the
+    // buyer's refund — they would otherwise disappear with no destination.
+    const effectiveRiderEarnings = (requestedRiderEarnings > 0 && order.rider_id)
+      ? requestedRiderEarnings
+      : 0;
+
+    if (requestedRiderEarnings > 0 && !order.rider_id) {
+      this.logger.warn(
+        `Staff ${staffId} entered riderEarnings=${requestedRiderEarnings} for order ${order.order_number} but no rider is assigned. Rider earnings ignored and returned to buyer.`,
+      );
+    }
+
+    // Validate allocations do not exceed the escrow total
+    const totalAllocated = effectiveRiderEarnings + vendorAmount + platformFeeAmount;
+    if (totalAllocated > escrowTotal) {
+      throw new BadRequestException(
+        `Allocated amounts (${totalAllocated}) exceed escrow total (${escrowTotal}). Please correct the values.`,
+      );
+    }
+
+    const buyerRefundAmount = escrowTotal - effectiveRiderEarnings - vendorAmount - platformFeeAmount;
 
     // Refund remaining amount to buyer
     if (buyerRefundAmount > 0) {
@@ -5721,7 +6213,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         order.buyer_id,
         WalletTransactionType.ESCROW_REFUND,
         buyerRefundAmount,
-        `Partial refund for order ${order.order_number}`,
+        `Partial refund for order ${order.order_number} (resolved by support)`,
         order.id,
         'order',
       );
@@ -5733,34 +6225,83 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         order.vendor_id,
         WalletTransactionType.ESCROW_RELEASE,
         vendorAmount,
-        `Partial payment for order ${order.order_number}`,
+        `Partial payment for order ${order.order_number} (resolved by support)`,
         order.id,
         'order',
       );
     }
 
-    // Pay rider their earnings
-    if (riderEarnings > 0 && order.rider_id) {
-      await this.walletService.processWalletTransaction(
+    // Pay rider their earnings (only when a rider is actually assigned)
+    if (effectiveRiderEarnings > 0 && order.rider_id) {
+      const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
         order.rider_id,
-        WalletTransactionType.ESCROW_RELEASE,
-        riderEarnings,
+        effectiveRiderEarnings,
         `Earnings for order ${order.order_number}`,
+      );
+
+      if (!partnerCredit.credited) {
+        // Independent rider — credit Freti wallet as before
+        await this.walletService.processWalletTransaction(
+          order.rider_id,
+          WalletTransactionType.DELIVERY_PAYMENT,
+          effectiveRiderEarnings,
+          `Earnings for order ${order.order_number} (resolved by support)`,
+          order.id,
+          'order',
+        );
+      }
+    }
+
+    // Credit platform fee to platform wallet
+    if (platformFeeAmount > 0) {
+      await this.walletService.processWalletTransaction(
+        this.PLATFORM_USER_ID,
+        WalletTransactionType.PLATFORM_COMMISSION,
+        platformFeeAmount,
+        `Platform fee for order ${order.order_number}`,
         order.id,
         'order',
       );
+    }
+
+    // The buyer's wallet holds the escrow balance for this order (credited via
+    // purchase_hold at checkout). ESCROW_RELEASE/DELIVERY_PAYMENT/PLATFORM_COMMISSION
+    // above only credit the vendor/rider/platform's own wallets — they never touch
+    // the buyer's escrow_balance. Debit the buyer's escrow_balance here for the
+    // portion that was released to other parties, so it doesn't stay stuck as
+    // phantom held funds.
+    const releasedAmount = vendorAmount + effectiveRiderEarnings + platformFeeAmount;
+    if (releasedAmount > 0) {
+      const escrowDebitResult = await this.walletService.processWalletTransaction(
+        order.buyer_id,
+        WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM,
+        releasedAmount,
+        `Escrow debit for released funds on order ${order.order_number} (resolved by support)`,
+        order.id,
+        'order',
+      );
+
+      if (!escrowDebitResult.success) {
+        this.logger.error(
+          `Failed to debit buyer escrow balance for order ${order.order_number}: ${escrowDebitResult.error}. Manual reconciliation required.`,
+        );
+      }
     }
 
     // Update escrow status
-    await this.supabase
+    const { error: escrowUpdateError } = await this.supabase
       .from('escrows')
       .update({
         status: 'refunded',
         refund_reason: refundData.reason,
-        refunded_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq('id', escrow.id);
+
+    if (escrowUpdateError) {
+      this.logger.error(`Failed to update escrow ${escrow.id} status to refunded: ${escrowUpdateError.message}`);
+      throw new Error(`Partial refund processed but escrow status update failed: ${escrowUpdateError.message}. Manual reconciliation required.`);
+    }
 
     // Update order status
     await this.supabase
@@ -5770,6 +6311,32 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         updated_at: new Date().toISOString(),
       })
       .eq('id', order.id);
+
+    // Notify all affected parties
+    if (buyerRefundAmount > 0) {
+      await this.notificationHelper.notifyOrderRefunded(
+        order.buyer_id,
+        buyerRefundAmount,
+        order.order_number,
+        refundData.reason,
+      );
+    }
+
+    if (vendorAmount > 0 && order.vendor_id) {
+      await this.notificationHelper.notifyVendorEscrowReleased(
+        order.vendor_id,
+        vendorAmount,
+        order.order_number,
+      );
+    }
+
+    if (effectiveRiderEarnings > 0 && order.rider_id) {
+      await this.notificationHelper.notifyRiderPaymentReleased(
+        order.rider_id,
+        effectiveRiderEarnings,
+        order.order_number,
+      );
+    }
   }
 
   /**
@@ -5783,7 +6350,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
   ) {
     try {
       // Call the actual escrow release function (same as buyer order completion)
-      await this.escrowService.releaseEscrow(order.id, `Admin release: ${reason}`);
+      await this.escrowService.releaseEscrow(escrow.id, `Admin release: ${reason}`);
 
       // Explicitly update order status to completed (admin override)
       await this.supabase
@@ -5793,6 +6360,13 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
           updated_at: new Date().toISOString(),
         })
         .eq('id', order.id);
+
+      // Notify buyer — vendor/rider are already notified inside escrowService.releaseEscrow
+      await this.notificationHelper.notifyBuyerFundsReleasedByAdmin(
+        order.buyer_id,
+        order.order_number,
+        reason,
+      );
 
       this.logger.log(`✅ Admin ${staffId} successfully released funds and completed order ${order.id}`);
     } catch (error: any) {
@@ -6245,7 +6819,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
    * Admin-only endpoint to view platform wallet
    */
   async getPlatformWallet(adminId: string) {
-    await this.verifyAdmin(adminId);
+    await this.verifyFinanceStaff(adminId);
     
     this.logger.log(`Admin ${adminId} fetching platform wallet`);
     
@@ -6262,11 +6836,27 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
    * Admin-only endpoint to view platform bank accounts
    */
   async getPlatformBankAccounts(adminId: string) {
-    await this.verifyAdmin(adminId);
+    await this.verifyFinanceStaff(adminId);
     
     this.logger.log(`Admin ${adminId} fetching platform bank accounts`);
     
     return this.bankAccountService.getUserBankAccounts(this.PLATFORM_USER_ID);
+  }
+
+  async getPlatformBanks(adminId: string, country: string) {
+    await this.verifyFinanceStaff(adminId);
+
+    this.logger.log(`Admin ${adminId} fetching platform banks for ${country.toUpperCase()}`);
+
+    return this.flutterwaveService.getBanks(country.toUpperCase());
+  }
+
+  async previewPlatformBankAccount(adminId: string, accountNumber: string, bankCode: string) {
+    await this.verifyFinanceStaff(adminId);
+
+    this.logger.log(`Admin ${adminId} previewing platform bank account ${accountNumber}`);
+
+    return this.bankAccountService.previewAccountName(accountNumber, bankCode);
   }
 
   /**
@@ -6274,7 +6864,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
    * Admin-only endpoint
    */
   async addPlatformBankAccount(adminId: string, dto: CreateBankAccountDto) {
-    await this.verifyAdmin(adminId);
+    await this.verifyFinanceStaff(adminId);
     
     this.logger.log(`Admin ${adminId} adding bank account for platform`);
     
@@ -6296,7 +6886,12 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       this.logger.warn(`Failed to log audit action: ${auditError.message}`);
     }
     
-    return this.bankAccountService.createBankAccount(this.PLATFORM_USER_ID, dto);
+    // Pass the admin-provided accountName as pre-verified so createBankAccount skips the
+    // redundant Flutterwave call (the admin panel already confirmed it via the preview endpoint).
+    return this.bankAccountService.createBankAccount(this.PLATFORM_USER_ID, {
+      ...dto,
+      preVerifiedAccountName: dto.accountName || undefined,
+    });
   }
 
   /**
@@ -6304,7 +6899,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
    * Admin-only endpoint
    */
   async updatePlatformBankAccount(adminId: string, accountId: string, dto: UpdateBankAccountDto) {
-    await this.verifyAdmin(adminId);
+    await this.verifyFinanceStaff(adminId);
     
     this.logger.log(`Admin ${adminId} updating platform bank account ${accountId}`);
     
@@ -6333,7 +6928,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
    * Admin-only endpoint
    */
   async deletePlatformBankAccount(adminId: string, accountId: string) {
-    await this.verifyAdmin(adminId);
+    await this.verifyFinanceStaff(adminId);
     
     this.logger.log(`Admin ${adminId} deleting platform bank account ${accountId}`);
     
@@ -6362,7 +6957,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
    * Admin-only endpoint
    */
   async createPlatformWithdrawal(adminId: string, dto: WithdrawRequestDto) {
-    await this.verifyAdmin(adminId);
+    await this.verifyFinanceStaff(adminId);
     
     this.logger.log(`Admin ${adminId} creating platform withdrawal request: ₣${dto.fretiAmount}`);
     
@@ -6402,7 +6997,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
    * Admin-only endpoint to view withdrawal history
    */
   async getPlatformWithdrawals(adminId: string, page: number = 1, limit: number = 50) {
-    await this.verifyAdmin(adminId);
+    await this.verifyFinanceStaff(adminId);
     
     this.logger.log(`Admin ${adminId} fetching platform withdrawal requests (page ${page}, limit ${limit})`);
     
@@ -6435,44 +7030,42 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       throw new BadRequestException('Failed to fetch platform withdrawal requests');
     }
 
-    // Fetch bank account details for each withdrawal
-    const withdrawalsWithBankInfo = await Promise.all(
-      (withdrawals || []).map(async (withdrawal) => {
-        // Extract bank_account_id from metadata
-        const bankAccountId = withdrawal.metadata?.bank_account_id;
-        
-        if (bankAccountId) {
-          try {
-            const bankAccount = await this.bankAccountService.getBankAccount(
-              this.PLATFORM_USER_ID,
-              bankAccountId
-            );
-            return {
-              ...withdrawal,
-              bank_account_id: bankAccountId, // Add it to the response for frontend compatibility
-              bankAccount: {
-                accountName: bankAccount.accountName,
-                bankName: bankAccount.bankName,
-                accountNumber: bankAccount.accountNumber,
-                currency: bankAccount.currency,
-              },
-            };
-          } catch (err) {
-            // If bank account is deleted or inaccessible, return without it
-            return {
-              ...withdrawal,
-              bank_account_id: bankAccountId,
-              bankAccount: null,
-            };
-          }
-        }
-        return {
-          ...withdrawal,
-          bank_account_id: null,
-          bankAccount: null,
+    // Collect unique bank account IDs referenced in these withdrawals
+    const bankAccountIds = [
+      ...new Set(
+        (withdrawals || []).map((w) => w.metadata?.bank_account_id).filter(Boolean),
+      ),
+    ] as string[];
+
+    // Batch-fetch all bank accounts in a single query (avoids N+1 and noisy NotFoundException logs)
+    const bankAccountMap: Record<string, { accountName: string; bankName: string; accountNumber: string; currency: string }> = {};
+    if (bankAccountIds.length > 0) {
+      const { data: bankAccountRows } = await this.supabase
+        .from('user_bank_accounts')
+        .select('id, account_name, bank_name, account_number, currency')
+        .in('id', bankAccountIds)
+        .eq('user_id', this.PLATFORM_USER_ID)
+        .eq('is_active', true);
+
+      (bankAccountRows || []).forEach((ba) => {
+        bankAccountMap[ba.id] = {
+          accountName: ba.account_name,
+          bankName: ba.bank_name,
+          accountNumber: ba.account_number,
+          currency: ba.currency,
         };
-      })
-    );
+      });
+    }
+
+    // Enrich withdrawals with bank account info (missing accounts silently become null)
+    const withdrawalsWithBankInfo = (withdrawals || []).map((withdrawal) => {
+      const bankAccountId = withdrawal.metadata?.bank_account_id ?? null;
+      return {
+        ...withdrawal,
+        bank_account_id: bankAccountId,
+        bankAccount: bankAccountId ? (bankAccountMap[bankAccountId] ?? null) : null,
+      };
+    });
 
     // Return with pagination metadata
     return {
@@ -7159,4 +7752,5 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     }
   }
 }
+
 

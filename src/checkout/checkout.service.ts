@@ -42,6 +42,52 @@ export class CheckoutService {
     return Math.floor(100 + Math.random() * 900).toString();
   }
 
+  /**
+   * Determine whether a seller location is out-of-state or out-of-country
+   * relative to the buyer's delivery address.
+   */
+  private detectInterstate(
+    sellerLocation: { state?: string; country?: string; city?: string } | null | undefined,
+    buyerState?: string,
+    buyerCountry?: string,
+  ): { isOutOfState: boolean; isOutOfCountry: boolean } {
+    if (!sellerLocation || (!sellerLocation.state && !sellerLocation.country)) {
+      return { isOutOfState: false, isOutOfCountry: false };
+    }
+    const sellerCountry = (sellerLocation.country || '').trim().toLowerCase();
+    const sellerState = (sellerLocation.state || '').trim().toLowerCase();
+    const bCountry = (buyerCountry || '').trim().toLowerCase();
+    const bState = (buyerState || '').trim().toLowerCase();
+
+    const isOutOfCountry =
+      sellerCountry !== '' && bCountry !== '' && sellerCountry !== bCountry;
+    const isOutOfState =
+      !isOutOfCountry &&
+      sellerState !== '' &&
+      bState !== '' &&
+      sellerState !== bState;
+
+    return { isOutOfState, isOutOfCountry };
+  }
+
+  /**
+   * Parse a "State, Country" (or "City, State, Country") string into a location object.
+   */
+  private parseItemLocation(
+    location?: string | null,
+  ): { state?: string; country?: string; city?: string } | null {
+    if (!location || typeof location !== 'string') return null;
+    const parts = location
+      .split(',')
+      .map(p => p.trim())
+      .filter(Boolean);
+    if (parts.length === 0) return null;
+    if (parts.length >= 2) {
+      return { state: parts[0], country: parts[parts.length - 1] };
+    }
+    return { state: parts[0] };
+  }
+
   // Get checkout summary from user's cart
   async getCheckoutSummary(userId: string, userToken?: string, selectedItemIds?: string[]) {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
@@ -59,13 +105,15 @@ export class CheckoutService {
           price,
           user_id,
           category_id,
-          quantity
+          quantity,
+          location
         ),
         services!cart_items_service_id_fkey (
           id,
           name,
           base_price,
           user_id,
+          location,
           service_categories (
             name
           )
@@ -102,6 +150,7 @@ export class CheckoutService {
           serviceTime: item.scheduled_time,
           serviceNotes: item.service_notes,
           category: item.services?.service_categories?.name || 'Services',
+          itemLocation: item.services?.location || undefined,
         };
       } else {
         // Product item
@@ -113,6 +162,7 @@ export class CheckoutService {
           sellerId: item.products.user_id,
           requiresEscrow: false,
           itemType: 'product',
+          itemLocation: item.products?.location || undefined,
         };
       }
     });
@@ -129,19 +179,68 @@ export class CheckoutService {
       }
     }
 
-    const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
-    const shipping = this.calculateShipping(subtotal, items);
+    // Fetch seller locations so the mobile can pass the vendor's state/country
+    // as pickupLocation when requesting nearby riders (pickup location filtering)
+    const sellerIds = [...new Set(items.map((i: any) => i.sellerId).filter(Boolean))];
+    let sellerLocationMap: Record<string, { state?: string; country?: string; city?: string }> = {};
+    if (sellerIds.length > 0) {
+      const { data: sellerProfiles } = await this.supabase
+        .from('user_profiles')
+        .select('id, location')
+        .in('id', sellerIds);
+      sellerProfiles?.forEach((profile: any) => {
+        sellerLocationMap[profile.id] = {
+          state: profile.location?.state || undefined,
+          country: profile.location?.country || undefined,
+          city: profile.location?.city || undefined,
+        };
+      });
+    }
+
+    const itemsWithLocation = items.map((item: any) => {
+      const parsedItemLocation = this.parseItemLocation(item.itemLocation);
+      return {
+        ...item,
+        sellerLocation: parsedItemLocation || sellerLocationMap[item.sellerId] || null,
+      };
+    });
+
+    // Fetch buyer's default delivery address for interstate detection
+    const { data: buyerDefaultAddress } = await this.supabase
+      .from('delivery_addresses')
+      .select('state, country')
+      .eq('user_id', userId)
+      .eq('is_default', true)
+      .single();
+    const buyerState = buyerDefaultAddress?.state || undefined;
+    const buyerCountry = buyerDefaultAddress?.country || undefined;
+
+    // Add interstate/international flags to each item
+    const itemsWithInterstate = itemsWithLocation.map((item: any) => {
+      const { isOutOfState, isOutOfCountry } = this.detectInterstate(
+        item.sellerLocation, buyerState, buyerCountry,
+      );
+      return { ...item, isOutOfState, isOutOfCountry };
+    });
+
+    const hasOutOfStateItems = itemsWithInterstate.some((i: any) => i.isOutOfState || i.isOutOfCountry);
+    const hasOutOfCountryItems = itemsWithInterstate.some((i: any) => i.isOutOfCountry);
+
+    const subtotal = itemsWithInterstate.reduce((sum: number, item: any) => sum + (item.price * item.quantity), 0);
+    const shipping = this.calculateShipping(subtotal, itemsWithInterstate);
     const tax = this.calculateTax(subtotal);
     const escrowFee = this.calculateEscrowFee(subtotal + shipping + tax);
     const total = subtotal + shipping + tax + escrowFee;
 
     return {
-      items,
+      items: itemsWithInterstate,
       subtotal,
       shipping,
       tax,
       escrowFee,
       total,
+      hasOutOfStateItems,
+      hasOutOfCountryItems,
     };
   }
 
@@ -165,7 +264,8 @@ export class CheckoutService {
           price,
           user_id,
           status,
-          quantity
+          quantity,
+          location
         )
       `)
       .eq('user_id', userId)
@@ -199,21 +299,62 @@ export class CheckoutService {
       quantity: 1, // Wishlist items are always quantity 1
       sellerId: item.products.user_id,
       requiresEscrow: true, // Wishlist purchases always use escrow
+      itemLocation: item.products?.location || undefined,
     }));
 
-    const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
-    const shipping = this.calculateShipping(subtotal, items);
+    // Attach seller location so mobile can pass vendor state/country to rider filter
+    const wishlistSellerIds = [...new Set(items.map((i: any) => i.sellerId).filter(Boolean))];
+    let wishlistSellerLocMap: Record<string, any> = {};
+    if (wishlistSellerIds.length > 0) {
+      const { data: wishlistSellerProfiles } = await this.supabase
+        .from('user_profiles').select('id, location').in('id', wishlistSellerIds);
+      wishlistSellerProfiles?.forEach((p: any) => {
+        wishlistSellerLocMap[p.id] = { state: p.location?.state, country: p.location?.country, city: p.location?.city };
+      });
+    }
+    const wishlistItemsWithLoc = items.map((item: any) => {
+      const parsedItemLocation = this.parseItemLocation(item.itemLocation);
+      return {
+        ...item,
+        sellerLocation: parsedItemLocation || wishlistSellerLocMap[item.sellerId] || null,
+      };
+    });
+
+    // Fetch buyer's default delivery address for interstate detection
+    const { data: wishlistBuyerAddr } = await this.supabase
+      .from('delivery_addresses')
+      .select('state, country')
+      .eq('user_id', userId)
+      .eq('is_default', true)
+      .single();
+    const wBuyerState = wishlistBuyerAddr?.state || undefined;
+    const wBuyerCountry = wishlistBuyerAddr?.country || undefined;
+
+    const wishlistItemsWithInterstate = wishlistItemsWithLoc.map((item: any) => {
+      const { isOutOfState, isOutOfCountry } = this.detectInterstate(
+        item.sellerLocation, wBuyerState, wBuyerCountry,
+      );
+      return { ...item, isOutOfState, isOutOfCountry };
+    });
+
+    const hasOutOfStateItems = wishlistItemsWithInterstate.some((i: any) => i.isOutOfState || i.isOutOfCountry);
+    const hasOutOfCountryItems = wishlistItemsWithInterstate.some((i: any) => i.isOutOfCountry);
+
+    const subtotal = wishlistItemsWithInterstate.reduce((sum: number, item: any) => sum + (item.price * item.quantity), 0);
+    const shipping = this.calculateShipping(subtotal, wishlistItemsWithInterstate);
     const tax = this.calculateTax(subtotal);
     const escrowFee = this.calculateEscrowFee(subtotal + shipping + tax);
     const total = subtotal + shipping + tax + escrowFee;
 
     return {
-      items,
+      items: wishlistItemsWithInterstate,
       subtotal,
       shipping,
       tax,
       escrowFee,
       total,
+      hasOutOfStateItems,
+      hasOutOfCountryItems,
     };
   }
 
@@ -224,7 +365,7 @@ export class CheckoutService {
     // Get product details
     const { data: product, error: productError } = await client
       .from('products')
-      .select('id, name, price, user_id, category_id, quantity')
+      .select('id, name, price, user_id, category_id, quantity, location')
       .eq('id', productId)
       .single();
 
@@ -246,19 +387,53 @@ export class CheckoutService {
       requiresEscrow: false,
     }];
 
+    // Attach seller location: prefer the product's own location, fall back to seller profile
+    const parsedProductLocation = this.parseItemLocation(product.location);
+    let directSellerLoc = parsedProductLocation;
+    if (!directSellerLoc) {
+      const { data: directSellerProfile } = await this.supabase
+        .from('user_profiles').select('id, location').eq('id', product.user_id).single();
+      directSellerLoc = directSellerProfile
+        ? { state: directSellerProfile.location?.state, country: directSellerProfile.location?.country, city: directSellerProfile.location?.city }
+        : null;
+    }
+    const itemsWithLoc = items.map((item: any) => ({ ...item, sellerLocation: directSellerLoc }));
+
+    // Fetch buyer's default delivery address for interstate detection
+    const { data: directBuyerAddr } = await this.supabase
+      .from('delivery_addresses')
+      .select('state, country')
+      .eq('user_id', userId)
+      .eq('is_default', true)
+      .single();
+    const dBuyerState = directBuyerAddr?.state || undefined;
+    const dBuyerCountry = directBuyerAddr?.country || undefined;
+
+    const itemsWithInterstate = itemsWithLoc.map((item: any) => {
+      const { isOutOfState, isOutOfCountry } = this.detectInterstate(
+        item.sellerLocation, dBuyerState, dBuyerCountry,
+      );
+      return { ...item, isOutOfState, isOutOfCountry };
+    });
+
+    const hasOutOfStateItems = itemsWithInterstate.some((i: any) => i.isOutOfState || i.isOutOfCountry);
+    const hasOutOfCountryItems = itemsWithInterstate.some((i: any) => i.isOutOfCountry);
+
     const subtotal = product.price * quantity;
-    const shipping = this.calculateShipping(subtotal, items);
+    const shipping = this.calculateShipping(subtotal, itemsWithInterstate);
     const tax = this.calculateTax(subtotal);
     const escrowFee = this.calculateEscrowFee(subtotal + shipping + tax);
     const total = subtotal + shipping + tax + escrowFee;
 
     return {
-      items,
+      items: itemsWithInterstate,
       subtotal,
       shipping,
       tax,
       escrowFee,
       total,
+      hasOutOfStateItems,
+      hasOutOfCountryItems,
     };
   }
 
@@ -468,6 +643,13 @@ export class CheckoutService {
     
     console.log(`✅ Found winning bid: ${winningBid} for auction ${auctionId}`);
 
+    // Fetch seller location for rider filtering (same pattern as other summary methods)
+    const { data: auctionSellerProfile } = await this.supabase
+      .from('user_profiles').select('id, location').eq('id', auction.seller_id).single();
+    const auctionSellerLoc = auctionSellerProfile
+      ? { state: auctionSellerProfile.location?.state, country: auctionSellerProfile.location?.country, city: auctionSellerProfile.location?.city }
+      : null;
+
     const items = [{
       id: auction.id,
       name: itemTitle,
@@ -477,6 +659,7 @@ export class CheckoutService {
       requiresEscrow: true, // Auctions always use escrow
       imageUrl: itemThumbnail,
       itemType: 'auction',
+      sellerLocation: auctionSellerLoc,
     }];
 
     const subtotal = winningBid;
@@ -550,6 +733,7 @@ export class CheckoutService {
       address: address.address,
       city: address.city,
       state: address.state,
+      country: address.country || undefined,
       postalCode: address.postal_code,
       isDefault: address.is_default,
     } : null;
@@ -574,6 +758,7 @@ export class CheckoutService {
       address: addressData.address,
       city: addressData.city,
       state: addressData.state,
+      country: addressData.country || null,
       postal_code: addressData.postalCode,
       is_default: addressData.isDefault || false,
       updated_at: new Date().toISOString(),
@@ -618,6 +803,7 @@ export class CheckoutService {
       address: result.address,
       city: result.city,
       state: result.state,
+      country: result.country || undefined,
       postalCode: result.postal_code,
       isDefault: result.is_default,
     };
@@ -646,6 +832,7 @@ export class CheckoutService {
       address: addr.address,
       city: addr.city,
       state: addr.state,
+      country: addr.country || undefined,
       postalCode: addr.postal_code,
       isDefault: addr.is_default,
       createdAt: addr.created_at,
@@ -673,6 +860,7 @@ export class CheckoutService {
         address: addressData.address,
         city: addressData.city,
         state: addressData.state,
+        country: addressData.country || null,
         postal_code: addressData.postalCode,
         is_default: addressData.isDefault || false,
         updated_at: new Date().toISOString(),
@@ -694,6 +882,7 @@ export class CheckoutService {
       address: data.address,
       city: data.city,
       state: data.state,
+      country: data.country || undefined,
       postalCode: data.postal_code,
       isDefault: data.is_default,
     };
@@ -841,6 +1030,21 @@ export class CheckoutService {
       summary = await this.getCheckoutSummary(userId, userToken, orderData.selectedItemIds);
     }
 
+    // ✅ INTERSTATE MIXED-CART REJECTION
+    // Cart and wishlist checkouts cannot mix in-state and out-of-state items.
+    // Direct/auction/invoice checkouts are single-vendor and exempt.
+    const isCartOrWishlist = !orderData.auctionCheckout && !orderData.invoiceCheckout && !orderData.directCheckout;
+    if (isCartOrWishlist && summary.hasOutOfStateItems) {
+      const hasInStateItems = summary.items.some((i: any) => !i.isOutOfState && !i.isOutOfCountry);
+      const hasOutOfState = summary.items.some((i: any) => i.isOutOfState || i.isOutOfCountry);
+      if (hasInStateItems && hasOutOfState) {
+        throw new HttpException(
+          'Your cart contains items from vendors in different states/regions. Please check them out separately.',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+    }
+
     // Validate payment method and balance if wallet
     if (orderData.paymentMethodId === 'wallet') {
       const { data: wallet } = await client
@@ -871,8 +1075,22 @@ export class CheckoutService {
     // Handle selected rider
     let actualDeliveryFee = summary.shipping;
     let riderId = null;
+    let isInterstateDelivery = false;
+    let isInternationalDelivery = false;
+    let interstateCompanyId: string | null = null;
+    let interstateCompanyName: string | null = null;
+    let estimatedDeliveryDays: number | null = null;
     
-    if (orderData.selectedRider) {
+    if (orderData.interstateCompany) {
+      // Interstate/international delivery via logistics company
+      isInterstateDelivery = true;
+      isInternationalDelivery = summary.hasOutOfCountryItems || false;
+      interstateCompanyId = orderData.interstateCompany.companyId;
+      interstateCompanyName = orderData.interstateCompany.companyName;
+      estimatedDeliveryDays = orderData.interstateCompany.estimatedDeliveryDays || null;
+      actualDeliveryFee = orderData.interstateCompany.deliveryPrice;
+      riderId = null;
+    } else if (orderData.selectedRider) {
       if (orderData.selectedRider.riderId === 'pickup') {
         // Self pickup - no delivery fee, no rider
         actualDeliveryFee = 0;
@@ -915,8 +1133,10 @@ export class CheckoutService {
       selectedRider: orderData.selectedRider,
       selectedRiderRiderId: orderData.selectedRider?.riderId,
       isPickup: orderData.selectedRider?.riderId === 'pickup',
+      isInterstateDelivery,
+      interstateCompanyId,
       calculatedRiderId: riderId,
-      deliveryType: orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery'
+      deliveryType: isInterstateDelivery ? 'interstate_delivery' : (orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery')
     });
 
     // Create order with correct schema
@@ -932,19 +1152,24 @@ export class CheckoutService {
         ? summary.commissionFee 
         : actualTotal * 0.02, // 2% for regular orders, auction commission rate for auction orders
       rider_id: riderId,
-      delivery_type: orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery',
+      delivery_type: isInterstateDelivery 
+        ? 'interstate_delivery' 
+        : (orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery'),
       delivery_address: {
         fullName: orderData.deliveryAddress.fullName,
         phone: orderData.deliveryAddress.phone,
         address: orderData.deliveryAddress.address,
         city: orderData.deliveryAddress.city,
         state: orderData.deliveryAddress.state,
+        country: orderData.deliveryAddress.country,
         postalCode: orderData.deliveryAddress.postalCode,
       },
       delivery_instructions: orderData.deliveryInstructions,
-      estimated_delivery: riderId ? 
-        new Date(Date.now() + (orderData.selectedRider?.estimatedArrival || 30) * 60 * 1000).toISOString() :
-        new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours for pickup
+      estimated_delivery: isInterstateDelivery
+        ? new Date(Date.now() + (estimatedDeliveryDays || 3) * 24 * 60 * 60 * 1000).toISOString()
+        : (riderId 
+          ? new Date(Date.now() + (orderData.selectedRider?.estimatedArrival || 30) * 60 * 1000).toISOString()
+          : new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()), // 24 hours for pickup
       rider_info: orderData.selectedRider ? {
         riderId: orderData.selectedRider.riderId,
         riderName: orderData.selectedRider.riderName,
@@ -960,6 +1185,16 @@ export class CheckoutService {
         escrow_fee: orderData.useEscrow ? summary.escrowFee : 0,
         payment_method: orderData.paymentMethodId,
         original_shipping: summary.shipping,
+        // Interstate delivery metadata
+        ...(isInterstateDelivery ? {
+          interstate_delivery: {
+            companyId: interstateCompanyId,
+            companyName: interstateCompanyName,
+            estimatedDeliveryDays,
+            deliveryPrice: actualDeliveryFee,
+            isInternational: isInternationalDelivery,
+          },
+        } : {}),
         // Add auction_id to metadata for easier querying
         ...(isAuctionOrder && orderData.auctionCheckout ? {
           auction_id: orderData.auctionCheckout.auctionId,
@@ -999,6 +1234,7 @@ export class CheckoutService {
     const orderItems = summary.items.map(item => {
       const isService = item.itemType === 'service';
       const isAuction = item.itemType === 'auction';
+      const isInvoiceOrder = orderSource === 'invoice';
       
       // Ensure unit_price is never null - use 0 as fallback if price is missing
       const unitPrice = item.price || 0;
@@ -1008,8 +1244,8 @@ export class CheckoutService {
       
       return {
         order_id: order.id,
-        product_id: isService || isAuction ? null : item.id,
-        service_id: isService ? item.id : null,
+        product_id: isService || isAuction || isInvoiceOrder ? null : item.id,
+        service_id: (isService && !isInvoiceOrder) ? item.id : null,
         product_name: item.name,
         category: item.category || 'General',  // ✅ Store category for countdown calculation
         quantity: item.quantity,
@@ -1292,6 +1528,38 @@ export class CheckoutService {
         console.log(`✅ Vendor ${vendorId} notified of payment in escrow (commission rate: ${orderCommissionRate ? (orderCommissionRate * 100).toFixed(1) + '%' : 'default 2%'})`);
       } catch (notifyError) {
         console.error('Failed to notify vendor of payment (non-critical):', notifyError);
+      }
+    }
+
+    // ✅ INTERSTATE DELIVERY: Generate pickup PIN and surface order to logistics partner
+    if (isInterstateDelivery && interstateCompanyId) {
+      try {
+        // Generate a pickup PIN so the logistics company's driver can claim the item from
+        // the vendor safely (same handoff-verification pattern used for regular rider delivery).
+        const interstatePickupPin = this.generatePIN();
+        const interstateDeliveryPin = this.generatePIN();
+
+        await client
+          .from('orders')
+          .update({
+            pickup_pin: interstatePickupPin,
+            delivery_pin: interstateDeliveryPin,
+            metadata: {
+              ...order.metadata,
+              interstate_delivery: {
+                ...(order.metadata?.interstate_delivery || {}),
+                status: 'pending_partner_acceptance',
+              },
+            },
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', order.id);
+
+        console.log(`✅ Generated pickup/delivery PINs for interstate order ${order.order_number}, company ${interstateCompanyName}`);
+        // The logistics partner sees this order (status: pending_partner_acceptance) in their
+        // "Interstate Orders" tab on the web dashboard and can Accept/Reject it there.
+      } catch (interstateError) {
+        console.error('Failed to finalize interstate delivery setup (non-critical):', interstateError);
       }
     }
 

@@ -3,6 +3,16 @@ import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 import { CreateServiceDto, UpdateServiceDto } from './dto/service.dto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { VideoProcessingHelper } from '../shared/video-processing.helper';
+import { TagsService } from '../tags/tags.service';
+import { MentionsService } from '../mentions/mentions.service';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+const execAsync = promisify(exec);
 
 @Injectable()
 export class ServicesService {
@@ -12,6 +22,8 @@ export class ServicesService {
   constructor(
     private configService: ConfigService,
     private supabaseClientManager: SupabaseClientManager,
+    private tagsService: TagsService,
+    private mentionsService: MentionsService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
@@ -99,6 +111,30 @@ export class ServicesService {
       throw new Error(`Failed to create service: ${error.message}`);
     }
 
+    // Fire-and-forget video processing for incompatible codecs
+    if (data.videos && data.videos.length > 0) {
+      data.videos.forEach((videoUrl: string, index: number) => {
+        VideoProcessingHelper.checkAndQueue(videoUrl, userId, 'service', data.id, index).catch(() => {
+          // Silent fail — original video still works
+        });
+      });
+    }
+
+    // Sync tags and mentions based on description
+    const descriptionForSync = createServiceDto.description || '';
+
+    try {
+      await this.tagsService.syncTaggings(data.id, 'service', descriptionForSync);
+    } catch (e) {
+      console.error('Failed to sync tags for service', data.id, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, data.id, 'service', descriptionForSync);
+    } catch (e) {
+      console.error('Failed to create mentions for service', data.id, e);
+    }
+
     return data;
   }
 
@@ -144,7 +180,8 @@ export class ServicesService {
         user_profiles!services_user_id_fkey (
           username,
           avatar_url,
-          is_verified
+          is_verified,
+          display_name
         )
       `)
       .eq('status', 'active');
@@ -192,7 +229,7 @@ export class ServicesService {
         // Add price field (frontend expects 'price', not 'base_price')
         price: service.base_price,
         // Flatten user_profiles data to provider fields
-        provider_name: service.user_profiles?.username || 'Unknown Provider',
+        provider_name: service.user_profiles?.username || service.user_profiles?.display_name || 'Unknown Rider',
         provider_avatar: service.user_profiles?.avatar_url || null,
         provider_verified: service.user_profiles?.is_verified || false,
         provider_id: service.user_id,
@@ -229,11 +266,12 @@ export class ServicesService {
         ),
         user_profiles!services_user_id_fkey (
           username,
-          avatar_url
+          avatar_url,
+          display_name
         )
       `)
       .eq('status', 'active')
-      .not('videos', 'eq', '{}')  // Only services with videos
+      .or('videos.not.eq.{},images.not.eq.{}')  // Services with videos or images
       .order('created_at', { ascending: false })  // Most recent first
       .limit(options.limit || 10);
 
@@ -313,7 +351,7 @@ export class ServicesService {
         booking_count: service.booking_count,
         average_rating: service.average_rating,
         user_id: service.user_id,
-        username: service.user_profiles?.username,
+        username: service.user_profiles?.username || service.user_profiles?.display_name || null,
         isLiked,
         isBookmarked,
         commentCount,
@@ -322,23 +360,30 @@ export class ServicesService {
       return {
         id: service.id,
         title: service.name,
-        thumbnail: service.images?.[0] || null,
-        videoUri: service.videos?.[0] || null,
+        thumbnail: service.images?.[0] || service.primary_media_url || null,
+        videoUri: service.processed_videos?.[0] || service.videos?.[0] || null,
+        mediaUrls: service.videos || [],
+        processedMediaUrls: service.processed_videos || [],
+        images: service.images || [],
+        mediaType: service.media_type || 'video',
         userId: service.user_id,
-        username: service.user_profiles?.username || 'user',
+        username: service.user_profiles?.username || service.user_profiles?.display_name || 'user',
         userAvatar: service.user_profiles?.avatar_url || null,
         description: service.description || '',
         likes: (service.like_count || 0).toString(),
         comments: commentCount.toString(),
         shares: (service.share_count || 0).toString(),
+        saves: (service.save_count || 0).toString(),
+        viewCount: service.view_count || 0,
         price: parseFloat(service.base_price) || 0,
         originalPrice: null, // No original price concept for services yet
         location: service.location || 'Location not set',
-        serviceProvider: service.user_profiles?.username || 'Unknown Provider',
+        serviceProvider: service.user_profiles?.username || service.user_profiles?.display_name || 'Unknown Rider',
         rating: parseFloat(service.average_rating) || 4.5, // Default to 4.5 if no rating yet
         completedJobs: (service.booking_count || 0).toString(),
         isLiked: isLiked, // User-specific like status from service_likes table
         isBookmarked: isBookmarked, // User-specific bookmark status from service_bookmarks table
+        createdAt: service.created_at, // Used by unified feed for recency scoring
       };
     }) || [];
 
@@ -362,7 +407,8 @@ export class ServicesService {
         ),
         user_profiles!services_user_id_fkey (
           username,
-          avatar_url
+          avatar_url,
+          display_name
         )
       `)
       .eq('id', id)
@@ -434,6 +480,22 @@ export class ServicesService {
     if (error) {
       throw new Error(`Failed to update service: ${error.message}`);
     }
+    // Sync tags and mentions based on the final description
+    const descriptionForSync = updateServiceDto.description !== undefined
+      ? updateServiceDto.description
+      : data.description;
+
+    try {
+      await this.tagsService.syncTaggings(serviceId, 'service', descriptionForSync || '');
+    } catch (e) {
+      console.error('Failed to sync tags for updated service', serviceId, e);
+    }
+
+    try {
+      await this.mentionsService.createMentions(userId, serviceId, 'service', descriptionForSync || '');
+    } catch (e) {
+      console.error('Failed to create mentions for updated service', serviceId, e);
+    }
 
     return data;
   }
@@ -467,6 +529,29 @@ export class ServicesService {
     }
 
     return { message: 'Service deleted successfully' };
+  }
+
+  async getServiceLikers(serviceId: string, limit: number = 50, offset: number = 0) {
+    const { data, error } = await this.serviceSupabase
+      .from('service_likes')
+      .select(`
+        user_id,
+        created_at,
+        user:user_profiles(id, username, avatar_url, is_verified, display_name)
+      `)
+      .eq('service_id', serviceId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) throw new Error(`Failed to fetch service likers: ${error.message}`);
+
+    return (data || []).map((row: any) => ({
+      id: row.user?.id,
+      username: row.user?.username || row.user?.display_name || 'Unknown',
+      avatarUrl: row.user?.avatar_url || null,
+      isVerified: row.user?.is_verified || false,
+      likedAt: row.created_at,
+    }));
   }
 
   async toggleLike(userId: string, serviceId: string, userToken?: string) {
@@ -613,6 +698,44 @@ export class ServicesService {
     return { bookmarked, saveCount: newSaveCount };
   }
 
+  async getBookmarkedServices(userId: string, userToken?: string) {
+    // Use serviceSupabase to bypass RLS
+    const supabaseClient = this.serviceSupabase;
+
+    const { data: bookmarks, error } = await supabaseClient
+      .from('service_bookmarks')
+      .select(`
+        service:services(
+          *,
+          service_categories (
+            name,
+            icon_name,
+            color_hex
+          ),
+          user_profiles!services_user_id_fkey (
+            username,
+            avatar_url,
+            is_verified,
+            display_name
+          )
+        )
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      throw new Error(`Failed to fetch bookmarked services: ${error.message}`);
+    }
+
+    // Extract services from bookmarks and add isBookmarked flag
+    const services = bookmarks?.map((bookmark: any) => ({
+      ...bookmark.service,
+      isBookmarked: true,
+    })) || [];
+
+    return services;
+  }
+
   async incrementShareCount(serviceId: string, userToken?: string) {
     // Use serviceSupabase to bypass RLS
     const supabaseClient = this.serviceSupabase;
@@ -670,7 +793,7 @@ export class ServicesService {
     return comments?.map(comment => ({
       id: comment.id,
       userId: comment.user_profiles?.id || '',
-      userName: comment.user_profiles?.username || 'Unknown User',
+      userName: comment.user_profiles?.username || comment.user_profiles?.display_name || 'Unknown User',
       userAvatar: comment.user_profiles?.avatar_url || null,
       comment: comment.content,
       createdAt: comment.created_at,
@@ -710,7 +833,7 @@ export class ServicesService {
     return {
       id: comment.id,
       userId: comment.user_profiles?.id || '',
-      userName: comment.user_profiles?.username || 'Unknown User',
+      userName: comment.user_profiles?.username || comment.user_profiles?.display_name || 'Unknown User',
       userAvatar: comment.user_profiles?.avatar_url || null,
       comment: comment.content,
       createdAt: comment.created_at,
@@ -851,8 +974,26 @@ export class ServicesService {
       });
 
       const mediaFiles = await Promise.all(uploadPromises);
-      const imageUrls = mediaFiles.filter(m => m.type === 'image').map(m => m.url);
+      let imageUrls = mediaFiles.filter(m => m.type === 'image').map(m => m.url);
       const videoUrls = mediaFiles.filter(m => m.type === 'video').map(m => m.url);
+
+      // Generate thumbnail for the first video if no images were provided
+      if (imageUrls.length === 0 && videoUrls.length > 0) {
+        const firstVideoFile = files.find(f => f.mimetype?.startsWith('video/'));
+        if (firstVideoFile) {
+          console.log('📸 No images provided, generating thumbnail from video...');
+          try {
+            const thumbnailUrl = await this.generateVideoThumbnail(firstVideoFile, userId, supabaseClient);
+            if (thumbnailUrl) {
+              imageUrls = [thumbnailUrl];
+              console.log('✅ Thumbnail generated successfully:', thumbnailUrl);
+            }
+          } catch (error) {
+            console.error('⚠️ Failed to generate video thumbnail:', error);
+            // Continue without thumbnail - service will use video placeholder
+          }
+        }
+      }
 
       // Create service with uploaded media URLs
       const createServiceDto: CreateServiceDto = {
@@ -874,5 +1015,68 @@ export class ServicesService {
       console.error('Service upload error:', error);
       throw error;
     }
+  }
+
+  /**
+   * Generate a thumbnail from a video file using ffmpeg
+   */
+  private async generateVideoThumbnail(
+    videoFile: Express.Multer.File,
+    userId: string,
+    supabaseClient: any
+  ): Promise<string | null> {
+    return new Promise((resolve, reject) => {
+      const tempDir = os.tmpdir();
+      const timestamp = Date.now();
+      const videoPath = path.join(tempDir, `service-video-${timestamp}.mp4`);
+      const thumbnailPath = path.join(tempDir, `service-thumb-${timestamp}.jpg`);
+
+      try {
+        fs.writeFileSync(videoPath, videoFile.buffer);
+
+        const ffmpegCommand = `ffmpeg -i "${videoPath}" -ss 00:00:01 -vframes 1 -vf "scale=640:-1" -y "${thumbnailPath}"`;
+        execAsync(ffmpegCommand)
+          .then(async () => {
+            try {
+              const thumbnailBuffer = fs.readFileSync(thumbnailPath);
+              const uniqueFileName = `${userId}/service/${timestamp}-video-thumbnail.jpg`;
+
+              const { data, error } = await supabaseClient.storage
+                .from('media')
+                .upload(uniqueFileName, thumbnailBuffer, {
+                  contentType: 'image/jpeg',
+                  upsert: false,
+                });
+
+              if (error) {
+                console.error('Thumbnail upload error:', error);
+                resolve(null);
+              } else {
+                const { data: urlData } = supabaseClient.storage
+                  .from('media')
+                  .getPublicUrl(data.path);
+
+                fs.unlinkSync(videoPath);
+                fs.unlinkSync(thumbnailPath);
+                resolve(urlData.publicUrl);
+              }
+            } catch (error) {
+              console.error('Error processing thumbnail:', error);
+              if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+              if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+              resolve(null);
+            }
+          })
+          .catch((error) => {
+            console.error('FFmpeg thumbnail error:', error);
+            if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+            if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+            resolve(null);
+          });
+      } catch (error) {
+        console.error('Error writing video for thumbnail:', error);
+        resolve(null);
+      }
+    });
   }
 }

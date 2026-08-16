@@ -2,6 +2,9 @@ export interface Location {
   latitude: number;
   longitude: number;
   address?: string;
+  state?: string;
+  country?: string;
+  city?: string;
 }
 
 export interface VendorLocation {

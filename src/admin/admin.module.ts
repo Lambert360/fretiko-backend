@@ -10,8 +10,10 @@ import { FinanceController } from './finance.controller';
 import { StaffAnalyticsController } from './analytics.controller';
 import { LogisticsController } from './logistics.controller';
 import { DashboardController } from './dashboard.controller';
+import { PartnershipsController } from '../partnerships/partnerships.controller';
 import { OrdersController } from './orders.controller';
 import { DisputesController } from './disputes.controller';
+import { AdminNotificationsController } from './admin-notifications.controller';
 import { AdminService } from './admin.service';
 import { AdminNotificationsGateway } from './admin-notifications.gateway';
 import { AdminNotificationsService } from './admin-notifications.service';
@@ -25,7 +27,10 @@ import { GiftModule } from '../gifts/gift.module';
 import { EmailService as AuthEmailService } from '../auth/email.service';
 import { EmailService as SharedEmailService } from '../shared/email.service';
 import { EscrowModule } from '../escrow/escrow.module';
+import { PartnershipsModule } from '../partnerships/partnerships.module';
+import { WebsiteContentModule } from '../website-content/website-content.module';
 import { AuthModule } from '../auth/auth.module';
+import { PartnersModule } from '../partners/partners.module';
 
 @Module({
   imports: [
@@ -48,6 +53,9 @@ import { AuthModule } from '../auth/auth.module';
     AuctionsModule, // For fraud detection and auctions service
     GiftModule, // For gift wallet statistics
     EscrowModule, // For escrow release functionality in refunds
+    PartnershipsModule, // For partnership applications management
+    WebsiteContentModule, // For website content management
+    PartnersModule, // For partner (logistics company) wallet crediting in refunds
   ],
   controllers: [
     AdminController, 
@@ -58,8 +66,10 @@ import { AuthModule } from '../auth/auth.module';
     StaffAnalyticsController, 
     LogisticsController, 
     DashboardController, 
+    PartnershipsController, // NEW: Partnership applications management
     OrdersController, 
     DisputesController,
+    AdminNotificationsController, // REST endpoints for admin notifications
   ],
   providers: [
     AdminService,

@@ -10,6 +10,7 @@ import {
   CallType,
 } from './dto/chat.dto';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { PushNotificationService } from '../notifications/push-notification.service';
 
 @Injectable()
 export class CallsService {
@@ -20,6 +21,7 @@ export class CallsService {
     private configService: ConfigService,
     @Inject(forwardRef(() => RealtimeGateway))
     private realtimeGateway: RealtimeGateway,
+    private pushNotificationService: PushNotificationService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -540,19 +542,36 @@ export class CallsService {
       }
 
       // Get initiator details if this is an incoming call
-      let initiatorData = null;
+      let initiatorData: {
+        id: string;
+        username: string;
+        full_name: string;
+        avatar_url?: string | null;
+      } | null = null;
       if (eventType === 'incoming_call' && initiatorId) {
-        const { data: initiator } = await this.supabase
+        const { data: profile } = await this.supabase
           .from('user_profiles')
-          .select('id, username, avatar_url, full_name')
+          .select('id, username, avatar_url')
           .eq('id', initiatorId)
           .single();
 
-        initiatorData = initiator || {
-          id: initiatorId,
-          username: 'Unknown User',
-          full_name: 'Unknown User',
-        };
+        let fullName = profile?.username || 'Unknown User';
+
+        // Try to get first/last name from auth metadata (stored at signup)
+        try {
+          const { data: authUser } = await this.supabase.auth.admin.getUserById(initiatorId);
+          const meta = authUser?.user?.user_metadata;
+          if (meta) {
+            const name = [meta.firstName, meta.lastName].filter(Boolean).join(' ').trim();
+            if (name) fullName = name;
+          }
+        } catch (_) {
+          // auth.admin may not be available; fall back to username
+        }
+
+        initiatorData = profile
+          ? { ...profile, full_name: fullName }
+          : { id: initiatorId, username: 'Unknown User', full_name: 'Unknown User' };
       }
 
       // Broadcast call event via WebSocket to all participants in the conversation
@@ -561,6 +580,40 @@ export class CallsService {
         callType,
         initiator: initiatorData,
       });
+
+      // For incoming_call, also send a high-priority push notification so the callee
+      // receives the alert even when the app is backgrounded or the device is locked.
+      if (eventType === 'incoming_call' && initiatorId) {
+        const { data: callees } = await this.supabase
+          .from('chat_participants')
+          .select('user_id')
+          .eq('conversation_id', conversationId!)
+          .neq('user_id', initiatorId);
+
+        if (callees && callees.length > 0) {
+          const callerName = initiatorData?.full_name || initiatorData?.username || 'Someone';
+          const pushPromises = callees.map(({ user_id }) =>
+            this.pushNotificationService.sendPushNotification(user_id, {
+              title: `Incoming ${callType === CallType.VIDEO ? 'video' : 'voice'} call`,
+              body: `${callerName} is calling you`,
+              priority: 'high',
+              sound: 'default',
+              channelId: 'calls',
+              data: {
+                type: 'call_incoming',
+                conversationId: conversationId!,
+                callSessionId,
+                callType,
+                callerName,
+                callerAvatar: initiatorData?.avatar_url || null,
+              },
+            }).catch(err =>
+              this.logger.warn(`Push to callee ${user_id} failed: ${err.message}`)
+            ),
+          );
+          await Promise.all(pushPromises);
+        }
+      }
 
       this.logger.log(`✅ Successfully notified participants of ${eventType} for call ${callSessionId}`);
     } catch (error) {

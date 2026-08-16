@@ -396,26 +396,29 @@ export class PinService {
         };
       }
 
-      // Update PIN using database function
-      const { data: result, error: updateError } = await this.supabase
-        .rpc('update_user_pin', { 
-          p_user_id: userId, 
-          p_new_pin: newPin 
-        });
+      // Generate new salt and hash using Node.js (consistent with createPin/changePin)
+      const salt = this.generateSalt();
+      const pinHash = this.hashPin(newPin, salt);
+
+      // Update PIN directly in database (clear all reset-related state)
+      const { error: updateError } = await this.supabase
+        .from('user_pins')
+        .update({
+          pin_hash: pinHash,
+          pin_salt: salt,
+          failed_attempts: 0,
+          locked_until: null,
+          requires_reset: false,
+          reset_token: null,
+          reset_token_expires_at: null,
+        })
+        .eq('user_id', userId);
 
       if (updateError) {
         this.logger.error('❌ PIN update error:', updateError);
         return {
           success: false,
           message: 'Failed to update PIN',
-        };
-      }
-
-      if (!result?.success) {
-        this.logger.error('❌ PIN update failed:', result?.message);
-        return {
-          success: false,
-          message: result?.message || 'Failed to update PIN',
         };
       }
 

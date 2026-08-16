@@ -6,6 +6,9 @@ export interface RiderLocation {
   latitude: number;
   longitude: number;
   address: string;
+  state?: string;   // e.g. "Lagos" — used for rider & partner eligibility filtering
+  country?: string; // e.g. "Nigeria"
+  city?: string;    // e.g. "Ikeja"
 }
 
 export interface OrderDetails {
@@ -20,6 +23,9 @@ export interface RiderAvailabilityRequest {
   deliveryLocation: RiderLocation;
   orderDetails: OrderDetails;
   maxDistance?: number;
+  // Item types in the order ('product' | 'service'). When 'service' is present,
+  // only motorized riders (car/van/truck) are eligible — never bikes/wheelbarrows.
+  itemTypes?: string[];
 }
 
 export interface RiderProfile {
@@ -58,6 +64,26 @@ export class RidersController {
     });
 
     return this.ridersService.findNearbyRiders(request, req.user.id);
+  }
+
+  @Post('interstate-options')
+  async getInterstateOptions(
+    @Body() request: {
+      pickupLocation: { state?: string; country?: string };
+      deliveryLocation: { state?: string; country?: string };
+    },
+  ) {
+    console.log('🚛 Finding interstate delivery companies:', {
+      pickup: request.pickupLocation,
+      delivery: request.deliveryLocation,
+    });
+
+    return this.ridersService.findInterstateCompanies(
+      request.pickupLocation?.state,
+      request.pickupLocation?.country,
+      request.deliveryLocation?.state,
+      request.deliveryLocation?.country,
+    );
   }
 
   @Post('recommendations')

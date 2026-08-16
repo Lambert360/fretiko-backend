@@ -10,12 +10,13 @@ import { AdminNotificationsService, AdminNotificationType } from '../admin/admin
 import { AdminNotificationEventType, ContentReportCreatedEvent } from '../admin/events/admin-notification.events';
 
 export interface CreateContentReportDto {
-  reportCategory: 'product' | 'service' | 'chat' | 'user';
+  reportCategory: 'product' | 'service' | 'chat' | 'user' | 'post';
   
   // Reference to reported content (one of these required)
   productId?: string;
   serviceId?: string;
   chatId?: string;
+  postId?: string;
   reportedUserId?: string;
   
   reportType: 
@@ -38,10 +39,11 @@ export interface ReviewContentReportDto {
 export interface ContentReport {
   id: string;
   reporterId: string;
-  reportCategory: 'product' | 'service' | 'chat' | 'user';
+  reportCategory: 'product' | 'service' | 'chat' | 'user' | 'post';
   productId?: string;
   serviceId?: string;
   chatId?: string;
+  postId?: string;
   reportedUserId?: string;
   reportType: string;
   status: 'pending' | 'under_review' | 'approved' | 'action_taken' | 'dismissed';
@@ -80,9 +82,18 @@ export class ContentReportsService {
       this.logger.log(`Creating ${createDto.reportCategory} report by user ${userId}`);
 
       // Validate that at least one reference ID is provided
-      const hasReference = createDto.productId || createDto.serviceId || createDto.chatId || createDto.reportedUserId;
+      const hasReference =
+        createDto.productId ||
+        createDto.serviceId ||
+        createDto.chatId ||
+        createDto.postId ||
+        createDto.reportedUserId;
+
       if (!hasReference) {
-        throw new HttpException('At least one reference ID (productId, serviceId, chatId, or reportedUserId) is required', HttpStatus.BAD_REQUEST);
+        throw new HttpException(
+          'At least one reference ID (productId, serviceId, chatId, postId, or reportedUserId) is required',
+          HttpStatus.BAD_REQUEST,
+        );
       }
 
       // Validate category matches reference
@@ -97,6 +108,9 @@ export class ContentReportsService {
       }
       if (createDto.reportCategory === 'user' && !createDto.reportedUserId) {
         throw new HttpException('reportedUserId is required for user reports', HttpStatus.BAD_REQUEST);
+      }
+      if (createDto.reportCategory === 'post' && !createDto.postId) {
+        throw new HttpException('postId is required for post reports', HttpStatus.BAD_REQUEST);
       }
 
       // Check if user is trying to report themselves
@@ -131,6 +145,8 @@ export class ContentReportsService {
         duplicateQuery = duplicateQuery.eq('service_id', createDto.serviceId);
       } else if (createDto.chatId) {
         duplicateQuery = duplicateQuery.eq('chat_id', createDto.chatId);
+      } else if (createDto.postId) {
+        duplicateQuery = duplicateQuery.eq('post_id', createDto.postId);
       } else if (createDto.reportedUserId) {
         duplicateQuery = duplicateQuery.eq('reported_user_id', createDto.reportedUserId);
       }
@@ -149,6 +165,7 @@ export class ContentReportsService {
           report_category: createDto.reportCategory,
           product_id: createDto.productId || null,
           service_id: createDto.serviceId || null,
+          post_id: createDto.postId || null,
           chat_id: createDto.chatId || null,
           reported_user_id: createDto.reportedUserId || null,
           report_type: createDto.reportType,
@@ -301,7 +318,7 @@ export class ContentReportsService {
    */
   async getAllReports(filters?: {
     status?: 'pending' | 'under_review' | 'approved' | 'action_taken' | 'dismissed';
-    category?: 'product' | 'service' | 'chat' | 'user';
+    category?: 'product' | 'service' | 'chat' | 'user' | 'post';
     search?: string;
     page?: number;
     limit?: number;
@@ -364,6 +381,7 @@ export class ContentReportsService {
       service: number;
       chat: number;
       user: number;
+      post: number;
     };
   }> {
     try {
@@ -391,6 +409,7 @@ export class ContentReportsService {
           service: reports.filter(r => r.report_category === 'service').length,
           chat: reports.filter(r => r.report_category === 'chat').length,
           user: reports.filter(r => r.report_category === 'user').length,
+          post: reports.filter(r => r.report_category === 'post').length,
         },
       };
 
@@ -761,6 +780,7 @@ export class ContentReportsService {
       reportCategory: record.report_category,
       productId: record.product_id,
       serviceId: record.service_id,
+      postId: record.post_id,
       chatId: record.chat_id,
       reportedUserId: record.reported_user_id,
       reportType: record.report_type,

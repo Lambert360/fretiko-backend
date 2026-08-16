@@ -15,8 +15,9 @@ import {
 import { FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 // import { Public } from '../auth/public.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { OptionalJwtAuthGuard } from '../auth/optional-jwt-auth.guard';
 import { ProductsService } from './products.service';
-import { CreateProductDto, UpdateProductDto, ProductQueryDto } from './dto/product.dto';
+import { CreateProductDto, UpdateProductDto, ProductQueryDto, RankedProductsQueryDto, RecordProductEventDto } from './dto/product.dto';
 
 @Controller('products')
 export class ProductsController {
@@ -32,6 +33,38 @@ export class ProductsController {
   async getProducts(@Query() query: ProductQueryDto) {
     console.log('📦 Fetching products with query:', query);
     return this.productsService.getProducts(query);
+  }
+
+  @Get('trending')
+  async getTrendingProducts(@Query('limit') limit?: string) {
+    const parsedLimit = limit ? parseInt(limit, 10) : 10;
+    console.log('📦 Fetching trending products, limit:', parsedLimit);
+    return this.productsService.getTrendingProducts(Number.isNaN(parsedLimit) ? 10 : parsedLimit);
+  }
+
+  @Get('seasonal')
+  async getSeasonalProducts(@Query('limit') limit?: string, @Query('region') region?: string) {
+    const parsedLimit = limit ? parseInt(limit, 10) : 12;
+    console.log('📦 Fetching seasonal products, limit:', parsedLimit, 'region:', region);
+    return this.productsService.getSeasonalProducts(Number.isNaN(parsedLimit) ? 12 : parsedLimit, region);
+  }
+
+  // Location-aware, engagement/trust-ranked product feed for the HomeScreen product tab.
+  // Works for both authenticated and guest users (personalization is applied when logged in).
+  @Get('ranked')
+  @UseGuards(OptionalJwtAuthGuard)
+  async getRankedProducts(@Query() query: RankedProductsQueryDto, @Request() req) {
+    const userId = req.user?.sub || null;
+    console.log('📦 Fetching ranked products for user:', userId, 'query:', query);
+    return this.productsService.getRankedProducts(userId, query);
+  }
+
+  // Record a product engagement event (impression, click, cart_add, etc.) for ranking feedback.
+  @Post('events')
+  @UseGuards(OptionalJwtAuthGuard)
+  async recordProductEvent(@Body() dto: RecordProductEventDto, @Request() req) {
+    const userId = req.user?.sub || null;
+    return this.productsService.recordProductEvent(userId, dto);
   }
 
   @Get('my-products')
@@ -122,17 +155,19 @@ export class ProductsController {
     FileFieldsInterceptor([
       { name: 'images', maxCount: 10 },
       { name: 'videos', maxCount: 2 },
+      { name: 'variant_media', maxCount: 20 },
     ]),
   )
   async uploadProduct(
     @Request() req,
-    @UploadedFiles() files: { images?: Express.Multer.File[]; videos?: Express.Multer.File[] },
+    @UploadedFiles() files: { images?: Express.Multer.File[]; videos?: Express.Multer.File[]; variant_media?: Express.Multer.File[] },
     @Body() body: any, // Use any for FormData parsing
   ) {
     console.log('📦 Uploading product with files for user:', req.user.sub);
     console.log('📝 Raw FormData body:', body);
     console.log('📸 Images count:', files?.images?.length || 0);
     console.log('🎥 Videos count:', files?.videos?.length || 0);
+    console.log('🧩 Variant media count:', files?.variant_media?.length || 0);
 
     // Parse FormData fields manually
     const productData: CreateProductDto = {
@@ -147,6 +182,8 @@ export class ProductsController {
       videos: [], // Will be populated by the service
       tags: body.tags ? JSON.parse(body.tags) : [],
       shipping_options: body.shipping_options ? JSON.parse(body.shipping_options) : undefined,
+      is_multi_item: body.is_multi_item === 'true' || body.is_multi_item === true,
+      variants: body.variants ? JSON.parse(body.variants) : undefined,
     };
 
     console.log('📦 Parsed product data:', productData);
@@ -157,6 +194,7 @@ export class ProductsController {
       files?.videos || [],
       productData,
       req.supabaseToken,
+      files?.variant_media || [],
     );
   }
 }

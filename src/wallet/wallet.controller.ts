@@ -492,6 +492,40 @@ export class WalletController {
         return this.bankAccountService.verifyBankAccount(req.user.sub, id);
   }
 
+  /**
+   * Get list of banks from Flutterwave (live data)
+   * GET /wallet/banks/:country
+   */
+  @Get('banks/:country')
+  @UseGuards(JwtAuthGuard)
+  async getBanks(@Param('country') country: string) {
+    const banks = await this.flutterwaveService.getBanks(country.toUpperCase());
+    return {
+      status: 'success',
+      data: banks,
+      message: `Retrieved ${banks.length} banks for ${country.toUpperCase()}`,
+    };
+  }
+
+  /**
+   * Preview account name before adding bank account
+   * POST /wallet/bank-accounts/preview
+   * Body: { accountNumber: string, bankCode: string }
+   */
+  @Post('bank-accounts/preview')
+  @UseGuards(JwtAuthGuard)
+  async previewBankAccount(@Body() dto: { accountNumber: string; bankCode: string }) {
+    const preview = await this.bankAccountService.previewAccountName(
+      dto.accountNumber,
+      dto.bankCode,
+    );
+    return {
+      status: 'success',
+      data: preview,
+      message: 'Account verified with bank',
+    };
+  }
+
   // ================================
   // PIN ENDPOINTS
   // ================================
@@ -630,33 +664,42 @@ export class WalletController {
    * 2. Process webhook asynchronously to avoid timeouts
    * 3. Use Svix signature verification (webhooks are forwarded from Svix)
    * 4. Always return 200 OK even on errors (Svix will retry if needed)
+   * 5. NO JWT auth - webhook uses signature verification instead
    */
   @Post('webhooks/flutterwave')
+  // Public endpoint - no JWT auth. Security via signature verification
   async handleFlutterwaveWebhook(
     @Req() req: RawBodyRequest<Request>,
     @Res() res?: Response,
   ) {
     const startTime = Date.now();
     
-    // Get raw body for signature verification - this is now available with rawBody: true
+    // Get raw body for signature verification
+    // Note: express.raw() middleware puts the Buffer in req.body for this route
+    let rawBodyBuffer: Buffer;
     let rawBody: string;
-    if (req.rawBody) {
-      // Handle different types of rawBody
-      if (req.rawBody instanceof Buffer) {
-        rawBody = req.rawBody.toString('utf8');
-      } else if (typeof req.rawBody === 'string') {
-        rawBody = req.rawBody;
-      } else if (req.rawBody && typeof req.rawBody === 'object' && 
-                 (req.rawBody as any).type === 'Buffer' && 
-                 Array.isArray((req.rawBody as any).data)) {
-        // Handle serialized Buffer object: {"type":"Buffer","data":[123,34,...]}
-        rawBody = Buffer.from((req.rawBody as any).data).toString('utf8');
-      } else {
-        rawBody = JSON.stringify(req.rawBody);
-      }
+    
+    // Check if express.raw() provided a Buffer in req.body
+    if (req.body instanceof Buffer) {
+      rawBodyBuffer = req.body;
+      rawBody = req.body.toString('utf8');
+    } else if (req.rawBody instanceof Buffer) {
+      // Fallback to NestJS rawBody if available
+      rawBodyBuffer = req.rawBody;
+      rawBody = req.rawBody.toString('utf8');
+    } else if (typeof req.rawBody === 'string') {
+      rawBody = req.rawBody;
+      rawBodyBuffer = Buffer.from(rawBody, 'utf8');
+    } else if (req.rawBody && typeof req.rawBody === 'object' && 
+               (req.rawBody as any).type === 'Buffer' && 
+               Array.isArray((req.rawBody as any).data)) {
+      // Handle serialized Buffer object: {"type":"Buffer","data":[123,34,...]}
+      rawBodyBuffer = Buffer.from((req.rawBody as any).data);
+      rawBody = rawBodyBuffer.toString('utf8');
     } else {
-      // Fallback - this shouldn't happen with rawBody: true
+      // Fallback - should not happen with proper middleware
       rawBody = JSON.stringify(req.body);
+      rawBodyBuffer = Buffer.from(rawBody, 'utf8');
     }
     
     // Parse the body from raw body
@@ -694,17 +737,24 @@ export class WalletController {
     let signatureValid = false;
     const isProduction = process.env.NODE_ENV === 'production';
     
-    // Check for Flutterwave's verif-hash header (direct webhook) or Svix signature
-    const flutterwaveSignature = Array.isArray(req.headers['verif-hash']) 
+    // Check for Flutterwave headers (verif-hash OR flutterwave-signature) or Svix signature
+    // Note: Flutterwave has used both header names in different API versions
+    const verifHash = Array.isArray(req.headers['verif-hash']) 
       ? req.headers['verif-hash'][0] 
       : req.headers['verif-hash'];
+    const flutterwaveSignatureHeader = Array.isArray(req.headers['flutterwave-signature']) 
+      ? req.headers['flutterwave-signature'][0] 
+      : req.headers['flutterwave-signature'];
+    const flutterwaveSignature = verifHash || flutterwaveSignatureHeader;
+    
     const svixSignature = Array.isArray(req.headers['svix-signature']) 
       ? req.headers['svix-signature'][0] 
       : req.headers['svix-signature'];
     const signature = flutterwaveSignature || svixSignature;
     
     console.log('🔍 WEBHOOK DEBUG:', {
-      hasFlutterwaveSignature: !!flutterwaveSignature,
+      hasVerifHash: !!verifHash,
+      hasFlutterwaveSignature: !!flutterwaveSignatureHeader,
       hasSvixSignature: !!svixSignature,
       signatureLength: signature?.length,
       rawBodyLength: rawBody?.length,
@@ -712,38 +762,78 @@ export class WalletController {
       env: process.env.NODE_ENV
     });
     
+    // Temporary: Log all headers to diagnose header issues
+    console.log('🔍 ALL HEADERS:', JSON.stringify(req.headers, null, 2));
+    console.log('🔍 Signature value:', {
+      verifHash: verifHash?.substring(0, 50),
+      verifHashLength: verifHash?.length,
+      flutterwaveSignature: flutterwaveSignatureHeader?.substring(0, 50),
+      flutterwaveSignatureLength: flutterwaveSignatureHeader?.length
+    });
+    
     // Production: Use appropriate signature verification
     // Development: Skip verification for testing
     if (isProduction) {
       console.log('🔒 PRODUCTION MODE: Verifying webhook signature');
       
-      if (flutterwaveSignature) {
-        // Direct Flutterwave webhook - use Flutterwave signature verification
-        console.log('🔍 Direct Flutterwave webhook detected');
+      // Get webhook secret once
+      const secretHash = this.configService.get<string>('FLUTTERWAVE_WEBHOOK_SECRET') || 
+                        this.configService.get<string>('FLW_WEBHOOK_SECRET');
+      if (!secretHash) {
+        console.error('❌ Missing Flutterwave webhook secret (FLUTTERWAVE_WEBHOOK_SECRET or FLW_WEBHOOK_SECRET)');
+        if (res) return res.status(401).json({ status: 'error', message: 'Missing webhook secret' });
+        return;
+      }
+
+      if (flutterwaveSignatureHeader) {
+        // Modern Flutterwave: uses 'flutterwave-signature' header with HMAC-SHA256
+        // Support both base64 (standard) and hex (fallback) formats
+        console.log('🔍 Flutterwave signature header detected (HMAC mode)');
         try {
-          const secretHash = this.configService.get<string>('FLUTTERWAVE_WEBHOOK_SECRET');
-          if (!secretHash) {
-            console.error('❌ Missing Flutterwave webhook secret');
-            if (res) return res.status(401).json({ status: 'error', message: 'Missing webhook secret' });
-            return;
-          }
-          
-          // Create HMAC-SHA256 hash to verify Flutterwave signature
           const crypto = require('crypto');
-          const hash = crypto.createHmac('sha256', secretHash).update(rawBody).digest('hex');
-          signatureValid = hash === flutterwaveSignature;
+          const hashBase64 = crypto.createHmac('sha256', secretHash).update(rawBodyBuffer).digest('base64');
+          const hashHex = crypto.createHmac('sha256', secretHash).update(rawBodyBuffer).digest('hex');
+          
+          signatureValid = (
+            hashBase64 === flutterwaveSignatureHeader ||
+            hashHex.toLowerCase() === flutterwaveSignatureHeader.toLowerCase()
+          );
+          
+          console.log('🔍 HMAC signature debug:', {
+            receivedLength: flutterwaveSignatureHeader.length,
+            calculatedBase64: hashBase64,
+            calculatedHex: hashHex,
+            valid: signatureValid
+          });
           
           if (!signatureValid) {
-            console.error('❌ Invalid Flutterwave webhook signature');
+            console.error('❌ Invalid Flutterwave HMAC signature (neither base64 nor hex matched)');
             if (res) return res.status(401).json({ status: 'error', message: 'Invalid webhook signature' });
             return;
           }
-          console.log('✅ Flutterwave webhook signature verified');
+          console.log('✅ Flutterwave HMAC signature verified');
         } catch (error) {
-          console.error('❌ Flutterwave webhook verification failed:', error);
+          console.error('❌ Flutterwave HMAC verification failed:', error);
           if (res) return res.status(401).json({ status: 'error', message: 'Webhook verification failed' });
           return;
         }
+      } else if (verifHash) {
+        // Legacy/test Flutterwave: uses 'verif-hash' header with direct secret match
+        console.log('🔍 Flutterwave verif-hash header detected (direct secret match mode)');
+        signatureValid = verifHash === secretHash;
+        
+        console.log('🔍 Direct secret debug:', {
+          receivedLength: verifHash.length,
+          secretLength: secretHash.length,
+          valid: signatureValid
+        });
+        
+        if (!signatureValid) {
+          console.error('❌ Invalid Flutterwave verif-hash');
+          if (res) return res.status(401).json({ status: 'error', message: 'Invalid webhook signature' });
+          return;
+        }
+        console.log('✅ Flutterwave verif-hash verified (direct match)');
       } else if (svixSignature) {
         // Svix webhook - use Svix signature verification
         console.log('🔍 Svix webhook detected');
@@ -759,7 +849,7 @@ export class WalletController {
           return;
         }
       } else {
-        console.error('❌ No webhook signature found (neither verif-hash nor svix-signature)');
+        console.error('❌ No webhook signature found (neither flutterwave-signature, verif-hash, nor svix-signature)');
         if (res) return res.status(401).json({ status: 'error', message: 'Missing webhook signature' });
         return;
       }

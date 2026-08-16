@@ -6,6 +6,7 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { ConnectionsService } from '../connections/connections.service';
 import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
+import { PartnersWalletService } from '../partners/partners-wallet.service';
 
 export interface EscrowBreakdown {
   totalAmount: number;
@@ -44,6 +45,7 @@ export class EscrowService {
     @Inject(forwardRef(() => ConnectionsService))
     private connectionsService: ConnectionsService,
     private walletService: WalletService,
+    private partnersWalletService: PartnersWalletService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -217,28 +219,32 @@ export class EscrowService {
       // Note: Sales tracking is already handled internally by 'escrow_release' transaction type
       // in the process_wallet_transaction RPC function (see add-sales-tracking.sql migration)
 
-      // 2. Credit rider wallet (if applicable)
+      // 2. Credit rider / partner wallet (if applicable)
       if (orderData.rider_id && escrowData.rider_amount > 0) {
-        this.logger.log(`Crediting rider ${orderData.rider_id} with ₣${escrowData.rider_amount}`);
-        const riderResult = await this.walletService.processWalletTransaction(
+        const riderAmount = parseFloat(escrowData.rider_amount);
+        const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
           orderData.rider_id,
-          WalletTransactionType.DELIVERY_PAYMENT,
-          parseFloat(escrowData.rider_amount),
+          riderAmount,
           `Delivery fee for order ${orderData.order_number}`,
-          orderData.id,
-          'order',
         );
 
-        if (!riderResult.success) {
-          this.logger.error('⚠️ CRITICAL: Failed to credit rider wallet after escrow release:', riderResult.error);
-          // ⚠️ Vendor already paid, but rider payment failed - requires reconciliation
-          this.logger.error(`🚨 RECONCILIATION REQUIRED: Escrow ${escrowId} released and vendor paid, but rider payment failed. Manual intervention required.`);
-          // Don't throw - vendor already paid, but log critical alert for reconciliation
-        } else if (riderResult.idempotent) {
-          // ✅ PHASE 2: Log idempotent transaction detection
-          this.logger.warn(
-            `⚠️ IDEMPOTENT: Rider payment for escrow ${escrowId} was idempotent (duplicate prevented).`
+        if (!partnerCredit.credited) {
+          // Independent rider — credit Freti wallet as before
+          this.logger.log(`Crediting rider ${orderData.rider_id} with ₣${riderAmount}`);
+          const riderResult = await this.walletService.processWalletTransaction(
+            orderData.rider_id,
+            WalletTransactionType.DELIVERY_PAYMENT,
+            riderAmount,
+            `Delivery fee for order ${orderData.order_number}`,
+            orderData.id,
+            'order',
           );
+          if (!riderResult.success) {
+            this.logger.error('⚠️ CRITICAL: Failed to credit rider wallet after escrow release:', riderResult.error);
+            this.logger.error(`🚨 RECONCILIATION REQUIRED: Escrow ${escrowId} released and vendor paid, but rider payment failed. Manual intervention required.`);
+          } else if (riderResult.idempotent) {
+            this.logger.warn(`⚠️ IDEMPOTENT: Rider payment for escrow ${escrowId} was idempotent (duplicate prevented).`);
+          }
         }
       }
 
@@ -269,6 +275,39 @@ export class EscrowService {
       }
 
       // ✅ Escrow status is already updated by atomic function, no need to update again
+
+      // 3. Debit buyer's escrow_balance for the amount released to vendor/rider/platform.
+      // The buyer's wallet holds the escrow balance for this order (credited via
+      // purchase_hold at checkout). The vendor/rider/platform credits above only
+      // touch their own wallets — they never decrement the buyer's escrow_balance.
+      // Without this, the buyer's escrow_balance keeps phantom "held" funds forever.
+      const round6 = (value: number): number => Math.round(value * 1000000) / 1000000;
+      const releasedAmount = round6(
+        parseFloat(escrowData.vendor_amount || 0) +
+        parseFloat(escrowData.rider_amount || 0) +
+        parseFloat(escrowData.platform_amount || 0)
+      );
+      if (releasedAmount > 0) {
+        const isAdminAction = reason.startsWith('Admin release:');
+        const buyerDebitDescription = isAdminAction
+          ? `Escrow debit for released funds on order ${orderData.order_number} (resolved by support)`
+          : `Escrow debit for released funds on order ${orderData.order_number}`;
+
+        const buyerDebitResult = await this.walletService.processWalletTransaction(
+          orderData.buyer_id,
+          WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM,
+          releasedAmount,
+          buyerDebitDescription,
+          orderData.id,
+          'order',
+        );
+
+        if (!buyerDebitResult.success) {
+          this.logger.error(
+            `⚠️ CRITICAL: Failed to debit buyer escrow balance after release for escrow ${escrowId}: ${buyerDebitResult.error}. Manual reconciliation required.`,
+          );
+        }
+      }
 
       // ✅ PHASE 3: Update order status and handle post-release tasks
       // 4. Update order status to completed (only if not already cancelled) - ✅ FIX Bug 14
@@ -589,21 +628,26 @@ export class EscrowService {
         // Don't throw - buyer already refunded, log and continue
       }
 
-      // 4. Release rider amount if applicable
+      // 4. Release rider / partner amount if applicable
       if (order.rider_id && riderAmount > 0) {
-        this.logger.log(`Releasing ₣${riderAmount} to rider ${order.rider_id}`);
-        const riderResult = await this.walletService.processWalletTransaction(
+        const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
           order.rider_id,
-          WalletTransactionType.DELIVERY_PAYMENT,
           riderAmount,
           `Delivery fee for order ${order.order_number} (partial)`,
-          order.id,
-          'order',
         );
-
-        if (!riderResult.success) {
-          this.logger.error('Failed to credit rider wallet:', riderResult.error);
-          // Don't throw - log and continue
+        if (!partnerCredit.credited) {
+          this.logger.log(`Releasing ₣${riderAmount} to rider ${order.rider_id}`);
+          const riderResult = await this.walletService.processWalletTransaction(
+            order.rider_id,
+            WalletTransactionType.DELIVERY_PAYMENT,
+            riderAmount,
+            `Delivery fee for order ${order.order_number} (partial)`,
+            order.id,
+            'order',
+          );
+          if (!riderResult.success) {
+            this.logger.error('Failed to credit rider wallet:', riderResult.error);
+          }
         }
       }
 
@@ -624,6 +668,28 @@ export class EscrowService {
           this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet:', platformResult.error);
           this.logger.warn(`Platform commission ${platformAmount} for order ${order.order_number} failed - requires manual reconciliation`);
           // Don't throw - buyer/vendor/rider already paid, but log as critical
+        }
+      }
+
+      // 4c. Debit buyer's escrow_balance for the amount released to vendor/rider/platform.
+      // The buyer's own refund (step 1) only covers `refundAmount` — the rest of their
+      // held escrow_balance was released to vendor/rider/platform above and must also
+      // be removed from the buyer's escrow_balance, or it stays as phantom held funds.
+      const releasedAmount = round6(vendorAmount + riderAmount + platformAmount);
+      if (releasedAmount > 0) {
+        const buyerDebitResult = await this.walletService.processWalletTransaction(
+          order.buyer_id,
+          WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM,
+          releasedAmount,
+          `Escrow debit for released funds on order ${order.order_number}`,
+          order.id,
+          'order',
+        );
+
+        if (!buyerDebitResult.success) {
+          this.logger.error(
+            `⚠️ CRITICAL: Failed to debit buyer escrow balance after partial refund for escrow ${escrowId}: ${buyerDebitResult.error}. Manual reconciliation required.`,
+          );
         }
       }
 
@@ -796,21 +862,26 @@ export class EscrowService {
         }
       }
 
-      // 4. Release rider amount if applicable
+      // 4. Release rider / partner amount if applicable
       if (order.rider_id && riderFinalAmount > 0) {
-        this.logger.log(`Releasing ₣${riderFinalAmount} to rider ${order.rider_id}`);
-        const riderResult = await this.walletService.processWalletTransaction(
+        const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
           order.rider_id,
-          WalletTransactionType.DELIVERY_PAYMENT,
           riderFinalAmount,
           `Delivery fee for order ${order.order_number} (split resolution)`,
-          order.id,
-          'order',
         );
-
-        if (!riderResult.success) {
-          this.logger.error('Failed to credit rider wallet:', riderResult.error);
-          // Don't throw - log and continue
+        if (!partnerCredit.credited) {
+          this.logger.log(`Releasing ₣${riderFinalAmount} to rider ${order.rider_id}`);
+          const riderResult = await this.walletService.processWalletTransaction(
+            order.rider_id,
+            WalletTransactionType.DELIVERY_PAYMENT,
+            riderFinalAmount,
+            `Delivery fee for order ${order.order_number} (split resolution)`,
+            order.id,
+            'order',
+          );
+          if (!riderResult.success) {
+            this.logger.error('Failed to credit rider wallet:', riderResult.error);
+          }
         }
       }
 
@@ -831,6 +902,28 @@ export class EscrowService {
           this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet:', platformResult.error);
           this.logger.warn(`Platform commission ${platformFinalAmount} for order ${order.order_number} failed - requires manual reconciliation`);
           // Don't throw - buyer/vendor/rider already paid, but log as critical
+        }
+      }
+
+      // 4c. Debit buyer's escrow_balance for the amount released to vendor/rider/platform.
+      // The buyer's own refund (step 1) only covers `buyerAmount` — the rest of their
+      // held escrow_balance was released to vendor/rider/platform above and must also
+      // be removed from the buyer's escrow_balance, or it stays as phantom held funds.
+      const releasedAmount = round6(vendorFinalAmount + riderFinalAmount + platformFinalAmount);
+      if (releasedAmount > 0) {
+        const buyerDebitResult = await this.walletService.processWalletTransaction(
+          order.buyer_id,
+          WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM,
+          releasedAmount,
+          `Escrow debit for released funds on order ${order.order_number}`,
+          order.id,
+          'order',
+        );
+
+        if (!buyerDebitResult.success) {
+          this.logger.error(
+            `⚠️ CRITICAL: Failed to debit buyer escrow balance after split resolution for escrow ${escrowId}: ${buyerDebitResult.error}. Manual reconciliation required.`,
+          );
         }
       }
 

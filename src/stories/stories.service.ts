@@ -7,6 +7,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { TagsService } from '../tags/tags.service';
+import { MentionsService } from '../mentions/mentions.service';
 
 const unlinkAsync = promisify(fs.unlink);
 
@@ -18,6 +20,8 @@ export class StoriesService {
   constructor(
     private configService: ConfigService,
     private clientManager: SupabaseClientManager,
+    private tagsService: TagsService,
+    private mentionsService: MentionsService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = this.clientManager.getServiceClient();
@@ -45,6 +49,22 @@ export class StoriesService {
 
     if (error) {
       throw new Error(`Failed to create story: ${error.message}`);
+    }
+    // Sync tags and mentions based on caption
+    const captionForSync = createStoryDto.caption || '';
+
+    if (captionForSync) {
+      try {
+        await this.tagsService.syncTaggings(data.id, 'story', captionForSync);
+      } catch (e) {
+        console.error('Failed to sync tags for story', data.id, e);
+      }
+
+      try {
+        await this.mentionsService.createMentions(userId, data.id, 'story', captionForSync);
+      } catch (e) {
+        console.error('Failed to create mentions for story', data.id, e);
+      }
     }
 
     return data;
@@ -77,18 +97,17 @@ export class StoriesService {
 
     // Apply user filter if specified
     if (options.user_id) {
+      // Explicit user filter: used when viewing a specific user's stories
       query = query.eq('user_id', options.user_id);
     } else {
-      // Only show stories from connected users
-      // Using EXISTS subquery to filter by user connections
+      // Only show stories from users that the current user has plugged into
+      // i.e. rows where current user is the requester and creator is the addressee
+      // Also always include the current user's own stories
       query = query.or(`user_id.eq.${userId},user_id.in.(
-        SELECT CASE
-          WHEN requester_id = '${userId}' THEN addressee_id
-          WHEN addressee_id = '${userId}' THEN requester_id
-        END as connected_user_id
+        SELECT addressee_id
         FROM user_connections
-        WHERE status = 'accepted'
-        AND ('${userId}' = requester_id OR '${userId}' = addressee_id)
+        WHERE requester_id = '${userId}'
+        AND status = 'accepted'
       )`);
     }
 
@@ -382,6 +401,29 @@ export class StoriesService {
     }
   }
 
+  async getStoryLikers(storyId: string, limit: number = 50, offset: number = 0) {
+    const { data, error } = await this.serviceSupabase
+      .from('story_likes')
+      .select(`
+        user_id,
+        created_at,
+        user:user_profiles(id, username, avatar_url, is_verified)
+      `)
+      .eq('story_id', storyId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) throw new Error(`Failed to fetch story likers: ${error.message}`);
+
+    return (data || []).map((row: any) => ({
+      id: row.user?.id,
+      username: row.user?.username,
+      avatarUrl: row.user?.avatar_url || null,
+      isVerified: row.user?.is_verified || false,
+      likedAt: row.created_at,
+    }));
+  }
+
   async addComment(userId: string, storyId: string, createCommentDto: CreateStoryCommentDto, userToken?: string) {
     // Check if story exists and user has access
     await this.getStoryById(storyId, userId, userToken);
@@ -404,6 +446,23 @@ export class StoriesService {
 
     if (error) {
       throw new Error(`Failed to add comment: ${error.message}`);
+    }
+
+    // Sync tags and mentions for the new comment
+    const contentForSync = createCommentDto.content || '';
+
+    if (contentForSync) {
+      try {
+        await this.tagsService.syncTaggings(data.id, 'comment', contentForSync);
+      } catch (e) {
+        console.error('Failed to sync tags for story comment', data.id, e);
+      }
+
+      try {
+        await this.mentionsService.createMentions(userId, data.id, 'comment', contentForSync);
+      } catch (e) {
+        console.error('Failed to create mentions for story comment', data.id, e);
+      }
     }
 
     return data;
@@ -505,8 +564,30 @@ export class StoriesService {
       });
     }
 
-    // Get stories from connected users grouped by user (EXCLUDE current user's own stories)
-    // This is for the discovery feed - user's own stories should be shown separately
+    // Get stories from users that the current user has plugged into (followers/clients perspective)
+    // EXCLUDE current user's own stories here; they are fetched separately via getMyStories
+
+    // First, fetch the list of connected user IDs (accepted connections where current user is requester)
+    const { data: connections, error: connectionsError } = await this.serviceSupabase
+      .from('user_connections')
+      .select('addressee_id')
+      .eq('requester_id', currentUserId)
+      .eq('status', 'accepted');
+
+    if (connectionsError) {
+      throw new Error(`Failed to fetch grouped stories: ${connectionsError.message}`);
+    }
+
+    const connectedUserIds = (connections || [])
+      .map((c: any) => c.addressee_id)
+      .filter((id: string | null | undefined) => !!id);
+
+    // If user has no accepted connections, there are no grouped stories to show
+    if (connectedUserIds.length === 0) {
+      console.log('📊 No connected users for grouped stories - returning empty array');
+      return [];
+    }
+
     const { data, error } = await this.serviceSupabase
       .from('stories')
       .select(`
@@ -529,6 +610,7 @@ export class StoriesService {
       .eq('is_active', true)
       .gt('expires_at', new Date().toISOString())
       .neq('user_id', currentUserId) // Exclude current user's stories
+      .in('user_id', connectedUserIds)
       .order('created_at', { ascending: false });
 
     if (error) {

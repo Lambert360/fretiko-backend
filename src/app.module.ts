@@ -25,7 +25,10 @@ import { StoresModule } from './stores/stores.module';
 import { AuctionsModule } from './auctions/auctions.module';
 import { IkoModule } from './iko/iko.module';
 import { RealtimeModule } from './realtime/realtime.module';
+import { TagsModule } from './tags/tags.module';
+import { MentionsModule } from './mentions/mentions.module';
 import { StoriesModule } from './stories/stories.module';
+import { PostsModule } from './posts/posts.module';
 import { WorkspaceModule } from './workspace/workspace.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { EscrowModule } from './escrow/escrow.module';
@@ -43,8 +46,15 @@ import { ReportsModule } from './reports/reports.module';
 import { AuditModule } from './audit/audit.module';
 import { GiftModule } from './gifts/gift.module';
 import { LoggerModule } from './logger/logger.module';
+import { LogisticsPartnersModule } from './logistics-partners/logistics-partners.module';
+import { RiderVerificationModule } from './rider-verification/rider-verification.module';
+import { PartnershipsModule } from './partnerships/partnerships.module';
+import { PartnersModule } from './partners/partners.module';
+import { GeneralPartnershipsModule } from './general-partnerships/general-partnerships.module';
+import { WebsiteContentModule } from './website-content/website-content.module';
 import { VideoProcessingModule } from './video-processing/video-processing.module';
 import { RssFeedsModule } from './rss-feeds/rss-feeds.module';
+import { AiModule } from './ai/ai.module';
 
 @Module({
   imports: [
@@ -78,22 +88,31 @@ import { RssFeedsModule } from './rss-feeds/rss-feeds.module';
     AuctionsModule,
     IkoModule,
     RealtimeModule,
+    TagsModule,
+    MentionsModule,
     StoriesModule,
+    PostsModule,
     WorkspaceModule,
     AnalyticsModule,
     EscrowModule,
     DisputesModule,
     ContentReportsModule,
     AdminModule,
-    // Internal Tool Modules
-    StaffModule,
     DepartmentsModule,
     MemosModule,
     ReportsModule,
     AuditModule,
     GiftModule,
+    StaffModule,
+    LogisticsPartnersModule,
+    RiderVerificationModule,
+    PartnershipsModule,
+    PartnersModule,
+    GeneralPartnershipsModule,
+    WebsiteContentModule,
     VideoProcessingModule,
     RssFeedsModule,
+    AiModule,
   ],
   controllers: [AppController, ExchangeRateController, HealthController],
   providers: [

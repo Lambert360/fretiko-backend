@@ -105,6 +105,21 @@ export class ServicesController {
     return this.servicesService.deleteService(req.user.sub, id, req.supabaseToken);
   }
 
+  @Get(':id/likes')
+  @UseGuards(JwtAuthGuard)
+  async getServiceLikers(
+    @Param('id') id: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    const likers = await this.servicesService.getServiceLikers(
+      id,
+      limit ? parseInt(limit) : 50,
+      offset ? parseInt(offset) : 0,
+    );
+    return { success: true, data: likers };
+  }
+
   @Post(':id/like')
   @UseGuards(JwtAuthGuard)
   async toggleLike(@Request() req, @Param('id') id: string) {
@@ -115,6 +130,12 @@ export class ServicesController {
   @UseGuards(JwtAuthGuard)
   async toggleBookmark(@Request() req, @Param('id') id: string) {
     return this.servicesService.toggleBookmark(req.user.sub, id, req.supabaseToken);
+  }
+
+  @Get('user/bookmarks/me')
+  @UseGuards(JwtAuthGuard)
+  async getMyBookmarkedServices(@Request() req) {
+    return this.servicesService.getBookmarkedServices(req.user.sub, req.supabaseToken);
   }
 
   @Post(':id/share')

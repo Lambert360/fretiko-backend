@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, OnModuleInit } from '@nestjs/common';
 import { VideoProcessingController } from './video-processing.controller';
 import { VideoProcessingService } from '../services/videoProcessingService';
 import { BackgroundVideoProcessor } from '../services/backgroundVideoProcessor';
@@ -16,4 +16,8 @@ import { AuthModule } from '../auth/auth.module';
     BackgroundVideoProcessor,
   ],
 })
-export class VideoProcessingModule {}
+export class VideoProcessingModule implements OnModuleInit {
+  async onModuleInit() {
+    await VideoProcessingService.checkFfmpegAvailability();
+  }
+}

@@ -1,10 +1,10 @@
 import { Controller, Get, Post, Delete, Put, Patch, Query, Request, Body, Param, UseGuards, ValidationPipe, ForbiddenException, BadRequestException, HttpCode, HttpStatus } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { AdminNotificationsService } from './admin-notifications.service';
-import { HybridAdminGuard } from '../auth/hybrid-admin.guard';
 import type { CreateBankAccountDto, UpdateBankAccountDto } from '../wallet/bank-account.service';
 import { WithdrawRequestDto } from '../wallet/dto/wallet.dto';
 import { AdminForgotPasswordDto, AdminConfirmResetPasswordDto } from './dto/admin-forgot-password.dto';
+import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
 
 /**
  * Admin Controller
@@ -76,7 +76,7 @@ export class AdminController {
    * Supports both regular admin users and staff users
    */
   @Get('revenue')
-  @UseGuards(HybridAdminGuard)
+  @UseGuards(StaffJwtAuthGuard)
   async getPlatformRevenue(
     @Request() req,
     @Query('start') start?: string,
@@ -111,6 +111,7 @@ export class AdminController {
    * GET /admin/escrow-health
    */
   @Get('escrow-health')
+  @UseGuards(StaffJwtAuthGuard)
   async getEscrowHealth(@Request() req) {
     if (req.authType === 'staff') {
       return this.adminService.getEscrowHealthForStaff(req.user.sub);
@@ -127,6 +128,7 @@ export class AdminController {
    * GET /admin/stats
    */
   @Get('stats')
+  @UseGuards(StaffJwtAuthGuard)
   async getPlatformStats(@Request() req) {
     if (req.authType === 'staff') {
       return this.adminService.getPlatformStatsForStaff(req.user.sub);
@@ -140,6 +142,7 @@ export class AdminController {
    * GET /admin/analytics/auctions/summary?start=...&end=...
    */
   @Get('analytics/auctions/summary')
+  @UseGuards(StaffJwtAuthGuard)
   async getAuctionAnalyticsSummary(
     @Request() req,
     @Query('start') start?: string,
@@ -168,10 +171,8 @@ export class AdminController {
    * Restricted to staff users only
    */
   @Get('platform/wallet')
+  @UseGuards(StaffJwtAuthGuard)
   async getPlatformWallet(@Request() req) {
-    if (req.authType !== 'staff') {
-      throw new ForbiddenException('Platform wallet access restricted to staff users only');
-    }
     return this.adminService.getPlatformWallet(req.user.sub);
   }
 
@@ -181,11 +182,39 @@ export class AdminController {
    * Restricted to staff users only
    */
   @Get('platform/bank-accounts')
+  @UseGuards(StaffJwtAuthGuard)
   async getPlatformBankAccounts(@Request() req) {
-    if (req.authType !== 'staff') {
-      throw new ForbiddenException('Platform bank accounts access restricted to staff users only');
-    }
     return this.adminService.getPlatformBankAccounts(req.user.sub);
+  }
+
+  @Get('platform/banks/:country')
+  @UseGuards(StaffJwtAuthGuard)
+  async getPlatformBanks(@Request() req, @Param('country') country: string) {
+    const banks = await this.adminService.getPlatformBanks(req.user.sub, country);
+    return {
+      status: 'success',
+      data: banks,
+      message: `Retrieved ${banks.length} banks for ${country.toUpperCase()}`,
+    };
+  }
+
+  @Post('platform/bank-accounts/preview')
+  @UseGuards(StaffJwtAuthGuard)
+  async previewPlatformBankAccount(
+    @Request() req,
+    @Body() dto: { accountNumber: string; bankCode: string },
+  ) {
+    const preview = await this.adminService.previewPlatformBankAccount(
+      req.user.sub,
+      dto.accountNumber,
+      dto.bankCode,
+    );
+
+    return {
+      status: 'success',
+      data: preview,
+      message: 'Account verified with bank',
+    };
   }
 
   /**
@@ -193,6 +222,7 @@ export class AdminController {
    * POST /admin/platform/bank-accounts
    */
   @Post('platform/bank-accounts')
+  @UseGuards(StaffJwtAuthGuard)
   async addPlatformBankAccount(
     @Request() req,
     @Body(ValidationPipe) dto: CreateBankAccountDto,
@@ -205,6 +235,7 @@ export class AdminController {
    * PUT /admin/platform/bank-accounts/:accountId
    */
   @Put('platform/bank-accounts/:accountId')
+  @UseGuards(StaffJwtAuthGuard)
   async updatePlatformBankAccount(
     @Request() req,
     @Param('accountId') accountId: string,
@@ -218,6 +249,7 @@ export class AdminController {
    * DELETE /admin/platform/bank-accounts/:accountId
    */
   @Delete('platform/bank-accounts/:accountId')
+  @UseGuards(StaffJwtAuthGuard)
   async deletePlatformBankAccount(
     @Request() req,
     @Param('accountId') accountId: string,
@@ -230,6 +262,7 @@ export class AdminController {
    * POST /admin/platform/withdraw
    */
   @Post('platform/withdraw')
+  @UseGuards(StaffJwtAuthGuard)
   async createPlatformWithdrawal(
     @Request() req,
     @Body(ValidationPipe) dto: WithdrawRequestDto,
@@ -243,112 +276,16 @@ export class AdminController {
    * Restricted to staff users only
    */
   @Get('platform/withdrawals')
+  @UseGuards(StaffJwtAuthGuard)
   async getPlatformWithdrawals(
     @Request() req,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
-    if (req.authType !== 'staff') {
-      throw new ForbiddenException('Platform withdrawal history access restricted to staff users only');
-    }
-    
     const pageNum = Math.max(1, parseInt(page || '1', 10));
     const limitNum = Math.min(Math.max(1, parseInt(limit || '50', 10)), 100); // Min 1, Max 100
     
     return this.adminService.getPlatformWithdrawals(req.user.sub, pageNum, limitNum);
-  }
-
-  // ============================================
-  // ADMIN NOTIFICATIONS ENDPOINTS
-  // ============================================
-
-  /**
-   * Get staff notifications
-   * GET /admin/notifications?page=1&limit=20&type=new_order&is_read=false
-   */
-  @Get('notifications')
-  async getNotifications(
-    @Request() req,
-    @Query('page') page?: string,
-    @Query('limit') limit?: string,
-    @Query('type') type?: string,
-    @Query('is_read') isRead?: string,
-    @Query('priority') priority?: string,
-  ) {
-    if (req.authType !== 'staff') {
-      throw new ForbiddenException('Notifications access restricted to staff users only');
-    }
-
-    const pageNum = Math.max(1, parseInt(page || '1', 10));
-    const limitNum = Math.min(Math.max(1, parseInt(limit || '20', 10)), 100);
-
-    const filters: any = {};
-    if (type) filters.type = type;
-    if (isRead !== undefined) filters.is_read = isRead === 'true';
-    if (priority) filters.priority = priority;
-
-    return this.notificationsService.getNotifications(req.user.sub, pageNum, limitNum, filters);
-  }
-
-  /**
-   * Get notification stats
-   * GET /admin/notifications/stats
-   */
-  @Get('notifications/stats')
-  async getNotificationStats(@Request() req) {
-    if (req.authType !== 'staff') {
-      throw new ForbiddenException('Notifications access restricted to staff users only');
-    }
-
-    return this.notificationsService.getStats(req.user.sub);
-  }
-
-  /**
-   * Mark notification as read
-   * PATCH /admin/notifications/:id/read
-   */
-  @Patch('notifications/:id/read')
-  async markNotificationAsRead(
-    @Request() req,
-    @Param('id') notificationId: string,
-  ) {
-    if (req.authType !== 'staff') {
-      throw new ForbiddenException('Notifications access restricted to staff users only');
-    }
-
-    await this.notificationsService.markAsRead(req.user.sub, notificationId);
-    return { success: true, message: 'Notification marked as read' };
-  }
-
-  /**
-   * Mark all notifications as read
-   * PATCH /admin/notifications/read-all
-   */
-  @Patch('notifications/read-all')
-  async markAllNotificationsAsRead(@Request() req) {
-    if (req.authType !== 'staff') {
-      throw new ForbiddenException('Notifications access restricted to staff users only');
-    }
-
-    await this.notificationsService.markAllAsRead(req.user.sub);
-    return { success: true, message: 'All notifications marked as read' };
-  }
-
-  /**
-   * Delete notification
-   * DELETE /admin/notifications/:id
-   */
-  @Delete('notifications/:id')
-  async deleteNotification(
-    @Request() req,
-    @Param('id') notificationId: string,
-  ) {
-    if (req.authType !== 'staff') {
-      throw new ForbiddenException('Notifications access restricted to staff users only');
-    }
-
-    await this.notificationsService.deleteNotification(req.user.sub, notificationId);
-    return { success: true, message: 'Notification deleted' };
   }
 
   /**
@@ -357,11 +294,8 @@ export class AdminController {
    * Returns unread counts for sidebar navigation items
    */
   @Get('nav-badges')
+  @UseGuards(StaffJwtAuthGuard)
   async getNavBadges(@Request() req) {
-    if (req.authType !== 'staff') {
-      throw new ForbiddenException('Badge access restricted to staff users only');
-    }
-
     return this.adminService.getNavBadges(req.user.sub);
   }
 }

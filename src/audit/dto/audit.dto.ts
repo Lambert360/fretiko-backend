@@ -51,6 +51,12 @@ export enum AuditAction {
   LOGIN = 'login',
   LOGOUT = 'logout',
   EXPORT_DATA = 'export_data',
+  
+  // Logistics partnership actions
+  CREATE = 'create',
+  UPDATE = 'update',
+  VERIFY = 'verify',
+  REJECT = 'reject',
 }
 
 export enum AuditEntityType {
@@ -70,6 +76,10 @@ export enum AuditEntityType {
   DEPARTMENT = 'department',
   MEMO = 'memo',
   REPORT = 'report',
+  
+  // Logistics partnership entities
+  LOGISTICS_PARTNERSHIP = 'logistics_partnership',
+  RIDER_VERIFICATION = 'rider_verification',
 }
 
 export enum AuditStatus {
