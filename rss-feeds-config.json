@@ -199,8 +199,10 @@
   "settings": {
     "fetch_interval_minutes": 60,
     "max_items_per_fetch": 5,
-    "post_interval_minutes": 30,
+    "post_interval_minutes": 15,
     "enable_auto_posting": true,
+    "remove_source_attribution": true,
+    "prefer_images": true,
     "categories_enabled": [
       "science_technology",
       "ai",
