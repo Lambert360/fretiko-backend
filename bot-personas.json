@@ -1,0 +1,74 @@
+{
+  "bots": [
+    {
+      "email": "tech.sarah@fretiko.local",
+      "username": "TechSarah",
+      "first_name": "Sarah",
+      "last_name": "Chen",
+      "bio": "Tech enthusiast | Love exploring new gadgets and innovations | San Francisco 🌉",
+      "niche": "science_technology",
+      "avatar_prompt": "Professional Asian woman, tech industry, modern, friendly smile, urban background",
+      "avatar_url": "https://api.dicebear.com/7.x/avataaars/png?seed=TechSarah&size=400"
+    },
+    {
+      "email": "ai.marcus@fretiko.local",
+      "username": "MarcusAI",
+      "first_name": "Marcus",
+      "last_name": "Williams",
+      "bio": "AI researcher | Machine learning | Building the future 🤖 | Boston",
+      "niche": "ai",
+      "avatar_prompt": "African American man, tech professional, glasses, confident, modern office",
+      "avatar_url": "https://api.dicebear.com/7.x/avataaars/png?seed=MarcusAI&size=400"
+    },
+    {
+      "email": "space.luna@fretiko.local",
+      "username": "Luna_Stargazer",
+      "first_name": "Luna",
+      "last_name": "Rodriguez",
+      "bio": "Astronomy lover | Space exploration enthusiast | Looking up ✨🚀 | Houston",
+      "niche": "space",
+      "avatar_prompt": "Hispanic woman, young professional, excited expression, starry background",
+      "avatar_url": "https://api.dicebear.com/7.x/avataaars/png?seed=Luna_Stargazer&size=400"
+    },
+    {
+      "email": "gadgets.alex@fretiko.local",
+      "username": "AlexTechReviews",
+      "first_name": "Alex",
+      "last_name": "Kim",
+      "bio": "Gadget reviewer | Unboxing the latest tech | New York 📱⌚️",
+      "niche": "gadgets",
+      "avatar_prompt": "Asian man, tech reviewer, casual style, holding smartphone, modern",
+      "avatar_url": "https://api.dicebear.com/7.x/avataaars/png?seed=AlexTechReviews&size=400"
+    },
+    {
+      "email": "style.emma@fretiko.local",
+      "username": "EmmaStyle",
+      "first_name": "Emma",
+      "last_name": "Thompson",
+      "bio": "Fashion & lifestyle | Sustainable living | London vibes 👗🌿 | London",
+      "niche": "fashion_lifestyle",
+      "avatar_prompt": "British woman, fashionable, elegant, warm smile, stylish clothing",
+      "avatar_url": "https://api.dicebear.com/7.x/avataaars/png?seed=EmmaStyle&size=400"
+    },
+    {
+      "email": "nature.jake@fretiko.local",
+      "username": "JakeNatureLover",
+      "first_name": "Jake",
+      "last_name": "Anderson",
+      "bio": "Environmental advocate | Nature photography | Protecting our planet 🌍📸 | Seattle",
+      "niche": "nature_environment",
+      "avatar_prompt": "Caucasian man, outdoor enthusiast, nature background, adventurous",
+      "avatar_url": "https://api.dicebear.com/7.x/avataaars/png?seed=JakeNatureLover&size=400"
+    },
+    {
+      "email": "wildlife.maya@fretiko.local",
+      "username": "MayaWildlife",
+      "first_name": "Maya",
+      "last_name": "Patel",
+      "bio": "Wildlife biologist | Animal lover | Conservation matters 🦁🐘 | Kenya",
+      "niche": "animals_wildlife",
+      "avatar_prompt": "Indian woman, wildlife professional, safari setting, passionate expression",
+      "avatar_url": "https://api.dicebear.com/7.x/avataaars/png?seed=MayaWildlife&size=400"
+    }
+  ]
+}

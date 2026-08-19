@@ -44,6 +44,8 @@ import { GiftModule } from './gifts/gift.module';
 import { LoggerModule } from './logger/logger.module';
 import { VideoProcessingModule } from './video-processing/video-processing.module';
 import { RssFeedsModule } from './rss-feeds/rss-feeds.module';
+import { ImageFeedsModule } from './image-feeds/image-feeds.module';
+import { AiModule } from './ai/ai.module';
 
 @Module({
   imports: [
@@ -93,6 +95,8 @@ import { RssFeedsModule } from './rss-feeds/rss-feeds.module';
     GiftModule,
     VideoProcessingModule,
     RssFeedsModule,
+    ImageFeedsModule,
+    AiModule,
   ],
   controllers: [AppController, ExchangeRateController],
   providers: [
