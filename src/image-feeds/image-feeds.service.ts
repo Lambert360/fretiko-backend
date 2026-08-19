@@ -226,7 +226,10 @@ export class ImageFeedsService {
         .eq('username', persona.username)
         .single();
 
-      if (existingProfile) return existingProfile.id;
+      if (existingProfile) {
+        await this.mirrorIntoLegacyUsersTable(persona, existingProfile.id);
+        return existingProfile.id;
+      }
 
       const { data: existingAuthList } = await this.supabaseClient.auth.admin.listUsers();
       let authUser = existingAuthList?.users?.find((u: any) => u.email === persona.email);
@@ -264,11 +267,33 @@ export class ImageFeedsService {
         return null;
       }
 
+      await this.mirrorIntoLegacyUsersTable(persona, authUser.id);
+
       this.logger.log(`Bot user ready: ${persona.username} (${profile.id})`);
       return profile.id;
     } catch (error) {
       this.logger.error(`Error ensuring bot user ${persona.username}`, error.stack);
       return null;
+    }
+  }
+
+  // Legacy schema compatibility: some projects have posts.user_id -> public.users
+  // instead of -> user_profiles/auth.users. Mirror the bot into that table too,
+  // if it exists, so post inserts don't fail on the FK constraint.
+  private async mirrorIntoLegacyUsersTable(persona: BotPersona, id: string): Promise<void> {
+    const { error } = await this.supabaseClient.from('users').upsert({
+      id,
+      email: persona.email,
+      username: persona.username,
+      first_name: persona.first_name,
+      last_name: persona.last_name,
+      bio: persona.bio,
+      avatar_url: persona.avatar_url,
+      is_bot: false,
+    });
+
+    if (error && error.code !== 'PGRST205') {
+      this.logger.warn(`Could not mirror ${persona.username} into legacy users table`, error.message);
     }
   }
 
