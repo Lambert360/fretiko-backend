@@ -63,7 +63,7 @@ export class EngagementBotsScheduler implements OnModuleInit {
       if (post.user_id === botUserId) continue;
 
       try {
-        const performed = await this.engagementBotsService.engageWithPost(botUserId, post.id);
+        const performed = await this.engagementBotsService.engageWithPost(botUserId, post.id, post.content);
         if (performed.length > 0) {
           engagementsPerformed += performed.length;
           touchedPosts.add(post.id);

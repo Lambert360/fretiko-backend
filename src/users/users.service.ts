@@ -31,11 +31,14 @@ export class UsersService {
   }
 
   async getPublicProfile(userId: string): Promise<PublicProfileResponse> {
-    const { data, error } = await this.supabase
-      .from('user_profiles')
-      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at')
+    // SECURITY: Use service role for public profile access (no sensitive data)
+    let { data, error } = await this.selectPublicProfile()
       .eq('id', userId)
       .single();
+
+    if (error && /followers_count|following_count/.test(error.message || '')) {
+      ({ data, error } = await this.selectPublicProfile(false).eq('id', userId).single());
+    }
 
     if (error) {
       if (error.code === 'PGRST116') {
@@ -46,13 +49,85 @@ export class UsersService {
 
     return {
       id: data.id,
-      username: data.username,
+      username: data.username || data.display_name || 'Unknown',
       bio: data.bio,
       avatarUrl: data.avatar_url,
       bgPicUrl: data.bg_pic_url,
       location: data.location,
       isSeller: data.is_seller,
       isRider: data.is_rider,
+      followersCount: data.followers_count || 0,
+      followingCount: data.following_count || 0,
+      createdAt: data.created_at,
+    };
+  }
+
+  async getPublicProfileByUsername(username: string): Promise<PublicProfileResponse> {
+    // SECURITY: Use service role for public profile access (no sensitive data)
+    let { data, error } = await this.selectPublicProfile()
+      .ilike('username', username)
+      .single();
+
+    if (error && /followers_count|following_count/.test(error.message || '')) {
+      ({ data, error } = await this.selectPublicProfile(false).ilike('username', username).single());
+    }
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // SECURITY: Don't auto-create profiles in public read operations
+        // This prevents unauthorized profile creation
+        console.log('Public profile not found for username', username);
+        throw new NotFoundException('User profile not found');
+      }
+      throw new Error(`Database error: ${error.message}`);
+    }
+
+    return {
+      id: data.id,
+      username: data.username || data.display_name || 'Unknown',
+      bio: data.bio,
+      avatarUrl: data.avatar_url,
+      bgPicUrl: data.bg_pic_url,
+      location: data.location,
+      isSeller: data.is_seller,
+      isRider: data.is_rider,
+      followersCount: data.followers_count || 0,
+      followingCount: data.following_count || 0,
+      createdAt: data.created_at,
+    };
+  }
+
+  async getPublicProfileByUsername(username: string): Promise<PublicProfileResponse> {
+    // SECURITY: Use service role for public profile access (no sensitive data)
+    let { data, error } = await this.selectPublicProfile()
+      .ilike('username', username)
+      .single();
+
+    if (error && /followers_count|following_count/.test(error.message || '')) {
+      ({ data, error } = await this.selectPublicProfile(false).ilike('username', username).single());
+    }
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // SECURITY: Don't auto-create profiles in public read operations
+        // This prevents unauthorized profile creation
+        console.log('Public profile not found for username', username);
+        throw new NotFoundException('User profile not found');
+      }
+      throw new Error(`Database error: ${error.message}`);
+    }
+
+    return {
+      id: data.id,
+      username: data.username || data.display_name || 'Unknown',
+      bio: data.bio,
+      avatarUrl: data.avatar_url,
+      bgPicUrl: data.bg_pic_url,
+      location: data.location,
+      isSeller: data.is_seller,
+      isRider: data.is_rider,
+      followersCount: data.followers_count || 0,
+      followingCount: data.following_count || 0,
       createdAt: data.created_at,
     };
   }
@@ -531,6 +606,34 @@ export class UsersService {
     };
   }
 
+  private async generateAndSaveVendorEmbedding(vendorId: string, profileData: any): Promise<void> {
+    const text = this.embeddingService.buildVendorText(profileData);
+    const { embedding } = await this.embeddingService.embed(text);
+    if (!embedding || embedding.length === 0) return;
+
+    const { error } = await this.serviceSupabase
+      .from('user_profiles')
+      .update({
+        embedding,
+        embedding_text: text,
+        embedding_updated_at: new Date().toISOString(),
+      })
+      .eq('id', vendorId);
+
+    if (error) {
+      this.logger.error(`Failed to save embedding for vendor ${vendorId}: ${error.message}`);
+    } else {
+      this.logger.debug(`Embedding generated for vendor ${vendorId}`);
+    }
+  }
+
+  private selectPublicProfile(includeCounts = true) {
+    const columns = includeCounts
+      ? 'id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name, followers_count, following_count'
+      : 'id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name';
+    return this.serviceSupabase.from('user_profiles').select(columns);
+  }
+
   private mapToProfileResponse(data: any): UserProfileResponse {
     return {
       id: data.id,
@@ -544,6 +647,8 @@ export class UsersService {
       preferences: data.preferences || {},
       isSeller: data.is_seller,
       isRider: data.is_rider,
+      followersCount: data.followers_count || 0,
+      followingCount: data.following_count || 0,
       createdAt: data.created_at,
       updatedAt: data.updated_at,
     };

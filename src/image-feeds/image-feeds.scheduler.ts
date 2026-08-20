@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { ImageFeedsService, BotPersona } from './image-feeds.service';
+import { EngagementBotsService } from '../engagement-bots/engagement-bots.service';
 
 @Injectable()
 export class ImageFeedsScheduler implements OnModuleInit {
@@ -10,7 +11,26 @@ export class ImageFeedsScheduler implements OnModuleInit {
   private isProcessing = false;
   private lastPostTime: Date = new Date(0);
 
-  constructor(private readonly imageFeedsService: ImageFeedsService) {}
+  constructor(
+    private readonly imageFeedsService: ImageFeedsService,
+    private readonly engagementBotsService: EngagementBotsService,
+  ) {}
+
+  private async seedEngagement(post: any, botUserId: string): Promise<void> {
+    if (!post?.id) return;
+    try {
+      const liked = await this.engagementBotsService.seedEngagementForPost(
+        post.id,
+        botUserId,
+        4,
+        9,
+        post.content,
+      );
+      if (liked > 0) this.logger.log(`Seeded ${liked} likes on post ${post.id}`);
+    } catch (error: any) {
+      this.logger.warn(`Failed to seed engagement for post ${post.id}: ${error.message}`);
+    }
+  }
 
   async onModuleInit() {
     await this.initializeBotUsers();
@@ -47,8 +67,9 @@ export class ImageFeedsScheduler implements OnModuleInit {
       const botUserId = this.personaUserIds.get(persona.username);
       if (!botUserId) return;
 
-      await this.imageFeedsService.createImagePost(persona, botUserId);
+      const post = await this.imageFeedsService.createImagePost(persona, botUserId);
       this.lastPostTime = now;
+      await this.seedEngagement(post, botUserId);
     } catch (error) {
       this.logger.error('Error in image post cycle', error.stack);
     } finally {
@@ -75,8 +96,9 @@ export class ImageFeedsScheduler implements OnModuleInit {
     }
 
     try {
-      await this.imageFeedsService.createImagePost(persona, botUserId);
+      const post = await this.imageFeedsService.createImagePost(persona, botUserId);
       this.lastPostTime = new Date();
+      await this.seedEngagement(post, botUserId);
       return { success: true, message: `Posted as ${persona.username}`, persona: persona.username };
     } catch (error) {
       return { success: false, message: error.message };

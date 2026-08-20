@@ -30,6 +30,12 @@
         "url": "https://www.sciencedaily.com/rss/all.xml",
         "category": "Science",
         "active": true
+      },
+      {
+        "name": "Ars Technica",
+        "url": "https://feeds.arstechnica.com/arstechnica/index",
+        "category": "Technology",
+        "active": true
       }
     ],
     "ai": [
@@ -54,6 +60,12 @@
       {
         "name": "VentureBeat AI",
         "url": "https://venturebeat.com/category/ai/feed/",
+        "category": "AI",
+        "active": true
+      },
+      {
+        "name": "Google AI Blog",
+        "url": "https://blog.google/technology/ai/rss/",
         "category": "AI",
         "active": true
       }
@@ -83,6 +95,12 @@
         "url": "https://www.universetoday.com/feed/",
         "category": "Space",
         "active": true
+      },
+      {
+        "name": "Sky & Telescope",
+        "url": "https://skyandtelescope.org/feed/",
+        "category": "Space",
+        "active": true
       }
     ],
     "gadgets": [
@@ -107,6 +125,12 @@
       {
         "name": "Android Authority",
         "url": "https://www.androidauthority.com/feed/",
+        "category": "Gadgets",
+        "active": true
+      },
+      {
+        "name": "TechRadar",
+        "url": "https://www.techradar.com/rss",
         "category": "Gadgets",
         "active": true
       }
@@ -141,6 +165,12 @@
         "url": "https://www.apartmenttherapy.com/main.rss",
         "category": "Lifestyle",
         "active": true
+      },
+      {
+        "name": "Elle",
+        "url": "https://www.elle.com/rss/all.xml/",
+        "category": "Fashion",
+        "active": true
       }
     ],
     "nature": [
@@ -148,23 +178,53 @@
         "name": "National Geographic",
         "url": "https://www.nationalgeographic.com/pages/topic/latest-stories/_jcr_content.feed",
         "category": "Nature",
-        "active": true
+        "active": false
       },
       {
         "name": "Nature.com News",
         "url": "https://www.nature.com/nature.rss",
         "category": "Nature",
-        "active": true
+        "active": false
       },
       {
         "name": "Earth.com",
         "url": "https://www.earth.com/news/feed/",
         "category": "Nature",
-        "active": true
+        "active": false
       },
       {
         "name": "BBC Earth",
         "url": "http://feeds.bbci.co.uk/earth/rss.xml",
+        "category": "Nature",
+        "active": false
+      },
+      {
+        "name": "Mongabay",
+        "url": "https://news.mongabay.com/feed/",
+        "category": "Nature",
+        "active": true
+      },
+      {
+        "name": "The Guardian Environment",
+        "url": "https://www.theguardian.com/uk/environment/rss",
+        "category": "Nature",
+        "active": true
+      },
+      {
+        "name": "Yale Environment 360",
+        "url": "https://e360.yale.edu/feed.xml",
+        "category": "Nature",
+        "active": true
+      },
+      {
+        "name": "Phys.org Earth",
+        "url": "https://phys.org/rss-feed/earth-news/",
+        "category": "Nature",
+        "active": true
+      },
+      {
+        "name": "ScienceDaily Environment",
+        "url": "https://www.sciencedaily.com/rss/earth_climate.xml",
         "category": "Nature",
         "active": true
       }
@@ -174,7 +234,7 @@
         "name": "National Geographic Animals",
         "url": "https://www.nationalgeographic.com/animals/rss",
         "category": "Animals",
-        "active": true
+        "active": false
       },
       {
         "name": "Animal Wellness Magazine",
@@ -186,19 +246,261 @@
         "name": "ZooBorns",
         "url": "https://www.zooborns.com/zooborns/atom.xml",
         "category": "Animals",
-        "active": true
+        "active": false
       },
       {
         "name": "The Dodo",
         "url": "https://www.thedodo.com/feed",
         "category": "Animals",
+        "active": false
+      },
+      {
+        "name": "Live Science Animals",
+        "url": "https://www.livescience.com/feeds/tag/animals",
+        "category": "Animals",
+        "active": true
+      },
+      {
+        "name": "ScienceDaily Animals",
+        "url": "https://www.sciencedaily.com/rss/plants_animals/animals.xml",
+        "category": "Animals",
+        "active": true
+      },
+      {
+        "name": "Phys.org Biology",
+        "url": "https://phys.org/rss-feed/biology-news/",
+        "category": "Animals",
+        "active": true
+      },
+      {
+        "name": "The Guardian Wildlife",
+        "url": "https://www.theguardian.com/environment/wildlife/rss",
+        "category": "Animals",
+        "active": true
+      }
+    ],
+    "nigeria_news": [
+      {
+        "name": "Premium Times",
+        "url": "https://www.premiumtimesng.com/feed",
+        "category": "Nigeria News",
+        "active": true
+      },
+      {
+        "name": "Punch",
+        "url": "https://punchng.com/feed/",
+        "category": "Nigeria News",
+        "active": true
+      },
+      {
+        "name": "Vanguard",
+        "url": "https://www.vanguardngr.com/feed/",
+        "category": "Nigeria News",
+        "active": true
+      },
+      {
+        "name": "BBC Africa",
+        "url": "http://feeds.bbci.co.uk/news/world/africa/rss.xml",
+        "category": "Africa News",
+        "active": true
+      },
+      {
+        "name": "Daily Trust",
+        "url": "https://dailytrust.com/feed/",
+        "category": "Nigeria News",
+        "active": true
+      },
+      {
+        "name": "The Cable",
+        "url": "https://www.thecable.ng/feed",
+        "category": "Nigeria News",
+        "active": true
+      }
+    ],
+    "sports": [
+      {
+        "name": "BBC Sport Football",
+        "url": "http://feeds.bbci.co.uk/sport/football/rss.xml",
+        "category": "Football",
+        "active": true
+      },
+      {
+        "name": "Complete Sports",
+        "url": "https://www.completesports.com/feed/",
+        "category": "Sports",
+        "active": true
+      },
+      {
+        "name": "ESPN Soccer",
+        "url": "https://www.espn.com/espn/rss/soccer/news",
+        "category": "Football",
+        "active": true
+      },
+      {
+        "name": "Sky Sports Football",
+        "url": "https://www.skysports.com/rss/12040",
+        "category": "Football",
+        "active": true
+      },
+      {
+        "name": "ESPN NBA",
+        "url": "https://www.espn.com/espn/rss/nba/news",
+        "category": "Basketball",
+        "active": true
+      },
+      {
+        "name": "CBS Sports NBA",
+        "url": "https://www.cbssports.com/rss/headlines/nba/",
+        "category": "Basketball",
+        "active": true
+      },
+      {
+        "name": "BBC Sport",
+        "url": "http://feeds.bbci.co.uk/sport/rss.xml",
+        "category": "Sports",
+        "active": true
+      }
+    ],
+    "business_entrepreneurship": [
+      {
+        "name": "TechCabal",
+        "url": "https://techcabal.com/feed/",
+        "category": "Business",
+        "active": true
+      },
+      {
+        "name": "Nairametrics",
+        "url": "https://nairametrics.com/feed/",
+        "category": "Business",
+        "active": true
+      },
+      {
+        "name": "BusinessDay NG",
+        "url": "https://businessday.ng/feed/",
+        "category": "Business",
+        "active": true
+      },
+      {
+        "name": "Entrepreneur",
+        "url": "https://www.entrepreneur.com/latest.rss",
+        "category": "Entrepreneurship",
+        "active": true
+      }
+    ],
+    "culture_entertainment": [
+      {
+        "name": "NotJustOk",
+        "url": "https://notjustok.com/feed/",
+        "category": "Music",
+        "active": true
+      },
+      {
+        "name": "BellaNaija",
+        "url": "https://www.bellanaija.com/feed/",
+        "category": "Entertainment",
+        "active": true
+      },
+      {
+        "name": "Rolling Stone Music",
+        "url": "https://www.rollingstone.com/music/music-news/feed/",
+        "category": "Music",
+        "active": true
+      },
+      {
+        "name": "Pitchfork",
+        "url": "https://pitchfork.com/rss/news/",
+        "category": "Music",
+        "active": true
+      },
+      {
+        "name": "Billboard",
+        "url": "https://www.billboard.com/feed/",
+        "category": "Music",
+        "active": true
+      }
+    ],
+    "food_travel": [
+      {
+        "name": "Cond\u00e9 Nast Traveler",
+        "url": "https://www.cntraveler.com/feed/rss",
+        "category": "Travel",
+        "active": true
+      },
+      {
+        "name": "Eater",
+        "url": "https://www.eater.com/rss/index.xml",
+        "category": "Food",
+        "active": true
+      },
+      {
+        "name": "Bon Appetit",
+        "url": "https://www.bonappetit.com/feed/rss",
+        "category": "Food",
+        "active": true
+      },
+      {
+        "name": "The Kitchn",
+        "url": "https://www.thekitchn.com/main.rss",
+        "category": "Food",
+        "active": true
+      }
+    ],
+    "health_fitness": [
+      {
+        "name": "Men's Health",
+        "url": "https://www.menshealth.com/rss/all.xml/",
+        "category": "Health",
+        "active": true
+      },
+      {
+        "name": "Prevention",
+        "url": "https://www.prevention.com/rss/all.xml/",
+        "category": "Health",
+        "active": true
+      },
+      {
+        "name": "Self",
+        "url": "https://www.self.com/feed/rss",
+        "category": "Fitness",
+        "active": true
+      },
+      {
+        "name": "BBC Health",
+        "url": "http://feeds.bbci.co.uk/news/health/rss.xml",
+        "category": "Health",
+        "active": true
+      }
+    ],
+    "education_career": [
+      {
+        "name": "Inside Higher Ed",
+        "url": "https://www.insidehighered.com/rss.xml",
+        "category": "Education",
+        "active": true
+      },
+      {
+        "name": "Fast Company Work Life",
+        "url": "https://www.fastcompany.com/work-life/rss",
+        "category": "Career",
+        "active": true
+      },
+      {
+        "name": "BBC Education",
+        "url": "http://feeds.bbci.co.uk/news/education/rss.xml",
+        "category": "Education",
+        "active": true
+      },
+      {
+        "name": "EdSurge",
+        "url": "https://www.edsurge.com/articles_rss",
+        "category": "Education",
         "active": true
       }
     ]
   },
   "settings": {
-    "fetch_interval_minutes": 60,
-    "max_items_per_fetch": 5,
+    "fetch_interval_minutes": 30,
+    "max_items_per_fetch": 8,
     "post_interval_minutes": 15,
     "enable_auto_posting": true,
     "remove_source_attribution": true,
@@ -210,7 +512,14 @@
       "gadgets",
       "fashion_lifestyle",
       "nature",
-      "animals"
+      "animals",
+      "nigeria_news",
+      "sports",
+      "business_entrepreneurship",
+      "culture_entertainment",
+      "food_travel",
+      "health_fitness",
+      "education_career"
     ]
   }
 }

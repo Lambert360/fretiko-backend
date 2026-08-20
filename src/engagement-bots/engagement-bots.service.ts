@@ -2,46 +2,17 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { BotPersona, loadPersonas, ensureBotUser } from '../shared/bot-persona.util';
+import { LlmService, ModelTier } from '../ai/core/llm.service';
+import {
+  buildCommentPrompt,
+  fallbackComment,
+  fallbackReply,
+  sanitizeComment,
+} from './bot-comment.util';
 
 const LIKE_ONLY_WEIGHT = 0.55;
 const LIKE_AND_COMMENT_WEIGHT = 0.3;
 const LIKE_COMMENT_AND_SHARE_WEIGHT = 0.15;
-
-const COMMENT_TEMPLATES = [
-  'This is fire 🔥',
-  'Nice one o!',
-  'I like this',
-  'Chai, this is interesting',
-  'Wow, didn\u2019t know this',
-  'Correct!',
-  'This one na sense',
-  'Interesting take',
-  'Thanks for sharing this',
-  'I dey feel this one',
-  'Make e continue like this',
-  'Great post 👏',
-  'This na wetin I dey talk about',
-  'Very true',
-  'Love this energy',
-  'Good stuff, keep it up',
-  'This got me thinking',
-  'Facts',
-  'God bless the person that made this',
-  'Sharing this to my people',
-];
-
-const REPLY_TEMPLATES = [
-  'Exactly my thoughts',
-  'Abeg you don talk am well',
-  'I agree with you 100%',
-  'This is so true',
-  'Well said',
-  'Na so e be',
-  'You just said it all',
-  'Thank you for this',
-  'True talk',
-  'I feel the same way',
-];
 
 @Injectable()
 export class EngagementBotsService {
@@ -52,7 +23,10 @@ export class EngagementBotsService {
   private engagementUserIds: Map<string, string> = new Map();
   private contentUserIds: Set<string> = new Set();
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly llmService: LlmService,
+  ) {
     this.supabaseClient = createServiceSupabaseClient(this.configService);
     this.loadPersonaFiles();
   }
@@ -78,7 +52,19 @@ export class EngagementBotsService {
     return this.engagementPersonas;
   }
 
+  private initPromise: Promise<number> | null = null;
+
   async initializeBotUsers(): Promise<number> {
+    if (!this.initPromise) {
+      this.initPromise = this.doInitializeBotUsers().catch((error) => {
+        this.initPromise = null;
+        throw error;
+      });
+    }
+    return this.initPromise;
+  }
+
+  private async doInitializeBotUsers(): Promise<number> {
     for (const persona of this.engagementPersonas) {
       const id = await ensureBotUser(this.supabaseClient, persona);
       if (id) {
@@ -87,13 +73,9 @@ export class EngagementBotsService {
     }
 
     for (const persona of this.contentPersonas) {
-      const { data: profile } = await this.supabaseClient
-        .from('user_profiles')
-        .select('id')
-        .eq('username', persona.username)
-        .single();
-      if (profile) {
-        this.contentUserIds.add(profile.id);
+      const id = await ensureBotUser(this.supabaseClient, persona);
+      if (id) {
+        this.contentUserIds.add(id);
       }
     }
 
@@ -122,7 +104,7 @@ export class EngagementBotsService {
 
     const { data, error } = await this.supabaseClient
       .from('posts')
-      .select('id, user_id, created_at')
+      .select('id, user_id, created_at, content')
       .in('user_id', contentIds)
       .eq('is_deleted', false)
       .order('created_at', { ascending: false })
@@ -146,9 +128,101 @@ export class EngagementBotsService {
     return { like: true, comment: true, share: true };
   }
 
-  async engageWithPost(botUserId: string, postId: string): Promise<string[]> {
+  private hashSeed(value: string): number {
+    let hash = 0;
+    for (let i = 0; i < value.length; i++) {
+      hash = (hash * 31 + value.charCodeAt(i)) | 0;
+    }
+    return Math.abs(hash);
+  }
+
+  async getPostContent(postId: string): Promise<string> {
+    const { data, error } = await this.supabaseClient
+      .from('posts')
+      .select('content')
+      .eq('id', postId)
+      .single();
+    if (error || !data?.content) return '';
+    return String(data.content);
+  }
+
+  async composeComment(postContent: string, botUserId: string, parentComment?: string): Promise<string | null> {
+    const content = (postContent || '').trim();
+    if (!content) return null;
+
+    const seed = this.hashSeed(`${botUserId}:${content.slice(0, 80)}:${parentComment || ''}`);
+
+    try {
+      const prompt = buildCommentPrompt(content, parentComment);
+      const result = await this.llmService.chat(
+        [
+          { role: 'system', content: prompt.system },
+          { role: 'user', content: prompt.user },
+        ],
+        ModelTier.FAST,
+        { temperature: 0.85, maxTokens: 80 },
+      );
+      const cleaned = sanitizeComment(result.content, content);
+      if (cleaned) return cleaned;
+    } catch (error: any) {
+      this.logger.warn(`Contextual comment LLM failed, using post-specific fallback: ${error.message}`);
+    }
+
+    return parentComment ? fallbackReply(content, parentComment, seed) : fallbackComment(content, seed);
+  }
+
+  // Called right after a content bot creates a post so it doesn't sit with
+  // zero engagement until the next scheduled cycle picks it up.
+  async seedEngagementForPost(
+    postId: string,
+    authorId: string,
+    minLikes = 4,
+    maxLikes = 9,
+    postContent?: string,
+  ): Promise<number> {
+    if (this.engagementUserIds.size === 0) {
+      await this.initializeBotUsers();
+    }
+
+    const candidates = Array.from(this.engagementUserIds.values()).filter((id) => id !== authorId);
+    if (candidates.length === 0) return 0;
+
+    const likeCount = minLikes + Math.floor(Math.random() * (maxLikes - minLikes + 1));
+    const shuffled = [...candidates].sort(() => Math.random() - 0.5).slice(0, likeCount);
+
+    let liked = 0;
+    for (const botUserId of shuffled) {
+      const { error } = await this.supabaseClient.from('post_interactions').insert({
+        post_id: postId,
+        user_id: botUserId,
+        interaction_type: 'like',
+      });
+      if (!error) liked++;
+      else if (error.code !== '23505') this.logger.warn(`Seed like failed: ${error.message}`);
+    }
+
+    if (Math.random() < 0.6 && shuffled.length > 0) {
+      const commenter = shuffled[0];
+      const sourceContent = postContent || (await this.getPostContent(postId));
+      const commentText = await this.composeComment(sourceContent, commenter);
+      if (commentText) {
+        const { error } = await this.supabaseClient.from('post_interactions').insert({
+          post_id: postId,
+          user_id: commenter,
+          interaction_type: 'comment',
+          content: commentText,
+        });
+        if (error && error.code !== '23505') this.logger.warn(`Seed comment failed: ${error.message}`);
+      }
+    }
+
+    return liked;
+  }
+
+  async engageWithPost(botUserId: string, postId: string, postContent?: string): Promise<string[]> {
     const performed: string[] = [];
     const actions = this.pickActions();
+    const content = postContent ?? (await this.getPostContent(postId));
 
     if (actions.like) {
       const { error } = await this.supabaseClient.from('post_interactions').insert({
@@ -161,34 +235,40 @@ export class EngagementBotsService {
     }
 
     if (actions.comment) {
-      const { data: comment, error } = await this.supabaseClient
-        .from('post_interactions')
-        .insert({
-          post_id: postId,
-          user_id: botUserId,
-          interaction_type: 'comment',
-          content: this.randomPick(COMMENT_TEMPLATES),
-        })
-        .select()
-        .single();
-      if (!error) {
-        performed.push('comment');
+      const commentText = await this.composeComment(content, botUserId);
+      if (commentText) {
+        const { data: comment, error } = await this.supabaseClient
+          .from('post_interactions')
+          .insert({
+            post_id: postId,
+            user_id: botUserId,
+            interaction_type: 'comment',
+            content: commentText,
+          })
+          .select()
+          .single();
+        if (!error) {
+          performed.push('comment');
 
-        if (Math.random() < 0.4) {
-          const replyBot = this.randomPick(Array.from(this.engagementUserIds.values()));
-          if (replyBot && replyBot !== botUserId) {
-            const { error: replyError } = await this.supabaseClient.from('post_interactions').insert({
-              post_id: postId,
-              user_id: replyBot,
-              interaction_type: 'comment',
-              content: this.randomPick(REPLY_TEMPLATES),
-              parent_comment_id: comment.id,
-            });
-            if (!replyError) performed.push('reply');
+          if (Math.random() < 0.4) {
+            const replyBot = this.randomPick(Array.from(this.engagementUserIds.values()));
+            if (replyBot && replyBot !== botUserId) {
+              const replyText = await this.composeComment(content, replyBot, commentText);
+              if (replyText) {
+                const { error: replyError } = await this.supabaseClient.from('post_interactions').insert({
+                  post_id: postId,
+                  user_id: replyBot,
+                  interaction_type: 'comment',
+                  content: replyText,
+                  parent_comment_id: comment.id,
+                });
+                if (!replyError) performed.push('reply');
+              }
+            }
           }
+        } else if (error.code !== '23505') {
+          this.logger.warn(`Comment failed: ${error.message}`);
         }
-      } else if (error.code !== '23505') {
-        this.logger.warn(`Comment failed: ${error.message}`);
       }
     }
 
