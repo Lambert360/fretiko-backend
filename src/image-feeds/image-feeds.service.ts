@@ -4,17 +4,9 @@ import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { BotPersona, ensureBotUser as ensureBotUserShared } from '../shared/bot-persona.util';
 
-export interface BotPersona {
-  email: string;
-  username: string;
-  first_name: string;
-  last_name: string;
-  bio: string;
-  niche: string;
-  avatar_prompt?: string;
-  avatar_url: string;
-}
+export { BotPersona };
 
 export interface NicheContent {
   search_terms: string[];
@@ -55,7 +47,7 @@ export class ImageFeedsService {
   constructor(private readonly configService: ConfigService) {
     this.supabaseClient = createServiceSupabaseClient(this.configService);
     this.configPath = path.join(process.cwd(), 'image-feeds-config.json');
-    this.personasPath = path.join(process.cwd(), 'bot-personas.json');
+    this.personasPath = path.join(process.cwd(), 'content-bots.json');
     this.usedItemsPath = path.join(process.cwd(), 'image-feeds-used-items.json');
     this.loadConfig();
     this.loadPersonas();
@@ -219,95 +211,17 @@ export class ImageFeedsService {
   }
 
   async ensureBotUser(persona: BotPersona): Promise<string | null> {
-    try {
-      const { data: existingProfile } = await this.supabaseClient
-        .from('user_profiles')
-        .select('id')
-        .eq('username', persona.username)
-        .single();
-
-      if (existingProfile) {
-        await this.mirrorIntoLegacyUsersTable(persona, existingProfile.id);
-        return existingProfile.id;
-      }
-
-      const { data: existingAuthList } = await this.supabaseClient.auth.admin.listUsers();
-      let authUser = existingAuthList?.users?.find((u: any) => u.email === persona.email);
-
-      if (!authUser) {
-        const { data: createdAuth, error: authError } = await this.supabaseClient.auth.admin.createUser({
-          email: persona.email,
-          email_confirm: true,
-          password: this.generateRandomPassword(),
-          user_metadata: {
-            full_name: `${persona.first_name} ${persona.last_name}`,
-          },
-        });
-
-        if (authError || !createdAuth?.user) {
-          this.logger.error(`Failed to create auth user for ${persona.username}`, authError);
-          return null;
-        }
-        authUser = createdAuth.user;
-      }
-
-      const { data: profile, error: profileError } = await this.supabaseClient
-        .from('user_profiles')
-        .upsert({
-          id: authUser.id,
-          username: persona.username,
-          bio: persona.bio,
-          avatar_url: persona.avatar_url,
-        })
-        .select()
-        .single();
-
-      if (profileError) {
-        this.logger.error(`Failed to create profile for ${persona.username}`, profileError);
-        return null;
-      }
-
-      await this.mirrorIntoLegacyUsersTable(persona, authUser.id);
-
-      this.logger.log(`Bot user ready: ${persona.username} (${profile.id})`);
-      return profile.id;
-    } catch (error) {
-      this.logger.error(`Error ensuring bot user ${persona.username}`, error.stack);
-      return null;
-    }
-  }
-
-  // Legacy schema compatibility: some projects have posts.user_id -> public.users
-  // instead of -> user_profiles/auth.users. Mirror the bot into that table too,
-  // if it exists, so post inserts don't fail on the FK constraint.
-  private async mirrorIntoLegacyUsersTable(persona: BotPersona, id: string): Promise<void> {
-    const { error } = await this.supabaseClient.from('users').upsert({
-      id,
-      email: persona.email,
-      username: persona.username,
-      first_name: persona.first_name,
-      last_name: persona.last_name,
-      bio: persona.bio,
-      avatar_url: persona.avatar_url,
-      is_bot: false,
-    });
-
-    if (error && error.code !== 'PGRST205') {
-      this.logger.warn(`Could not mirror ${persona.username} into legacy users table`, error.message);
-    }
-  }
-
-  private generateRandomPassword(): string {
-    return `Fr3t1ko_${Math.random().toString(36).slice(2)}${Date.now()}`;
+    return ensureBotUserShared(this.supabaseClient, persona);
   }
 
   async createImagePost(persona: BotPersona, botUserId: string): Promise<any> {
-    const image = await this.fetchImageForNiche(persona.niche);
+    const niche = persona.niche || 'science_technology';
+    const image = await this.fetchImageForNiche(niche);
     if (!image) {
-      throw new Error(`No image found for niche ${persona.niche}`);
+      throw new Error(`No image found for niche ${niche}`);
     }
 
-    const caption = this.generateCaption(persona.niche);
+    const caption = this.generateCaption(niche);
     let content = caption;
 
     if (this.config.settings.show_attribution && image.photographer) {

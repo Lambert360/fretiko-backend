@@ -27,9 +27,12 @@ export interface RssConfig {
 export interface ParsedFeedItem {
   title: string;
   content: string;
+  description: string;
   link: string;
   pubDate: Date;
   category: string;
+  tags: string[];
+  location?: string;
   feedName: string;
   imageUrl?: string;
   author?: string;
@@ -53,6 +56,9 @@ export class RssFeedsService {
           ['media:thumbnail', 'thumbnail'],
           ['enclosure', 'enclosure'],
           ['content:encoded', 'contentEncoded'],
+          ['georss:point', 'geoPoint'],
+          ['geo:lat', 'geoLat'],
+          ['geo:long', 'geoLong'],
         ],
       },
     });
@@ -138,17 +144,36 @@ export class RssFeedsService {
 
   private parseFeedItem(item: any, feed: RssFeed): ParsedFeedItem {
     const imageUrl = this.extractImageUrl(item);
-    
+    const rawText = item.contentEncoded || item.content || item.contentSnippet || item.description || '';
+
+    const itemCategories: string[] = Array.isArray(item.categories)
+      ? item.categories.filter((c: any) => typeof c === 'string' && c.trim().length > 0)
+      : [];
+    const tags = Array.from(new Set([feed.category, ...itemCategories].filter(Boolean)));
+
     return {
       title: item.title || 'Untitled',
-      content: this.cleanContent(item.contentSnippet || item.content || item.description || ''),
+      content: this.cleanContent(rawText, 280),
+      description: this.cleanContent(rawText, 900),
       link: item.link || '',
       pubDate: item.pubDate ? new Date(item.pubDate) : new Date(),
       category: feed.category,
+      tags,
+      location: this.extractLocation(item),
       feedName: feed.name,
       imageUrl,
       author: item.creator || item.author || feed.name,
     };
+  }
+
+  private extractLocation(item: any): string | undefined {
+    if (item.geoPoint) {
+      return String(item.geoPoint).trim();
+    }
+    if (item.geoLat && item.geoLong) {
+      return `${item.geoLat}, ${item.geoLong}`;
+    }
+    return undefined;
   }
 
   private extractImageUrl(item: any): string | undefined {
@@ -161,7 +186,7 @@ export class RssFeedsService {
     return imgMatch ? imgMatch[1] : undefined;
   }
 
-  private cleanContent(content: string): string {
+  private cleanContent(content: string, maxLength = 500): string {
     return content
       .replace(/<[^>]*>/g, '')
       .replace(/&nbsp;/g, ' ')
@@ -169,7 +194,8 @@ export class RssFeedsService {
       .replace(/&lt;/g, '<')
       .replace(/&gt;/g, '>')
       .replace(/&quot;/g, '"')
-      .substring(0, 500)
+      .replace(/\s+/g, ' ')
+      .substring(0, maxLength)
       .trim();
   }
 
@@ -194,33 +220,65 @@ export class RssFeedsService {
     }
   }
 
+  buildCaptionFromItem(item: ParsedFeedItem): string {
+    const parts: string[] = [item.title.trim()];
+
+    if (item.description && item.description !== item.title) {
+      parts.push(item.description);
+    }
+
+    if (item.location) {
+      parts.push(`📍 ${item.location}`);
+    }
+
+    const hashtagSource = item.tags.length > 0 ? item.tags : [item.category];
+    const hashtags = hashtagSource
+      .slice(0, 4)
+      .map((t) => `#${t.replace(/[^a-zA-Z0-9]/g, '')}`)
+      .filter((t) => t.length > 1)
+      .join(' ');
+
+    if (hashtags) parts.push(hashtags);
+
+    return parts.join('\n\n');
+  }
+
   async createPostFromRssItem(item: ParsedFeedItem, botUserId: string): Promise<any> {
     try {
+      const content = this.buildCaptionFromItem(item);
+      const hasImage = !!item.imageUrl;
+
       const { data: post, error } = await this.supabaseClient
         .from('posts')
         .insert({
           user_id: botUserId,
-          caption: `${item.title}\n\n${item.content}\n\nRead more: ${item.link}`,
-          visibility: 'public',
-          post_type: 'text',
-          tags: [item.category, item.feedName],
-          metadata: {
-            source: 'rss_feed',
-            feed_name: item.feedName,
-            original_link: item.link,
-            published_date: item.pubDate,
-            author: item.author,
-          },
-          created_at: new Date().toISOString(),
+          content,
+          media_urls: hasImage ? [item.imageUrl] : [],
+          media_type: hasImage ? 'image' : 'text',
+          privacy_level: 'public',
         })
         .select()
         .single();
 
       if (error) throw error;
 
+      if (hasImage) {
+        const { error: mediaError } = await this.supabaseClient
+          .from('post_media')
+          .insert({
+            post_id: post.id,
+            media_type: 'image',
+            media_url: item.imageUrl,
+            order_index: 0,
+          });
+        if (mediaError) {
+          this.logger.warn(`Failed to insert post_media row for post ${post.id}`, mediaError.message);
+        }
+      }
+
       this.logger.log(`Created post from RSS: ${item.title}`);
       await this.markItemAsProcessed(item);
-      
+
       return post;
     } catch (error) {
       this.logger.error('Failed to create post from RSS item', error.stack);

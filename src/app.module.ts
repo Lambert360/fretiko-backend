@@ -45,6 +45,7 @@ import { LoggerModule } from './logger/logger.module';
 import { VideoProcessingModule } from './video-processing/video-processing.module';
 import { RssFeedsModule } from './rss-feeds/rss-feeds.module';
 import { ImageFeedsModule } from './image-feeds/image-feeds.module';
+import { EngagementBotsModule } from './engagement-bots/engagement-bots.module';
 import { AiModule } from './ai/ai.module';
 
 @Module({
@@ -96,6 +97,7 @@ import { AiModule } from './ai/ai.module';
     VideoProcessingModule,
     RssFeedsModule,
     ImageFeedsModule,
+    EngagementBotsModule,
     AiModule,
   ],
   controllers: [AppController, ExchangeRateController],

@@ -3,11 +3,14 @@ import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { RssFeedsService } from './rss-feeds.service';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { BotPersona, loadPersonas, ensureBotUser } from '../shared/bot-persona.util';
 
 @Injectable()
 export class RssFeedsScheduler implements OnModuleInit {
   private readonly logger = new Logger(RssFeedsScheduler.name);
-  private botUserId: string | null = null;
+  private personas: BotPersona[] = [];
+  private personaUserIds: Map<string, string> = new Map();
+  private rotationIndex = 0;
   private isProcessing = false;
   private postQueue: any[] = [];
   private lastPostTime: Date = new Date(0);
@@ -21,54 +24,43 @@ export class RssFeedsScheduler implements OnModuleInit {
   }
 
   async onModuleInit() {
-    await this.initializeBotUser();
+    await this.initializeBotUsers();
     this.logger.log('RSS Feeds Scheduler initialized');
   }
 
-  private async initializeBotUser(): Promise<void> {
+  private async initializeBotUsers(): Promise<void> {
     try {
-      const { data: botUser, error } = await this.supabaseClient
-        .from('users')
-        .select('id')
-        .eq('email', 'rss-bot@fretiko.com')
-        .single();
-
-      if (error || !botUser) {
-        this.logger.log('Creating RSS bot user...');
-        const { data: newBot, error: createError } = await this.supabaseClient
-          .from('users')
-          .insert({
-            email: 'rss-bot@fretiko.com',
-            username: 'FretikoCurator',
-            first_name: 'Fretiko',
-            last_name: 'Curator',
-            bio: 'Automated content curator bringing you the latest from around the web',
-            is_verified: true,
-            is_bot: true,
-          })
-          .select()
-          .single();
-
-        if (createError) {
-          this.logger.error('Failed to create bot user', createError);
-          return;
-        }
-
-        this.botUserId = newBot.id;
-        this.logger.log(`RSS bot user created with ID: ${this.botUserId}`);
-      } else {
-        this.botUserId = botUser.id;
-        this.logger.log(`RSS bot user found with ID: ${this.botUserId}`);
-      }
+      this.personas = loadPersonas('content-bots.json');
     } catch (error) {
-      this.logger.error('Error initializing bot user', error.stack);
+      this.logger.error('Could not load content-bots.json, falling back to no RSS bots', error.message);
+      this.personas = [];
+      return;
     }
+
+    for (const persona of this.personas) {
+      const id = await ensureBotUser(this.supabaseClient, persona);
+      if (id) {
+        this.personaUserIds.set(persona.username, id);
+      }
+    }
+    this.logger.log(`RSS: initialized ${this.personaUserIds.size}/${this.personas.length} content bot users`);
+  }
+
+  private nextBotUserId(): string | null {
+    if (this.personas.length === 0) return null;
+    for (let i = 0; i < this.personas.length; i++) {
+      const persona = this.personas[this.rotationIndex % this.personas.length];
+      this.rotationIndex++;
+      const id = this.personaUserIds.get(persona.username);
+      if (id) return id;
+    }
+    return null;
   }
 
   @Cron(CronExpression.EVERY_HOUR)
   async fetchNewRssContent() {
-    if (!this.botUserId) {
-      this.logger.warn('Bot user not initialized, skipping RSS fetch');
+    if (this.personaUserIds.size === 0) {
+      this.logger.warn('No content bot users initialized, skipping RSS fetch');
       return;
     }
 
@@ -106,7 +98,7 @@ export class RssFeedsScheduler implements OnModuleInit {
 
   @Cron('*/30 * * * *')
   async postQueuedContent() {
-    if (!this.botUserId || this.postQueue.length === 0) {
+    if (this.personaUserIds.size === 0 || this.postQueue.length === 0) {
       return;
     }
 
@@ -123,12 +115,15 @@ export class RssFeedsScheduler implements OnModuleInit {
       return;
     }
 
+    const botUserId = this.nextBotUserId();
+    if (!botUserId) return;
+
     try {
       const item = this.postQueue.shift();
-      
+
       this.logger.log(`Posting RSS item: ${item.title}`);
-      await this.rssFeedsService.createPostFromRssItem(item, this.botUserId);
-      
+      await this.rssFeedsService.createPostFromRssItem(item, botUserId);
+
       this.lastPostTime = now;
       this.logger.log(`Successfully posted. ${this.postQueue.length} items remaining in queue`);
 
@@ -138,8 +133,8 @@ export class RssFeedsScheduler implements OnModuleInit {
   }
 
   async manualFetchAndPost(): Promise<{ success: boolean; message: string; posted?: number }> {
-    if (!this.botUserId) {
-      return { success: false, message: 'Bot user not initialized' };
+    if (this.personaUserIds.size === 0) {
+      return { success: false, message: 'No content bot users initialized' };
     }
 
     try {
@@ -151,8 +146,10 @@ export class RssFeedsScheduler implements OnModuleInit {
 
       let posted = 0;
       for (const item of newItems.slice(0, 5)) {
+        const botUserId = this.nextBotUserId();
+        if (!botUserId) continue;
         try {
-          await this.rssFeedsService.createPostFromRssItem(item, this.botUserId);
+          await this.rssFeedsService.createPostFromRssItem(item, botUserId);
           posted++;
         } catch (error) {
           this.logger.error(`Failed to post item: ${item.title}`, error.message);
@@ -169,11 +166,11 @@ export class RssFeedsScheduler implements OnModuleInit {
     }
   }
 
-  getQueueStatus(): { queueSize: number; lastPostTime: Date; botUserId: string | null } {
+  getQueueStatus(): { queueSize: number; lastPostTime: Date; botsInitialized: number } {
     return {
       queueSize: this.postQueue.length,
       lastPostTime: this.lastPostTime,
-      botUserId: this.botUserId,
+      botsInitialized: this.personaUserIds.size,
     };
   }
 
