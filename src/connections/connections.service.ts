@@ -33,12 +33,21 @@ export class ConnectionsService {
       .eq('id', userId)
       .single();
 
+    const { data: profile } = await this.serviceSupabase
+      .from('user_profiles')
+      .select('followers_count, following_count')
+      .eq('id', userId)
+      .maybeSingle();
+
+    const displayFollowers = Number(profile?.followers_count) || 0;
+    const displayFollowing = Number(profile?.following_count) || 0;
+
     if (error) {
-      // If no stats found, return zeros (new user)
+      // If no stats found, return display counters (or zeros for a new user)
       if (error.code === 'PGRST116') {
         return {
-          plugsCount: 0,
-          clientsCount: 0,
+          plugsCount: displayFollowing,
+          clientsCount: displayFollowers,
           connectionRequestsCount: 0,
         };
       }
@@ -46,8 +55,8 @@ export class ConnectionsService {
     }
 
     return {
-      plugsCount: data.plugs_count || 0,
-      clientsCount: data.clients_count || 0,
+      plugsCount: Math.max(data.plugs_count || 0, displayFollowing),
+      clientsCount: Math.max(data.clients_count || 0, displayFollowers),
       connectionRequestsCount: data.connection_requests_count || 0,
     };
   }

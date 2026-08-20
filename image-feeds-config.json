@@ -1,21 +1,33 @@
 {
   "niches": {
     "science_technology": {
-      "search_terms": ["technology", "computer science", "electronics", "coding setup", "innovation lab"],
+      "search_terms": [
+        "technology",
+        "computer science",
+        "electronics",
+        "coding setup",
+        "innovation lab"
+      ],
       "captions": [
-        "this is giving future ✨",
-        "the setup we're all manifesting 💻",
+        "this is giving future \u2728",
+        "the setup we're all manifesting \ud83d\udcbb",
         "okay but this is actually so cool",
-        "tech that hits different 🔋",
+        "tech that hits different \ud83d\udd0b",
         "living for this energy",
         "we're so back",
         "not me staring at this for 10 minutes"
       ]
     },
     "ai": {
-      "search_terms": ["artificial intelligence", "robotics", "futuristic technology", "digital art abstract", "neural network visual"],
+      "search_terms": [
+        "artificial intelligence",
+        "robotics",
+        "futuristic technology",
+        "digital art abstract",
+        "neural network visual"
+      ],
       "captions": [
-        "the future is loading... 🤖",
+        "the future is loading... \ud83e\udd16",
         "this is what tomorrow looks like",
         "AI is not playing fair rn",
         "we're living in a sci-fi movie and idk how to feel",
@@ -24,10 +36,16 @@
       ]
     },
     "space": {
-      "search_terms": ["galaxy", "night sky stars", "nebula", "astronaut", "planets space"],
+      "search_terms": [
+        "galaxy",
+        "night sky stars",
+        "nebula",
+        "astronaut",
+        "planets space"
+      ],
       "captions": [
-        "we're so small and it's kind of comforting 🌌",
-        "space core aesthetic 🚀",
+        "we're so small and it's kind of comforting \ud83c\udf0c",
+        "space core aesthetic \ud83d\ude80",
         "this made me feel something",
         "the universe really said 'let there be vibes'",
         "certified cosmic moment",
@@ -35,9 +53,15 @@
       ]
     },
     "gadgets": {
-      "search_terms": ["smartphone", "headphones aesthetic", "gadget flatlay", "wireless earbuds", "smartwatch"],
+      "search_terms": [
+        "smartphone",
+        "headphones aesthetic",
+        "gadget flatlay",
+        "wireless earbuds",
+        "smartwatch"
+      ],
       "captions": [
-        "adding this to cart rn 🛒",
+        "adding this to cart rn \ud83d\uded2",
         "the aesthetic is unmatched",
         "why is this so satisfying to look at",
         "tech flatlay of the day",
@@ -46,20 +70,32 @@
       ]
     },
     "fashion_lifestyle": {
-      "search_terms": ["street style fashion", "aesthetic outfit", "minimalist fashion", "lifestyle photography", "coffee shop aesthetic"],
+      "search_terms": [
+        "street style fashion",
+        "aesthetic outfit",
+        "minimalist fashion",
+        "lifestyle photography",
+        "coffee shop aesthetic"
+      ],
       "captions": [
-        "the fit is doing numbers 🔥",
+        "the fit is doing numbers \ud83d\udd25",
         "this outfit lives in my head rent free",
         "main character energy fr",
         "mood board material",
         "obsessed with this whole vibe",
-        "screenshot for inspo 📸"
+        "screenshot for inspo \ud83d\udcf8"
       ]
     },
     "nature_environment": {
-      "search_terms": ["forest landscape", "waterfall nature", "mountains sunrise", "ocean waves", "green landscape"],
+      "search_terms": [
+        "forest landscape",
+        "waterfall nature",
+        "mountains sunrise",
+        "ocean waves",
+        "green landscape"
+      ],
       "captions": [
-        "nature really said 'i got you' 🌿",
+        "nature really said 'i got you' \ud83c\udf3f",
         "this is healing my nervous system",
         "take me here right now",
         "certified peace of mind",
@@ -68,14 +104,140 @@
       ]
     },
     "animals_wildlife": {
-      "search_terms": ["wildlife animal", "cute animal", "wild animal portrait", "birds nature", "ocean animal"],
+      "search_terms": [
+        "wildlife animal",
+        "cute animal",
+        "wild animal portrait",
+        "birds nature",
+        "ocean animal"
+      ],
       "captions": [
-        "he/she is just like me fr 🥹",
+        "he/she is just like me fr \ud83e\udd79",
         "this made my whole day better",
         "protecting this creature at all costs",
         "the audacity of this cutie",
         "nature's main character",
         "rate this little guy /10"
+      ]
+    },
+    "nigeria_news": {
+      "search_terms": [
+        "nigeria city street",
+        "lagos skyline",
+        "abuja city",
+        "nigerian flag",
+        "african city life"
+      ],
+      "captions": [
+        "things happening around us right now",
+        "this is why I stay informed",
+        "had to share this update",
+        "keeping up with wetin dey happen",
+        "important gist for today",
+        "the news never rests"
+      ]
+    },
+    "sports": {
+      "search_terms": [
+        "football stadium",
+        "soccer match action",
+        "basketball game",
+        "nba dunk",
+        "nigerian football fans",
+        "african basketball"
+      ],
+      "captions": [
+        "matchday energy \ud83d\udd25\u26bd",
+        "this is why we love the game",
+        "the passion is unreal",
+        "who else watched this?!",
+        "sport no dey rest",
+        "champions mentality"
+      ]
+    },
+    "business_entrepreneurship": {
+      "search_terms": [
+        "business meeting africa",
+        "entrepreneur working laptop",
+        "startup office",
+        "african businesswoman",
+        "young entrepreneur"
+      ],
+      "captions": [
+        "building something from nothing \ud83d\udcbc",
+        "hustle never stops",
+        "this is the grind everyone should see",
+        "small business energy",
+        "another day building the dream",
+        "entrepreneurship no be easy but we dey push"
+      ]
+    },
+    "culture_entertainment": {
+      "search_terms": [
+        "african music concert",
+        "nigerian fashion culture",
+        "afrobeat performance",
+        "cultural dance",
+        "party crowd nightlife"
+      ],
+      "captions": [
+        "the vibes were unmatched last night \ud83c\udfb6",
+        "culture no dey lie",
+        "this energy is everything",
+        "afrobeats to the world \ud83c\udf0d",
+        "had to share this moment",
+        "the rhythm got everybody"
+      ]
+    },
+    "food_travel": {
+      "search_terms": [
+        "nigerian jollof rice",
+        "african street food",
+        "travel destination beach",
+        "local market food",
+        "african cuisine plate"
+      ],
+      "captions": [
+        "food no go ever fall my hand \ud83d\ude0b",
+        "this meal was everything",
+        "add this to your bucket list",
+        "street food hits different",
+        "wanderlust mode activated \u2708\ufe0f",
+        "jollof rice supremacy"
+      ]
+    },
+    "health_fitness": {
+      "search_terms": [
+        "gym workout africa",
+        "healthy lifestyle fitness",
+        "morning run outdoors",
+        "yoga workout",
+        "fitness training"
+      ],
+      "captions": [
+        "no excuses today \ud83d\udcaa",
+        "consistency is the secret",
+        "morning workout done \u2705",
+        "health na wealth",
+        "small steps every day",
+        "discipline over motivation"
+      ]
+    },
+    "education_career": {
+      "search_terms": [
+        "students studying africa",
+        "graduation ceremony",
+        "career professional office",
+        "young professional working",
+        "university campus"
+      ],
+      "captions": [
+        "invest in yourself, always \ud83d\udcda",
+        "another skill unlocked",
+        "education go always pay",
+        "career growth mode",
+        "proud of this milestone",
+        "learning never stops"
       ]
     }
   },
@@ -83,7 +245,11 @@
     "fetch_interval_minutes": 15,
     "post_interval_minutes": 15,
     "enable_auto_posting": true,
-    "image_sources": ["unsplash", "pexels", "pixabay"],
+    "image_sources": [
+      "unsplash",
+      "pexels",
+      "pixabay"
+    ],
     "show_attribution": false,
     "max_recent_images_remembered": 300
   }

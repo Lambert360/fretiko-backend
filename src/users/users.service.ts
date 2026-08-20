@@ -44,11 +44,13 @@ export class UsersService {
 
   async getPublicProfile(userId: string): Promise<PublicProfileResponse> {
     // SECURITY: Use service role for public profile access (no sensitive data)
-    const { data, error } = await this.serviceSupabase
-      .from('user_profiles')
-      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name')
+    let { data, error } = await this.selectPublicProfile()
       .eq('id', userId)
       .single();
+
+    if (error && /followers_count|following_count/.test(error.message || '')) {
+      ({ data, error } = await this.selectPublicProfile(false).eq('id', userId).single());
+    }
 
     if (error) {
       if (error.code === 'PGRST116') {
@@ -69,17 +71,21 @@ export class UsersService {
       location: data.location,
       isSeller: data.is_seller,
       isRider: data.is_rider,
+      followersCount: data.followers_count || 0,
+      followingCount: data.following_count || 0,
       createdAt: data.created_at,
     };
   }
 
   async getPublicProfileByUsername(username: string): Promise<PublicProfileResponse> {
     // SECURITY: Use service role for public profile access (no sensitive data)
-    const { data, error } = await this.serviceSupabase
-      .from('user_profiles')
-      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name')
+    let { data, error } = await this.selectPublicProfile()
       .ilike('username', username)
       .single();
+
+    if (error && /followers_count|following_count/.test(error.message || '')) {
+      ({ data, error } = await this.selectPublicProfile(false).ilike('username', username).single());
+    }
 
     if (error) {
       if (error.code === 'PGRST116') {
@@ -100,6 +106,8 @@ export class UsersService {
       location: data.location,
       isSeller: data.is_seller,
       isRider: data.is_rider,
+      followersCount: data.followers_count || 0,
+      followingCount: data.following_count || 0,
       createdAt: data.created_at,
     };
   }
@@ -678,6 +686,13 @@ export class UsersService {
     }
   }
 
+  private selectPublicProfile(includeCounts = true) {
+    const columns = includeCounts
+      ? 'id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name, followers_count, following_count'
+      : 'id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name';
+    return this.serviceSupabase.from('user_profiles').select(columns);
+  }
+
   private mapToProfileResponse(data: any): UserProfileResponse {
     return {
       id: data.id,
@@ -691,6 +706,8 @@ export class UsersService {
       preferences: data.preferences || {},
       isSeller: data.is_seller,
       isRider: data.is_rider,
+      followersCount: data.followers_count || 0,
+      followingCount: data.following_count || 0,
       createdAt: data.created_at,
       updatedAt: data.updated_at,
     };

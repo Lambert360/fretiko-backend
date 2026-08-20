@@ -21,6 +21,8 @@ export interface RssConfig {
     post_interval_minutes: number;
     enable_auto_posting: boolean;
     categories_enabled: string[];
+    remove_source_attribution?: boolean;
+    prefer_images?: boolean;
   };
 }
 
@@ -31,6 +33,7 @@ export interface ParsedFeedItem {
   link: string;
   pubDate: Date;
   category: string;
+  niche: string;
   tags: string[];
   location?: string;
   feedName: string;
@@ -129,7 +132,7 @@ export class RssFeedsService {
           
           const items = parsedFeed.items
             .slice(0, this.config.settings.max_items_per_fetch)
-            .map((item) => this.parseFeedItem(item, feed));
+            .map((item) => this.parseFeedItem(item, feed, categoryKey));
 
           allItems.push(...items);
           this.logger.log(`Fetched ${items.length} items from ${feed.name}`);
@@ -142,7 +145,7 @@ export class RssFeedsService {
     return allItems;
   }
 
-  private parseFeedItem(item: any, feed: RssFeed): ParsedFeedItem {
+  private parseFeedItem(item: any, feed: RssFeed, niche: string): ParsedFeedItem {
     const imageUrl = this.extractImageUrl(item);
     const rawText = item.contentEncoded || item.content || item.contentSnippet || item.description || '';
 
@@ -158,6 +161,7 @@ export class RssFeedsService {
       link: item.link || '',
       pubDate: item.pubDate ? new Date(item.pubDate) : new Date(),
       category: feed.category,
+      niche,
       tags,
       location: this.extractLocation(item),
       feedName: feed.name,
@@ -202,10 +206,17 @@ export class RssFeedsService {
   async getNewItems(): Promise<ParsedFeedItem[]> {
     const allItems = await this.fetchAllFeeds();
     
-    const newItems = allItems.filter((item) => {
+    let newItems = allItems.filter((item) => {
       const itemId = `${item.link}-${item.title}`;
       return !this.processedItems.has(itemId);
     });
+
+    if (this.config.settings.prefer_images) {
+      const withImages = newItems.filter((item) => !!item.imageUrl);
+      if (withImages.length > 0) {
+        newItems = withImages;
+      }
+    }
 
     this.logger.log(`Found ${newItems.length} new items out of ${allItems.length} total`);
     return newItems;

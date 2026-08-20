@@ -1,9 +1,15 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Cron } from '@nestjs/schedule';
 import { RssFeedsService } from './rss-feeds.service';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { BotPersona, loadPersonas, ensureBotUser } from '../shared/bot-persona.util';
+import { EngagementBotsService } from '../engagement-bots/engagement-bots.service';
+
+const RSS_NICHE_TO_BOT_NICHE: Record<string, string> = {
+  nature: 'nature_environment',
+  animals: 'animals_wildlife',
+};
 
 @Injectable()
 export class RssFeedsScheduler implements OnModuleInit {
@@ -11,6 +17,7 @@ export class RssFeedsScheduler implements OnModuleInit {
   private personas: BotPersona[] = [];
   private personaUserIds: Map<string, string> = new Map();
   private rotationIndex = 0;
+  private nicheRotation = new Map<string, number>();
   private isProcessing = false;
   private postQueue: any[] = [];
   private lastPostTime: Date = new Date(0);
@@ -19,8 +26,25 @@ export class RssFeedsScheduler implements OnModuleInit {
   constructor(
     private readonly rssFeedsService: RssFeedsService,
     private readonly configService: ConfigService,
+    private readonly engagementBotsService: EngagementBotsService,
   ) {
     this.supabaseClient = createServiceSupabaseClient(this.configService);
+  }
+
+  private async seedEngagement(post: any, botUserId: string): Promise<void> {
+    if (!post?.id) return;
+    try {
+      const liked = await this.engagementBotsService.seedEngagementForPost(
+        post.id,
+        botUserId,
+        4,
+        9,
+        post.content,
+      );
+      if (liked > 0) this.logger.log(`Seeded ${liked} likes on post ${post.id}`);
+    } catch (error: any) {
+      this.logger.warn(`Failed to seed engagement for post ${post.id}: ${error.message}`);
+    }
   }
 
   async onModuleInit() {
@@ -57,7 +81,23 @@ export class RssFeedsScheduler implements OnModuleInit {
     return null;
   }
 
-  @Cron(CronExpression.EVERY_HOUR)
+  private nextBotUserIdForNiche(rssNiche?: string): string | null {
+    if (!rssNiche) return this.nextBotUserId();
+
+    const botNiche = RSS_NICHE_TO_BOT_NICHE[rssNiche] || rssNiche;
+    const matching = this.personas.filter(
+      (persona) => persona.niche === botNiche && this.personaUserIds.has(persona.username),
+    );
+
+    if (matching.length === 0) return this.nextBotUserId();
+
+    const current = this.nicheRotation.get(botNiche) || 0;
+    const persona = matching[current % matching.length];
+    this.nicheRotation.set(botNiche, current + 1);
+    return this.personaUserIds.get(persona.username) || this.nextBotUserId();
+  }
+
+  @Cron('*/30 * * * *')
   async fetchNewRssContent() {
     if (this.personaUserIds.size === 0) {
       this.logger.warn('No content bot users initialized, skipping RSS fetch');
@@ -96,7 +136,7 @@ export class RssFeedsScheduler implements OnModuleInit {
     }
   }
 
-  @Cron('*/30 * * * *')
+  @Cron('*/5 * * * *')
   async postQueuedContent() {
     if (this.personaUserIds.size === 0 || this.postQueue.length === 0) {
       return;
@@ -115,16 +155,19 @@ export class RssFeedsScheduler implements OnModuleInit {
       return;
     }
 
-    const botUserId = this.nextBotUserId();
-    if (!botUserId) return;
-
     try {
       const item = this.postQueue.shift();
+      const botUserId = this.nextBotUserIdForNiche(item?.niche);
+      if (!botUserId) {
+        if (item) this.postQueue.unshift(item);
+        return;
+      }
 
       this.logger.log(`Posting RSS item: ${item.title}`);
-      await this.rssFeedsService.createPostFromRssItem(item, botUserId);
+      const post = await this.rssFeedsService.createPostFromRssItem(item, botUserId);
 
       this.lastPostTime = now;
+      await this.seedEngagement(post, botUserId);
       this.logger.log(`Successfully posted. ${this.postQueue.length} items remaining in queue`);
 
     } catch (error) {
@@ -146,11 +189,12 @@ export class RssFeedsScheduler implements OnModuleInit {
 
       let posted = 0;
       for (const item of newItems.slice(0, 5)) {
-        const botUserId = this.nextBotUserId();
+        const botUserId = this.nextBotUserIdForNiche(item.niche);
         if (!botUserId) continue;
         try {
-          await this.rssFeedsService.createPostFromRssItem(item, botUserId);
+          const post = await this.rssFeedsService.createPostFromRssItem(item, botUserId);
           posted++;
+          await this.seedEngagement(post, botUserId);
         } catch (error) {
           this.logger.error(`Failed to post item: ${item.title}`, error.message);
         }

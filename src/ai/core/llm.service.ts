@@ -84,7 +84,7 @@ export class LlmService {
   async chat(
     messages: LlmMessage[],
     tier: ModelTier = ModelTier.BALANCED,
-    options?: { responseFormat?: { type: string }; tools?: any[] }
+    options?: { responseFormat?: { type: string }; tools?: any[]; temperature?: number; maxTokens?: number }
   ): Promise<LlmResponse> {
     const config = this.getConfig(tier);
     const startTime = Date.now();
@@ -100,8 +100,8 @@ export class LlmService {
         ...(m.tool_calls && { tool_calls: m.tool_calls }),
         ...(m.tool_call_id && { tool_call_id: m.tool_call_id }),
       })),
-      temperature: config.temperature,
-      max_tokens: config.maxTokens,
+      temperature: options?.temperature ?? config.temperature,
+      max_tokens: options?.maxTokens ?? config.maxTokens,
     };
 
     if (options?.responseFormat) {

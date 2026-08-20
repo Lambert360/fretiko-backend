@@ -77,6 +77,8 @@ export class UserProfileResponse {
   preferences?: any;
   isSeller: boolean;
   isRider: boolean;
+  followersCount?: number;
+  followingCount?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -90,5 +92,7 @@ export class PublicProfileResponse {
   location?: string;
   isSeller: boolean;
   isRider: boolean;
+  followersCount?: number;
+  followingCount?: number;
   createdAt: string;
 }
