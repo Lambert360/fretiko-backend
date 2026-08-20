@@ -54,6 +54,7 @@
     "pdfkit": "^0.17.2",
     "redis": "^4.7.1",
     "reflect-metadata": "^0.2.2",
+    "rss-parser": "^3.13.0",
     "rxjs": "^7.8.1",
     "socket.io": "^4.8.1",
     "svix": "^1.88.0",
