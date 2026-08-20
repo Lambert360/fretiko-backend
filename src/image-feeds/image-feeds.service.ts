@@ -106,12 +106,20 @@ export class ImageFeedsService {
     return arr[Math.floor(Math.random() * arr.length)];
   }
 
+  private shuffle<T>(arr: T[]): T[] {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
   async fetchImageForNiche(niche: string): Promise<SourcedImage | null> {
     const nicheContent = this.config.niches[niche];
     if (!nicheContent) return null;
 
     const term = this.randomPick(nicheContent.search_terms);
-    const sources = this.config.settings.image_sources;
+    const sources = this.shuffle([...this.config.settings.image_sources]);
 
     for (const source of sources) {
       try {
