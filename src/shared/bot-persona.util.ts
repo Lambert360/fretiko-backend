@@ -111,15 +111,22 @@ async function listAllAuthUsers(supabaseClient: any): Promise<any[]> {
   if (authUsersCache) return authUsersCache;
 
   const all: any[] = [];
-  for (let page = 1; page <= 10; page++) {
-    const { data, error } = await supabaseClient.auth.admin.listUsers({ page, perPage: 1000 });
+  const PER_PAGE = 200;
+  for (let page = 1; page <= 50; page++) {
+    let { data, error } = await supabaseClient.auth.admin.listUsers({ page, perPage: PER_PAGE });
+    if (error) {
+      // Some Supabase projects error out on larger page sizes; retry once with a smaller page.
+      const retry = await supabaseClient.auth.admin.listUsers({ page, perPage: 50 });
+      data = retry.data;
+      error = retry.error;
+    }
     if (error) {
       logger.warn(`listUsers page ${page} failed: ${error.message}`);
       break;
     }
     const users = data?.users || [];
     all.push(...users);
-    if (users.length < 1000) break;
+    if (users.length < PER_PAGE) break;
   }
   authUsersCache = all;
   return all;
