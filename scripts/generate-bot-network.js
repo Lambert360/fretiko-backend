@@ -1,6 +1,6 @@
 /**
  * Generates the full bot network personas: 200 content bots + 200 engagement bots.
- * Ethnic mix: Yoruba 45%, Igbo 45%, Hausa 10%. Gender is balanced inside each group.
+ * Ethnic mix: Yoruba ~42%, Igbo ~42%, Hausa ~8%, English (Nigerian-common) ~8%. Gender is balanced inside each group.
  * Avatars prefer avatar-pool.json (Pexels portraits), falling back to randomuser.me.
  * Run: node scripts/generate-bot-network.js
  * Output: content-bots.json, engagement-bots.json, bot-network-roster.csv
@@ -41,6 +41,9 @@ const yorubaFemale = [
   'Damilola Adebayo', 'Oluwatoyin Ajayi', 'Anjola Aluko', 'Ifeoluwa Adekunle', 'Yetunde Adeyemi', 'Folake Adeleke',
 ];
 
+const englishMale = ['Charles Francis', 'David Johnson', 'Michael Brown', 'Samuel Edwards', 'Daniel Okoye', 'Peter Williams', 'Victor Anthony', 'Emmanuel Roberts', 'Joseph Bassey', 'Richard Etim'];
+const englishFemale = ['Grace Williams', 'Patience Edwards', 'Mercy Johnson', 'Blessing Brown', 'Comfort Roberts', 'Faith Anthony', 'Joy Bassey', 'Precious Etim', 'Gift Francis', 'Peace Daniels'];
+
 const niches = [
   'science_technology', 'ai', 'space', 'gadgets', 'fashion_lifestyle', 'nature_environment', 'animals_wildlife',
   'nigeria_news', 'sports', 'business_entrepreneurship', 'culture_entertainment', 'food_travel', 'health_fitness', 'education_career',
@@ -49,8 +52,9 @@ const niches = [
 const CONTENT_BOT_COUNT = 200;
 const ENGAGEMENT_BOT_COUNT = 200;
 
-const YORUBA_SHARE = 0.45;
-const IGBO_SHARE = 0.45;
+const YORUBA_SHARE = 0.42;
+const IGBO_SHARE = 0.42;
+const ENGLISH_SHARE = 0.08;
 
 let avatarPool = { men: [], women: [] };
 try {
@@ -101,15 +105,21 @@ function expandGroup(maleNames, femaleNames, group, count, seed) {
 function buildWeightedNames(totalNeeded) {
   const yorubaCount = Math.round(totalNeeded * YORUBA_SHARE);
   const igboCount = Math.round(totalNeeded * IGBO_SHARE);
-  const hausaCount = totalNeeded - yorubaCount - igboCount;
+  const englishCount = Math.round(totalNeeded * ENGLISH_SHARE);
+  const hausaCount = totalNeeded - yorubaCount - igboCount - englishCount;
 
   const yoruba = expandGroup(yorubaMale, yorubaFemale, 'yoruba', yorubaCount, 11);
   const igbo = expandGroup(igboMale, igboFemale, 'igbo', igboCount, 23);
   const hausa = expandGroup(hausaMale, hausaFemale, 'hausa', hausaCount, 37);
+  const english = expandGroup(englishMale, englishFemale, 'english', englishCount, 53);
 
-  // 20-slot pattern: 9 Yoruba, 9 Igbo, 2 Hausa => 45% / 45% / 10%
-  const pattern = ['yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'hausa', 'hausa'];
-  const queues = { yoruba, igbo, hausa };
+  // 25-slot pattern: 10 Yoruba, 10 Igbo, 3 Hausa, 2 English => ~42%/42%/8%/8%
+  const pattern = [
+    'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo',
+    'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo', 'yoruba', 'igbo',
+    'hausa', 'english', 'hausa', 'english', 'hausa',
+  ];
+  const queues = { yoruba, igbo, hausa, english };
   const mixed = [];
   let patternIndex = 0;
   while (mixed.length < totalNeeded) {
