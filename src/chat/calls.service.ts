@@ -615,10 +615,14 @@ export class CallsService {
           };
           const pushPromises = callees.map(({ user_id }) =>
             this.pushNotificationService.sendPushNotification(user_id, {
+              title: `Incoming ${callType === CallType.VIDEO ? 'video' : 'voice'} call`,
+              body: `${callerName} is calling you`,
               priority: 'high',
               channelId: 'calls',
+              sound: 'default',
               _contentAvailable: false,
               data: {
+                ...callIncomingData,
                 dataString: JSON.stringify(callIncomingData),
                 categoryId: 'call_incoming',
               },
@@ -660,10 +664,13 @@ export class CallsService {
           };
           const endPushPromises = participants.map(({ user_id }) =>
             this.pushNotificationService.sendPushNotification(user_id, {
+              title: 'Call ended',
+              body: `The ${callType === CallType.VIDEO ? 'video' : 'voice'} call has ended`,
               priority: 'high',
               channelId: 'calls',
               _contentAvailable: false,
               data: {
+                ...callEndedData,
                 dataString: JSON.stringify(callEndedData),
                 categoryId: 'call_ended',
               },
