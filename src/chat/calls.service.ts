@@ -666,7 +666,18 @@ export class CallsService {
               this.logger.warn(`Push end-call to ${user_id} failed: ${err.message}`)
             ),
           );
-          await Promise.all(endPushPromises);
+          const endVoipPromises = participants.map(({ user_id }) =>
+            this.pushNotificationService.sendVoipPush(user_id, {
+              type: 'call_ended',
+              conversationId: conversationId!,
+              callSessionId,
+              callType,
+              reason: eventData?.reason,
+            }).catch(err =>
+              this.logger.warn(`VoIP end-call to ${user_id} failed: ${err.message}`)
+            ),
+          );
+          await Promise.all([...endPushPromises, ...endVoipPromises]);
         }
       }
 
