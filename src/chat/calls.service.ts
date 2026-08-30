@@ -615,12 +615,8 @@ export class CallsService {
           };
           const pushPromises = callees.map(({ user_id }) =>
             this.pushNotificationService.sendPushNotification(user_id, {
-              title: `Incoming ${callType === CallType.VIDEO ? 'video' : 'voice'} call`,
-              body: `${callerName} is calling you`,
               priority: 'high',
-              channelId: 'calls',
-              sound: 'default',
-              _contentAvailable: false,
+              _contentAvailable: true,
               data: {
                 ...callIncomingData,
                 dataString: JSON.stringify(callIncomingData),
