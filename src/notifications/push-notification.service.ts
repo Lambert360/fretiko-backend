@@ -25,13 +25,14 @@ export class PushNotificationService {
   async sendPushNotification(
     userId: string,
     notification: {
-      title: string;
-      body: string;
+      title?: string;
+      body?: string;
       data?: any;
       badge?: number;
       sound?: 'default' | null;
       priority?: 'default' | 'normal' | 'high';
       channelId?: string;
+      _contentAvailable?: boolean;
     }
   ): Promise<boolean> {
     try {
@@ -62,6 +63,7 @@ export class PushNotificationService {
         badge: notification.badge,
         priority: notification.priority || 'default',
         channelId: notification.channelId,
+        _contentAvailable: notification._contentAvailable,
       }));
 
       // Send push notifications

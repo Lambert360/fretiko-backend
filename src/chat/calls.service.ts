@@ -605,20 +605,22 @@ export class CallsService {
 
         if (callees && callees.length > 0) {
           const callerName = initiatorData?.full_name || initiatorData?.username || 'Someone';
+          const callIncomingData = {
+            type: 'call_incoming',
+            conversationId: conversationId!,
+            callSessionId,
+            callType,
+            callerName,
+            callerAvatar: initiatorData?.avatar_url || null,
+          };
           const pushPromises = callees.map(({ user_id }) =>
             this.pushNotificationService.sendPushNotification(user_id, {
-              title: `Incoming ${callType === CallType.VIDEO ? 'video' : 'voice'} call`,
-              body: `${callerName} is calling you`,
               priority: 'high',
-              sound: 'default',
               channelId: 'calls',
+              _contentAvailable: false,
               data: {
-                type: 'call_incoming',
-                conversationId: conversationId!,
-                callSessionId,
-                callType,
-                callerName,
-                callerAvatar: initiatorData?.avatar_url || null,
+                dataString: JSON.stringify(callIncomingData),
+                categoryId: 'call_incoming',
               },
             }).catch(err =>
               this.logger.warn(`Push to callee ${user_id} failed: ${err.message}`)
@@ -649,18 +651,21 @@ export class CallsService {
           .eq('conversation_id', conversationId!);
 
         if (participants && participants.length > 0) {
+          const callEndedData = {
+            type: 'call_ended',
+            conversationId: conversationId!,
+            callSessionId,
+            callType,
+            reason: eventData?.reason,
+          };
           const endPushPromises = participants.map(({ user_id }) =>
             this.pushNotificationService.sendPushNotification(user_id, {
-              title: 'Call ended',
-              body: `The ${callType === CallType.VIDEO ? 'video' : 'voice'} call has ended`,
               priority: 'high',
               channelId: 'calls',
+              _contentAvailable: false,
               data: {
-                type: 'call_ended',
-                conversationId: conversationId!,
-                callSessionId,
-                callType,
-                reason: eventData?.reason,
+                dataString: JSON.stringify(callEndedData),
+                categoryId: 'call_ended',
               },
             }).catch(err =>
               this.logger.warn(`Push end-call to ${user_id} failed: ${err.message}`)
