@@ -3,6 +3,7 @@ import { ProductsService } from '../products/products.service';
 import { ServicesService } from '../services/services.service';
 import { UsersService } from '../users/users.service';
 import { RidersService } from '../riders/riders.service';
+import { RiderProfile } from '../riders/riders.controller';
 import { SearchQueryDto, SearchType, TrendingSearchDto, FeaturedContentDto, SearchSuggestionsDto } from './dto/search.dto';
 
 @Injectable()
@@ -95,7 +96,7 @@ export class SearchService {
 
       this.logger.log(`Search completed - Total results: ${results.pagination.total}`);
       return results;
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Search failed:', error.message);
       throw error;
     }
@@ -166,7 +167,7 @@ export class SearchService {
 
       this.logger.log('Featured content fetched successfully');
       return featured;
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Failed to fetch featured content:', error.message);
       throw error;
     }
@@ -235,7 +236,7 @@ export class SearchService {
       }
 
       return recommendations;
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Failed to get personalized recommendations:', error.message);
       throw error;
     }
@@ -249,7 +250,7 @@ export class SearchService {
         limit: Math.min(searchQuery.limit || 10, 10),
       };
       return await this.productsService.getProducts(queryParams);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Product search failed:', error.message);
       return [];
     }
@@ -262,7 +263,7 @@ export class SearchService {
         limit: Math.min(searchQuery.limit || 10, 10),
       };
       return await this.servicesService.getServices(queryParams);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Service search failed:', error.message);
       return [];
     }
@@ -274,7 +275,7 @@ export class SearchService {
       const query = searchQuery.query || '';
       const limit = Math.min(searchQuery.limit || 10, 10);
       return await this.usersService.searchUsers(query, limit);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('People search failed:', error.message);
       return [];
     }
@@ -282,28 +283,12 @@ export class SearchService {
 
   private async searchProviders(searchQuery: SearchQueryDto) {
     try {
-      // Return mock data for now since getRiders method doesn't exist
-      return [
-        {
-          id: '1',
-          name: 'Ahmed Hassan',
-          rating: 4.9,
-          vehicleType: 'bike',
-          totalDeliveries: 1250,
-          isOnline: true,
-          distance: 0.5,
-        },
-        {
-          id: '2', 
-          name: 'Kemi Adeleke',
-          rating: 4.8,
-          vehicleType: 'car',
-          totalDeliveries: 890,
-          isOnline: true,
-          distance: 1.2,
-        }
-      ];
-    } catch (error) {
+      const riders = await this.ridersService.getRidersForSearch(
+        searchQuery.limit || 20,
+        searchQuery.query,
+      );
+      return this.mapRiderProfiles(riders);
+    } catch (error: any) {
       this.logger.error('Provider search failed:', error.message);
       return [];
     }
@@ -312,7 +297,7 @@ export class SearchService {
   private async getFeaturedProducts(limit: number = 10) {
     try {
       return await this.productsService.getProducts({ limit });
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Featured products failed:', error.message);
       return [];
     }
@@ -321,7 +306,7 @@ export class SearchService {
   private async getFeaturedServices(limit: number = 10) {
     try {
       return await this.servicesService.getServices({ limit });
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Featured services failed:', error.message);
       return [];
     }
@@ -331,7 +316,7 @@ export class SearchService {
     try {
       // Use empty search to get featured people
       return await this.usersService.searchUsers('', limit);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Featured people failed:', error.message);
       return [];
     }
@@ -339,19 +324,9 @@ export class SearchService {
 
   private async getFeaturedProviders(limit: number = 10) {
     try {
-      // Return mock featured providers
-      return [
-        {
-          id: '1',
-          name: 'Ahmed Hassan',
-          rating: 4.9,
-          vehicleType: 'bike',
-          totalDeliveries: 1250,
-          isOnline: true,
-          verified: true,
-        }
-      ];
-    } catch (error) {
+      const riders = await this.ridersService.getRidersForSearch(limit);
+      return this.mapRiderProfiles(riders);
+    } catch (error: any) {
       this.logger.error('Featured providers failed:', error.message);
       return [];
     }
@@ -361,7 +336,7 @@ export class SearchService {
     try {
       // Get regular products as recommendations for now
       return await this.productsService.getProducts({ limit });
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Recommended products failed:', error.message);
       return [];
     }
@@ -370,7 +345,7 @@ export class SearchService {
   private async getRecommendedServices(userId: string, limit: number = 10) {
     try {
       return await this.servicesService.getServices({ limit });
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Recommended services failed:', error.message);
       return [];
     }
@@ -379,7 +354,7 @@ export class SearchService {
   private async getRecommendedPeople(userId: string, limit: number = 10) {
     try {
       return await this.usersService.searchUsers('', limit);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Recommended people failed:', error.message);
       return [];
     }
@@ -387,24 +362,23 @@ export class SearchService {
 
   private async getRecommendedProviders(userId: string, limit: number = 10) {
     try {
-      // Return mock recommendations
-      return [
-        {
-          id: '2',
-          name: 'Kemi Adeleke', 
-          rating: 4.8,
-          vehicleType: 'car',
-          totalDeliveries: 890,
-          isOnline: true,
-        }
-      ];
-    } catch (error) {
+      const riders = await this.ridersService.getRidersForSearch(limit);
+      return this.mapRiderProfiles(riders);
+    } catch (error: any) {
       this.logger.error('Recommended providers failed:', error.message);
       return [];
     }
   }
 
   // Utility methods
+  private mapRiderProfiles(riders: RiderProfile[]): any[] {
+    return riders.map(rider => ({
+      ...rider,
+      distance: rider.distanceFromPickup,
+      verified: true,
+    }));
+  }
+
   private sanitizeSearchQuery(query?: string): string {
     if (!query) return '';
     

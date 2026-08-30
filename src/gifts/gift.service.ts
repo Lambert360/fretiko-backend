@@ -11,6 +11,7 @@ import {
   UserGift,
   GiftTransaction,
   UserGiftWithDetails,
+  Sound,
 } from './entities/gift.entity';
 import {
   CreateGiftDto,
@@ -21,6 +22,8 @@ import {
   PurchaseGiftsResponse,
   ConvertGiftsResponse,
   UserGiftsResponse,
+  CreateSoundDto,
+  UpdateSoundDto,
 } from './dto/gift.dto';
 
 @Injectable()
@@ -55,7 +58,10 @@ export class GiftService {
   async getAvailableGifts(): Promise<VirtualGift[]> {
     const { data, error } = await this.supabase
       .from('virtual_gifts')
-      .select('*')
+      .select(`
+        *,
+        sound:sounds ( sound_url )
+      `)
       .eq('is_active', true)
       .order('sort_order', { ascending: true });
 
@@ -64,7 +70,10 @@ export class GiftService {
       throw new BadRequestException('Failed to fetch available gifts');
     }
 
-    return data || [];
+    return (data || []).map((g: any) => ({
+      ...g,
+      sound_url: g.sound?.sound_url,
+    }));
   }
 
   /**
@@ -83,7 +92,14 @@ export class GiftService {
           id,
           name,
           emoji,
-          credit_value
+          credit_value,
+          display_lottie_url,
+          lottie_config,
+          animation_type,
+          sound_id,
+          sound:sounds (
+            sound_url
+          )
         )
       `)
       .eq('user_id', userId)
@@ -103,6 +119,11 @@ export class GiftService {
       total_value: ug.quantity * ug.gift.credit_value,
       source: ug.source,
       received_at: ug.received_at,
+      display_lottie_url: ug.gift.display_lottie_url,
+      lottie_config: ug.gift.lottie_config,
+      sound_id: ug.gift.sound_id,
+      sound_url: ug.gift.sound?.sound_url,
+      animation_type: ug.gift.animation_type,
     }));
 
     const total_gifts = gifts.reduce((sum, g) => sum + g.quantity, 0);
@@ -167,110 +188,48 @@ export class GiftService {
     const purchaseReferenceId = randomUUID();
     this.logger.log(`[GiftService] Generated purchase reference ID: ${purchaseReferenceId} for user ${userId}`);
 
-    // 5. Debit user wallet (with unique reference ID for idempotency)
-    this.logger.log(`[GiftService] Processing wallet debit: ${totalCost} for user ${userId}`);
-    const debitResult = await this.walletService.processWalletTransaction(
-      userId,
-      WalletTransactionType.GIFT_PURCHASE,
-      -totalCost,
-      `Purchase of ${dto.purchases.length} gift type(s)`,
-      purchaseReferenceId,
-      'gift_purchase',
+    // 5. ✅ ATOMIC FIX: One RPC performs the wallet debit, admin wallet
+    // credit, user_gifts upsert, and gift_transactions insert in a
+    // single Postgres transaction. If any part fails, the whole
+    // transaction rolls back, eliminating the previous "user debited
+    // but admin credit/gift records failed" saga window.
+    const purchasesPayload = dto.purchases.map(purchase => {
+      const gift = giftMap.get(purchase.gift_id)!;
+      return {
+        gift_id: purchase.gift_id,
+        quantity: purchase.quantity,
+        credit_amount: gift.credit_value * purchase.quantity,
+      };
+    });
+
+    const { data: purchaseResult, error: purchaseRpcError } = await this.supabase.rpc(
+      'purchase_gifts_atomic',
+      {
+        p_user_id: userId,
+        p_admin_user_id: this.ADMIN_GIFT_WALLET_ID,
+        p_total_cost: totalCost,
+        p_purchases: purchasesPayload,
+        p_reference_id: purchaseReferenceId,
+      }
     );
 
-    if (!debitResult.success) {
-      throw new BadRequestException(`Failed to debit wallet: ${debitResult.error}`);
+    if (purchaseRpcError) {
+      this.logger.error(`[GiftService] purchase_gifts_atomic RPC error: ${purchaseRpcError.message}`);
+      throw new BadRequestException(`Gift purchase failed: ${purchaseRpcError.message}`);
     }
-    
-    // ✅ Log idempotent detection
-    if (debitResult.idempotent) {
+
+    if (!purchaseResult || !purchaseResult.success) {
+      this.logger.error(`[GiftService] purchase_gifts_atomic returned failure: ${purchaseResult?.error || 'Unknown'}`);
+      throw new BadRequestException(purchaseResult?.error || 'Gift purchase failed');
+    }
+
+    if (purchaseResult.already_processed) {
       this.logger.warn(`[GiftService] ⚠️ IDEMPOTENT: Duplicate gift purchase detected and prevented for user ${userId}, reference: ${purchaseReferenceId}`);
     } else {
-      this.logger.log(`[GiftService] ✅ Wallet debit successful: ${debitResult.transactionId} for user ${userId}`);
+      this.logger.log(`[GiftService] ✅ Atomic gift purchase successful: ${purchaseResult.transaction_id} for user ${userId}`);
     }
 
-    // 6. Credit admin gift wallet (use same reference ID to link transactions)
-    const creditResult = await this.walletService.processWalletTransaction(
-      this.ADMIN_GIFT_WALLET_ID,
-      WalletTransactionType.PLATFORM_COMMISSION, // Using platform commission type for admin gift wallet
-      totalCost,
-      `Gift purchase from user ${userId}`,
-      purchaseReferenceId,
-      'gift_purchase',
-    );
-
-    if (!creditResult.success) {
-      // Critical: User already debited, but admin wallet credit failed
-      // This requires manual reconciliation
-      this.logger.error(`CRITICAL: User ${userId} debited ${totalCost} but admin gift wallet credit failed`);
-      // Continue anyway - we'll add gifts, but log the issue
-    }
-
-    // 6. Add gifts to user's collection (using upsert to aggregate quantities)
-    for (const purchase of dto.purchases) {
-      // Check if user already has this gift
-      const { data: existingGift, error: checkError } = await this.supabase
-        .from('user_gifts')
-        .select('id, quantity')
-        .eq('user_id', userId)
-        .eq('gift_id', purchase.gift_id)
-        .single();
-
-      if (checkError && checkError.code !== 'PGRST116') { // PGRST116 = no rows returned
-        this.logger.error(`Failed to check existing gift: ${checkError.message}`);
-        throw new BadRequestException('Failed to check existing gifts');
-      }
-
-      if (existingGift) {
-        // Update quantity for existing gift (updated_at is handled by trigger)
-        const { error: updateError } = await this.supabase
-          .from('user_gifts')
-          .update({ 
-            quantity: existingGift.quantity + purchase.quantity,
-          })
-          .eq('id', existingGift.id);
-
-        if (updateError) {
-          this.logger.error(`Failed to update gift quantity: ${updateError.message}`);
-          throw new BadRequestException('Failed to update gift collection');
-        }
-      } else {
-        // Insert new gift
-        const { error: insertError } = await this.supabase
-          .from('user_gifts')
-          .insert({
-            user_id: userId,
-            gift_id: purchase.gift_id,
-            quantity: purchase.quantity,
-            source: 'purchased' as const,
-            received_from: null,
-            session_id: null,
-          });
-
-        if (insertError) {
-          this.logger.error(`Failed to add gift to collection: ${insertError.message}`);
-          throw new BadRequestException('Failed to add gifts to collection');
-        }
-      }
-    }
-
-    // 7. Log transaction
-    const transactionsToInsert = dto.purchases.map(purchase => ({
-      user_id: userId,
-      gift_id: purchase.gift_id,
-      quantity: purchase.quantity,
-      transaction_type: 'purchase' as const,
-      credit_amount: (giftMap.get(purchase.gift_id) as VirtualGift)!.credit_value * purchase.quantity,
-      recipient_id: null,
-      session_type: null,
-      session_id: null,
-    }));
-
-    await this.supabase
-      .from('gift_transactions')
-      .insert(transactionsToInsert);
-
-    // 8. Get updated wallet balance
+    // 6. Get updated wallet balance
     const updatedWallet = await this.walletService.getWallet(userId);
 
     // 9. Emit real-time event for gift collection update
@@ -294,7 +253,7 @@ export class GiftService {
         'Gift Purchase Successful! 🎁',
         `You successfully purchased ${dto.purchases.length} virtual gift type(s)!`,
         { 
-          transactionId: debitResult.transactionId,
+          transactionId: purchaseResult.transaction_id,
           giftsPurchased: giftsToAdd,
         },
       );
@@ -304,7 +263,7 @@ export class GiftService {
 
     return {
       success: true,
-      transaction_id: debitResult.transactionId || '',
+      transaction_id: purchaseResult.transaction_id || '',
       total_cost: totalCost,
       gifts_added: giftsToAdd,
       new_wallet_balance: updatedWallet.availableBalance,
@@ -400,118 +359,55 @@ export class GiftService {
     const userCredit = Math.floor(totalValue * (1 - this.CONVERSION_FEE_RATE));
     const platformFee = totalValue - userCredit;
 
-    // 4. Debit total value from platform gift wallet FIRST
-    const giftWalletDebitResult = await this.walletService.processWalletTransaction(
-      this.ADMIN_GIFT_WALLET_ID,
-      WalletTransactionType.GIFT_CONVERSION,
-      -totalValue, // Debit the full amount
-      `Gift conversion: ${giftsToConvert.length} gift type(s) from user ${userId}`,
-      undefined,
-      'gift_conversion',
-    );
+    // 4. ✅ ATOMIC FIX: One RPC debits the admin gift wallet, credits
+    // the user, credits the platform fee wallet, decrements/removes
+    // user_gifts, and inserts gift_transactions in a single Postgres
+    // transaction. This eliminates the previous manual "rollback"
+    // workaround and the "user credited but gifts not consumed" gap.
+    const conversionReferenceId = randomUUID();
 
-    if (!giftWalletDebitResult.success) {
-      throw new BadRequestException(`Failed to debit platform gift wallet: ${giftWalletDebitResult.error}`);
-    }
-
-    // 5. Credit user wallet (80%)
-    const userCreditResult = await this.walletService.processWalletTransaction(
-      userId,
-      WalletTransactionType.GIFT_CONVERSION,
-      userCredit,
-      `Gift conversion: ${giftsToConvert.length} gift type(s)`,
-      giftWalletDebitResult.transactionId,
-      'gift_conversion',
-    );
-
-    if (!userCreditResult.success) {
-      // CRITICAL: Rollback platform gift wallet debit if user credit fails
-      await this.walletService.processWalletTransaction(
-        this.ADMIN_GIFT_WALLET_ID,
-        WalletTransactionType.GIFT_CONVERSION,
-        totalValue, // Credit back
-        `Rollback: Gift conversion failed for user ${userId}`,
-        giftWalletDebitResult.transactionId,
-        'gift_conversion_rollback',
-      );
-      throw new BadRequestException(`Failed to credit user wallet: ${userCreditResult.error}`);
-    }
-
-    // 6. Credit platform wallet (20%) - This goes to the main platform wallet, NOT the gift wallet
-    const platformCreditResult = await this.walletService.processWalletTransaction(
-      this.PLATFORM_USER_ID,
-      WalletTransactionType.PLATFORM_COMMISSION,
-      platformFee,
-      `Gift conversion fee (20%) from user ${userId} - ${giftsToConvert.length} gift(s) converted`,
-      userCreditResult.transactionId,
-      'gift_conversion',
-    );
-
-    if (!platformCreditResult.success) {
-      this.logger.error(`❌ CRITICAL: Platform wallet credit failed for gift conversion fee: ${platformCreditResult.error}`);
-      this.logger.error(`Platform fee amount: ${platformFee}, Platform User ID: ${this.PLATFORM_USER_ID}`);
-      // Continue - user already credited, but log the error for investigation
-      // The platform fee should be credited to PLATFORM_USER_ID (main platform wallet)
-    } else {
-      this.logger.log(`✅ Platform fee (${platformFee}) credited to platform wallet (${this.PLATFORM_USER_ID})`);
-    }
-
-    // 7. Update or remove gifts from user collection based on conversion quantity
-    // Create a map of convertItem by user_gift_id for quick lookup
-    const convertItemMap = new Map(dto.gifts.map(item => [item.user_gift_id, item]));
-    
-    for (const userGift of userGifts) {
-      const convertItem = convertItemMap.get(userGift.id);
-      if (!convertItem) continue;
-
-      if (convertItem.quantity === userGift.quantity) {
-        // Converting all quantity - delete the row
-        const { error: deleteError } = await this.supabase
-          .from('user_gifts')
-          .delete()
-          .eq('id', userGift.id);
-
-        if (deleteError) {
-          this.logger.error(`Failed to remove gift ${userGift.id} from collection: ${deleteError.message}`);
-          // User already credited - log but don't fail
-        }
-      } else {
-        // Converting partial quantity - update the row by decrementing quantity
-        const newQuantity = userGift.quantity - convertItem.quantity;
-        const { error: updateError } = await this.supabase
-          .from('user_gifts')
-          .update({ quantity: newQuantity })
-          .eq('id', userGift.id);
-
-        if (updateError) {
-          this.logger.error(`Failed to update gift ${userGift.id} quantity: ${updateError.message}`);
-          // User already credited - log but don't fail
-        }
-      }
-    }
-
-    // 8. Log transactions (use the actual converted quantities, not full quantities)
-    const transactionsToInsert = dto.gifts.map(convertItem => {
+    const conversionsPayload = dto.gifts.map(convertItem => {
       const userGift = userGiftMap.get(convertItem.user_gift_id);
       if (!userGift || !userGift.gift) return null;
-      
       return {
-        user_id: userId,
+        user_gift_id: convertItem.user_gift_id,
         gift_id: userGift.gift_id,
-        quantity: convertItem.quantity, // Use converted quantity, not full quantity
-        transaction_type: 'convert' as const,
+        quantity: convertItem.quantity,
         credit_amount: userGift.gift.credit_value * convertItem.quantity,
-        recipient_id: null,
-        session_type: null,
-        session_id: null,
       };
     }).filter(Boolean);
 
-    await this.supabase
-      .from('gift_transactions')
-      .insert(transactionsToInsert);
+    const { data: conversionResult, error: conversionRpcError } = await this.supabase.rpc(
+      'convert_gifts_atomic',
+      {
+        p_user_id: userId,
+        p_admin_gift_user_id: this.ADMIN_GIFT_WALLET_ID,
+        p_platform_user_id: this.PLATFORM_USER_ID,
+        p_total_value: totalValue,
+        p_user_credit: userCredit,
+        p_platform_fee: platformFee,
+        p_conversions: conversionsPayload,
+        p_reference_id: conversionReferenceId,
+      }
+    );
 
-    // 9. Get updated wallet balance
+    if (conversionRpcError) {
+      this.logger.error(`[GiftService] convert_gifts_atomic RPC error: ${conversionRpcError.message}`);
+      throw new BadRequestException(`Gift conversion failed: ${conversionRpcError.message}`);
+    }
+
+    if (!conversionResult || !conversionResult.success) {
+      this.logger.error(`[GiftService] convert_gifts_atomic returned failure: ${conversionResult?.error || 'Unknown'}`);
+      throw new BadRequestException(conversionResult?.error || 'Gift conversion failed');
+    }
+
+    if (conversionResult.already_processed) {
+      this.logger.warn(`[GiftService] ⚠️ IDEMPOTENT: Duplicate gift conversion detected and prevented for user ${userId}, reference: ${conversionReferenceId}`);
+    } else {
+      this.logger.log(`[GiftService] ✅ Atomic gift conversion successful: ${conversionResult.transaction_id} for user ${userId}`);
+    }
+
+    // 5. Get updated wallet balance
     const updatedWallet = await this.walletService.getWallet(userId);
 
     // 10. Emit real-time event for gift collection update
@@ -538,7 +434,7 @@ export class GiftService {
         'Gift Conversion Successful! 💰',
         `Converted ${giftsToConvert.length} gift type(s) to credits`,
         {
-          transactionId: userCreditResult.transactionId,
+          transactionId: conversionResult.transaction_id,
           totalValue,
           userCredit,
           platformFee,
@@ -551,7 +447,7 @@ export class GiftService {
 
     return {
       success: true,
-      transaction_id: userCreditResult.transactionId || '',
+      transaction_id: conversionResult.transaction_id || '',
       total_value: totalValue,
       user_credit: userCredit,
       platform_fee: platformFee,
@@ -616,6 +512,27 @@ export class GiftService {
     // Extract gift details from result
     const giftName = result.gift_name || 'Gift';
     const giftEmoji = result.gift_emoji || '🎁';
+
+    // Fetch full gift metadata for client-side rendering
+    let giftMetadata: any = { id: dto.gift_id, name: giftName, emoji: giftEmoji };
+    try {
+      const { data: gift } = await this.supabase
+        .from('virtual_gifts')
+        .select(`
+          *,
+          sound:sounds ( sound_url )
+        `)
+        .eq('id', dto.gift_id)
+        .single();
+      if (gift) {
+        giftMetadata = {
+          ...gift,
+          sound_url: gift.sound?.sound_url,
+        };
+      }
+    } catch (giftFetchError) {
+      this.logger.warn(`[GiftService] Could not fetch gift metadata for ${dto.gift_id}:`, giftFetchError);
+    }
 
     // Resolve the sender's display name for a personalized notification
     let senderName = 'a user';
@@ -702,6 +619,7 @@ export class GiftService {
                   senderId: senderId,
                   recipientId: dto.recipient_id,
                   timestamp: new Date().toISOString(),
+                  giftMetadata,
                 },
                 conversationId: callSession.conversation_id,
                 from: senderId,
@@ -931,6 +849,10 @@ export class GiftService {
         credit_value: dto.credit_value,
         sort_order: dto.sort_order || 0,
         is_active: dto.is_active !== undefined ? dto.is_active : true,
+        display_lottie_url: dto.display_lottie_url,
+        lottie_config: dto.lottie_config,
+        sound_id: dto.sound_id,
+        animation_type: dto.animation_type || 'lottie_single',
       })
       .select()
       .single();
@@ -953,6 +875,10 @@ export class GiftService {
     if (dto.credit_value !== undefined) updates.credit_value = dto.credit_value;
     if (dto.sort_order !== undefined) updates.sort_order = dto.sort_order;
     if (dto.is_active !== undefined) updates.is_active = dto.is_active;
+    if (dto.display_lottie_url !== undefined) updates.display_lottie_url = dto.display_lottie_url;
+    if (dto.lottie_config !== undefined) updates.lottie_config = dto.lottie_config;
+    if (dto.sound_id !== undefined) updates.sound_id = dto.sound_id;
+    if (dto.animation_type !== undefined) updates.animation_type = dto.animation_type;
     updates.updated_at = new Date().toISOString();
 
     const { data, error } = await this.supabase
@@ -1029,7 +955,10 @@ export class GiftService {
   async getAllGiftsForAdmin(): Promise<VirtualGift[]> {
     const { data, error } = await this.supabase
       .from('virtual_gifts')
-      .select('*')
+      .select(`
+        *,
+        sound:sounds ( sound_url )
+      `)
       .order('sort_order', { ascending: true })
       .order('created_at', { ascending: false });
 
@@ -1038,7 +967,128 @@ export class GiftService {
       throw new BadRequestException('Failed to fetch gifts');
     }
 
+    return (data || []).map((g: any) => ({
+      ...g,
+      sound_url: g.sound?.sound_url,
+    }));
+  }
+
+  // =====================
+  // SOUND ASSET MANAGEMENT
+  // =====================
+
+  async getSounds(): Promise<Sound[]> {
+    const { data, error } = await this.supabase
+      .from('sounds')
+      .select('*')
+      .eq('is_active', true)
+      .order('sort_order', { ascending: true });
+
+    if (error) {
+      this.logger.error(`Failed to fetch sounds: ${error.message}`);
+      throw new BadRequestException('Failed to fetch sounds');
+    }
+
     return data || [];
+  }
+
+  async createSound(dto: CreateSoundDto): Promise<Sound> {
+    const { data, error } = await this.supabase
+      .from('sounds')
+      .insert({
+        name: dto.name,
+        sound_url: dto.sound_url,
+        sort_order: dto.sort_order || 0,
+        is_active: dto.is_active !== undefined ? dto.is_active : true,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      this.logger.error(`Failed to create sound: ${error.message}`);
+      throw new BadRequestException('Failed to create sound');
+    }
+
+    return data;
+  }
+
+  async updateSound(id: string, dto: UpdateSoundDto): Promise<Sound> {
+    const updates: any = {};
+    if (dto.name !== undefined) updates.name = dto.name;
+    if (dto.sound_url !== undefined) updates.sound_url = dto.sound_url;
+    if (dto.sort_order !== undefined) updates.sort_order = dto.sort_order;
+    if (dto.is_active !== undefined) updates.is_active = dto.is_active;
+    updates.updated_at = new Date().toISOString();
+
+    const { data, error } = await this.supabase
+      .from('sounds')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      this.logger.error(`Failed to update sound: ${error.message}`);
+      throw new BadRequestException('Failed to update sound');
+    }
+
+    if (!data) {
+      throw new NotFoundException('Sound not found');
+    }
+
+    return data;
+  }
+
+  async deleteSound(id: string): Promise<void> {
+    const { data: sound, error: findError } = await this.supabase
+      .from('sounds')
+      .select('sound_url')
+      .eq('id', id)
+      .single();
+
+    if (findError || !sound) {
+      throw new NotFoundException('Sound not found');
+    }
+
+    const pathMatch = sound.sound_url?.match(/gift-sounds\/(.+)$/);
+    if (pathMatch) {
+      await this.supabase.storage.from('gift-sounds').remove([pathMatch[1]]).catch(() => {
+        // Silent fail — DB cleanup is more important
+      });
+    }
+
+    const { error } = await this.supabase.from('sounds').delete().eq('id', id);
+    if (error) {
+      this.logger.error(`Failed to delete sound: ${error.message}`);
+      throw new BadRequestException('Failed to delete sound');
+    }
+  }
+
+  // =====================
+  // ASSET UPLOAD
+  // =====================
+
+  async uploadAsset(file: Express.Multer.File, type: 'lottie' | 'sound') {
+    const bucket = type === 'lottie' ? 'gift-lotties' : 'gift-sounds';
+    const folder = type === 'lottie' ? 'lotties' : 'sounds';
+    const fileName = `gifts/${folder}/${Date.now()}-${Math.random().toString(36).substring(7)}.${file.originalname?.split('.').pop() || (type === 'lottie' ? 'lottie' : 'mp3')}`;
+    const contentType = file.mimetype || (type === 'lottie' ? 'application/octet-stream' : 'audio/mpeg');
+
+    const { data, error } = await this.supabase.storage
+      .from(bucket)
+      .upload(fileName, file.buffer, {
+        contentType,
+        cacheControl: '3600',
+        upsert: false,
+      });
+
+    if (error) {
+      this.logger.error(`Failed to upload ${type}: ${error.message}`);
+      throw new BadRequestException(`Failed to upload ${type}`);
+    }
+
+    const { data: publicUrlData } = this.supabase.storage.from(bucket).getPublicUrl(data.path);
+    return { url: publicUrlData.publicUrl, type };
   }
 }
 

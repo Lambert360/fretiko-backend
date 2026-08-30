@@ -1,11 +1,17 @@
 import { Injectable, BadRequestException, NotFoundException, ForbiddenException, HttpException, HttpStatus, Inject, forwardRef, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import * as os from 'os';
+import * as path from 'path';
+import * as fs from 'fs';
+import axios from 'axios';
+import ffmpeg from 'fluent-ffmpeg';
 import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { EscrowService } from '../escrow/escrow.service';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
+import { GiftCardService } from '../gift-cards/gift-cards.service';
 import {
   CreateLiveStreamDto,
   UpdateStreamStatusDto,
@@ -27,6 +33,7 @@ import {
   TransactionStatus,
   TransactionType,
 } from './dto/live-sales.dto';
+import { LiveSalesGamificationService } from './live-sales-gamification.service';
 
 /**
  * Live Sales Service
@@ -60,6 +67,9 @@ export class LiveSalesService {
     private escrowService: EscrowService,
     private notificationHelper: NotificationHelperService,
     private walletService: WalletService,
+    @Inject(forwardRef(() => GiftCardService))
+    private giftCardService: GiftCardService,
+    private readonly gamificationService: LiveSalesGamificationService,
   ) {
     // CRITICAL: Use service role client to bypass RLS for system operations
     // like updating agora_resource_id, agora_sid, and other system fields
@@ -221,6 +231,9 @@ export class LiveSalesService {
           total_comments,
           total_reactions,
           total_gifts,
+          thumbnail_url,
+          preview_video_url,
+          stream_url,
           created_at,
           started_at,
           vendor:user_profiles!vendor_id (
@@ -280,6 +293,7 @@ export class LiveSalesService {
           total_viewers,
           total_sales,
           thumbnail_url,
+          preview_video_url,
           stream_url,
           started_at,
           ended_at,
@@ -363,6 +377,15 @@ export class LiveSalesService {
 
       // Use service role client to bypass RLS policies during stream creation
       // This ensures streams are always created successfully without timing/transaction issues
+      // If a preview video is provided but no thumbnail image, generate a thumbnail from the video
+      let thumbnailUrl = createStreamDto.thumbnail_url;
+      if (createStreamDto.preview_video_url && !thumbnailUrl) {
+        thumbnailUrl = await this.generateVideoThumbnailFromUrl(
+          createStreamDto.preview_video_url,
+          vendorId,
+        );
+      }
+
       const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
         .insert({
@@ -370,7 +393,8 @@ export class LiveSalesService {
           title: createStreamDto.title,
           description: createStreamDto.description,
           stream_type: createStreamDto.stream_type,
-          thumbnail_url: createStreamDto.thumbnail_url,
+          thumbnail_url: thumbnailUrl,
+          preview_video_url: createStreamDto.preview_video_url,
           status: StreamStatus.SETUP,
         })
         .select()
@@ -718,6 +742,9 @@ export class LiveSalesService {
         });
       }
 
+      // Track gamification join
+      await this.gamificationService.onViewerJoin(streamId, userId, accessToken);
+
       // Log analytics
       await this.logAnalytics(streamId, 'viewer_join', 1, { user_id: userId });
     } catch (error) {
@@ -753,6 +780,9 @@ export class LiveSalesService {
           error: updateError.message,
         });
       }
+
+      // Track gamification leave
+      await this.gamificationService.onViewerLeave(streamId, userId);
 
       // Log analytics
       await this.logAnalytics(streamId, 'viewer_leave', 1, { user_id: userId });
@@ -1046,121 +1076,44 @@ export class LiveSalesService {
         throw new BadRequestException('Insufficient wallet balance for gift');
       }
 
-      // 6. Start transaction - deduct from sender (using fee_deduction for direct transfer)
-      const deductResult = await this.walletService.processWalletTransaction(
-        userId,
-        WalletTransactionType.FEE_DEDUCTION, // ✅ FIX: Use valid transaction type (gifts are direct transfers, not escrow)
-        totalCost, // Helper handles negative internally for debits
-        `Gift: ${sendGiftDto.quantity}x ${giftType.name} to stream "${stream.title}"`,
-        sendGiftDto.stream_id,
-        'live_stream_gift',
-      );
-
-      if (!deductResult.success) {
-        this.logEvent('error', 'gift_wallet_deduction_failed', {
-          giftId,
-          senderId: userId,
-          amount: totalCost,
-          error: deductResult.error,
-        });
-        throw new BadRequestException(`Failed to process gift payment: ${deductResult.error}`);
-      }
-
-      // 7. Credit vendor's wallet (platform takes no commission on gifts)
-      // Note: fee_deduction doesn't support negative amounts, so we use reward_credit for the vendor
-      const creditResult = await this.walletService.processWalletTransaction(
-        stream.vendor_id,
-        WalletTransactionType.REWARD_CREDIT, // ✅ FIX: Use valid transaction type for direct credit
-        totalCost,
-        `Gift received: ${sendGiftDto.quantity}x ${giftType.name} from viewer`,
-        sendGiftDto.stream_id,
-        'live_stream_gift',
-      );
-
-      if (!creditResult.success) {
-        this.logEvent('error', 'gift_vendor_credit_failed', {
-          giftId,
-          vendorId: stream.vendor_id,
-          amount: totalCost,
-          error: creditResult.error,
-        });
-
-        // CRITICAL: Rollback buyer's payment since vendor credit failed
-        try {
-          const refundResult = await this.walletService.processWalletTransaction(
-            userId,
-            WalletTransactionType.ADMIN_ADJUSTMENT, // Refund back to available balance
-            totalCost,
-            `Gift refund: Vendor credit failed for ${giftType.name} gift`,
-            sendGiftDto.stream_id,
-            'gift_refund',
-          );
-
-          if (!refundResult.success) {
-            this.logEvent('error', 'gift_refund_failed_critical', {
-              giftId,
-              senderId: userId,
-              vendorId: stream.vendor_id,
-              amount: totalCost,
-              creditError: creditResult.error,
-              refundError: refundResult.error,
-            });
-            throw new HttpException(
-              `Gift payment processed but vendor credit failed. Refund also failed. Manual intervention required. Amount: ${totalCost}`,
-              HttpStatus.INTERNAL_SERVER_ERROR
-            );
-          }
-
-          this.logEvent('warn', 'gift_rolled_back_successfully', {
-            giftId,
-            senderId: userId,
-            vendorId: stream.vendor_id,
-            amount: totalCost,
-            reason: 'Vendor credit failure',
-          });
-
-        } catch (rollbackError) {
-          this.logEvent('error', 'gift_rollback_exception', {
-            giftId,
-            senderId: userId,
-            vendorId: stream.vendor_id,
-            amount: totalCost,
-          }, rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)));
-          throw new HttpException(
-            `Gift payment processed but vendor credit failed. Rollback exception occurred. Manual intervention required.`,
-            HttpStatus.INTERNAL_SERVER_ERROR
-          );
+      // 6. Send gift atomically (debit viewer, credit vendor, record gift)
+      const { data: giftResult, error: giftRpcError } = await this.supabase.rpc(
+        'send_live_stream_gift_atomic',
+        {
+          p_stream_id: sendGiftDto.stream_id,
+          p_sender_id: userId,
+          p_vendor_id: stream.vendor_id,
+          p_gift_type_id: giftType.id,
+          p_quantity: sendGiftDto.quantity,
+          p_unit_value: giftType.base_value,
+          p_total_amount: totalCost,
+          p_message: sendGiftDto.message || null,
         }
+      );
 
-        throw new BadRequestException(`Failed to credit vendor for gift. Your payment has been refunded.`);
-      }
-
-      // 8. Record gift in live stream gifts table
-      const { data: giftTransaction, error: giftRecordError } = await this.supabase
-        .from('live_stream_gifts')
-        .insert({
-          stream_id: sendGiftDto.stream_id,
-          sender_id: userId,
-          gift_type_id: giftType.id,
-          quantity: sendGiftDto.quantity,
-          unit_value: giftType.base_value,
-          total_amount: totalCost,
-          message: sendGiftDto.message || null,
-        })
-        .select()
-        .single();
-
-      if (giftRecordError || !giftTransaction) {
-        this.logEvent('error', 'gift_record_failed', {
+      if (giftRpcError) {
+        this.logEvent('error', 'gift_rpc_error', {
           giftId,
           senderId: userId,
           vendorId: stream.vendor_id,
           amount: totalCost,
-          error: giftRecordError?.message || 'Gift transaction not returned',
+          error: giftRpcError.message,
         });
-        // Note: Payment already processed, just log the error
-        throw new BadRequestException('Failed to record gift transaction');
+        throw new BadRequestException(`Failed to send gift: ${giftRpcError.message}`);
       }
+
+      if (!giftResult || !giftResult.success) {
+        this.logEvent('error', 'gift_rpc_failed', {
+          giftId,
+          senderId: userId,
+          vendorId: stream.vendor_id,
+          amount: totalCost,
+          error: giftResult?.error || 'Unknown error',
+        });
+        throw new BadRequestException(`Failed to send gift: ${giftResult?.error || 'Unknown error'}`);
+      }
+
+      const giftTransaction = giftResult.gift;
 
       // 9. Log analytics
       await this.logAnalytics(sendGiftDto.stream_id, 'gift_sent', totalCost, {
@@ -1464,54 +1417,7 @@ export class LiveSalesService {
         // If reservation is valid, it will be confirmed after successful purchase
       }
 
-      // 4. Atomically update stock (check + update in single operation)
-      // This prevents race conditions where multiple users purchase simultaneously
-      const stockUpdateResult = await this.supabase.rpc('update_live_stream_stock_atomic', {
-        p_live_product_id: liveProduct.id,
-        p_quantity: purchaseDto.quantity,
-      });
-
-      if (stockUpdateResult.error || !stockUpdateResult.data?.success) {
-        const errorMessage = stockUpdateResult.data?.error || stockUpdateResult.error?.message || 'Failed to update stock';
-        const errorCode = stockUpdateResult.data?.error_code || 'STOCK_UPDATE_FAILED';
-        
-        this.logEvent('error', 'stock_update_failed', {
-          purchaseId,
-          userId,
-          productId: liveProduct.id,
-          requestedQuantity: purchaseDto.quantity,
-          error: errorMessage,
-          errorCode,
-          availableStock: stockUpdateResult.data?.available_stock,
-        });
-
-        if (errorCode === 'INSUFFICIENT_STOCK') {
-          throw new BadRequestException(
-            stockUpdateResult.data?.error || `Insufficient stock. Only ${stockUpdateResult.data?.available_stock || 0} items available`
-          );
-        } else if (errorCode === 'PRODUCT_NOT_FOUND') {
-          throw new NotFoundException('Live stream product not found');
-        } else {
-          throw new BadRequestException(`Stock update failed: ${errorMessage}`);
-        }
-      }
-
-      // Stock successfully updated atomically
-      const updatedStockData = stockUpdateResult.data;
-      this.logEvent('log', 'stock_updated', {
-        purchaseId,
-        productId: liveProduct.id,
-        oldStock: updatedStockData.old_stock,
-        newStock: updatedStockData.new_stock,
-        quantityDeducted: updatedStockData.quantity_deducted,
-      });
-
-      // Update local liveProduct object with new stock values for consistency
-      liveProduct.live_stock = updatedStockData.new_stock;
-      liveProduct.sold_count = updatedStockData.new_sold_count;
-
-      // Track that stock was deducted (for error handling)
-      let stockDeducted = true;
+      // 4. Stock is decremented inside create_live_product_order_atomic
 
       // 5. Calculate pricing
       const unitPrice = liveProduct.live_price;
@@ -1540,25 +1446,9 @@ export class LiveSalesService {
         totalAmount,
       });
 
-      // 5. Get buyer's wallet
-      const { data: buyerWallet, error: walletError } = await this.supabase
-        .from('wallets')
-        .select('id, available_balance')
-        .eq('user_id', userId)
-        .single();
-
-      if (walletError || !buyerWallet) {
-        throw new NotFoundException('Buyer wallet not found');
-      }
-
-      // 6. Check sufficient balance
-      if (buyerWallet.available_balance < totalAmount) {
-        throw new BadRequestException('Insufficient wallet balance for purchase');
-      }
-
-      // 7. Start transaction processing
-      const transactionId = `live_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      const orderNumber = `LIVE-${Date.now()}-${Math.random().toString(36).substring(7).toUpperCase()}`;
+      // 5. Start transaction processing
+      const transactionId = 'live_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+      const orderNumber = 'LIVE-' + Date.now() + '-' + Math.random().toString(36).substring(7).toUpperCase();
 
       // 8. Create order record for live stream purchase
       // Use product owner (product.user_id) as vendor_id, not stream owner
@@ -1577,137 +1467,121 @@ export class LiveSalesService {
         throw new BadRequestException('Invalid order data: missing required fields');
       }
 
-      let order;
-      try {
-        const { data: orderData, error: orderError } = await this.supabase
-          .from('orders')
-          .insert({
-            order_number: orderNumber,
-            buyer_id: userId,
-            vendor_id: productVendorId, // Use product owner, not stream owner
-            total_amount: totalAmount,
-            delivery_fee: deliveryFee,
-            platform_fee: platformFee,
-            status: 'pending',
-            escrow_enabled: true,
-            source: 'live_stream',
-            delivery_type: purchaseDto.rider_id ? 'delivery' : 'pickup',
-            rider_id: purchaseDto.rider_id || null,
-            delivery_address: purchaseDto.delivery_address || null,
-            metadata: {
-              stream_id: purchaseDto.stream_id,
-              stream_title: stream.title,
-              booking_type: 'product', // Distinguish product purchases within live_stream
-              transaction_id: transactionId,
-              subtotal: subtotal,
-              unit_price: unitPrice,
-              continue_watching: purchaseDto.continue_watching || false
-            }
-          })
-          .select()
-          .single();
+      // 6. Build the atomic RPC payload
+      const riderCommission = purchaseDto.rider_id && deliveryFee > 0
+        ? deliveryFee * this.PLATFORM_COMMISSION_RATE
+        : 0;
 
-        if (orderError) {
-          this.logEvent('error', 'order_creation_failed', {
-            purchaseId,
-            userId,
-            productVendorId,
-            streamVendorId: stream.vendor_id,
-            totalAmount,
-            orderNumber,
-            errorCode: orderError.code,
-            errorMessage: orderError.message,
-            errorDetails: orderError.details,
-            errorHint: orderError.hint,
-          });
+      const pEscrow = {
+        total_amount: totalAmount,
+        vendor_amount: vendorAmount,
+        rider_amount: deliveryFee - riderCommission,
+        platform_amount: platformFee + riderCommission,
+      };
 
-          // Provide specific error messages based on error code
-          if (orderError.code === '23505') { // Unique constraint violation
-            throw new BadRequestException('Order number already exists. Please try again.');
-          } else if (orderError.code === '23503') { // Foreign key violation
-            throw new BadRequestException('Invalid reference data. Please verify product and vendor information.');
-          } else if (orderError.code === '23514') { // Check constraint violation
-            throw new BadRequestException('Order data violates constraints. Please check amounts and status.');
-          } else {
-            throw new BadRequestException(`Failed to create order: ${orderError.message || 'Unknown error'}`);
+      const pOrder = {
+        buyer_id: userId,
+        vendor_id: productVendorId,
+        order_number: orderNumber,
+        source: 'live_stream',
+        total_amount: totalAmount,
+        delivery_fee: deliveryFee,
+        platform_fee: platformFee,
+        status: 'pending',
+        escrow_enabled: true,
+        rider_id: purchaseDto.rider_id || null,
+        delivery_type: purchaseDto.rider_id ? 'delivery' : 'pickup',
+        delivery_address: purchaseDto.delivery_address || null,
+        metadata: {
+          stream_id: purchaseDto.stream_id,
+          stream_title: stream.title,
+          transaction_id: transactionId,
+          subtotal: subtotal,
+          unit_price: unitPrice,
+          continue_watching: purchaseDto.continue_watching || false,
+        },
+      };
+
+      const pItems = [
+        {
+          product_id: purchaseDto.product_id,
+          product_name: liveProduct.product.name,
+          quantity: purchaseDto.quantity,
+          unit_price: unitPrice,
+          total_price: subtotal,
+          product_metadata: {
+            description: liveProduct.product.description,
+            live_price: unitPrice,
+          },
+        },
+      ];
+
+      const pLiveTransaction = {
+        id: transactionId,
+        stream_id: purchaseDto.stream_id,
+        buyer_id: userId,
+        vendor_id: productVendorId,
+        transaction_type: TransactionType.PRODUCT,
+        product_id: purchaseDto.product_id,
+        quantity: purchaseDto.quantity,
+        unit_price: unitPrice,
+        total_amount: totalAmount,
+        platform_fee: pEscrow.platform_amount,
+        rider_fee: pEscrow.rider_amount,
+        status: TransactionStatus.PENDING,
+        rider_id: purchaseDto.rider_id || null,
+        delivery_address: purchaseDto.delivery_address || null,
+        continue_watching: purchaseDto.continue_watching || false,
+        order_id: null,
+      };
+
+      const pGiftCard = purchaseDto.giftCard
+        ? {
+            card_number: purchaseDto.giftCard.cardNumber,
+            pin: purchaseDto.giftCard.pin,
+            ...(purchaseDto.giftCard.amount !== undefined ? { requested_amount: purchaseDto.giftCard.amount } : {}),
           }
-        }
+        : null;
 
-        if (!orderData) {
-          throw new BadRequestException('Order creation returned no data');
-        }
+      this.logEvent('log', 'calling_atomic_purchase_rpc', {
+        purchaseId,
+        userId,
+        liveProductId: liveProduct.id,
+        quantity: purchaseDto.quantity,
+        totalAmount,
+      });
 
-        order = orderData;
-      } catch (error) {
-        // If order creation fails, we need to rollback stock update
-        // Only restore stock if it was actually deducted
-        if (stockDeducted) {
-          try {
-            // Restore stock atomically using the restoration function
-            const stockRestoreResult = await this.supabase.rpc('restore_live_stream_stock_atomic', {
-              p_live_product_id: liveProduct.id,
-              p_quantity: purchaseDto.quantity,
-            });
+      // 7. Execute the atomic live product purchase
+      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('create_live_product_order_atomic', {
+        p_buyer_id: userId,
+        p_order: pOrder,
+        p_items: pItems,
+        p_escrow: pEscrow,
+        p_live_product_id: liveProduct.id,
+        p_quantity: purchaseDto.quantity,
+        p_live_transaction: pLiveTransaction,
+        p_gift_card: pGiftCard,
+        p_rewards_amount: 0,
+        p_admin_gift_user_id: null,
+        p_user_ip: null,
+      });
 
-          if (stockRestoreResult.error || !stockRestoreResult.data?.success) {
-            const restoreError = stockRestoreResult.data?.error || stockRestoreResult.error?.message || 'Unknown error';
-            this.logEvent('error', 'stock_restore_failed', {
-              purchaseId,
-              userId,
-              liveProductId: liveProduct.id,
-              quantityToRestore: purchaseDto.quantity,
-              error: restoreError,
-            }, new Error(restoreError));
-            
-            // Log for manual intervention
-            this.logEvent('error', 'manual_intervention_required', {
-              purchaseId,
-              userId,
-              liveProductId: liveProduct.id,
-              quantityToRestore: purchaseDto.quantity,
-              originalStock: updatedStockData.old_stock,
-              currentStock: updatedStockData.new_stock,
-              reason: 'Stock restoration failed after order creation failure',
-            });
-          } else {
-            this.logEvent('log', 'stock_restored', {
-              purchaseId,
-              liveProductId: liveProduct.id,
-              quantityRestored: purchaseDto.quantity,
-              oldStock: stockRestoreResult.data.old_stock,
-              newStock: stockRestoreResult.data.new_stock,
-            });
-          }
-        } catch (restoreError) {
-          this.logEvent('error', 'stock_restore_exception', {
-            purchaseId,
-            userId,
-            liveProductId: liveProduct.id,
-            quantityToRestore: purchaseDto.quantity,
-          }, restoreError instanceof Error ? restoreError : new Error(String(restoreError)));
-        }
-        // If stock wasn't deducted, no need to restore
-        }
-
-        // Cancel reservation if purchase failed
-        if (purchaseDto.reservation_id) {
-          try {
-            await this.cancelReservation(purchaseDto.reservation_id);
-          } catch (cancelError) {
-            // Log but don't throw - reservation cancellation failure is non-critical
-            this.logEvent('warn', 'reservation_cancel_failed_on_order_failure', {
-              purchaseId,
-              reservationId: purchaseDto.reservation_id,
-            });
-          }
-        }
-
-        // Re-throw the original error
-        if (error instanceof BadRequestException) {
-          throw error;
-        }
-        throw new BadRequestException(`Failed to create order: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      if (rpcError || !rpcResult || !rpcResult.success) {
+        const errorMessage = rpcResult?.error || rpcError?.message || 'Purchase failed';
+        const errorCode = rpcResult?.error_code || 'PURCHASE_RPC_FAILED';
+        this.logEvent('error', 'purchase_rpc_failed', {
+          purchaseId,
+          userId,
+          liveProductId: liveProduct.id,
+          error: errorMessage,
+          errorCode,
+        });
+        throw new BadRequestException(errorMessage);
       }
+
+      const order = { ...pOrder, ...rpcResult.order };
+      const liveTransactionId = rpcResult.live_transaction?.id as string;
+      const escrow = rpcResult.escrow;
 
       this.logEvent('log', 'order_created', {
         orderId: order.id,
@@ -1717,275 +1591,84 @@ export class LiveSalesService {
         streamVendorId: stream.vendor_id,
       });
 
-      // 9. Create order item
-      const { error: orderItemError } = await this.supabase
-        .from('order_items')
-        .insert({
-          order_id: order.id,
-          product_id: purchaseDto.product_id,
-          product_name: liveProduct.product.name,
-          unit_price: unitPrice,
-          quantity: purchaseDto.quantity,
-          total_price: subtotal,
-          product_metadata: {
-            description: liveProduct.product.description,
-            live_price: unitPrice
-          }
-        });
+      // 8. Send PIN notifications
+      try {
+        const { data: vendorProfile } = await this.supabase
+          .from('user_profiles')
+          .select('username, display_name')
+          .eq('id', productVendorId)
+          .single();
 
-      if (orderItemError) {
-        this.logEvent('error', 'order_item_creation_failed', {
-          purchaseId,
-          orderId: order.id,
-          error: orderItemError.message,
-        });
-        
-        // Rollback: Delete order, restore stock, and cancel reservation
-        try {
-          await this.supabase.from('orders').delete().eq('id', order.id);
+        const deliveryType = purchaseDto.rider_id ? 'delivery' : 'pickup';
 
-          // Restore stock
-          const stockRestoreResult = await this.supabase.rpc('restore_live_stream_stock_atomic', {
-            p_live_product_id: liveProduct.id,
-            p_quantity: purchaseDto.quantity,
+        if (deliveryType === 'pickup') {
+          await this.notificationHelper.notifyVendorSelfPickupPin(productVendorId, {
+            id: order.id,
+            orderNumber: order.order_number,
+            deliveryPin: order.delivery_pin,
+            buyerName: 'Live Stream Customer',
+          });
+          this.logEvent('log', 'pickup_pin_sent_to_vendor', {
+            orderId: order.id,
+            productVendorId,
           });
 
-          if (stockRestoreResult.error || !stockRestoreResult.data?.success) {
-            this.logEvent('error', 'order_item_failure_stock_restore_failed', {
-              purchaseId,
-              orderId: order.id,
-              liveProductId: liveProduct.id,
-              quantity: purchaseDto.quantity,
-            });
-          }
-
-          // Cancel reservation if it exists
-          if (purchaseDto.reservation_id) {
-            try {
-              await this.cancelReservation(purchaseDto.reservation_id);
-              this.logEvent('log', 'reservation_cancelled_on_order_failure', {
-                purchaseId,
-                reservationId: purchaseDto.reservation_id,
-                orderId: order.id,
-              });
-            } catch (reservationError) {
-              this.logEvent('warn', 'reservation_cancel_failed_on_order_failure', {
-                purchaseId,
-                reservationId: purchaseDto.reservation_id,
-                orderId: order.id,
-              }, reservationError instanceof Error ? reservationError : new Error(String(reservationError)));
-              // Don't throw - reservation cleanup failure is non-critical
-            }
-          }
-        } catch (rollbackError) {
-          this.logEvent('error', 'order_item_failure_rollback_exception', {
-            purchaseId,
+          await this.notificationHelper.notifyBuyerSelfPickupPin(userId, {
+            id: order.id,
+            orderNumber: order.order_number,
+            deliveryPin: order.delivery_pin,
+            vendorName: vendorProfile?.username || vendorProfile?.display_name,
+          });
+          this.logEvent('log', 'pickup_pin_sent_to_buyer', {
             orderId: order.id,
-          }, rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)));
-        }
-        
-        throw new BadRequestException('Failed to create order item. Please try again.');
-      }
-
-      // 10. Deduct from buyer wallet (move to escrow)
-      const deductResult = await this.walletService.processWalletTransaction(
-        userId,
-        WalletTransactionType.PURCHASE_HOLD, // ✅ FIX: Use valid transaction type (moves money to escrow)
-        totalAmount,
-        `Live purchase: ${purchaseDto.quantity}x ${liveProduct.product.name} from "${stream.title}"`,
-        order.id,
-        'order',
-      );
-
-      if (!deductResult.success) {
-        this.logEvent('error', 'purchase_wallet_deduction_failed', {
-          purchaseId,
-          orderId: order.id,
-          userId,
-          amount: totalAmount,
-          error: deductResult.error,
-        });
-        throw new BadRequestException(`Failed to process payment: ${deductResult.error}`);
-      }
-
-      // 11. Create escrow for buyer protection
-      try {
-        // Calculate rider commission (10% of rider earnings)
-        const riderCommission = purchaseDto.rider_id && deliveryFee > 0
-          ? deliveryFee * this.PLATFORM_COMMISSION_RATE
-          : 0;
-
-        const escrowBreakdown = {
-          totalAmount: totalAmount,
-          vendorAmount: vendorAmount,
-          riderAmount: deliveryFee - riderCommission, // Rider gets delivery fee minus platform commission
-          platformAmount: platformFee + riderCommission, // Platform gets vendor commission + rider commission
-        };
-
-        await this.escrowService.createEscrow(order.id, escrowBreakdown);
-        this.logEvent('log', 'escrow_created', {
-          purchaseId,
-          orderId: order.id,
-          orderNumber: order.order_number,
-          amount: totalAmount,
-        });
-
-        // Generate handoff PINs (3-digit) for order verification
-        // For self-pickup: only delivery PIN needed (buyer shows to vendor)
-        // For regular delivery: both PINs needed (pickup PIN for rider→vendor, delivery PIN for rider→buyer)
-        const pickupPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
-        const deliveryPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
-        
-        // Update order with PINs and keep status as 'pending' so vendor can accept it
-        // Status will change to 'processing' when vendor accepts, then 'paid' when completed
-        await this.supabase
-          .from('orders')
-          .update({ 
-            pickup_pin: pickupPin,
-            delivery_pin: deliveryPin,
-            status: 'pending', // Keep as 'pending' so vendor can accept the order
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', order.id);
-        
-        this.logEvent('log', 'pins_generated', {
-          purchaseId,
-          orderId: order.id,
-          orderNumber: order.order_number,
-          pickupPin,
-          deliveryPin,
-          deliveryType: purchaseDto.rider_id ? 'delivery' : 'pickup',
-        });
-
-        // Send PIN notifications to relevant parties
-        try {
-          // Get vendor profile for notifications (use product owner, not stream owner)
-          const { data: vendorProfile } = await this.supabase
-            .from('user_profiles')
-            .select('username, display_name')
-            .eq('id', productVendorId)
-            .single();
-
-          const deliveryType = purchaseDto.rider_id ? 'delivery' : 'pickup';
-          
-          if (deliveryType === 'pickup') {
-            // Self-pickup: Send deliveryPin to BOTH vendor and buyer
-            // Buyer provides deliveryPin to vendor for handoff verification
-            
-            // Send deliveryPin to vendor (for verification) - use product owner
-            await this.notificationHelper.notifyVendorSelfPickupPin(productVendorId, {
+            buyerId: userId,
+          });
+        } else {
+          if (purchaseDto.rider_id) {
+            await this.notificationHelper.notifyRiderPickupPin(purchaseDto.rider_id, {
               id: order.id,
               orderNumber: order.order_number,
-              deliveryPin: deliveryPin,
-              buyerName: 'Live Stream Customer', // Could fetch buyer username if needed
-            });
-            this.logEvent('log', 'pickup_pin_sent_to_vendor', {
-              orderId: order.id,
-              productVendorId,
-            });
-
-            // Send deliveryPin to buyer (to provide to vendor)
-            await this.notificationHelper.notifyBuyerSelfPickupPin(userId, {
-              id: order.id,
-              orderNumber: order.order_number,
-              deliveryPin: deliveryPin,
+              pickupPin: order.pickup_pin,
               vendorName: vendorProfile?.username || vendorProfile?.display_name,
             });
-            this.logEvent('log', 'pickup_pin_sent_to_buyer', {
+            this.logEvent('log', 'pickup_pin_sent_to_rider', {
               orderId: order.id,
-              buyerId: userId,
-            });
-          } else {
-            // Regular delivery: Send pickupPin to rider, deliveryPin to buyer
-            
-            // Send pickup PIN to rider
-            if (purchaseDto.rider_id) {
-              await this.notificationHelper.notifyRiderPickupPin(purchaseDto.rider_id, {
-                id: order.id,
-                orderNumber: order.order_number,
-                pickupPin: pickupPin,
-                vendorName: vendorProfile?.username || vendorProfile?.display_name,
-              });
-              this.logEvent('log', 'pickup_pin_sent_to_rider', {
-                orderId: order.id,
-                riderId: purchaseDto.rider_id,
-              });
-            }
-
-            // Send delivery PIN to buyer
-            await this.notificationHelper.notifyBuyerDeliveryPin(userId, {
-              id: order.id,
-              orderNumber: order.order_number,
-              deliveryPin: deliveryPin,
-            });
-            this.logEvent('log', 'delivery_pin_sent_to_buyer', {
-              orderId: order.id,
-              buyerId: userId,
+              riderId: purchaseDto.rider_id,
             });
           }
-        } catch (pinNotifyError) {
-          this.logEvent('warn', 'pin_notification_failed', {
-            orderId: order.id,
-            error: pinNotifyError instanceof Error ? pinNotifyError.message : String(pinNotifyError),
-          });
-          // Don't throw - PIN notification failure is non-critical
-        }
 
-      } catch (escrowError) {
-        this.logEvent('error', 'escrow_creation_failed', {
-          purchaseId,
+          await this.notificationHelper.notifyBuyerDeliveryPin(userId, {
+            id: order.id,
+            orderNumber: order.order_number,
+            deliveryPin: order.delivery_pin,
+          });
+          this.logEvent('log', 'delivery_pin_sent_to_buyer', {
+            orderId: order.id,
+            buyerId: userId,
+          });
+        }
+      } catch (pinNotifyError) {
+        this.logEvent('warn', 'pin_notification_failed', {
           orderId: order.id,
-          userId,
-          amount: totalAmount,
-        }, escrowError instanceof Error ? escrowError : new Error(String(escrowError)));
-        
-        // Rollback transaction: refund money from escrow back to available balance and restore stock
-        const rollbackReason = `Escrow creation failed: ${escrowError instanceof Error ? escrowError.message : 'Unknown error'}`;
-        const rollbackResult = await this.rollbackPurchaseTransaction(
-          userId,
-          order.id,
-          totalAmount,
-          rollbackReason,
-          liveProduct.id, // Pass liveProductId for stock restoration
-          purchaseDto.quantity, // Pass quantity for stock restoration
-        );
-
-        if (!rollbackResult.success) {
-          // Rollback itself failed - this is a critical state requiring manual intervention
-          this.logEvent('error', 'rollback_failed_after_escrow_failure', {
-            purchaseId,
-            orderId: order.id,
-            userId,
-            rollbackError: rollbackResult.error,
-          });
-          throw new HttpException(
-            `Payment processed but escrow creation failed. Rollback also failed: ${rollbackResult.error}. Manual intervention required. Order ID: ${order.id}`,
-            HttpStatus.INTERNAL_SERVER_ERROR
-          );
-        }
-
-        // Rollback successful - throw error to inform user
-        throw new BadRequestException(
-          'Payment was processed but escrow creation failed. Payment has been refunded to your wallet. Please try again.'
-        );
+          error: pinNotifyError instanceof Error ? pinNotifyError.message : String(pinNotifyError),
+        });
       }
 
-      // 12. Notify vendor of new order (notify product owner, not stream owner)
+      // 9. Notify vendor
       try {
         await this.notificationHelper.notifyVendorNewOrder(productVendorId, {
           id: order.id,
           orderNumber: order.order_number,
           totalAmount: totalAmount,
           itemCount: 1,
-          buyerName: 'Live Stream Customer', // Could fetch buyer profile if needed
+          buyerName: 'Live Stream Customer',
         });
 
-        // Notify vendor payment is in escrow
         await this.notificationHelper.notifyVendorOrderPaid(productVendorId, {
           orderId: order.id,
           orderNumber: order.order_number,
           vendorAmount: vendorAmount,
-          escrowId: order.id, // Using order ID as escrow reference
+          escrowId: escrow?.id,
         });
 
         this.logEvent('debug', 'vendor_notified', {
@@ -2001,44 +1684,7 @@ export class LiveSalesService {
         }, notifyError instanceof Error ? notifyError : new Error(String(notifyError)));
       }
 
-      // 13. Stock already updated atomically earlier (step 3)
-      // No need to update again here - this prevents race conditions
-
-      // 14. Create transaction record (for live stream analytics)
-      const transactionData = {
-        id: transactionId,
-        stream_id: purchaseDto.stream_id,
-        buyer_id: userId,
-        transaction_type: TransactionType.PRODUCT,
-        product_id: purchaseDto.product_id,
-        quantity: purchaseDto.quantity,
-        unit_price: unitPrice,
-        subtotal: subtotal,
-        platform_fee: platformFee,
-        delivery_fee: deliveryFee,
-        total_amount: totalAmount,
-        status: TransactionStatus.PENDING, // All purchases go through escrow now
-        rider_id: purchaseDto.rider_id || null,
-        delivery_address: purchaseDto.delivery_address || null,
-        order_id: order.id, // Link to order record
-      };
-
-      const { error: transactionError } = await this.supabase
-        .from('live_stream_transactions')
-        .insert(transactionData);
-
-      if (transactionError) {
-        this.logEvent('error', 'transaction_record_failed', {
-          purchaseId,
-          orderId: order.id,
-          transactionType: TransactionType.PRODUCT,
-          amount: totalAmount,
-          error: transactionError.message,
-        });
-        // Continue anyway - transaction already processed
-      }
-
-      // 11. Log analytics
+      // 10. Log analytics and metrics
       await this.logAnalytics(purchaseDto.stream_id, 'product_purchase', totalAmount, {
         buyer_id: userId,
         product_id: purchaseDto.product_id,
@@ -2051,13 +1697,13 @@ export class LiveSalesService {
       const duration = Date.now() - startTime;
       this.performanceMetrics.purchaseCount++;
       this.performanceMetrics.purchaseTotal += totalAmount;
-      this.performanceMetrics.averagePurchaseTime = 
-        (this.performanceMetrics.averagePurchaseTime * (this.performanceMetrics.purchaseCount - 1) + duration) / 
+      this.performanceMetrics.averagePurchaseTime =
+        (this.performanceMetrics.averagePurchaseTime * (this.performanceMetrics.purchaseCount - 1) + duration) /
         this.performanceMetrics.purchaseCount;
 
       this.logPerformance('purchase_product', duration, {
         purchaseId,
-        transactionId,
+        transactionId: liveTransactionId || transactionId,
         userId,
         vendorId: stream.vendor_id,
         productId: liveProduct.product_id,
@@ -2067,7 +1713,7 @@ export class LiveSalesService {
 
       this.logEvent('log', 'purchase_completed', {
         purchaseId,
-        transactionId,
+        transactionId: liveTransactionId || transactionId,
         userId,
         vendorId: stream.vendor_id,
         productId: liveProduct.product_id,
@@ -2079,15 +1725,12 @@ export class LiveSalesService {
         duration,
       });
 
-      // Return transaction details
-      // Note: All purchases go through escrow now, so status is always PENDING
-      // The continue_watching flag is for UX only (allows user to continue watching stream)
       return {
-        id: transactionId,
+        id: liveTransactionId || transactionId,
         stream_id: purchaseDto.stream_id,
         transaction_type: TransactionType.PRODUCT,
         total_amount: totalAmount,
-        status: TransactionStatus.PENDING, // All purchases go through escrow
+        status: TransactionStatus.PENDING,
         product: {
           id: liveProduct.product_id,
           name: liveProduct.product.name,
@@ -2109,6 +1752,18 @@ export class LiveSalesService {
         quantity: purchaseDto.quantity,
         duration,
       }, error instanceof Error ? error : new Error(String(error)));
+
+      if (purchaseDto.reservation_id) {
+        try {
+          await this.cancelReservation(purchaseDto.reservation_id);
+        } catch (cancelError) {
+          this.logEvent('warn', 'reservation_cancel_failed_on_purchase_failure', {
+            purchaseId,
+            userId,
+            reservationId: purchaseDto.reservation_id,
+          }, cancelError instanceof Error ? cancelError : new Error(String(cancelError)));
+        }
+      }
 
       if (error instanceof NotFoundException || error instanceof BadRequestException) {
         throw error;
@@ -2147,27 +1802,47 @@ export class LiveSalesService {
         quantity,
       });
 
-      // 1. Refund money from escrow back to available balance
-      const refundResult = await this.walletService.processWalletTransaction(
-        userId,
-        WalletTransactionType.ESCROW_REFUND, // Moves money from escrow → available
-        amount,
-        `Rollback: ${reason}`,
-        orderId,
-        'order',
+      // 1. Refund and cancel in one atomic transaction
+      const { data: cancelResult, error: cancelRpcError } = await this.supabase.rpc(
+        'cancel_live_purchase_atomic',
+        {
+          p_order_id: orderId,
+          p_user_id: userId,
+          p_amount: amount,
+          p_reason: reason,
+          p_metadata: {
+            cancellation_reason: reason,
+            cancelled_at: new Date().toISOString(),
+            rollback_performed: true,
+          },
+        }
       );
 
-      if (!refundResult.success) {
+      if (cancelRpcError) {
         this.logEvent('error', 'rollback_refund_failed', {
           userId,
           orderId,
           amount,
           reason,
-          error: refundResult.error,
+          error: cancelRpcError.message,
         });
         return {
           success: false,
-          error: `Failed to refund payment: ${refundResult.error}. Manual intervention required.`,
+          error: `Failed to refund payment: ${cancelRpcError.message}. Manual intervention required.`,
+        };
+      }
+
+      if (!cancelResult || !cancelResult.success) {
+        this.logEvent('error', 'rollback_refund_failed', {
+          userId,
+          orderId,
+          amount,
+          reason,
+          error: cancelResult?.error || 'Unknown error',
+        });
+        return {
+          success: false,
+          error: `Failed to refund payment: ${cancelResult?.error || 'Unknown error'}. Manual intervention required.`,
         };
       }
 
@@ -2175,7 +1850,7 @@ export class LiveSalesService {
         userId,
         orderId,
         amount,
-        refundTransactionId: refundResult.transactionId,
+        refundTransactionId: cancelResult.escrow?.refund_transaction_id,
       });
 
       // 2. Restore stock if liveProductId and quantity provided
@@ -2217,41 +1892,12 @@ export class LiveSalesService {
         }
       }
 
-      // 3. Update order status to cancelled
-      const { error: orderUpdateError } = await this.supabase
-        .from('orders')
-        .update({
-          status: 'cancelled',
-          metadata: {
-            cancellation_reason: reason,
-            cancelled_at: new Date().toISOString(),
-            rollback_performed: true,
-          },
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', orderId);
-
-      if (orderUpdateError) {
-        this.logEvent('warn', 'rollback_order_update_failed', {
-          userId,
-          orderId,
-          error: orderUpdateError.message,
-        });
-        // Continue anyway - refund was successful
-      } else {
-        this.logEvent('log', 'rollback_order_cancelled', {
-          userId,
-          orderId,
-        });
-      }
-
       // 4. Log rollback event for audit
       this.logEvent('log', 'rollback_completed', {
         userId,
         orderId,
         amount,
         reason,
-        refundTransactionId: refundResult.transactionId,
         stockRestored: !!(liveProductId && quantity),
       });
 
@@ -2273,6 +1919,431 @@ export class LiveSalesService {
   /**
    * Book a service during live stream
    */
+  async bookService(userId: string, bookingDto: LiveServiceBookingDto): Promise<TransactionResponse> {
+    const startTime = Date.now();
+    const bookingId = `booking_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Input validation
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new BadRequestException('Invalid user ID');
+    }
+
+    if (!bookingDto.stream_id || typeof bookingDto.stream_id !== 'string') {
+      throw new BadRequestException('Invalid stream ID');
+    }
+
+    if (!bookingDto.service_date || typeof bookingDto.service_date !== 'string') {
+      throw new BadRequestException('Invalid service date');
+    }
+
+    if (!bookingDto.service_time || typeof bookingDto.service_time !== 'string') {
+      throw new BadRequestException('Invalid service time');
+    }
+
+    // Validate date format (YYYY-MM-DD)
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(bookingDto.service_date)) {
+      throw new BadRequestException('Service date must be in YYYY-MM-DD format');
+    }
+
+    // Validate time format (HH:MM)
+    const timeRegex = /^\d{2}:\d{2}$/;
+    if (!timeRegex.test(bookingDto.service_time)) {
+      throw new BadRequestException('Service time must be in HH:MM format');
+    }
+
+    // Validate date is not in the past
+    const requestedDateTime = new Date(`${bookingDto.service_date}T${bookingDto.service_time}`);
+    const now = new Date();
+    if (requestedDateTime <= now) {
+      throw new BadRequestException('Service booking must be scheduled for a future date and time');
+    }
+
+    if (bookingDto.service_notes && typeof bookingDto.service_notes !== 'string') {
+      throw new BadRequestException('Service notes must be a string');
+    }
+
+    if (bookingDto.continue_watching !== undefined &&
+        typeof bookingDto.continue_watching !== 'boolean') {
+      throw new BadRequestException('Continue watching must be a boolean');
+    }
+
+    this.logEvent('log', 'service_booking_initiated', {
+      bookingId,
+      userId,
+      streamId: bookingDto.stream_id,
+      serviceDate: bookingDto.service_date,
+      serviceTime: bookingDto.service_time,
+      continueWatching: bookingDto.continue_watching,
+    });
+
+    try {
+      // 1. Get stream details and verify it's live
+      const { data: stream, error: streamError } = await this.supabase
+        .from('live_streams')
+        .select('vendor_id, status, title')
+        .eq('id', bookingDto.stream_id)
+        .single();
+
+      if (streamError || !stream) {
+        throw new NotFoundException('Live stream not found');
+      }
+
+      if (stream.status !== 'live') {
+        throw new BadRequestException('Cannot book services from inactive streams');
+      }
+
+      if (stream.vendor_id === userId) {
+        throw new BadRequestException('Cannot book services from your own stream');
+      }
+
+      // 2. Check for duplicate service booking (idempotency)
+      const duplicateCheckWindowMs = this.configService.get<number>('LIVE_SALES_DUPLICATE_WINDOW_MS') || 30000;
+      const duplicateCheckWindow = new Date(Date.now() - duplicateCheckWindowMs).toISOString();
+      const { data: recentBooking, error: duplicateError } = await this.supabase
+        .from('orders')
+        .select('id, order_number, status, created_at, metadata')
+        .eq('buyer_id', userId)
+        .eq('vendor_id', stream.vendor_id)
+        .eq('source', 'live_stream')
+        .eq('metadata->>booking_type', 'service')
+        .in('status', ['pending', 'paid', 'processing'])
+        .gte('created_at', duplicateCheckWindow)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (duplicateError) {
+        this.logEvent('warn', 'service_duplicate_check_failed', {
+          bookingId,
+          userId,
+          streamId: bookingDto.stream_id,
+          error: duplicateError.message,
+        });
+      }
+
+      if (recentBooking) {
+        const { data: recentOrderItem } = await this.supabase
+          .from('order_items')
+          .select('product_metadata')
+          .eq('order_id', recentBooking.id)
+          .maybeSingle();
+
+        if (recentOrderItem?.product_metadata?.booking_date === bookingDto.service_date &&
+            recentOrderItem.product_metadata.booking_time === bookingDto.service_time) {
+          const timeSinceBooking = Date.now() - new Date(recentBooking.created_at).getTime();
+          this.logEvent('log', 'duplicate_service_booking_detected', {
+            bookingId,
+            userId,
+            streamId: bookingDto.stream_id,
+            serviceDate: bookingDto.service_date,
+            serviceTime: bookingDto.service_time,
+            recentOrderId: recentBooking.id,
+            timeSinceBooking,
+          });
+
+          return {
+            id: recentBooking.metadata?.transaction_id || `dup_${recentBooking.id}`,
+            stream_id: bookingDto.stream_id,
+            transaction_type: TransactionType.SERVICE,
+            total_amount: recentBooking.total_amount,
+            status: TransactionStatus.PENDING,
+            service: {
+              date: bookingDto.service_date,
+              time: bookingDto.service_time,
+              notes: recentOrderItem.product_metadata.special_notes,
+            },
+            created_at: recentBooking.created_at,
+          };
+        }
+      }
+
+      // 3. Get live stream service details
+      const { data: liveService, error: serviceError } = await this.supabase
+        .from('live_stream_services')
+        .select(`
+          id,
+          service_id,
+          live_price,
+          available_slots,
+          booking_window_days,
+          max_advance_days,
+          service:services!service_id (
+            id,
+            name,
+            description,
+            duration_minutes,
+            location_type,
+            vendor_id
+          )
+        `)
+        .eq('stream_id', bookingDto.stream_id)
+        .single();
+
+      if (serviceError || !liveService) {
+        throw new NotFoundException('Service not found in this stream');
+      }
+
+      // 4. Validate booking date and time
+      const requestedDateTime = new Date(`${bookingDto.service_date}T${bookingDto.service_time}`);
+      const now = new Date();
+      const daysDifference = Math.ceil((requestedDateTime.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+
+      if (daysDifference < liveService.booking_window_days) {
+        throw new BadRequestException(`Bookings must be made at least ${liveService.booking_window_days} days in advance`);
+      }
+
+      if (daysDifference > liveService.max_advance_days) {
+        throw new BadRequestException(`Bookings cannot be made more than ${liveService.max_advance_days} days in advance`);
+      }
+
+      // 5. Calculate pricing
+      const servicePrice = liveService.live_price;
+      const platformFeeRate = 0.05;
+      const platformFee = servicePrice * platformFeeRate;
+      const vendorAmount = servicePrice - platformFee;
+
+      this.logEvent('log', 'service_booking_calculation', {
+        bookingId,
+        userId,
+        servicePrice,
+        platformFee,
+        vendorAmount,
+        totalAmount: servicePrice,
+      });
+
+      // 6. Wallet balance pre-check
+      const { data: customerWallet, error: walletError } = await this.supabase
+        .from('wallets')
+        .select('id, available_balance')
+        .eq('user_id', userId)
+        .single();
+
+      if (walletError || !customerWallet) {
+        throw new NotFoundException('Customer wallet not found');
+      }
+
+      if (customerWallet.available_balance < servicePrice) {
+        throw new BadRequestException('Insufficient wallet balance for service booking');
+      }
+
+      const transactionId = `live_svc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const orderNumber = `SVC-${Date.now()}-${Math.random().toString(36).substring(7).toUpperCase()}`;
+
+      const pOrder = {
+        order_number: orderNumber,
+        buyer_id: userId,
+        vendor_id: stream.vendor_id,
+        total_amount: servicePrice,
+        delivery_fee: 0,
+        platform_fee: platformFee,
+        status: 'pending',
+        escrow_enabled: true,
+        source: 'live_stream',
+        delivery_type: 'service',
+        rider_id: null,
+        delivery_address: null,
+        metadata: {
+          stream_id: bookingDto.stream_id,
+          booking_type: 'service',
+          service_id: liveService.service_id,
+          service_name: liveService.service.name,
+          booking_date: bookingDto.service_date,
+          booking_time: bookingDto.service_time,
+          duration_minutes: liveService.service.duration_minutes,
+          location_type: liveService.service.location_type,
+          transaction_id: transactionId,
+          special_notes: bookingDto.service_notes,
+        },
+      };
+
+      const pItems = [
+        {
+          service_id: liveService.service_id,
+          product_name: liveService.service.name,
+          quantity: 1,
+          unit_price: servicePrice,
+          total_price: servicePrice,
+          scheduled_date: bookingDto.service_date,
+          scheduled_time: bookingDto.service_time,
+          service_notes: bookingDto.service_notes || null,
+          product_metadata: {
+            description: liveService.service.description,
+            duration_minutes: liveService.service.duration_minutes,
+            location_type: liveService.service.location_type,
+            special_notes: bookingDto.service_notes,
+          },
+        },
+      ];
+
+      const pEscrow = {
+        total_amount: servicePrice,
+        vendor_amount: vendorAmount,
+        rider_amount: 0,
+        platform_amount: platformFee,
+      };
+
+      const pSlot = {
+        date: bookingDto.service_date,
+        time: bookingDto.service_time,
+      };
+
+      const pLiveTransaction = {
+        id: transactionId,
+        stream_id: bookingDto.stream_id,
+        buyer_id: userId,
+        vendor_id: stream.vendor_id,
+        transaction_type: 'service',
+        service_id: liveService.service_id,
+        service_date: bookingDto.service_date,
+        service_time: bookingDto.service_time,
+        service_notes: bookingDto.service_notes || null,
+        total_amount: servicePrice,
+        platform_fee: platformFee,
+        rider_fee: 0,
+        status: 'pending',
+        rider_id: null,
+        delivery_address: null,
+        continue_watching: false,
+        order_id: null,
+      };
+
+      const pGiftCard = bookingDto.giftCard
+        ? {
+            card_number: bookingDto.giftCard.cardNumber,
+            pin: bookingDto.giftCard.pin,
+            requested_amount: bookingDto.giftCard.amount ?? null,
+          }
+        : null;
+
+      const { data: rpcResult, error: rpcError } = await this.supabase.rpc(
+        'create_live_service_booking_atomic',
+        {
+          p_buyer_id: userId,
+          p_order: pOrder,
+          p_items: pItems,
+          p_escrow: pEscrow,
+          p_live_service_id: liveService.id,
+          p_slot: pSlot,
+          p_live_transaction: pLiveTransaction,
+          p_gift_card: pGiftCard,
+          p_rewards_amount: 0,
+          p_admin_gift_user_id: this.configService.get<string>('PLATFORM_GIFT_WALLET_USER_ID', '00000000-0000-4000-8000-000000000003'),
+          p_user_ip: null,
+        },
+      );
+
+      if (rpcError) {
+        this.logEvent('error', 'service_booking_rpc_error', {
+          bookingId,
+          userId,
+          streamId: bookingDto.stream_id,
+          serviceId: liveService.service_id,
+          error: rpcError.message,
+        });
+        throw new BadRequestException(`Service booking failed: ${rpcError.message}`);
+      }
+
+      if (!rpcResult || !rpcResult.success) {
+        this.logEvent('error', 'service_booking_rpc_failed', {
+          bookingId,
+          userId,
+          streamId: bookingDto.stream_id,
+          serviceId: liveService.service_id,
+          error: rpcResult?.error || 'Unknown error',
+        });
+        throw new BadRequestException(`Service booking failed: ${rpcResult?.error || 'Unknown error'}`);
+      }
+
+      const order = { ...pOrder, ...rpcResult.order };
+
+      // 7. Post-success side effects
+      try {
+        await this.notificationHelper.notifyVendorNewOrder(stream.vendor_id, {
+          id: order.id,
+          orderNumber: order.order_number,
+          totalAmount: servicePrice,
+          itemCount: 1,
+          buyerName: 'Service Customer',
+        });
+
+        await this.notificationHelper.notifyVendorOrderPaid(stream.vendor_id, {
+          orderId: order.id,
+          orderNumber: order.order_number,
+          vendorAmount,
+          escrowId: rpcResult.escrow?.id || order.id,
+        });
+      } catch (notifyError) {
+        this.logEvent('warn', 'vendor_notification_failed_service', {
+          vendorId: stream.vendor_id,
+          orderId: order.id,
+        }, notifyError instanceof Error ? notifyError : new Error(String(notifyError)));
+      }
+
+      // 8. Log analytics
+      await this.logAnalytics(bookingDto.stream_id, 'service_booking', servicePrice, {
+        customer_id: userId,
+        service_id: liveService.service_id,
+        booking_date: bookingDto.service_date,
+        booking_time: bookingDto.service_time,
+        service_price: servicePrice,
+        booking_type: bookingDto.continue_watching ? 'instant' : 'checkout',
+      });
+
+      const duration = Date.now() - startTime;
+      this.logPerformance('book_service', duration, {
+        bookingId,
+        transactionId,
+        userId,
+        vendorId: stream.vendor_id,
+        serviceId: liveService.service_id,
+        amount: servicePrice,
+      });
+
+      this.logEvent('log', 'service_booking_completed', {
+        bookingId,
+        transactionId,
+        userId,
+        vendorId: stream.vendor_id,
+        serviceId: liveService.service_id,
+        serviceName: liveService.service.name,
+        bookingDate: bookingDto.service_date,
+        bookingTime: bookingDto.service_time,
+        amount: servicePrice,
+        orderId: order.id,
+        orderNumber: order.order_number,
+        duration,
+      });
+
+      return {
+        id: rpcResult.live_transaction.id,
+        stream_id: bookingDto.stream_id,
+        transaction_type: TransactionType.SERVICE,
+        total_amount: servicePrice,
+        status: TransactionStatus.ESCROW,
+        service: {
+          date: bookingDto.service_date,
+          time: bookingDto.service_time,
+          notes: bookingDto.service_notes,
+        },
+        created_at: new Date().toISOString(),
+      };
+
+    } catch (error) {
+      this.logEvent('error', 'service_booking_exception', {
+        streamId: bookingDto.stream_id,
+        userId,
+        serviceDate: bookingDto.service_date,
+        serviceTime: bookingDto.service_time,
+      }, error instanceof Error ? error : new Error(String(error)));
+      if (error instanceof NotFoundException || error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to process service booking');
+    }
+  }
+
+  /* ==== OLD CODE — pre-ACID service booking, kept for reference; not executed ====
   async bookService(userId: string, bookingDto: LiveServiceBookingDto): Promise<TransactionResponse> {
     const startTime = Date.now();
     const bookingId = `booking_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -2631,32 +2702,131 @@ export class LiveSalesService {
         });
       }
 
-      // 10. Deduct from customer wallet (move to escrow)
-      const deductResult = await this.walletService.processWalletTransaction(
-        userId,
-        WalletTransactionType.PURCHASE_HOLD, // ✅ FIX: Use valid transaction type (moves money to escrow)
-        servicePrice,
-        `Service booking: ${liveService.service.name} on ${bookingDto.service_date} ${bookingDto.service_time}`,
-        order.id,
-        'order',
-      );
+      // 9.5. Apply gift card if provided - reduces the wallet portion that needs to be held.
+      let giftCardAppliedAmount = 0;
+      let giftCardTransactionId: string | null = null;
+      if (bookingDto.giftCard) {
+        try {
+          const giftCardResult = await this.giftCardService.applyToCheckout(
+            bookingDto.giftCard.cardNumber,
+            bookingDto.giftCard.pin,
+            servicePrice,
+            userId,
+            bookingDto.giftCard.amount,
+          );
+          giftCardAppliedAmount = giftCardResult.appliedAmount;
+          giftCardTransactionId = giftCardResult.transactionId;
+        } catch (giftCardError: any) {
+          this.logEvent('error', 'service_booking_gift_card_failed', {
+            bookingId,
+            orderId: order.id,
+            userId,
+            error: giftCardError?.message,
+          });
 
-      if (!deductResult.success) {
-        this.logEvent('error', 'service_booking_wallet_deduction_failed', {
-          bookingId,
-          orderId: order.id,
-          userId,
-          amount: servicePrice,
-          error: deductResult.error,
-        });
-        throw new BadRequestException(`Failed to process booking payment: ${deductResult.error}`);
+          // Rollback: nothing has been charged to the wallet yet - just clean up the order.
+          try {
+            await this.supabase.from('order_items').delete().eq('order_id', order.id);
+            await this.supabase.from('orders').delete().eq('id', order.id);
+          } catch (rollbackError) {
+            this.logEvent('error', 'service_gift_card_failure_rollback_exception', {
+              bookingId,
+              orderId: order.id,
+            }, rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)));
+          }
+
+          throw new BadRequestException(giftCardError?.message || 'Failed to apply gift card');
+        }
+      }
+
+      const walletPortion = Math.max(0, servicePrice - giftCardAppliedAmount);
+      const paymentSource = giftCardAppliedAmount > 0
+        ? (walletPortion > 0 ? 'mixed' : 'gift_card')
+        : 'wallet';
+
+      // 10. Deduct from customer wallet (move to escrow) - only for whatever the gift
+      // card didn't cover.
+      if (walletPortion > 0) {
+        const { data: holdResult, error: holdRpcError } = await this.supabase.rpc(
+          'complete_purchase_hold_atomic',
+          {
+            p_order_id: order.id,
+            p_buyer_id: userId,
+            p_amount: walletPortion,
+            p_description: `Service booking: ${liveService.service.name} on ${bookingDto.service_date} ${bookingDto.service_time}`,
+          }
+        );
+
+        if (holdRpcError) {
+          this.logEvent('error', 'service_booking_hold_rpc_error', {
+            bookingId,
+            orderId: order.id,
+            userId,
+            amount: walletPortion,
+            error: holdRpcError.message,
+          });
+
+          if (giftCardTransactionId) {
+            await this.giftCardService.revertGiftCardApplication(
+              giftCardTransactionId,
+              'Wallet payment failed for service booking'
+            );
+          }
+
+          throw new BadRequestException(`Failed to process booking payment: ${holdRpcError.message}`);
+        }
+
+        if (!holdResult || !holdResult.success) {
+          this.logEvent('error', 'service_booking_wallet_deduction_failed', {
+            bookingId,
+            orderId: order.id,
+            userId,
+            amount: walletPortion,
+            error: holdResult?.error || 'Unknown error',
+          });
+
+          if (giftCardTransactionId) {
+            await this.giftCardService.revertGiftCardApplication(
+              giftCardTransactionId,
+              'Wallet payment failed for service booking'
+            );
+          }
+
+          throw new BadRequestException(`Failed to process booking payment: ${holdResult?.error || 'Unknown error'}`);
+        }
       }
 
       this.logEvent('log', 'customer_wallet_deducted_service', {
         bookingId,
         userId,
-        amount: servicePrice,
+        amount: walletPortion,
       });
+
+      // Record gift card usage on the order for accounting/refund purposes
+      if (giftCardAppliedAmount > 0) {
+        try {
+          await this.supabase
+            .from('orders')
+            .update({
+              gift_card_applied_amount: giftCardAppliedAmount,
+              gift_card_transaction_id: giftCardTransactionId,
+              payment_source: paymentSource,
+            })
+            .eq('id', order.id);
+
+          if (giftCardTransactionId) {
+            await this.supabase
+              .from('gift_card_transactions')
+              .update({ order_id: order.id })
+              .eq('id', giftCardTransactionId);
+          }
+        } catch (linkError) {
+          this.logEvent('warn', 'service_gift_card_order_link_failed', {
+            bookingId,
+            orderId: order.id,
+          }, linkError instanceof Error ? linkError : new Error(String(linkError)));
+        }
+      }
 
       // 11. Create escrow for buyer protection
       try {
@@ -2665,6 +2835,8 @@ export class LiveSalesService {
           vendorAmount: vendorAmount,
           riderAmount: 0, // Services don't have delivery
           platformAmount: platformFee,
+          paymentSource,
+          giftCardAmount: giftCardAppliedAmount,
         };
 
         await this.escrowService.createEscrow(order.id, escrowBreakdown);
@@ -2688,32 +2860,38 @@ export class LiveSalesService {
         }, escrowError instanceof Error ? escrowError : new Error(String(escrowError)));
         
         // Rollback transaction: refund money from escrow back to available balance
-        // Note: Services don't have stock to restore, only wallet refund
+        // Note: Services don't have stock to restore, only wallet refund + gift card revert.
         const rollbackReason = `Escrow creation failed: ${escrowError instanceof Error ? escrowError.message : 'Unknown error'}`;
-        const rollbackResult = await this.rollbackPurchaseTransaction(
-          userId,
-          order.id,
-          servicePrice,
-          rollbackReason,
-          // No liveProductId or quantity for services
-        );
+        const rollbackResult = walletPortion > 0
+          ? await this.rollbackPurchaseTransaction(
+              userId,
+              order.id,
+              walletPortion,
+              rollbackReason,
+              // No liveProductId or quantity for services
+            )
+          : { success: true };
+
+        if (giftCardTransactionId) {
+          await this.giftCardService.revertGiftCardApplication(giftCardTransactionId, rollbackReason);
+        }
 
         if (!rollbackResult.success) {
           // Rollback itself failed - this is a critical state requiring manual intervention
           this.logEvent('error', 'service_rollback_failed_after_escrow_failure', {
             userId,
             orderId: order.id,
-            rollbackError: rollbackResult.error,
+            rollbackError: (rollbackResult as any).error,
           });
           throw new HttpException(
-            `Payment processed but escrow creation failed. Rollback also failed: ${rollbackResult.error}. Manual intervention required. Order ID: ${order.id}`,
+            `Payment processed but escrow creation failed. Rollback also failed: ${(rollbackResult as any).error}. Manual intervention required. Order ID: ${order.id}`,
             HttpStatus.INTERNAL_SERVER_ERROR
           );
         }
 
         // Rollback successful - throw error to inform user
         throw new BadRequestException(
-          'Payment was processed but escrow creation failed. Payment has been refunded to your wallet. Please try again.'
+          'Payment was processed but escrow creation failed. Payment has been refunded. Please try again.'
         );
       }
 
@@ -2956,6 +3134,7 @@ export class LiveSalesService {
       throw new BadRequestException('Failed to process service booking');
     }
   }
+  ==== OLD CODE END ==== */
 
   /**
    * Get gift types available for sending
@@ -4524,6 +4703,441 @@ export class LiveSalesService {
       service_date: string;
       service_time: string;
       service_notes?: string;
+      giftCard?: { cardNumber: string; pin: string; amount?: number };
+    },
+  ): Promise<TransactionResponse> {
+    const startTime = Date.now();
+    const bookingId = `portfolio_booking_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Input validation
+    if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+      throw new BadRequestException('Invalid user ID');
+    }
+
+    if (!bookingDto.stream_id || typeof bookingDto.stream_id !== 'string') {
+      throw new BadRequestException('Invalid stream ID');
+    }
+
+    if (!bookingDto.portfolio_id || typeof bookingDto.portfolio_id !== 'string') {
+      throw new BadRequestException('Invalid portfolio ID');
+    }
+
+    if (!bookingDto.service_date || typeof bookingDto.service_date !== 'string') {
+      throw new BadRequestException('Invalid service date');
+    }
+
+    if (!bookingDto.service_time || typeof bookingDto.service_time !== 'string') {
+      throw new BadRequestException('Invalid service time');
+    }
+
+    // Validate date format (YYYY-MM-DD)
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(bookingDto.service_date)) {
+      throw new BadRequestException('Service date must be in YYYY-MM-DD format');
+    }
+
+    // Validate time format (HH:MM)
+    const timeRegex = /^\d{2}:\d{2}$/;
+    if (!timeRegex.test(bookingDto.service_time)) {
+      throw new BadRequestException('Service time must be in HH:MM format');
+    }
+
+    // Validate date is not in the past
+    const requestedDateTime = new Date(`${bookingDto.service_date}T${bookingDto.service_time}`);
+    const now = new Date();
+    if (requestedDateTime <= now) {
+      throw new BadRequestException('Service booking must be scheduled for a future date and time');
+    }
+
+    if (bookingDto.service_notes && typeof bookingDto.service_notes !== 'string') {
+      throw new BadRequestException('Service notes must be a string');
+    }
+
+    this.logEvent('log', 'portfolio_booking_initiated', {
+      bookingId,
+      userId,
+      streamId: bookingDto.stream_id,
+      portfolioId: bookingDto.portfolio_id,
+      serviceDate: bookingDto.service_date,
+      serviceTime: bookingDto.service_time,
+    });
+
+    try {
+      // 1. Get stream details and verify it's live
+      const { data: stream, error: streamError } = await this.supabase
+        .from('live_streams')
+        .select('vendor_id, status, title')
+        .eq('id', bookingDto.stream_id)
+        .single();
+
+      if (streamError || !stream) {
+        throw new NotFoundException('Live stream not found');
+      }
+
+      if (stream.status !== 'live') {
+        throw new BadRequestException('Cannot book portfolio services from inactive streams');
+      }
+
+      if (stream.vendor_id === userId) {
+        throw new BadRequestException('Cannot book portfolio services from your own stream');
+      }
+
+      // 2. Get portfolio service details
+      const { data: portfolioService, error: portfolioError } = await this.supabase
+        .from('live_portfolio_services')
+        .select(`
+          id,
+          stream_id,
+          title,
+          description,
+          price,
+          category
+        `)
+        .eq('id', bookingDto.portfolio_id)
+        .eq('stream_id', bookingDto.stream_id)
+        .eq('is_active', true)
+        .is('deleted_at', null)
+        .single();
+
+      if (portfolioError || !portfolioService) {
+        throw new NotFoundException('Portfolio service not found in this stream');
+      }
+
+      // 3. Check for duplicate booking (idempotency)
+      const duplicateCheckWindowMs = this.configService.get<number>('LIVE_SALES_DUPLICATE_WINDOW_MS') || 30000;
+      const duplicateCheckWindow = new Date(Date.now() - duplicateCheckWindowMs).toISOString();
+      const { data: recentBooking, error: duplicateError } = await this.supabase
+        .from('orders')
+        .select('id, order_number, status, created_at, metadata')
+        .eq('buyer_id', userId)
+        .eq('vendor_id', stream.vendor_id)
+        .eq('source', 'live_stream')
+        .eq('metadata->>booking_type', 'portfolio')
+        .in('status', ['pending', 'paid', 'processing'])
+        .gte('created_at', duplicateCheckWindow)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (duplicateError) {
+        this.logEvent('warn', 'portfolio_duplicate_check_failed', {
+          bookingId,
+          userId,
+          streamId: bookingDto.stream_id,
+          error: duplicateError.message,
+        });
+      }
+
+      if (recentBooking) {
+        const recentMetadata = recentBooking.metadata as any;
+        if (recentMetadata?.portfolio_id === bookingDto.portfolio_id &&
+            recentMetadata?.booking_date === bookingDto.service_date &&
+            recentMetadata?.booking_time === bookingDto.service_time) {
+          const timeSinceBooking = Date.now() - new Date(recentBooking.created_at).getTime();
+          this.logEvent('log', 'duplicate_portfolio_booking_detected', {
+            bookingId,
+            userId,
+            streamId: bookingDto.stream_id,
+            portfolioId: bookingDto.portfolio_id,
+            recentOrderId: recentBooking.id,
+            timeSinceBooking,
+          });
+
+          return {
+            id: recentBooking.metadata?.transaction_id || `dup_${recentBooking.id}`,
+            stream_id: bookingDto.stream_id,
+            transaction_type: TransactionType.SERVICE,
+            total_amount: recentBooking.total_amount,
+            status: TransactionStatus.PENDING,
+            service: {
+              date: bookingDto.service_date,
+              time: bookingDto.service_time,
+              notes: recentMetadata?.service_notes,
+            },
+            created_at: recentBooking.created_at,
+          };
+        }
+      }
+
+      // 4. Calculate pricing
+      const servicePrice = parseFloat(portfolioService.price) || 0;
+      if (servicePrice <= 0) {
+        throw new BadRequestException('Portfolio service price must be greater than zero');
+      }
+
+      const platformFeeRate = 0.05;
+      const platformFee = servicePrice * platformFeeRate;
+      const vendorAmount = servicePrice - platformFee;
+
+      this.logEvent('log', 'portfolio_booking_calculation', {
+        bookingId,
+        userId,
+        servicePrice,
+        platformFee,
+        vendorAmount,
+        totalAmount: servicePrice,
+      });
+
+      // 5. Wallet balance pre-check
+      const { data: customerWallet, error: walletError } = await this.supabase
+        .from('wallets')
+        .select('id, available_balance')
+        .eq('user_id', userId)
+        .single();
+
+      if (walletError || !customerWallet) {
+        throw new NotFoundException('Customer wallet not found');
+      }
+
+      if (customerWallet.available_balance < servicePrice) {
+        throw new BadRequestException('Insufficient wallet balance for portfolio service booking');
+      }
+
+      const transactionId = `portfolio_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const orderNumber = `PORT-${Date.now()}-${Math.random().toString(36).substring(7).toUpperCase()}`;
+
+      const pOrder = {
+        order_number: orderNumber,
+        buyer_id: userId,
+        vendor_id: stream.vendor_id,
+        total_amount: servicePrice,
+        delivery_fee: 0,
+        platform_fee: platformFee,
+        status: 'pending',
+        escrow_enabled: true,
+        source: 'live_stream',
+        delivery_type: 'service',
+        rider_id: null,
+        delivery_address: null,
+        metadata: {
+          stream_id: bookingDto.stream_id,
+          booking_type: 'portfolio',
+          portfolio_id: bookingDto.portfolio_id,
+          portfolio_title: portfolioService.title,
+          booking_date: bookingDto.service_date,
+          booking_time: bookingDto.service_time,
+          transaction_id: transactionId,
+          service_notes: bookingDto.service_notes,
+        },
+      };
+
+      const pItems = [
+        {
+          service_id: null,
+          product_name: portfolioService.title,
+          quantity: 1,
+          unit_price: servicePrice,
+          total_price: servicePrice,
+          scheduled_date: bookingDto.service_date,
+          scheduled_time: bookingDto.service_time,
+          service_notes: bookingDto.service_notes || null,
+          product_metadata: {
+            portfolio_id: bookingDto.portfolio_id,
+            portfolio_title: portfolioService.title,
+            portfolio_category: portfolioService.category,
+            booking_date: bookingDto.service_date,
+            booking_time: bookingDto.service_time,
+            description: portfolioService.description,
+            special_notes: bookingDto.service_notes,
+          },
+        },
+      ];
+
+      const pEscrow = {
+        total_amount: servicePrice,
+        vendor_amount: vendorAmount,
+        rider_amount: 0,
+        platform_amount: platformFee,
+      };
+
+      const pSlot = {
+        date: bookingDto.service_date,
+        time: bookingDto.service_time,
+      };
+
+      const pLiveTransaction = {
+        id: transactionId,
+        stream_id: bookingDto.stream_id,
+        buyer_id: userId,
+        vendor_id: stream.vendor_id,
+        transaction_type: 'service',
+        service_id: portfolioService.id,
+        service_date: bookingDto.service_date,
+        service_time: bookingDto.service_time,
+        service_notes: bookingDto.service_notes || null,
+        total_amount: servicePrice,
+        platform_fee: platformFee,
+        rider_fee: 0,
+        status: 'pending',
+        rider_id: null,
+        delivery_address: null,
+        continue_watching: false,
+        order_id: null,
+      };
+
+      const pGiftCard = bookingDto.giftCard
+        ? {
+            card_number: bookingDto.giftCard.cardNumber,
+            pin: bookingDto.giftCard.pin,
+            requested_amount: bookingDto.giftCard.amount ?? null,
+          }
+        : null;
+
+      const { data: rpcResult, error: rpcError } = await this.supabase.rpc(
+        'create_live_service_booking_atomic',
+        {
+          p_buyer_id: userId,
+          p_order: pOrder,
+          p_items: pItems,
+          p_escrow: pEscrow,
+          p_live_service_id: portfolioService.id,
+          p_slot: pSlot,
+          p_live_transaction: pLiveTransaction,
+          p_gift_card: pGiftCard,
+          p_rewards_amount: 0,
+          p_admin_gift_user_id: this.configService.get<string>('PLATFORM_GIFT_WALLET_USER_ID', '00000000-0000-4000-8000-000000000003'),
+          p_user_ip: null,
+        },
+      );
+
+      if (rpcError) {
+        this.logEvent('error', 'portfolio_booking_rpc_error', {
+          bookingId,
+          userId,
+          streamId: bookingDto.stream_id,
+          portfolioId: bookingDto.portfolio_id,
+          error: rpcError.message,
+        });
+        throw new BadRequestException(`Portfolio booking failed: ${rpcError.message}`);
+      }
+
+      if (!rpcResult || !rpcResult.success) {
+        this.logEvent('error', 'portfolio_booking_rpc_failed', {
+          bookingId,
+          userId,
+          streamId: bookingDto.stream_id,
+          portfolioId: bookingDto.portfolio_id,
+          error: rpcResult?.error || 'Unknown error',
+        });
+        throw new BadRequestException(`Portfolio booking failed: ${rpcResult?.error || 'Unknown error'}`);
+      }
+
+      const order = { ...pOrder, ...rpcResult.order };
+
+      // 6. Post-success side effects
+      try {
+        await this.notificationHelper.notifyVendorNewOrder(stream.vendor_id, {
+          id: order.id,
+          orderNumber: order.order_number,
+          totalAmount: servicePrice,
+          itemCount: 1,
+          buyerName: 'Portfolio Customer',
+        });
+      } catch (notifyError) {
+        this.logEvent('warn', 'portfolio_vendor_notification_failed', {
+          vendorId: stream.vendor_id,
+          orderId: order.id,
+        }, notifyError instanceof Error ? notifyError : new Error(String(notifyError)));
+      }
+
+      // Send PIN notifications
+      try {
+        const { data: vendorProfile } = await this.supabase
+          .from('user_profiles')
+          .select('username, display_name')
+          .eq('id', stream.vendor_id)
+          .single();
+
+        const { data: buyerProfile } = await this.supabase
+          .from('user_profiles')
+          .select('username, display_name')
+          .eq('id', userId)
+          .single();
+
+        await this.notificationHelper.notifyVendorSelfPickupPin(stream.vendor_id, {
+          id: order.id,
+          orderNumber: order.order_number,
+          deliveryPin: order.delivery_pin,
+          buyerName: buyerProfile?.username || buyerProfile?.display_name || 'Portfolio Customer',
+        });
+
+        await this.notificationHelper.notifyBuyerSelfPickupPin(userId, {
+          id: order.id,
+          orderNumber: order.order_number,
+          deliveryPin: order.delivery_pin,
+          vendorName: vendorProfile?.username || vendorProfile?.display_name,
+        });
+      } catch (pinNotifyError) {
+        this.logEvent('warn', 'portfolio_pin_notification_failed', {
+          orderId: order.id,
+          error: pinNotifyError instanceof Error ? pinNotifyError.message : String(pinNotifyError),
+        });
+      }
+
+      // 7. Log analytics
+      await this.logAnalytics(bookingDto.stream_id, 'portfolio_booking', servicePrice, {
+        customer_id: userId,
+        portfolio_id: bookingDto.portfolio_id,
+        booking_date: bookingDto.service_date,
+        booking_time: bookingDto.service_time,
+        service_price: servicePrice,
+      });
+
+      const duration = Date.now() - startTime;
+      this.logEvent('log', 'portfolio_booking_completed', {
+        bookingId,
+        transactionId,
+        userId,
+        vendorId: stream.vendor_id,
+        portfolioId: bookingDto.portfolio_id,
+        portfolioTitle: portfolioService.title,
+        bookingDate: bookingDto.service_date,
+        bookingTime: bookingDto.service_time,
+        amount: servicePrice,
+        orderId: order.id,
+        orderNumber: order.order_number,
+        duration,
+      });
+
+      return {
+        id: rpcResult.live_transaction.id,
+        stream_id: bookingDto.stream_id,
+        transaction_type: TransactionType.SERVICE,
+        total_amount: servicePrice,
+        status: TransactionStatus.ESCROW,
+        service: {
+          date: bookingDto.service_date,
+          time: bookingDto.service_time,
+          notes: bookingDto.service_notes,
+        },
+        created_at: new Date().toISOString(),
+      };
+
+    } catch (error) {
+      this.logEvent('error', 'portfolio_booking_exception', {
+        streamId: bookingDto.stream_id,
+        userId,
+        portfolioId: bookingDto.portfolio_id,
+        serviceDate: bookingDto.service_date,
+        serviceTime: bookingDto.service_time,
+      }, error instanceof Error ? error : new Error(String(error)));
+      if (error instanceof NotFoundException || error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to process portfolio service booking');
+    }
+  }
+
+  /* ==== OLD CODE — pre-ACID portfolio booking, kept for reference; not executed ====
+  async bookPortfolioService(
+    userId: string,
+    bookingDto: {
+      stream_id: string;
+      portfolio_id: string;
+      service_date: string;
+      service_time: string;
+      service_notes?: string;
+      giftCard?: { cardNumber: string; pin: string; amount?: number };
     },
   ): Promise<TransactionResponse> {
     const startTime = Date.now();
@@ -4834,25 +5448,123 @@ export class LiveSalesService {
         throw new BadRequestException('Failed to create order item. Please try again.');
       }
 
-      // 10. Deduct from customer wallet (move to escrow)
-      const deductResult = await this.walletService.processWalletTransaction(
-        userId,
-        WalletTransactionType.PURCHASE_HOLD,
-        servicePrice,
-        `Portfolio booking: ${portfolioService.title} on ${bookingDto.service_date} ${bookingDto.service_time}`,
-        order.id,
-        'order',
-      );
+      // 9.5. Apply gift card if provided - reduces the wallet portion that needs to be held.
+      let giftCardAppliedAmount = 0;
+      let giftCardTransactionId: string | null = null;
+      if (bookingDto.giftCard) {
+        try {
+          const giftCardResult = await this.giftCardService.applyToCheckout(
+            bookingDto.giftCard.cardNumber,
+            bookingDto.giftCard.pin,
+            servicePrice,
+            userId,
+            bookingDto.giftCard.amount,
+          );
+          giftCardAppliedAmount = giftCardResult.appliedAmount;
+          giftCardTransactionId = giftCardResult.transactionId;
+        } catch (giftCardError: any) {
+          this.logEvent('error', 'portfolio_booking_gift_card_failed', {
+            bookingId,
+            orderId: order.id,
+            userId,
+            error: giftCardError?.message,
+          });
 
-      if (!deductResult.success) {
-        this.logEvent('error', 'portfolio_booking_wallet_deduction_failed', {
-          bookingId,
-          orderId: order.id,
-          userId,
-          amount: servicePrice,
-          error: deductResult.error,
-        });
-        throw new BadRequestException(`Failed to process booking payment: ${deductResult.error}`);
+          try {
+            await this.supabase.from('order_items').delete().eq('order_id', order.id);
+            await this.supabase.from('orders').delete().eq('id', order.id);
+          } catch (rollbackError) {
+            this.logEvent('error', 'portfolio_gift_card_failure_rollback_exception', {
+              bookingId,
+              orderId: order.id,
+            }, rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)));
+          }
+
+          throw new BadRequestException(giftCardError?.message || 'Failed to apply gift card');
+        }
+      }
+
+      const walletPortion = Math.max(0, servicePrice - giftCardAppliedAmount);
+      const paymentSource = giftCardAppliedAmount > 0
+        ? (walletPortion > 0 ? 'mixed' : 'gift_card')
+        : 'wallet';
+
+      // 10. Deduct from customer wallet (move to escrow) - only for whatever the gift
+      // card didn't cover.
+      if (walletPortion > 0) {
+        const { data: holdResult, error: holdRpcError } = await this.supabase.rpc(
+          'complete_purchase_hold_atomic',
+          {
+            p_order_id: order.id,
+            p_buyer_id: userId,
+            p_amount: walletPortion,
+            p_description: `Portfolio booking: ${portfolioService.title} on ${bookingDto.service_date} ${bookingDto.service_time}`,
+          }
+        );
+
+        if (holdRpcError) {
+          this.logEvent('error', 'portfolio_booking_hold_rpc_error', {
+            bookingId,
+            orderId: order.id,
+            userId,
+            amount: walletPortion,
+            error: holdRpcError.message,
+          });
+
+          if (giftCardTransactionId) {
+            await this.giftCardService.revertGiftCardApplication(
+              giftCardTransactionId,
+              'Wallet payment failed for portfolio booking'
+            );
+          }
+
+          throw new BadRequestException(`Failed to process booking payment: ${holdRpcError.message}`);
+        }
+
+        if (!holdResult || !holdResult.success) {
+          this.logEvent('error', 'portfolio_booking_wallet_deduction_failed', {
+            bookingId,
+            orderId: order.id,
+            userId,
+            amount: walletPortion,
+            error: holdResult?.error || 'Unknown error',
+          });
+
+          if (giftCardTransactionId) {
+            await this.giftCardService.revertGiftCardApplication(
+              giftCardTransactionId,
+              'Wallet payment failed for portfolio booking'
+            );
+          }
+
+          throw new BadRequestException(`Failed to process booking payment: ${holdResult?.error || 'Unknown error'}`);
+        }
+      }
+
+      // Record gift card usage on the order for accounting/refund purposes
+      if (giftCardAppliedAmount > 0) {
+        try {
+          await this.supabase
+            .from('orders')
+            .update({
+              gift_card_applied_amount: giftCardAppliedAmount,
+              gift_card_transaction_id: giftCardTransactionId,
+              payment_source: paymentSource,
+            })
+            .eq('id', order.id);
+
+          if (giftCardTransactionId) {
+            await this.supabase
+              .from('gift_card_transactions')
+              .update({ order_id: order.id })
+              .eq('id', giftCardTransactionId);
+          }
+        } catch (linkError) {
+          this.logEvent('warn', 'portfolio_gift_card_order_link_failed', {
+            bookingId,
+            orderId: order.id,
+          }, linkError instanceof Error ? linkError : new Error(String(linkError)));
+        }
       }
 
       // 11. Create escrow for buyer protection
@@ -4862,6 +5574,8 @@ export class LiveSalesService {
           vendorAmount: vendorAmount,
           riderAmount: 0, // Portfolio services don't have delivery
           platformAmount: platformFee,
+          paymentSource,
+          giftCardAmount: giftCardAppliedAmount,
         };
 
         await this.escrowService.createEscrow(order.id, escrowBreakdown);
@@ -4954,27 +5668,33 @@ export class LiveSalesService {
         
         // Rollback transaction
         const rollbackReason = `Escrow creation failed: ${escrowError instanceof Error ? escrowError.message : 'Unknown error'}`;
-        const rollbackResult = await this.rollbackPurchaseTransaction(
-          userId,
-          order.id,
-          servicePrice,
-          rollbackReason,
-        );
+        const rollbackResult = walletPortion > 0
+          ? await this.rollbackPurchaseTransaction(
+              userId,
+              order.id,
+              walletPortion,
+              rollbackReason,
+            )
+          : { success: true };
+
+        if (giftCardTransactionId) {
+          await this.giftCardService.revertGiftCardApplication(giftCardTransactionId, rollbackReason);
+        }
 
         if (!rollbackResult.success) {
           this.logEvent('error', 'portfolio_rollback_failed_after_escrow_failure', {
             userId,
             orderId: order.id,
-            rollbackError: rollbackResult.error,
+            rollbackError: (rollbackResult as any).error,
           });
           throw new HttpException(
-            `Payment processed but escrow creation failed. Rollback also failed: ${rollbackResult.error}. Manual intervention required. Order ID: ${order.id}`,
+            `Payment processed but escrow creation failed. Rollback also failed: ${(rollbackResult as any).error}. Manual intervention required. Order ID: ${order.id}`,
             HttpStatus.INTERNAL_SERVER_ERROR
           );
         }
 
         throw new BadRequestException(
-          'Payment was processed but escrow creation failed. Payment has been refunded to your wallet. Please try again.'
+          'Payment was processed but escrow creation failed. Payment has been refunded. Please try again.'
         );
       }
 
@@ -5051,6 +5771,7 @@ export class LiveSalesService {
       throw new BadRequestException('Failed to process portfolio service booking');
     }
   }
+  ==== OLD CODE END ==== */
 
   /**
    * Create/upload portfolio service for a stream
@@ -5285,6 +6006,73 @@ export class LiveSalesService {
     } catch (error) {
       this.logEvent('error', 'get_portfolio_analytics_error', { streamId }, error instanceof Error ? error : new Error(String(error)));
       throw new BadRequestException('Failed to fetch portfolio analytics');
+    }
+  }
+
+  // Download a remote preview video and generate a JPEG thumbnail from the first second
+  private async generateVideoThumbnailFromUrl(videoUrl: string, userId: string): Promise<string | undefined> {
+    const tempDir = os.tmpdir();
+    const timestamp = Date.now();
+    const videoPath = path.join(tempDir, `live-preview-${timestamp}.mp4`);
+    const thumbnailPath = path.join(tempDir, `live-thumb-${timestamp}.jpg`);
+
+    try {
+      this.logger.log(`📥 Downloading preview video for thumbnail: ${videoUrl}`);
+      const response = await axios.get(videoUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+      });
+      fs.writeFileSync(videoPath, Buffer.from(response.data));
+
+      this.logger.log('🖼️ Generating thumbnail with ffmpeg...');
+      await new Promise<void>((resolve, reject) => {
+        ffmpeg(videoPath)
+          .screenshots({
+            timestamps: ['00:00:00.500'],
+            filename: path.basename(thumbnailPath),
+            folder: path.dirname(thumbnailPath),
+            size: '640x?',
+          })
+          .on('end', () => resolve())
+          .on('error', (err) => reject(err));
+      });
+
+      if (!fs.existsSync(thumbnailPath)) {
+        this.logger.warn('⚠️ Thumbnail file not generated');
+        return undefined;
+      }
+
+      const thumbnailBuffer = fs.readFileSync(thumbnailPath);
+      const uniqueFileName = `${userId}/${timestamp}-live-thumbnail.jpg`;
+
+      const { data, error } = await this.supabase.storage
+        .from('media')
+        .upload(uniqueFileName, thumbnailBuffer, {
+          contentType: 'image/jpeg',
+          cacheControl: '3600',
+          upsert: false,
+        });
+
+      if (error) {
+        this.logger.warn(`⚠️ Thumbnail upload failed: ${error.message}`);
+        return undefined;
+      }
+
+      const { data: publicUrlData } = this.supabase.storage
+        .from('media')
+        .getPublicUrl(data.path);
+
+      return publicUrlData.publicUrl;
+    } catch (error) {
+      this.logger.error('⚠️ Failed to generate live preview thumbnail:', error);
+      return undefined;
+    } finally {
+      try {
+        if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+        if (fs.existsSync(thumbnailPath)) fs.unlinkSync(thumbnailPath);
+      } catch {
+        // ignore cleanup errors
+      }
     }
   }
 }

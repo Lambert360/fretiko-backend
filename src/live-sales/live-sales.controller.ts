@@ -150,7 +150,7 @@ export class LiveSalesController {
         throw error;
       }
       // If profile not found or other error, log but allow (profile might be incomplete)
-      this.liveSalesService['logger']?.warn(`Could not verify vendor role: ${error.message}`);
+      this.liveSalesService['logger']?.warn(`Could not verify vendor role: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     const token = req.headers.authorization?.replace('Bearer ', '');
@@ -585,6 +585,7 @@ export class LiveSalesController {
       service_date: string;
       service_time: string;
       service_notes?: string;
+      giftCard?: { cardNumber: string; pin: string; amount?: number };
     },
   ) {
     const userId = req.user?.sub;

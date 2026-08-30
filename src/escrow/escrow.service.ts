@@ -1,4 +1,4 @@
-import { Injectable, Logger, HttpException, HttpStatus, forwardRef, Inject } from '@nestjs/common';
+import { Injectable, Logger, HttpException, HttpStatus, forwardRef, Inject, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
@@ -7,12 +7,15 @@ import { ConnectionsService } from '../connections/connections.service';
 import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
 import { PartnersWalletService } from '../partners/partners-wallet.service';
+import { GiftCardService } from '../gift-cards/gift-cards.service';
 
 export interface EscrowBreakdown {
   totalAmount: number;
   vendorAmount: number;
   riderAmount: number;
   platformAmount: number;
+  paymentSource?: string;
+  giftCardAmount?: number;
 }
 
 export interface Escrow {
@@ -46,6 +49,9 @@ export class EscrowService {
     private connectionsService: ConnectionsService,
     private walletService: WalletService,
     private partnersWalletService: PartnersWalletService,
+    @Optional()
+    @Inject(forwardRef(() => GiftCardService))
+    private giftCardService?: GiftCardService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -76,6 +82,8 @@ export class EscrowService {
           vendor_amount: breakdown.vendorAmount,
           rider_amount: breakdown.riderAmount,
           platform_amount: breakdown.platformAmount,
+          payment_source: breakdown.paymentSource || 'wallet',
+          gift_card_amount: breakdown.giftCardAmount || 0,
           status: 'held', // Immediately held after payment
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
@@ -184,130 +192,10 @@ export class EscrowService {
 
       this.logger.log(`✅ Escrow ${escrowId} locked and status updated atomically`);
 
-      // ✅ PHASE 2: Process wallet transactions (escrow is already released, preventing duplicate processing)
-      // Even if called concurrently, only one will succeed due to atomic lock, others will get ESCROW_NOT_FOUND
-
-      // 1. Credit vendor wallet using RPC function (escrow release)
-      this.logger.log(`Crediting vendor ${orderData.vendor_id} with ₣${escrowData.vendor_amount}`);
-      const vendorResult = await this.walletService.processWalletTransaction(
-        orderData.vendor_id,
-        WalletTransactionType.ESCROW_RELEASE,
-        parseFloat(escrowData.vendor_amount),
-        `Escrow release for order ${orderData.order_number}`,
-        orderData.id,
-        'order',
-      );
-
-      if (!vendorResult.success) {
-        this.logger.error('❌ CRITICAL: Failed to credit vendor wallet after escrow status update:', vendorResult.error);
-        // ⚠️ Escrow status is already 'released', but vendor payment failed
-        // This requires manual reconciliation - log critical alert
-        this.logger.error(`🚨 CRITICAL RECONCILIATION REQUIRED: Escrow ${escrowId} status is 'released' but vendor payment failed. Manual intervention required.`);
-        throw new HttpException(
-          `Escrow released but vendor payment failed: ${vendorResult.error}. Manual reconciliation required.`,
-          HttpStatus.INTERNAL_SERVER_ERROR
-        );
-      }
-
-      // ✅ PHASE 2: Log idempotent transaction detection (shouldn't happen with atomic lock, but log for monitoring)
-      if (vendorResult.idempotent) {
-        this.logger.warn(
-          `⚠️ IDEMPOTENT: Vendor payment for escrow ${escrowId} was idempotent (duplicate prevented). This suggests a concurrent release attempt was detected and prevented.`
-        );
-      }
-
-      // Note: Sales tracking is already handled internally by 'escrow_release' transaction type
-      // in the process_wallet_transaction RPC function (see add-sales-tracking.sql migration)
-
-      // 2. Credit rider / partner wallet (if applicable)
-      if (orderData.rider_id && escrowData.rider_amount > 0) {
-        const riderAmount = parseFloat(escrowData.rider_amount);
-        const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
-          orderData.rider_id,
-          riderAmount,
-          `Delivery fee for order ${orderData.order_number}`,
-        );
-
-        if (!partnerCredit.credited) {
-          // Independent rider — credit Freti wallet as before
-          this.logger.log(`Crediting rider ${orderData.rider_id} with ₣${riderAmount}`);
-          const riderResult = await this.walletService.processWalletTransaction(
-            orderData.rider_id,
-            WalletTransactionType.DELIVERY_PAYMENT,
-            riderAmount,
-            `Delivery fee for order ${orderData.order_number}`,
-            orderData.id,
-            'order',
-          );
-          if (!riderResult.success) {
-            this.logger.error('⚠️ CRITICAL: Failed to credit rider wallet after escrow release:', riderResult.error);
-            this.logger.error(`🚨 RECONCILIATION REQUIRED: Escrow ${escrowId} released and vendor paid, but rider payment failed. Manual intervention required.`);
-          } else if (riderResult.idempotent) {
-            this.logger.warn(`⚠️ IDEMPOTENT: Rider payment for escrow ${escrowId} was idempotent (duplicate prevented).`);
-          }
-        }
-      }
-
-      // 2b. Credit platform wallet with commission (if applicable)
-      const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
-      if (escrowData.platform_amount > 0) {
-        this.logger.log(`Crediting platform wallet with ₣${escrowData.platform_amount}`);
-        const platformResult = await this.walletService.processWalletTransaction(
-          PLATFORM_USER_ID,
-          WalletTransactionType.PLATFORM_COMMISSION,
-          parseFloat(escrowData.platform_amount),
-          `Platform commission for order ${orderData.order_number}`,
-          orderData.id,
-          'order',
-        );
-
-        if (!platformResult.success) {
-          this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet after escrow release:', platformResult.error);
-          // ⚠️ Vendor/rider already paid, but platform commission failed - requires reconciliation
-          this.logger.error(`🚨 RECONCILIATION REQUIRED: Escrow ${escrowId} released and vendor/rider paid, but platform commission failed. Manual intervention required.`);
-          // Don't throw - vendor/rider already paid, but log critical alert
-        } else if (platformResult.idempotent) {
-          // ✅ PHASE 2: Log idempotent transaction detection
-          this.logger.warn(
-            `⚠️ IDEMPOTENT: Platform commission for escrow ${escrowId} was idempotent (duplicate prevented).`
-          );
-        }
-      }
-
-      // ✅ Escrow status is already updated by atomic function, no need to update again
-
-      // 3. Debit buyer's escrow_balance for the amount released to vendor/rider/platform.
-      // The buyer's wallet holds the escrow balance for this order (credited via
-      // purchase_hold at checkout). The vendor/rider/platform credits above only
-      // touch their own wallets — they never decrement the buyer's escrow_balance.
-      // Without this, the buyer's escrow_balance keeps phantom "held" funds forever.
-      const round6 = (value: number): number => Math.round(value * 1000000) / 1000000;
-      const releasedAmount = round6(
-        parseFloat(escrowData.vendor_amount || 0) +
-        parseFloat(escrowData.rider_amount || 0) +
-        parseFloat(escrowData.platform_amount || 0)
-      );
-      if (releasedAmount > 0) {
-        const isAdminAction = reason.startsWith('Admin release:');
-        const buyerDebitDescription = isAdminAction
-          ? `Escrow debit for released funds on order ${orderData.order_number} (resolved by support)`
-          : `Escrow debit for released funds on order ${orderData.order_number}`;
-
-        const buyerDebitResult = await this.walletService.processWalletTransaction(
-          orderData.buyer_id,
-          WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM,
-          releasedAmount,
-          buyerDebitDescription,
-          orderData.id,
-          'order',
-        );
-
-        if (!buyerDebitResult.success) {
-          this.logger.error(
-            `⚠️ CRITICAL: Failed to debit buyer escrow balance after release for escrow ${escrowId}: ${buyerDebitResult.error}. Manual reconciliation required.`,
-          );
-        }
-      }
+      // ✅ ALL MONEY MOVED INSIDE release_escrow_atomic: vendor credit,
+      // rider/partner credit, platform commission, and buyer escrow debit
+      // are now all executed inside the same Postgres transaction as the
+      // escrow status update. No multi-call saga remains here.
 
       // ✅ PHASE 3: Update order status and handle post-release tasks
       // 4. Update order status to completed (only if not already cancelled) - ✅ FIX Bug 14
@@ -392,7 +280,7 @@ export class EscrowService {
           totalSpent: parseFloat(escrowData.total_amount),
         });
         this.logger.log(`✅ Updated client relationship for vendor ${orderData.vendor_id}`);
-      } catch (error) {
+      } catch (error: any) {
         this.logger.warn('⚠️ Failed to update client relationship (non-critical):', error.message);
         // This is non-critical - escrow release still succeeded
       }
@@ -406,98 +294,56 @@ export class EscrowService {
 
   /**
    * Refund escrow to buyer
+   *
+   * ✅ ATOMIC FIX: All wallet and gift-card reversal movements plus the
+   * escrow status update are now handled inside refund_escrow_atomic() in
+   * one Postgres transaction. This eliminates the previous race condition
+   * where the wallet could be refunded and then the escrow status update
+   * could fail, making a second refund possible.
    */
   async refundEscrow(escrowId: string, reason: string, userId?: string): Promise<void> {
     try {
       this.logger.log(`Refunding escrow ${escrowId}: ${reason}`);
 
-      // Fetch escrow with order details
-      const { data: escrow, error: fetchError } = await this.supabase
-        .from('escrows')
-        .select(`
-          *,
-          orders!inner(
-            id,
-            order_number,
-            buyer_id,
-            vendor_id,
-            rider_id
-          )
-        `)
-        .eq('id', escrowId)
-        .eq('status', 'held')
-        .single();
-
-      if (fetchError || !escrow) {
-        throw new HttpException('Escrow not found or already processed', HttpStatus.NOT_FOUND);
-      }
-
-      const order = escrow.orders;
-
-      // ✅ FIX Bug 17: Validate authorization if userId provided
-      if (userId) {
-        const isBuyer = order.buyer_id === userId;
-        const isVendor = order.vendor_id === userId;
-        
-        // TODO: Check if user is admin (implement admin check when admin system is added)
-        // const isAdmin = await this.isAdmin(userId);
-        
-        // Only buyer or vendor (or admin) can request refund
-        if (!isBuyer && !isVendor) {
-          throw new HttpException('Unauthorized - only buyer or vendor can refund escrow', HttpStatus.FORBIDDEN);
-        }
-      }
-
-      // Credit buyer wallet (refund)
-      this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${escrow.total_amount}`);
-      
-      // 🔧 SURGICAL FIX: Validate amount and log parameters
-      const amount = parseFloat(escrow.total_amount);
-      this.logger.log(`🔍 Refund params: buyerId=${order.buyer_id}, amount=${amount}, orderId=${order.id}, escrowId=${escrowId}`);
-      
-      if (isNaN(amount) || amount <= 0) {
-        this.logger.error(`❌ Invalid escrow amount: ${escrow.total_amount} (parsed as ${amount})`);
-        throw new HttpException(`Invalid escrow amount: ${escrow.total_amount}`, HttpStatus.BAD_REQUEST);
-      }
-      
-      if (!order.buyer_id || !order.id) {
-        this.logger.error(`❌ Invalid order data: buyerId=${order.buyer_id}, orderId=${order.id}`);
-        throw new HttpException('Invalid order data for refund', HttpStatus.BAD_REQUEST);
-      }
-      
-      const refundResult = await this.walletService.processWalletTransaction(
-        order.buyer_id,
-        WalletTransactionType.ESCROW_REFUND,
-        amount,
-        `Refund for order ${order.order_number}`,
-        order.id,
-        'order',
+      const adminGiftWalletId = this.configService.get<string>(
+        'PLATFORM_GIFT_WALLET_USER_ID',
+        '00000000-0000-4000-8000-000000000003'
       );
 
-      if (!refundResult.success) {
-        this.logger.error('Failed to refund buyer wallet:', refundResult.error);
+      const { data: refundResult, error: refundRpcError } = await this.supabase.rpc(
+        'refund_escrow_atomic',
+        {
+          p_escrow_id: escrowId,
+          p_reason: reason,
+          p_admin_gift_user_id: adminGiftWalletId,
+          p_user_id: userId || null,
+        }
+      );
+
+      if (refundRpcError) {
+        this.logger.error('refund_escrow_atomic RPC error:', refundRpcError);
         throw new HttpException(
-          `Failed to process refund: ${refundResult.error}`,
+          `Failed to refund escrow: ${refundRpcError.message}`,
           HttpStatus.INTERNAL_SERVER_ERROR
         );
       }
 
-      // Update escrow status (with status check to prevent double-refund)
-      const { error: updateError } = await this.supabase
-        .from('escrows')
-        .update({
-          status: 'refunded',
-          refund_reason: reason,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', escrowId)
-        .eq('status', 'held'); // ✅ Prevent double-refund race condition
+      if (!refundResult || !refundResult.success) {
+        const errorCode = refundResult?.error_code || 'UNKNOWN';
+        const errorMessage = refundResult?.error || 'Refund failed';
 
-      if (updateError) {
-        this.logger.error('Failed to update escrow status:', updateError);
-        // ⚠️ Refund already processed, but escrow status update failed
-        throw new HttpException('Escrow refund partially completed - refund succeeded but status update failed. Manual intervention required.', HttpStatus.INTERNAL_SERVER_ERROR);
+        if (errorCode === 'ESCROW_NOT_FOUND') {
+          throw new HttpException(errorMessage, HttpStatus.NOT_FOUND);
+        } else if (errorCode === 'UNAUTHORIZED') {
+          throw new HttpException(errorMessage, HttpStatus.FORBIDDEN);
+        } else if (errorCode === 'INTERNAL_ERROR') {
+          throw new HttpException(errorMessage, HttpStatus.INTERNAL_SERVER_ERROR);
+        } else {
+          throw new HttpException(errorMessage, HttpStatus.INTERNAL_SERVER_ERROR);
+        }
       }
+
+      const orderData = refundResult.order;
 
       // Update order status
       await this.supabase
@@ -506,18 +352,18 @@ export class EscrowService {
           status: 'cancelled',
           updated_at: new Date().toISOString(),
         })
-        .eq('id', order.id);
+        .eq('id', orderData.id);
 
       // Notify buyer
       await this.notificationHelper.notifyOrderRefunded(
-        order.buyer_id,
-        parseFloat(escrow.total_amount),
-        order.order_number,
+        orderData.buyer_id,
+        parseFloat(refundResult.escrow.total_amount),
+        orderData.order_number,
         reason,
       );
 
       // Broadcast real-time update
-      await this.realtimeGateway.notifyWalletBalanceUpdate(order.buyer_id, {
+      await this.realtimeGateway.notifyWalletBalanceUpdate(orderData.buyer_id, {
         availableBalance: 0,
         escrowBalance: 0,
         pendingWithdrawal: 0,
@@ -534,6 +380,10 @@ export class EscrowService {
 
   /**
    * Partial refund - refund buyer partial amount, release rest to vendor
+   *
+   * ✅ ATOMIC FIX: All wallet/partner credits, the buyer refund, and the
+   * escrow status update are now handled in one Postgres transaction by
+   * partial_refund_escrow_atomic().
    */
   async partialRefundEscrow(
     escrowId: string,
@@ -543,199 +393,65 @@ export class EscrowService {
     try {
       this.logger.log(`Processing partial refund for escrow ${escrowId}: ₣${refundAmount}`);
 
-      // Fetch escrow with order details
-      const { data: escrow, error: fetchError } = await this.supabase
-        .from('escrows')
-        .select(`
-          *,
-          orders!inner(
-            id,
-            order_number,
-            buyer_id,
-            vendor_id,
-            rider_id
-          )
-        `)
-        .eq('id', escrowId)
-        .in('status', ['held', 'dispute'])
-        .single();
-
-      if (fetchError || !escrow) {
-        throw new HttpException('Escrow not found or already processed', HttpStatus.NOT_FOUND);
-      }
-
-      const totalAmount = parseFloat(escrow.total_amount);
-      if (refundAmount > totalAmount || refundAmount <= 0) {
-        throw new HttpException('Invalid refund amount', HttpStatus.BAD_REQUEST);
-      }
-
-      const order = escrow.orders;
-      const remainingAmount = totalAmount - refundAmount;
-
-      // Helper function to round to 6 decimal places (matching DECIMAL(18,6) precision)
-      const round6 = (value: number): number => Math.round(value * 1000000) / 1000000;
-
-      // 1. Refund buyer partial amount
-      this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${refundAmount}`);
-      const refundResult = await this.walletService.processWalletTransaction(
-        order.buyer_id,
-        WalletTransactionType.ESCROW_REFUND,
-        round6(refundAmount),
-        `Partial refund for order ${order.order_number}: ${reason}`,
-        order.id,
-        'order',
+      const { data: partialResult, error: partialRpcError } = await this.supabase.rpc(
+        'partial_refund_escrow_atomic',
+        {
+          p_escrow_id: escrowId,
+          p_refund_amount: refundAmount,
+          p_reason: reason,
+        }
       );
 
-      if (!refundResult.success) {
-        this.logger.error('Failed to refund buyer wallet:', refundResult.error);
+      if (partialRpcError) {
+        this.logger.error('partial_refund_escrow_atomic RPC error:', partialRpcError);
         throw new HttpException(
-          `Failed to process partial refund: ${refundResult.error}`,
+          `Failed to process partial refund: ${partialRpcError.message}`,
           HttpStatus.INTERNAL_SERVER_ERROR
         );
       }
 
-      // 2. Calculate vendor and rider amounts proportionally (with rounding fix)
-      const vendorProportion = parseFloat(escrow.vendor_amount) / totalAmount;
-      const riderProportion = parseFloat(escrow.rider_amount) / totalAmount;
-      const platformProportion = parseFloat(escrow.platform_amount) / totalAmount;
+      if (!partialResult || !partialResult.success) {
+        const errorCode = partialResult?.error_code || 'UNKNOWN';
+        const errorMessage = partialResult?.error || 'Partial refund failed';
 
-      // ✅ FIX: Round amounts and ensure sum equals remainingAmount exactly
-      const vendorAmount = round6(remainingAmount * vendorProportion);
-      const riderAmount = round6(remainingAmount * riderProportion);
-      // Platform amount gets any remainder to ensure sum equals remainingAmount exactly
-      const platformAmount = round6(remainingAmount - vendorAmount - riderAmount);
-
-      // Validate sum equals remainingAmount (within floating point tolerance)
-      const sum = round6(vendorAmount + riderAmount + platformAmount);
-      const difference = Math.abs(sum - remainingAmount);
-      if (difference > 0.000001) {
-        this.logger.warn(`⚠️ Partial refund calculation rounding adjustment: ${difference} difference`);
-      }
-
-      // 3. Release remaining amount to vendor
-      this.logger.log(`Releasing remaining ₣${vendorAmount} to vendor ${order.vendor_id}`);
-      const vendorResult = await this.walletService.processWalletTransaction(
-        order.vendor_id,
-        WalletTransactionType.ESCROW_RELEASE,
-        vendorAmount,
-        `Partial escrow release for order ${order.order_number} (after partial refund)`,
-        escrowId,
-        'escrow',
-      );
-
-      if (!vendorResult.success) {
-        this.logger.error('Failed to credit vendor wallet:', vendorResult.error);
-        // Don't throw - buyer already refunded, log and continue
-      }
-
-      // 4. Release rider / partner amount if applicable
-      if (order.rider_id && riderAmount > 0) {
-        const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
-          order.rider_id,
-          riderAmount,
-          `Delivery fee for order ${order.order_number} (partial)`,
-        );
-        if (!partnerCredit.credited) {
-          this.logger.log(`Releasing ₣${riderAmount} to rider ${order.rider_id}`);
-          const riderResult = await this.walletService.processWalletTransaction(
-            order.rider_id,
-            WalletTransactionType.DELIVERY_PAYMENT,
-            riderAmount,
-            `Delivery fee for order ${order.order_number} (partial)`,
-            order.id,
-            'order',
-          );
-          if (!riderResult.success) {
-            this.logger.error('Failed to credit rider wallet:', riderResult.error);
-          }
+        if (errorCode === 'ESCROW_NOT_FOUND') {
+          throw new HttpException(errorMessage, HttpStatus.NOT_FOUND);
+        } else if (errorCode === 'UNAUTHORIZED') {
+          throw new HttpException(errorMessage, HttpStatus.FORBIDDEN);
+        } else if (errorCode === 'INVALID_REFUND_AMOUNT' || errorCode === 'REFUND_EXCEEDS_TOTAL') {
+          throw new HttpException(errorMessage, HttpStatus.BAD_REQUEST);
+        } else {
+          throw new HttpException(errorMessage, HttpStatus.INTERNAL_SERVER_ERROR);
         }
       }
 
-      // 4b. Credit platform wallet with commission (if applicable) - ✅ FIX Bug 11
-      const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
-      if (platformAmount > 0) {
-        this.logger.log(`Crediting platform wallet with ₣${platformAmount} (partial refund)`);
-        const platformResult = await this.walletService.processWalletTransaction(
-          PLATFORM_USER_ID,
-          WalletTransactionType.PLATFORM_COMMISSION,
-          platformAmount,
-          `Platform commission for order ${order.order_number} (partial refund)`,
-          order.id,
-          'order',
-        );
+      const orderData = partialResult.order;
 
-        if (!platformResult.success) {
-          this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet:', platformResult.error);
-          this.logger.warn(`Platform commission ${platformAmount} for order ${order.order_number} failed - requires manual reconciliation`);
-          // Don't throw - buyer/vendor/rider already paid, but log as critical
-        }
-      }
-
-      // 4c. Debit buyer's escrow_balance for the amount released to vendor/rider/platform.
-      // The buyer's own refund (step 1) only covers `refundAmount` — the rest of their
-      // held escrow_balance was released to vendor/rider/platform above and must also
-      // be removed from the buyer's escrow_balance, or it stays as phantom held funds.
-      const releasedAmount = round6(vendorAmount + riderAmount + platformAmount);
-      if (releasedAmount > 0) {
-        const buyerDebitResult = await this.walletService.processWalletTransaction(
-          order.buyer_id,
-          WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM,
-          releasedAmount,
-          `Escrow debit for released funds on order ${order.order_number}`,
-          order.id,
-          'order',
-        );
-
-        if (!buyerDebitResult.success) {
-          this.logger.error(
-            `⚠️ CRITICAL: Failed to debit buyer escrow balance after partial refund for escrow ${escrowId}: ${buyerDebitResult.error}. Manual reconciliation required.`,
-          );
-        }
-      }
-
-      // 5. Update escrow status to released (partial refund completed)
-      const { error: updateError } = await this.supabase
-        .from('escrows')
-        .update({
-          status: 'released',
-          released_at: new Date().toISOString(),
-          release_reason: `Partial refund: ${reason}. Refunded ₣${refundAmount}, released ₣${remainingAmount}`,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', escrowId)
-        .in('status', ['held', 'dispute']); // ✅ Status check prevents updating if already processed
-
-      if (updateError) {
-        this.logger.error('Failed to update escrow status:', updateError);
-        // ⚠️ Wallet transactions already succeeded, but escrow status update failed
-        throw new HttpException('Partial refund partially completed - wallet transactions succeeded but status update failed. Manual intervention required.', HttpStatus.INTERNAL_SERVER_ERROR);
-      }
-
-      // 6. Update order status
+      // Update order status
       await this.supabase
         .from('orders')
         .update({
           status: 'completed',
           updated_at: new Date().toISOString(),
         })
-        .eq('id', order.id);
+        .eq('id', orderData.id);
 
-      // 7. Send notifications
+      // Send notifications
       await this.notificationHelper.notifyOrderRefunded(
-        order.buyer_id,
-        refundAmount,
-        order.order_number,
+        orderData.buyer_id,
+        partialResult.escrow.refunded_amount,
+        orderData.order_number,
         `Partial refund: ${reason}`,
       );
 
       await this.notificationHelper.notifyVendorEscrowReleased(
-        order.vendor_id,
-        vendorAmount,
-        order.order_number,
+        orderData.vendor_id,
+        partialResult.escrow.vendor_released,
+        orderData.order_number,
       );
 
-      // 8. Broadcast real-time updates
-      await this.realtimeGateway.notifyWalletBalanceUpdate(order.buyer_id, {
+      // Broadcast real-time updates
+      await this.realtimeGateway.notifyWalletBalanceUpdate(orderData.buyer_id, {
         availableBalance: 0,
         escrowBalance: 0,
         pendingWithdrawal: 0,
@@ -743,7 +459,7 @@ export class EscrowService {
         transactionType: 'refund',
       });
 
-      await this.realtimeGateway.notifyWalletBalanceUpdate(order.vendor_id, {
+      await this.realtimeGateway.notifyWalletBalanceUpdate(orderData.vendor_id, {
         availableBalance: 0,
         escrowBalance: 0,
         pendingWithdrawal: 0,
@@ -760,6 +476,10 @@ export class EscrowService {
 
   /**
    * Split escrow amount between buyer and vendor
+   *
+   * ✅ ATOMIC FIX: All wallet/partner credits, the buyer refund, and the
+   * escrow status update are now handled in one Postgres transaction by
+   * split_escrow_amount_atomic().
    */
   async splitEscrowAmount(
     escrowId: string,
@@ -769,212 +489,70 @@ export class EscrowService {
     try {
       this.logger.log(`Splitting escrow ${escrowId}: Buyer gets ₣${buyerAmount}`);
 
-      // Fetch escrow with order details
-      const { data: escrow, error: fetchError } = await this.supabase
-        .from('escrows')
-        .select(`
-          *,
-          orders!inner(
-            id,
-            order_number,
-            buyer_id,
-            vendor_id,
-            rider_id
-          )
-        `)
-        .eq('id', escrowId)
-        .in('status', ['held', 'dispute'])
-        .single();
+      const { data: splitResult, error: splitRpcError } = await this.supabase.rpc(
+        'split_escrow_amount_atomic',
+        {
+          p_escrow_id: escrowId,
+          p_buyer_amount: buyerAmount,
+          p_reason: reason,
+        }
+      );
 
-      if (fetchError || !escrow) {
-        throw new HttpException('Escrow not found or already processed', HttpStatus.NOT_FOUND);
-      }
-
-      const totalAmount = parseFloat(escrow.total_amount);
-      if (buyerAmount > totalAmount || buyerAmount < 0) {
-        throw new HttpException('Invalid split amount', HttpStatus.BAD_REQUEST);
-      }
-
-      const order = escrow.orders;
-      const vendorAmount = totalAmount - buyerAmount;
-
-      // Helper function to round to 6 decimal places (matching DECIMAL(18,6) precision)
-      const round6 = (value: number): number => Math.round(value * 1000000) / 1000000;
-
-      // 1. Refund buyer their portion
-      if (buyerAmount > 0) {
-        this.logger.log(`Refunding buyer ${order.buyer_id} with ₣${buyerAmount}`);
-        const refundResult = await this.walletService.processWalletTransaction(
-          order.buyer_id,
-          WalletTransactionType.ESCROW_REFUND,
-          round6(buyerAmount),
-          `Split resolution for order ${order.order_number}: ${reason}`,
-          order.id,
-          'order',
+      if (splitRpcError) {
+        this.logger.error('split_escrow_amount_atomic RPC error:', splitRpcError);
+        throw new HttpException(
+          `Failed to split escrow: ${splitRpcError.message}`,
+          HttpStatus.INTERNAL_SERVER_ERROR
         );
+      }
 
-        if (!refundResult.success) {
-          this.logger.error('Failed to refund buyer wallet:', refundResult.error);
-          throw new HttpException(
-            `Failed to process buyer refund: ${refundResult.error}`,
-            HttpStatus.INTERNAL_SERVER_ERROR
-          );
+      if (!splitResult || !splitResult.success) {
+        const errorCode = splitResult?.error_code || 'UNKNOWN';
+        const errorMessage = splitResult?.error || 'Split resolution failed';
+
+        if (errorCode === 'ESCROW_NOT_FOUND') {
+          throw new HttpException(errorMessage, HttpStatus.NOT_FOUND);
+        } else if (errorCode === 'UNAUTHORIZED') {
+          throw new HttpException(errorMessage, HttpStatus.FORBIDDEN);
+        } else if (errorCode === 'INVALID_BUYER_AMOUNT' || errorCode === 'AMOUNT_EXCEEDS_TOTAL') {
+          throw new HttpException(errorMessage, HttpStatus.BAD_REQUEST);
+        } else {
+          throw new HttpException(errorMessage, HttpStatus.INTERNAL_SERVER_ERROR);
         }
       }
 
-      // 2. Calculate vendor, rider, and platform amounts proportionally from vendor portion (with rounding fix) - ✅ FIX Bug 12
-      const vendorProportion = parseFloat(escrow.vendor_amount) / totalAmount;
-      const riderProportion = parseFloat(escrow.rider_amount) / totalAmount;
-      const platformProportion = parseFloat(escrow.platform_amount) / totalAmount;
+      const orderData = splitResult.order;
 
-      // Calculate proportions from the vendor portion (vendorAmount = totalAmount - buyerAmount)
-      // Platform fee comes from vendor's share, so we need to allocate vendorAmount proportionally
-      const totalProportion = vendorProportion + riderProportion + platformProportion;
-      
-      // ✅ FIX: Round amounts and ensure sum equals vendorAmount exactly
-      const vendorFinalAmount = round6(vendorAmount * (vendorProportion / totalProportion));
-      const riderFinalAmount = round6(vendorAmount * (riderProportion / totalProportion));
-      // Platform amount gets any remainder to ensure sum equals vendorAmount exactly
-      const platformFinalAmount = round6(vendorAmount - vendorFinalAmount - riderFinalAmount);
-
-      // Validate sum equals vendorAmount (within floating point tolerance)
-      const sum = round6(vendorFinalAmount + riderFinalAmount + platformFinalAmount);
-      const difference = Math.abs(sum - vendorAmount);
-      if (difference > 0.000001) {
-        this.logger.warn(`⚠️ Split escrow calculation rounding adjustment: ${difference} difference`);
-      }
-
-      // 3. Release vendor portion
-      if (vendorFinalAmount > 0) {
-        this.logger.log(`Releasing ₣${vendorFinalAmount} to vendor ${order.vendor_id}`);
-        const vendorResult = await this.walletService.processWalletTransaction(
-          order.vendor_id,
-          WalletTransactionType.ESCROW_RELEASE,
-          vendorFinalAmount,
-          `Split escrow release for order ${order.order_number}: ${reason}`,
-          escrowId,
-          'escrow',
-        );
-
-        if (!vendorResult.success) {
-          this.logger.error('Failed to credit vendor wallet:', vendorResult.error);
-          // Don't throw - buyer already refunded
-        }
-      }
-
-      // 4. Release rider / partner amount if applicable
-      if (order.rider_id && riderFinalAmount > 0) {
-        const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
-          order.rider_id,
-          riderFinalAmount,
-          `Delivery fee for order ${order.order_number} (split resolution)`,
-        );
-        if (!partnerCredit.credited) {
-          this.logger.log(`Releasing ₣${riderFinalAmount} to rider ${order.rider_id}`);
-          const riderResult = await this.walletService.processWalletTransaction(
-            order.rider_id,
-            WalletTransactionType.DELIVERY_PAYMENT,
-            riderFinalAmount,
-            `Delivery fee for order ${order.order_number} (split resolution)`,
-            order.id,
-            'order',
-          );
-          if (!riderResult.success) {
-            this.logger.error('Failed to credit rider wallet:', riderResult.error);
-          }
-        }
-      }
-
-      // 4b. Credit platform wallet with commission (if applicable) - ✅ FIX Bug 12
-      const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000002';
-      if (platformFinalAmount > 0) {
-        this.logger.log(`Crediting platform wallet with ₣${platformFinalAmount} (split resolution)`);
-        const platformResult = await this.walletService.processWalletTransaction(
-          PLATFORM_USER_ID,
-          WalletTransactionType.PLATFORM_COMMISSION,
-          platformFinalAmount,
-          `Platform commission for order ${order.order_number} (split resolution)`,
-          order.id,
-          'order',
-        );
-
-        if (!platformResult.success) {
-          this.logger.error('⚠️ CRITICAL: Failed to credit platform wallet:', platformResult.error);
-          this.logger.warn(`Platform commission ${platformFinalAmount} for order ${order.order_number} failed - requires manual reconciliation`);
-          // Don't throw - buyer/vendor/rider already paid, but log as critical
-        }
-      }
-
-      // 4c. Debit buyer's escrow_balance for the amount released to vendor/rider/platform.
-      // The buyer's own refund (step 1) only covers `buyerAmount` — the rest of their
-      // held escrow_balance was released to vendor/rider/platform above and must also
-      // be removed from the buyer's escrow_balance, or it stays as phantom held funds.
-      const releasedAmount = round6(vendorFinalAmount + riderFinalAmount + platformFinalAmount);
-      if (releasedAmount > 0) {
-        const buyerDebitResult = await this.walletService.processWalletTransaction(
-          order.buyer_id,
-          WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM,
-          releasedAmount,
-          `Escrow debit for released funds on order ${order.order_number}`,
-          order.id,
-          'order',
-        );
-
-        if (!buyerDebitResult.success) {
-          this.logger.error(
-            `⚠️ CRITICAL: Failed to debit buyer escrow balance after split resolution for escrow ${escrowId}: ${buyerDebitResult.error}. Manual reconciliation required.`,
-          );
-        }
-      }
-
-      // 5. Update escrow status
-      const { error: updateError } = await this.supabase
-        .from('escrows')
-        .update({
-          status: 'released',
-          released_at: new Date().toISOString(),
-          release_reason: `Split resolution: ${reason}. Buyer: ₣${buyerAmount}, Vendor: ₣${vendorFinalAmount}, Platform: ₣${platformFinalAmount || 0}`,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', escrowId)
-        .in('status', ['held', 'dispute']); // ✅ Status check prevents updating if already processed
-
-      if (updateError) {
-        this.logger.error('Failed to update escrow status:', updateError);
-        // ⚠️ Wallet transactions already succeeded, but escrow status update failed
-        throw new HttpException('Split resolution partially completed - wallet transactions succeeded but status update failed. Manual intervention required.', HttpStatus.INTERNAL_SERVER_ERROR);
-      }
-
-      // 6. Update order status
+      // Update order status
       await this.supabase
         .from('orders')
         .update({
           status: 'completed',
           updated_at: new Date().toISOString(),
         })
-        .eq('id', order.id);
+        .eq('id', orderData.id);
 
-      // 7. Send notifications
-      if (buyerAmount > 0) {
+      // Send notifications
+      if (splitResult.escrow.buyer_amount > 0) {
         await this.notificationHelper.notifyOrderRefunded(
-          order.buyer_id,
-          buyerAmount,
-          order.order_number,
+          orderData.buyer_id,
+          splitResult.escrow.buyer_amount,
+          orderData.order_number,
           `Split resolution: ${reason}`,
         );
       }
 
-      if (vendorFinalAmount > 0) {
+      if (splitResult.escrow.vendor_released > 0) {
         await this.notificationHelper.notifyVendorEscrowReleased(
-          order.vendor_id,
-          vendorFinalAmount,
-          order.order_number,
+          orderData.vendor_id,
+          splitResult.escrow.vendor_released,
+          orderData.order_number,
         );
       }
 
-      // 8. Broadcast real-time updates
-      if (buyerAmount > 0) {
-        await this.realtimeGateway.notifyWalletBalanceUpdate(order.buyer_id, {
+      // Broadcast real-time updates
+      if (splitResult.escrow.buyer_amount > 0) {
+        await this.realtimeGateway.notifyWalletBalanceUpdate(orderData.buyer_id, {
           availableBalance: 0,
           escrowBalance: 0,
           pendingWithdrawal: 0,
@@ -983,8 +561,8 @@ export class EscrowService {
         });
       }
 
-      if (vendorFinalAmount > 0) {
-        await this.realtimeGateway.notifyWalletBalanceUpdate(order.vendor_id, {
+      if (splitResult.escrow.vendor_released > 0) {
+        await this.realtimeGateway.notifyWalletBalanceUpdate(orderData.vendor_id, {
           availableBalance: 0,
           escrowBalance: 0,
           pendingWithdrawal: 0,

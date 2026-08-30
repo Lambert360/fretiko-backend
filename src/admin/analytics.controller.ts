@@ -79,5 +79,17 @@ export class StaffAnalyticsController {
       { start, end }
     );
   }
+
+  /**
+   * Get live sales / gamification analytics
+   * GET /admin/analytics/live-sales
+   * Requires: view_platform_stats permission
+   */
+  @Get('live-sales')
+  @UseGuards(PermissionsGuard)
+  @Permissions('view_platform_stats')
+  async getLiveSalesAnalytics(@Req() req) {
+    return this.adminService.getLiveSalesAnalyticsForStaff(req.user.sub);
+  }
 }
 

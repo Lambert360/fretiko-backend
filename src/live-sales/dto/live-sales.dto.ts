@@ -39,7 +39,7 @@ export class CreateLiveStreamDto {
   @IsString()
   @MinLength(3)
   @MaxLength(255)
-  title: string;
+  title!: string;
 
   @IsOptional()
   @IsString()
@@ -47,11 +47,15 @@ export class CreateLiveStreamDto {
   description?: string;
 
   @IsEnum(StreamType)
-  stream_type: StreamType;
+  stream_type!: StreamType;
 
   @IsOptional()
   @IsString()
   thumbnail_url?: string;
+
+  @IsOptional()
+  @IsString()
+  preview_video_url?: string;
 
   @IsOptional()
   @IsArray()
@@ -63,15 +67,15 @@ export class CreateLiveStreamDto {
 // DTO for adding products to a live stream
 export class LiveStreamProductDto {
   @IsUUID()
-  product_id: string;
+  product_id!: string;
 
   @IsNumber()
   @IsPositive()
-  live_price: number;
+  live_price!: number;
 
   @IsNumber()
   @IsPositive()
-  live_stock: number;
+  live_stock!: number;
 
   @IsOptional()
   @IsNumber()
@@ -85,7 +89,7 @@ export class LiveStreamProductDto {
 // DTO for updating live stream status
 export class UpdateStreamStatusDto {
   @IsEnum(StreamStatus)
-  status: StreamStatus;
+  status!: StreamStatus;
 
   @IsOptional()
   @IsString()
@@ -95,34 +99,34 @@ export class UpdateStreamStatusDto {
 // DTO for posting a comment
 export class PostCommentDto {
   @IsUUID()
-  stream_id: string;
+  stream_id!: string;
 
   @IsString()
   @MinLength(1)
   @MaxLength(500)
-  message: string;
+  message!: string;
 }
 
 // DTO for sending a reaction
 export class SendReactionDto {
   @IsUUID()
-  stream_id: string;
+  stream_id!: string;
 
   @IsEnum(ReactionType)
-  reaction_type: ReactionType;
+  reaction_type!: ReactionType;
 }
 
 // DTO for sending a gift
 export class SendGiftDto {
   @IsUUID()
-  stream_id: string;
+  stream_id!: string;
 
   @IsString()
-  gift_type: string;
+  gift_type!: string;
 
   @IsNumber()
   @IsPositive()
-  quantity: number;
+  quantity!: number;
 
   @IsOptional()
   @IsString()
@@ -130,17 +134,31 @@ export class SendGiftDto {
   message?: string;
 }
 
+// DTO for applying a gift card to a live purchase/booking
+export class LiveGiftCardDto {
+  @IsString()
+  cardNumber!: string;
+
+  @IsString()
+  pin!: string;
+
+  @IsOptional()
+  @IsNumber()
+  @IsPositive()
+  amount?: number; // Optional: manually specify how much of the card balance to use
+}
+
 // DTO for live product purchase
 export class LiveProductPurchaseDto {
   @IsUUID()
-  stream_id: string;
+  stream_id!: string;
 
   @IsUUID()
-  product_id: string;
+  product_id!: string;
 
   @IsNumber()
   @IsPositive()
-  quantity: number;
+  quantity!: number;
 
   @IsOptional()
   @IsBoolean()
@@ -160,18 +178,23 @@ export class LiveProductPurchaseDto {
   @IsOptional()
   @IsUUID()
   reservation_id?: string; // Optional: Reservation ID if user has an active reservation
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LiveGiftCardDto)
+  giftCard?: LiveGiftCardDto;
 }
 
 // DTO for live service booking
 export class LiveServiceBookingDto {
   @IsUUID()
-  stream_id: string;
+  stream_id!: string;
 
   @IsDateString()
-  service_date: string;
+  service_date!: string;
 
   @IsString()
-  service_time: string;
+  service_time!: string;
 
   @IsOptional()
   @IsString()
@@ -181,18 +204,23 @@ export class LiveServiceBookingDto {
   @IsOptional()
   @IsBoolean()
   continue_watching?: boolean;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LiveGiftCardDto)
+  giftCard?: LiveGiftCardDto;
 }
 
 // DTO for joining a stream
 export class JoinStreamDto {
   @IsUUID()
-  stream_id: string;
+  stream_id!: string;
 }
 
 // DTO for leaving a stream
 export class LeaveStreamDto {
   @IsUUID()
-  stream_id: string;
+  stream_id!: string;
 }
 
 // Response DTOs
@@ -213,6 +241,7 @@ export interface LiveStreamResponse {
   total_viewers: number;
   total_sales: number;
   thumbnail_url?: string;
+  preview_video_url?: string;
   stream_url?: string;
   products?: LiveStreamProductResponse[];
   started_at?: string;

@@ -1577,151 +1577,261 @@ export class AdminService {
       .lte('created_at', endDate);
 
     if (ordersError) {
-      this.logger.error(`Failed to fetch orders for time series: ${ordersError.message}`);
-    }
-    
-    this.logger.log(`Fetched ${orders?.length || 0} orders for time series`);
-
-    // Get released escrows for revenue
-    const { data: escrows, error: escrowsError } = await this.supabase
-      .from('escrows')
-      .select('platform_amount, released_at')
-      .eq('status', 'released')
-      .gte('released_at', startDate)
-      .lte('released_at', endDate);
-
-    if (escrowsError) {
-      this.logger.error(`Failed to fetch escrows for time series: ${escrowsError.message}`);
+      this.logger.error('Failed to fetch time series orders:', ordersError);
+      throw new BadRequestException('Failed to fetch time series data');
     }
 
-    // Get new users
+    // Group by period
+    const groupedData = new Map<string, number>();
+    orders?.forEach(order => {
+      const date = new Date(order.created_at);
+      let key: string;
+
+      if (period === 'daily') {
+        key = date.toISOString().split('T')[0];
+      } else if (period === 'weekly') {
+        const weekStart = new Date(date);
+        weekStart.setDate(date.getDate() - date.getDay());
+        key = weekStart.toISOString().split('T')[0];
+      } else {
+        key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+      }
+
+      groupedData.set(key, (groupedData.get(key) || 0) + (order.total_amount || 0));
+    });
+
+    // Convert to array and sort
+    const timeSeriesData = Array.from(groupedData.entries())
+      .map(([date, value]) => ({ date, value }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    return timeSeriesData;
+  }
+
+  /**
+   * Get conversion metrics for staff (time to first purchase)
+   */
+  async getConversionMetricsForStaff(staffId: string) {
+    // Verify staff has permission
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`Staff ${staffId} fetching conversion metrics`);
+
+    // Get all user profiles (registration dates)
     const { data: users, error: usersError } = await this.supabase
       .from('user_profiles')
       .select('id, created_at')
-      .gte('created_at', startDate)
-      .lte('created_at', endDate);
+      .limit(10000);
 
     if (usersError) {
-      this.logger.error(`Failed to fetch users for time series: ${usersError.message}`);
+      this.logger.error('Failed to fetch user profiles for conversion metrics:', usersError);
+      throw new BadRequestException('Failed to fetch user profiles');
     }
 
-    // Helper function to get period key based on period type
-    const getPeriodKey = (dateString: string): string => {
-      const date = new Date(dateString);
-      
-      // Convert UTC timestamp to local timezone for grouping
-      if (timezoneOffset !== undefined) {
-        date.setMinutes(date.getMinutes() - timezoneOffset);
+    if (!users || users.length === 0) {
+      return {
+        averageTimeToFirstPurchaseHours: 0,
+        medianTimeToFirstPurchaseHours: 0,
+        conversionRate: 0,
+        totalUsers: 0,
+        purchasers: 0,
+        nonPurchasers: 0,
+        timeBuckets: {
+          within24Hours: 0,
+          within7Days: 0,
+          within30Days: 0,
+          over30Days: 0,
+        },
+        timeBucketsPercentage: {
+          within24Hours: 0,
+          within7Days: 0,
+          within30Days: 0,
+          over30Days: 0,
+        },
+      };
+    }
+
+    // Get first order dates for all users
+    const { data: allOrders, error: ordersError } = await this.supabase
+      .from('orders')
+      .select('buyer_id, created_at')
+      .order('created_at', { ascending: true })
+      .limit(10000);
+
+    if (ordersError) {
+      this.logger.error('Failed to fetch orders for conversion metrics:', ordersError);
+      throw new BadRequestException('Failed to fetch orders');
+    }
+
+    // Build first order map
+    const firstOrderMap = new Map<string, Date>();
+    allOrders?.forEach(order => {
+      const buyerId = order.buyer_id;
+      if (!buyerId) return;
+
+      if (!firstOrderMap.has(buyerId)) {
+        firstOrderMap.set(buyerId, new Date(order.created_at));
       }
-      
-      switch (period) {
-        case 'daily':
-          return date.toISOString().split('T')[0]; // YYYY-MM-DD (now in local timezone)
-          
-        case 'weekly':
-          // Get Monday of the week
-          const monday = new Date(date);
-          const day = monday.getDay();
-          const diff = monday.getDate() - day + (day === 0 ? -6 : 1); // Adjust when day is Sunday
-          monday.setDate(diff);
-          monday.setHours(0, 0, 0, 0);
-          return monday.toISOString().split('T')[0]; // Monday date as key
-          
-        case 'monthly':
-          const year = date.getFullYear();
-          const month = String(date.getMonth() + 1).padStart(2, '0');
-          return `${year}-${month}`; // YYYY-MM
-          
-        default:
-          return date.toISOString().split('T')[0];
-      }
+    });
+
+    // Calculate time to first purchase for each user
+    const timeToPurchaseArray: number[] = [];
+    const timeBuckets = {
+      within24Hours: 0,
+      within7Days: 0,
+      within30Days: 0,
+      over30Days: 0,
     };
 
-    // Helper function to format date for display
-    const formatPeriodDate = (key: string): string => {
-      switch (period) {
-        case 'daily':
-          return key; // Already YYYY-MM-DD
-          
-        case 'weekly':
-          // Return the Monday date as display
-          return key;
-          
-        case 'monthly':
-          // Return first day of month for consistency
-          return `${key}-01`;
-          
-        default:
-          return key;
-      }
-    };
+    users.forEach(user => {
+      const registrationDate = new Date(user.created_at);
+      const firstOrderDate = firstOrderMap.get(user.id);
 
-    // Group by period
-    const periodData: Record<string, { orders: number; revenue: number; users: number }> = {};
+      if (firstOrderDate) {
+        const timeDiffHours = (firstOrderDate.getTime() - registrationDate.getTime()) / (1000 * 60 * 60);
+        
+        // Only include positive time differences (order after registration)
+        if (timeDiffHours > 0) {
+          timeToPurchaseArray.push(timeDiffHours);
 
-    orders?.forEach(order => {
-      const key = getPeriodKey(order.created_at);
-      if (!periodData[key]) {
-        periodData[key] = { orders: 0, revenue: 0, users: 0 };
-      }
-      periodData[key].orders += 1;
-    });
-
-    escrows?.forEach(escrow => {
-      if (!escrow.released_at) return;
-      const key = getPeriodKey(escrow.released_at);
-      if (!periodData[key]) {
-        periodData[key] = { orders: 0, revenue: 0, users: 0 };
-      }
-      periodData[key].revenue += parseFloat(escrow.platform_amount || '0');
-    });
-
-    users?.forEach(user => {
-      const key = getPeriodKey(user.created_at);
-      if (!periodData[key]) {
-        periodData[key] = { orders: 0, revenue: 0, users: 0 };
-      }
-      periodData[key].users += 1;
-    });
-
-    // Generate all period keys between start and end dates
-    const generateAllPeriodKeys = (start: string, end: string): string[] => {
-      const keys: string[] = [];
-      const current = new Date(start);
-      const endDate = new Date(end);
-
-      while (current <= endDate) {
-        keys.push(getPeriodKey(current.toISOString()));
-
-        // Increment based on period
-        switch (period) {
-          case 'daily':
-            current.setDate(current.getDate() + 1);
-            break;
-          case 'weekly':
-            current.setDate(current.getDate() + 7);
-            break;
-          case 'monthly':
-            current.setMonth(current.getMonth() + 1);
-            break;
+          // Categorize into time buckets
+          if (timeDiffHours <= 24) {
+            timeBuckets.within24Hours++;
+          } else if (timeDiffHours <= 168) { // 7 days = 168 hours
+            timeBuckets.within7Days++;
+          } else if (timeDiffHours <= 720) { // 30 days = 720 hours
+            timeBuckets.within30Days++;
+          } else {
+            timeBuckets.over30Days++;
+          }
         }
       }
+    });
 
-      return keys;
+    const totalUsers = users.length;
+    const purchasers = timeToPurchaseArray.length;
+    const nonPurchasers = totalUsers - purchasers;
+    const conversionRate = totalUsers > 0 ? (purchasers / totalUsers) * 100 : 0;
+
+    // Calculate average
+    const averageTimeToFirstPurchaseHours = purchasers > 0
+      ? timeToPurchaseArray.reduce((sum, time) => sum + time, 0) / purchasers
+      : 0;
+
+    // Calculate median
+    let medianTimeToFirstPurchaseHours = 0;
+    if (purchasers > 0) {
+      const sorted = [...timeToPurchaseArray].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      medianTimeToFirstPurchaseHours = sorted.length % 2 !== 0
+        ? sorted[mid]
+        : (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+
+    // Calculate percentages
+    const timeBucketsPercentage = {
+      within24Hours: purchasers > 0 ? (timeBuckets.within24Hours / purchasers) * 100 : 0,
+      within7Days: purchasers > 0 ? (timeBuckets.within7Days / purchasers) * 100 : 0,
+      within30Days: purchasers > 0 ? (timeBuckets.within30Days / purchasers) * 100 : 0,
+      over30Days: purchasers > 0 ? (timeBuckets.over30Days / purchasers) * 100 : 0,
     };
 
-    // Generate continuous data for all periods
-    const allKeys = generateAllPeriodKeys(startDate, endDate);
-    const timeSeries = allKeys
-      .map(key => ({
-        date: formatPeriodDate(key),
-        orders: periodData[key]?.orders || 0,
-        revenue: periodData[key]?.revenue || 0,
-        users: periodData[key]?.users || 0,
-      }))
-      .sort((a, b) => a.date.localeCompare(b.date));
+    return {
+      averageTimeToFirstPurchaseHours: Math.round(averageTimeToFirstPurchaseHours * 100) / 100,
+      medianTimeToFirstPurchaseHours: Math.round(medianTimeToFirstPurchaseHours * 100) / 100,
+      conversionRate: Math.round(conversionRate * 100) / 100,
+      totalUsers,
+      purchasers,
+      nonPurchasers,
+      timeBuckets,
+      timeBucketsPercentage: {
+        within24Hours: Math.round(timeBucketsPercentage.within24Hours * 10) / 10,
+        within7Days: Math.round(timeBucketsPercentage.within7Days * 10) / 10,
+        within30Days: Math.round(timeBucketsPercentage.within30Days * 10) / 10,
+        over30Days: Math.round(timeBucketsPercentage.over30Days * 10) / 10,
+      },
+    };
+  }
 
-    return timeSeries;
+  /**
+   * Get vendor rankings by completed orders (not revenue)
+   * This provides an alternative ranking based on order volume rather than revenue
+   */
+  async getTopVendorsByOrdersForStaff(staffId: string) {
+    // Verify staff has permission
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`Staff ${staffId} fetching top vendors by completed orders`);
+
+    // Get all completed orders with vendor information
+    const { data: orders, error: ordersError } = await this.supabase
+      .from('orders')
+      .select('vendor_id, status, total_amount, created_at')
+      .eq('status', 'completed')
+      .order('created_at', { ascending: false })
+      .limit(10000);
+
+    if (ordersError) {
+      this.logger.error('Failed to fetch orders for vendor ranking:', ordersError);
+      throw new BadRequestException('Failed to fetch orders');
+    }
+
+    // Count orders by vendor
+    const vendorOrderCounts: Record<string, { 
+      completedOrders: number; 
+      totalRevenue: number; 
+      averageOrderValue: number 
+    }> = {};
+
+    orders?.forEach(order => {
+      const vendorId = order.vendor_id;
+      if (!vendorId) return;
+
+      if (!vendorOrderCounts[vendorId]) {
+        vendorOrderCounts[vendorId] = {
+          completedOrders: 0,
+          totalRevenue: 0,
+          averageOrderValue: 0,
+        };
+      }
+
+      vendorOrderCounts[vendorId].completedOrders += 1;
+      vendorOrderCounts[vendorId].totalRevenue += parseFloat(order.total_amount || '0');
+    });
+
+    // Calculate average order value for each vendor
+    Object.keys(vendorOrderCounts).forEach(vendorId => {
+      const data = vendorOrderCounts[vendorId];
+      data.averageOrderValue = data.completedOrders > 0 
+        ? data.totalRevenue / data.completedOrders 
+        : 0;
+    });
+
+    // Sort by completed order count (descending)
+    const sortedVendors = Object.entries(vendorOrderCounts)
+      .sort(([, a], [, b]) => b.completedOrders - a.completedOrders)
+      .slice(0, 10);
+
+    // Get vendor details
+    const topVendors = await Promise.all(
+      sortedVendors.map(async ([vendorId, data]) => {
+        const { data: profile } = await this.supabase
+          .from('user_profiles')
+          .select('id, username, preferences')
+          .eq('id', vendorId)
+          .single();
+
+        return {
+          vendorId,
+          vendorName: profile?.preferences?.fullName || profile?.username || 'Unknown',
+          completedOrders: data.completedOrders,
+          totalRevenue: data.totalRevenue,
+          averageOrderValue: Math.round(data.averageOrderValue * 100) / 100,
+        };
+      })
+    );
+
+    return topVendors;
   }
 
   /**
@@ -1851,6 +1961,96 @@ export class AdminService {
       averageUniqueBiddersPerAuction,
       topCategories,
       topAuctions,
+    };
+  }
+
+  /**
+   * Get live sales and gamification analytics for staff
+   */
+  async getLiveSalesAnalyticsForStaff(staffId: string) {
+    // Verify staff has permission
+    await this.verifyContentModerator(staffId);
+
+    this.logger.log(`Staff ${staffId} fetching live sales analytics`);
+
+    // Get gamification config
+    const { data: configRows, error: configError } = await this.supabase
+      .from('live_sales_event_config')
+      .select('*')
+      .limit(1);
+
+    if (configError) {
+      this.logger.error(`Failed to fetch live sales event config: ${configError.message}`);
+      throw new BadRequestException('Failed to fetch live sales event config');
+    }
+
+    const config = configRows?.[0] || null;
+
+    // Get currently live streams with viewer counts and vendor info
+    const { data: liveStreams, error: streamsError } = await this.supabase
+      .from('live_stream_stats')
+      .select(`
+        id,
+        vendor_id,
+        title,
+        status,
+        current_viewers,
+        total_viewers,
+        total_sales,
+        total_gifts,
+        total_gift_value,
+        started_at,
+        vendor:user_profiles!vendor_id (
+          id,
+          username,
+          avatar_url,
+          display_name
+        )
+      `)
+      .eq('status', 'live')
+      .order('current_viewers', { ascending: false });
+
+    if (streamsError) {
+      this.logger.error(`Failed to fetch live streams: ${streamsError.message}`);
+      throw new BadRequestException('Failed to fetch live streams');
+    }
+
+    const streams = (liveStreams || []).map((stream: any) => ({
+      streamId: stream.id,
+      vendorId: stream.vendor_id,
+      vendorName: stream.vendor?.display_name || stream.vendor?.username || 'Unknown Vendor',
+      vendorAvatar: stream.vendor?.avatar_url || null,
+      title: stream.title || 'Untitled Stream',
+      currentViewers: stream.current_viewers || 0,
+      totalViewers: stream.total_viewers || 0,
+      totalSales: stream.total_sales || 0,
+      totalGifts: stream.total_gifts || 0,
+      totalGiftValue: stream.total_gift_value || 0,
+      startedAt: stream.started_at,
+    }));
+
+    const currentlyLiveStreams = streams.length;
+    const currentlyLiveVendors = new Set(streams.map(s => s.vendorId)).size;
+    const totalActiveViewers = streams.reduce((sum, s) => sum + s.currentViewers, 0);
+
+    return {
+      currentlyLiveStreams,
+      currentlyLiveVendors,
+      totalActiveViewers,
+      streams,
+      gamification: config ? {
+        watchRewardsEnabled: config.watch_rewards_enabled,
+        watchTimeMinutes: config.watch_time_minutes,
+        fretiPerReward: config.freti_per_reward,
+        dailyCapPerUser: config.daily_cap_per_user,
+        perStreamCapPerUser: config.per_stream_cap_per_user,
+        leaderboardEnabled: config.leaderboard_enabled,
+        specialEventEnabled: config.special_event_enabled,
+        specialEventName: config.special_event_name,
+        defaultOrderWeight: config.default_order_weight,
+        defaultViewerWeight: config.default_viewer_weight,
+        defaultRevenueWeight: config.default_revenue_weight,
+      } : null,
     };
   }
 
@@ -3176,7 +3376,7 @@ export class AdminService {
           try {
             disputeDetails = await this.getDisputeByIdForStaff(staffId, disputeId);
           } catch (err) {
-            this.logger.warn(`Could not fetch full dispute details: ${err.message}`);
+            this.logger.warn(`Could not fetch full dispute details: ${err instanceof Error ? err.message : String(err)}`);
             // Use basic dispute info if full details unavailable
             disputeDetails = {
               disputeId: dispute.id,
@@ -3245,7 +3445,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
           }
         }
       } catch (reportErr) {
-        this.logger.warn(`Failed to create report for escalated dispute (non-critical): ${reportErr.message}`);
+        this.logger.warn(`Failed to create report for escalated dispute (non-critical): ${reportErr instanceof Error ? reportErr.message : String(reportErr)}`);
         // Don't fail the escalation if report creation fails
       }
     }
@@ -3263,7 +3463,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       this.eventEmitter.emit(AdminNotificationEventType.DISPUTE_ESCALATED, event);
       this.logger.log(`📢 Emitted dispute escalation event for dispute ${disputeId}`);
     } catch (eventError) {
-      this.logger.warn(`Failed to emit dispute escalation event: ${eventError.message}`);
+      this.logger.warn(`Failed to emit dispute escalation event: ${eventError instanceof Error ? eventError.message : String(eventError)}`);
       // Don't fail the escalation if event emission fails
     }
 
@@ -4143,7 +4343,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         await this.suspendUser(staffId, userId, `Auto-suspended after ${warningCount} warnings (${highSeverityCount} high, ${mediumSeverityCount} medium, ${lowSeverityCount} low)`);
         this.logger.log(`User ${userId} auto-suspended after reaching warning threshold`);
       } catch (suspendError) {
-        this.logger.error(`Failed to auto-suspend user: ${suspendError.message}`);
+        this.logger.error(`Failed to auto-suspend user: ${suspendError instanceof Error ? suspendError.message : String(suspendError)}`);
         // Don't throw - warning was created successfully
       }
     }
@@ -4159,7 +4359,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         relatedContentType,
       });
     } catch (notifError) {
-      this.logger.warn(`Failed to send warning notification: ${notifError.message}`);
+      this.logger.warn(`Failed to send warning notification: ${notifError instanceof Error ? notifError.message : String(notifError)}`);
       // Don't throw - warning was created successfully
     }
 
@@ -4180,7 +4380,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         status: AuditStatus.SUCCESS,
       });
     } catch (auditError) {
-      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+      this.logger.warn(`Failed to log audit action: ${auditError instanceof Error ? auditError.message : String(auditError)}`);
     }
 
     this.logger.log(`User ${userId} warned by staff ${staffId} with ${severity} severity`);
@@ -6120,6 +6320,10 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
 
   /**
    * Process full refund to buyer
+   *
+   * ✅ ATOMIC FIX: The full refund, gift-card reversal, escrow status, and
+   * order cancellation are now handled in one Postgres transaction by
+   * admin_full_refund_escrow_atomic().
    */
   private async processFullRefund(
     order: any,
@@ -6127,39 +6331,37 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     reason: string,
     staffId: string
   ) {
-    // Refund full amount to buyer
-    await this.walletService.processWalletTransaction(
-      order.buyer_id,
-      WalletTransactionType.ESCROW_REFUND,
-      parseFloat(escrow.total_amount),
-      `Full refund for order ${order.order_number} (resolved by support)`,
-      order.id,
-      'order',
+    const adminGiftWalletId = this.configService.get<string>(
+      'PLATFORM_GIFT_WALLET_USER_ID',
+      '00000000-0000-4000-8000-000000000003'
     );
 
-    // Update escrow status
-    const { error: escrowUpdateError } = await this.supabase
-      .from('escrows')
-      .update({
-        status: 'refunded',
-        refund_reason: reason,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', escrow.id);
+    const { data: refundResult, error: refundRpcError } = await this.supabase.rpc(
+      'admin_full_refund_escrow_atomic',
+      {
+        p_escrow_id: escrow.id,
+        p_reason: reason,
+        p_admin_gift_user_id: adminGiftWalletId,
+      }
+    );
 
-    if (escrowUpdateError) {
-      this.logger.error(`Failed to update escrow ${escrow.id} status to refunded: ${escrowUpdateError.message}`);
-      throw new Error(`Refund credited to buyer but escrow status update failed: ${escrowUpdateError.message}. Manual reconciliation required.`);
+    if (refundRpcError) {
+      this.logger.error('admin_full_refund_escrow_atomic RPC error:', refundRpcError);
+      throw new Error(`Admin full refund failed: ${refundRpcError.message}`);
     }
 
-    // Update order status
-    await this.supabase
-      .from('orders')
-      .update({
-        status: 'cancelled',
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', order.id);
+    if (!refundResult || !refundResult.success) {
+      const errorCode = refundResult?.error_code || 'UNKNOWN';
+      const errorMessage = refundResult?.error || 'Admin full refund failed';
+
+      if (errorCode === 'ESCROW_NOT_FOUND') {
+        throw new NotFoundException(errorMessage);
+      } else if (errorCode === 'UNAUTHORIZED') {
+        throw new UnauthorizedException(errorMessage);
+      } else {
+        throw new Error(errorMessage);
+      }
+    }
 
     // Notify buyer
     await this.notificationHelper.notifyOrderRefunded(
@@ -6172,6 +6374,10 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
 
   /**
    * Process partial refund (rider keeps earnings)
+   *
+   * ✅ ATOMIC FIX: All wallet/partner credits, the buyer refund, escrow/order
+   * status updates, and buyer escrow debit are now handled in one Postgres
+   * transaction by staff_resolve_escrow_atomic().
    */
   private async processPartialRefund(
     order: any,
@@ -6182,14 +6388,6 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
     const requestedRiderEarnings = refundData.riderEarnings || 0;
     const vendorAmount = refundData.vendorAmount || 0;
     const platformFeeAmount = refundData.platformFee || 0;
-    const escrowTotal = parseFloat(escrow.total_amount);
-
-    // Only apply rider earnings if this order actually has a rider assigned.
-    // If no rider exists, those funds must NOT be silently removed from the
-    // buyer's refund — they would otherwise disappear with no destination.
-    const effectiveRiderEarnings = (requestedRiderEarnings > 0 && order.rider_id)
-      ? requestedRiderEarnings
-      : 0;
 
     if (requestedRiderEarnings > 0 && !order.rider_id) {
       this.logger.warn(
@@ -6197,143 +6395,59 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
       );
     }
 
-    // Validate allocations do not exceed the escrow total
-    const totalAllocated = effectiveRiderEarnings + vendorAmount + platformFeeAmount;
-    if (totalAllocated > escrowTotal) {
-      throw new BadRequestException(
-        `Allocated amounts (${totalAllocated}) exceed escrow total (${escrowTotal}). Please correct the values.`,
-      );
+    const { data: resolveResult, error: resolveRpcError } = await this.supabase.rpc(
+      'staff_resolve_escrow_atomic',
+      {
+        p_escrow_id: escrow.id,
+        p_vendor_amount: vendorAmount,
+        p_rider_earnings: requestedRiderEarnings,
+        p_platform_fee: platformFeeAmount,
+        p_reason: refundData.reason,
+      }
+    );
+
+    if (resolveRpcError) {
+      this.logger.error('staff_resolve_escrow_atomic RPC error:', resolveRpcError);
+      throw new Error(`Staff resolution failed: ${resolveRpcError.message}`);
     }
 
-    const buyerRefundAmount = escrowTotal - effectiveRiderEarnings - vendorAmount - platformFeeAmount;
+    if (!resolveResult || !resolveResult.success) {
+      const errorCode = resolveResult?.error_code || 'UNKNOWN';
+      const errorMessage = resolveResult?.error || 'Staff resolution failed';
 
-    // Refund remaining amount to buyer
-    if (buyerRefundAmount > 0) {
-      await this.walletService.processWalletTransaction(
-        order.buyer_id,
-        WalletTransactionType.ESCROW_REFUND,
-        buyerRefundAmount,
-        `Partial refund for order ${order.order_number} (resolved by support)`,
-        order.id,
-        'order',
-      );
-    }
-
-    // Pay vendor their share
-    if (vendorAmount > 0 && order.vendor_id) {
-      await this.walletService.processWalletTransaction(
-        order.vendor_id,
-        WalletTransactionType.ESCROW_RELEASE,
-        vendorAmount,
-        `Partial payment for order ${order.order_number} (resolved by support)`,
-        order.id,
-        'order',
-      );
-    }
-
-    // Pay rider their earnings (only when a rider is actually assigned)
-    if (effectiveRiderEarnings > 0 && order.rider_id) {
-      const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
-        order.rider_id,
-        effectiveRiderEarnings,
-        `Earnings for order ${order.order_number}`,
-      );
-
-      if (!partnerCredit.credited) {
-        // Independent rider — credit Freti wallet as before
-        await this.walletService.processWalletTransaction(
-          order.rider_id,
-          WalletTransactionType.DELIVERY_PAYMENT,
-          effectiveRiderEarnings,
-          `Earnings for order ${order.order_number} (resolved by support)`,
-          order.id,
-          'order',
-        );
+      if (errorCode === 'ESCROW_NOT_FOUND') {
+        throw new NotFoundException(errorMessage);
+      } else if (errorCode === 'OVER_ALLOCATION' || errorCode === 'NEGATIVE_ALLOCATION') {
+        throw new BadRequestException(errorMessage);
+      } else {
+        throw new Error(errorMessage);
       }
     }
 
-    // Credit platform fee to platform wallet
-    if (platformFeeAmount > 0) {
-      await this.walletService.processWalletTransaction(
-        this.PLATFORM_USER_ID,
-        WalletTransactionType.PLATFORM_COMMISSION,
-        platformFeeAmount,
-        `Platform fee for order ${order.order_number}`,
-        order.id,
-        'order',
-      );
-    }
-
-    // The buyer's wallet holds the escrow balance for this order (credited via
-    // purchase_hold at checkout). ESCROW_RELEASE/DELIVERY_PAYMENT/PLATFORM_COMMISSION
-    // above only credit the vendor/rider/platform's own wallets — they never touch
-    // the buyer's escrow_balance. Debit the buyer's escrow_balance here for the
-    // portion that was released to other parties, so it doesn't stay stuck as
-    // phantom held funds.
-    const releasedAmount = vendorAmount + effectiveRiderEarnings + platformFeeAmount;
-    if (releasedAmount > 0) {
-      const escrowDebitResult = await this.walletService.processWalletTransaction(
-        order.buyer_id,
-        WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM,
-        releasedAmount,
-        `Escrow debit for released funds on order ${order.order_number} (resolved by support)`,
-        order.id,
-        'order',
-      );
-
-      if (!escrowDebitResult.success) {
-        this.logger.error(
-          `Failed to debit buyer escrow balance for order ${order.order_number}: ${escrowDebitResult.error}. Manual reconciliation required.`,
-        );
-      }
-    }
-
-    // Update escrow status
-    const { error: escrowUpdateError } = await this.supabase
-      .from('escrows')
-      .update({
-        status: 'refunded',
-        refund_reason: refundData.reason,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', escrow.id);
-
-    if (escrowUpdateError) {
-      this.logger.error(`Failed to update escrow ${escrow.id} status to refunded: ${escrowUpdateError.message}`);
-      throw new Error(`Partial refund processed but escrow status update failed: ${escrowUpdateError.message}. Manual reconciliation required.`);
-    }
-
-    // Update order status
-    await this.supabase
-      .from('orders')
-      .update({
-        status: 'cancelled',
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', order.id);
+    const result = resolveResult.escrow;
 
     // Notify all affected parties
-    if (buyerRefundAmount > 0) {
+    if (result.buyer_refund > 0) {
       await this.notificationHelper.notifyOrderRefunded(
         order.buyer_id,
-        buyerRefundAmount,
+        result.buyer_refund,
         order.order_number,
         refundData.reason,
       );
     }
 
-    if (vendorAmount > 0 && order.vendor_id) {
+    if (result.vendor_released > 0 && order.vendor_id) {
       await this.notificationHelper.notifyVendorEscrowReleased(
         order.vendor_id,
-        vendorAmount,
+        result.vendor_released,
         order.order_number,
       );
     }
 
-    if (effectiveRiderEarnings > 0 && order.rider_id) {
+    if (result.rider_earnings > 0 && order.rider_id) {
       await this.notificationHelper.notifyRiderPaymentReleased(
         order.rider_id,
-        effectiveRiderEarnings,
+        result.rider_earnings,
         order.order_number,
       );
     }
@@ -6732,7 +6846,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         .single();
       username = userProfile?.username || null;
     } catch (error) {
-      this.logger.warn(`Failed to fetch user details for email: ${error.message}`);
+      this.logger.warn(`Failed to fetch user details for email: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     // If approved, unsuspend the user
@@ -6747,12 +6861,12 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
             await this.sharedEmailService.sendAppealApprovalEmail(appeal.user_id, username || undefined);
             this.logger.log(`Appeal approval email sent to ${userEmail}`);
           } catch (emailError) {
-            this.logger.warn(`Failed to send appeal approval email: ${emailError.message}`);
+            this.logger.warn(`Failed to send appeal approval email: ${emailError instanceof Error ? emailError.message : String(emailError)}`);
             // Don't fail the appeal review if email fails
           }
         }
       } catch (error) {
-        this.logger.warn(`Failed to unsuspend user after appeal approval: ${error.message}`);
+        this.logger.warn(`Failed to unsuspend user after appeal approval: ${error instanceof Error ? error.message : String(error)}`);
         // Don't fail the appeal review if unsuspension fails
       }
     } else {
@@ -6762,7 +6876,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
           await this.sharedEmailService.sendAppealRejectionEmail(appeal.user_id, username, notes || undefined);
           this.logger.log(`Appeal rejection email sent to ${userEmail}`);
         } catch (emailError) {
-          this.logger.warn(`Failed to send appeal rejection email: ${emailError.message}`);
+          this.logger.warn(`Failed to send appeal rejection email: ${emailError instanceof Error ? emailError.message : String(emailError)}`);
           // Don't fail the appeal review if email fails
         }
       }
@@ -6783,7 +6897,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         },
       );
     } catch (notifError) {
-      this.logger.warn(`Failed to send appeal notification: ${notifError.message}`);
+      this.logger.warn(`Failed to send appeal notification: ${notifError instanceof Error ? notifError.message : String(notifError)}`);
     }
 
     // Log audit action
@@ -6802,7 +6916,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         status: AuditStatus.SUCCESS,
       });
     } catch (auditError) {
-      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+      this.logger.warn(`Failed to log audit action: ${auditError instanceof Error ? auditError.message : String(auditError)}`);
     }
 
     return {
@@ -6883,7 +6997,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         status: AuditStatus.SUCCESS,
       });
     } catch (auditError) {
-      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+      this.logger.warn(`Failed to log audit action: ${auditError instanceof Error ? auditError.message : String(auditError)}`);
     }
     
     // Pass the admin-provided accountName as pre-verified so createBankAccount skips the
@@ -6917,7 +7031,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         status: AuditStatus.SUCCESS,
       });
     } catch (auditError) {
-      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+      this.logger.warn(`Failed to log audit action: ${auditError instanceof Error ? auditError.message : String(auditError)}`);
     }
     
     return this.bankAccountService.updateBankAccount(this.PLATFORM_USER_ID, accountId, dto);
@@ -6946,7 +7060,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         status: AuditStatus.SUCCESS,
       });
     } catch (auditError) {
-      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+      this.logger.warn(`Failed to log audit action: ${auditError instanceof Error ? auditError.message : String(auditError)}`);
     }
     
     return this.bankAccountService.deleteBankAccount(this.PLATFORM_USER_ID, accountId);
@@ -6985,7 +7099,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         status: AuditStatus.SUCCESS,
       });
     } catch (auditError) {
-      this.logger.warn(`Failed to log audit action: ${auditError.message}`);
+      this.logger.warn(`Failed to log audit action: ${auditError instanceof Error ? auditError.message : String(auditError)}`);
     }
     
     // Use wallet service to create withdrawal request for platform user
@@ -7232,7 +7346,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         totalUsers: result.reduce((sum, r) => sum + r.users, 0)
       };
     } catch (error) {
-      this.logger.error(`Failed to get regional revenue: ${error.message}`);
+      this.logger.error(`Failed to get regional revenue: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     }
   }
@@ -7301,7 +7415,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         }
       };
     } catch (error) {
-      this.logger.error(`Failed to get provider performance: ${error.message}`);
+      this.logger.error(`Failed to get provider performance: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     }
   }
@@ -7387,7 +7501,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         }
       };
     } catch (error) {
-      this.logger.error(`Failed to get transaction patterns: ${error.message}`);
+      this.logger.error(`Failed to get transaction patterns: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     }
   }
@@ -7513,7 +7627,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         }
       };
     } catch (error) {
-      this.logger.error(`Failed to get revenue summary: ${error.message}`);
+      this.logger.error(`Failed to get revenue summary: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
     }
   }

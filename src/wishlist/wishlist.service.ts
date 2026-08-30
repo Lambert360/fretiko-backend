@@ -1291,7 +1291,206 @@ export class WishlistService {
       throw new Error('A gift order already exists for this wishlist item');
     }
 
-    // Check giver's wallet balance
+    // Calculate pricing and fees
+    const itemPrice = (wishlistItem as any).products.price;
+    const platformFee = itemPrice * 0.02; // 2% platform commission (deducted from vendor during escrow release)
+
+    // Calculate delivery fee and rider info based on selected rider
+    let deliveryFee = 0;
+    let riderId: string | null = null;
+    let deliveryType: 'delivery' | 'pickup' = 'delivery';
+
+    if (selectedRider) {
+      if (selectedRider.riderId === 'pickup') {
+        deliveryFee = 0;
+        riderId = null;
+        deliveryType = 'pickup';
+      } else if (selectedRider.deliveryPrice) {
+        deliveryFee = selectedRider.deliveryPrice;
+        riderId = selectedRider.riderId;
+        deliveryType = 'delivery';
+      }
+    }
+
+    const total = itemPrice + deliveryFee;
+
+    // Generate order number
+    const orderNumber = `GIFT-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+
+    // Get vendor_id from product
+    const vendorId = (wishlistItem as any).products.seller_id;
+
+    // Build payloads for the atomic gift order RPC
+    const pOrder = {
+      buyer_id: giftGiverId,
+      vendor_id: vendorId,
+      order_number: orderNumber,
+      status: 'pending',
+      escrow_enabled: true,
+      total_amount: total,
+      delivery_fee: deliveryFee,
+      platform_fee: platformFee,
+      rider_id: riderId,
+      delivery_type: deliveryType,
+      delivery_address: {
+        fullName: deliveryAddress.fullName,
+        phone: deliveryAddress.phone,
+        address: deliveryAddress.address,
+        city: deliveryAddress.city,
+        state: deliveryAddress.state,
+        country: deliveryAddress.country,
+        postalCode: deliveryAddress.postalCode,
+      },
+      delivery_instructions: giftMessage ? `Gift from ${giverUser.username}: ${giftMessage}` : `Gift from ${giverUser.username}`,
+      estimated_delivery: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+      source: 'wishlist',
+      metadata: {
+        gift_giver_id: giftGiverId,
+        gift_recipient_id: actualRecipientId,
+        wishlist_item_id: wishlistItemId,
+        gift_message: giftMessage,
+        is_surprise: isSurprise,
+        rider_info: selectedRider ? {
+          riderId: selectedRider.riderId,
+          riderName: selectedRider.riderName,
+          vehicleType: selectedRider.vehicleType,
+          deliveryPrice: selectedRider.deliveryPrice,
+          estimatedArrival: selectedRider.estimatedArrival,
+        } : null,
+      },
+    };
+
+    const pItems = [
+      {
+        product_id: wishlistItem.product_id,
+        product_name: (wishlistItem as any).products.name,
+        quantity: 1,
+        unit_price: (wishlistItem as any).products.price,
+        total_price: (wishlistItem as any).products.price,
+        product_metadata: {
+          gift_giver: giverUser.username,
+          gift_recipient: recipientUser.username,
+          gift_message: giftMessage,
+          is_surprise: isSurprise,
+        },
+      },
+    ];
+
+    const riderCommission = riderId && deliveryFee > 0
+      ? deliveryFee * this.PLATFORM_COMMISSION_RATE
+      : 0;
+
+    const pEscrow = {
+      total_amount: total,
+      vendor_amount: itemPrice - platformFee,
+      rider_amount: deliveryFee - riderCommission,
+      platform_amount: platformFee + riderCommission,
+    };
+
+    if (Math.abs((pEscrow.vendor_amount + pEscrow.rider_amount + pEscrow.platform_amount) - total) > 0.000001) {
+      throw new Error('Escrow breakdown does not sum to order total');
+    }
+
+    const pGiftOrder = {
+      gift_giver_id: giftGiverId,
+      gift_recipient_id: actualRecipientId,
+      wishlist_item_id: wishlistItemId,
+      gift_message: giftMessage,
+      is_surprise: isSurprise,
+      status: 'pending',
+    };
+
+    const { data: rpcData, error: rpcError } = await this.supabase.rpc('create_gift_order_atomic', {
+      p_buyer_id: giftGiverId,
+      p_order: pOrder,
+      p_items: pItems,
+      p_escrow: pEscrow,
+      p_gift_order: pGiftOrder,
+      p_gift_card: null,
+      p_rewards_amount: 0,
+      p_admin_gift_user_id: null,
+      p_user_ip: null,
+    });
+
+    if (rpcError) {
+      console.error('create_gift_order_atomic RPC error:', rpcError);
+      throw new Error(`Failed to create gift order: ${rpcError.message}`);
+    }
+
+    const rpcResult = rpcData as any;
+    if (!rpcResult || !rpcResult.success) {
+      console.error('create_gift_order_atomic failed:', rpcResult?.error);
+      throw new Error(rpcResult?.error || 'Gift order creation failed');
+    }
+
+    const order = { ...pOrder, ...rpcResult.order };
+    const giftOrderId = rpcResult.gift_order?.id;
+
+    console.log('✅ Gift order created via RPC:', {
+      orderId: order.id,
+      orderNumber: order.order_number,
+      giftOrderId,
+    });
+
+    // Send notification to gift recipient (if not a surprise)
+    if (!isSurprise) {
+      try {
+        const { data: notifPrefs } = await serviceClient
+          .from('notification_settings')
+          .select('order_notifications')
+          .eq('user_id', actualRecipientId)
+          .single();
+
+        const shouldSendNotification = !notifPrefs || notifPrefs.order_notifications !== false;
+
+        if (shouldSendNotification) {
+          await this.notificationsService.createNotification({
+            user_id: actualRecipientId,
+            type: NotificationType.ORDER,
+            title: '🎁 You Received a Gift!',
+            message: `${giverUser.username} sent you ${(wishlistItem as any).products?.name} as a gift!`,
+            priority: NotificationPriority.HIGH,
+            data: {
+              gift_order_id: giftOrderId,
+              gift_giver_id: giftGiverId,
+              gift_giver_username: giverUser.username,
+              product_id: wishlistItem.product_id,
+              product_name: (wishlistItem as any).products?.name,
+              wishlist_item_id: wishlistItemId,
+              order_id: order.id,
+              gift_message: giftMessage,
+              is_surprise: isSurprise,
+            },
+            badge: 'gift'
+          });
+          console.log('💖 Gift notification sent to recipient:', actualRecipientId);
+        }
+      } catch (notifError) {
+        console.error('Error sending gift notification:', notifError);
+      }
+    }
+
+    // Remove purchased wishlist item
+    try {
+      await this.removePurchasedItems(actualRecipientId, [wishlistItemId], userToken);
+      console.log(`✅ Removed purchased wishlist item ${wishlistItemId} from recipient's wishlist`);
+    } catch (cleanupError) {
+      console.error('⚠️ Failed to remove wishlist item after gift purchase (non-critical):', cleanupError);
+    }
+
+    return {
+      message: 'Gift purchase successful!',
+      giftOrderId,
+      orderId: order.id,
+      orderNumber: order.order_number,
+      recipientName: recipientUser.username,
+      productName: (wishlistItem as any).products?.name,
+      totalAmount: total,
+      isSurprise,
+    };
+  }
+
+/* ==== OLD CODE — pre-ACID gift order flow, kept for reference; not executed ====
     const { data: giverWallet, error: walletError } = await client
       .from('wallets')
       .select('available_balance')
@@ -1493,22 +1692,23 @@ export class WishlistService {
       orderNumber: createdOrder.order_number,
     });
     
-    const walletResult = await this.walletService.processWalletTransaction(
-      giftGiverId,
-      WalletTransactionType.PURCHASE_HOLD, // Moves money to escrow
-      total,
-      `Gift purchase: ${(wishlistItem as any).products.name} for ${recipientUser.username}`,
-      createdOrder.id, // Already validated as valid UUID above
-      'order',
+    // ✅ ATOMIC FIX: Hold the wallet funds in the same transaction as the order.
+    const { data: holdResult, error: holdRpcError } = await client.rpc(
+      'complete_purchase_hold_atomic',
+      {
+        p_order_id: createdOrder.id,
+        p_buyer_id: giftGiverId,
+        p_amount: total,
+        p_description: `Gift purchase: ${(wishlistItem as any).products.name} for ${recipientUser.username}`,
+      }
     );
 
-    if (!walletResult.success) {
-      console.error('Wallet transaction error:', walletResult.error);
+    if (holdRpcError) {
+      console.error('complete_purchase_hold_atomic RPC error:', holdRpcError);
       // Rollback order, items, and stock
       await client.from('order_items').delete().eq('order_id', createdOrder.id);
       await client.from('orders').delete().eq('id', createdOrder.id);
-      
-      // 🔥 FIX: Rollback stock if it was updated (use service client)
+
       if (stockUpdated) {
         try {
           const { data: currentProduct } = await serviceClient
@@ -1516,10 +1716,10 @@ export class WishlistService {
             .select('quantity')
             .eq('id', wishlistItem.product_id)
             .maybeSingle();
-          
+
           if (currentProduct) {
             const currentStock = currentProduct.quantity;
-            
+
             await serviceClient
               .from('products')
               .update({
@@ -1533,13 +1733,47 @@ export class WishlistService {
           console.error('⚠️ Failed to rollback stock (non-critical):', rollbackError);
         }
       }
-      
+
+      throw new Error('Payment processing failed');
+    }
+
+    if (!holdResult || !holdResult.success) {
+      console.error('complete_purchase_hold_atomic failed:', holdResult?.error);
+      // Rollback order, items, and stock
+      await client.from('order_items').delete().eq('order_id', createdOrder.id);
+      await client.from('orders').delete().eq('id', createdOrder.id);
+
+      if (stockUpdated) {
+        try {
+          const { data: currentProduct } = await serviceClient
+            .from('products')
+            .select('quantity')
+            .eq('id', wishlistItem.product_id)
+            .maybeSingle();
+
+          if (currentProduct) {
+            const currentStock = currentProduct.quantity;
+
+            await serviceClient
+              .from('products')
+              .update({
+                quantity: currentStock !== null ? currentStock + 1 : 1,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', wishlistItem.product_id);
+            console.log(`✅ Stock rolled back for product ${wishlistItem.product_id}`);
+          }
+        } catch (rollbackError) {
+          console.error('⚠️ Failed to rollback stock (non-critical):', rollbackError);
+        }
+      }
+
       throw new Error('Payment processing failed');
     }
 
     console.log(`✅ Wallet payment processed via RPC:`, {
-      transactionId: walletResult.transactionId,
-      success: walletResult.success,
+      transactionId: holdResult.hold_transaction_id,
+      success: true,
     });
 
     // 🔥 FIX: Create escrow for the order - platform fee deducted from vendor, not added to buyer total
@@ -1925,7 +2159,7 @@ export class WishlistService {
       totalAmount: total,
       isSurprise: isSurprise
     };
-  }
+  */
 
   /**
    * Get gifts received by user
@@ -2147,7 +2381,7 @@ export class WishlistService {
 
   /**
    * Check if a wishlist item can be purchased as a gift
-   */
+   ==== OLD CODE END ==== */
   async canPurchaseAsGift(
     giftGiverId: string,
     wishlistItemId: string,

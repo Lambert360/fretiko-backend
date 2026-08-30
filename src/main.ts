@@ -22,12 +22,12 @@ async function bootstrap() {
   // Enable CORS for frontend and mobile app
   app.enableCors({
     origin: [
-      'http://localhost:3001', 
+      'http://localhost:3001',
       'http://localhost:3000',
       'https://fretiko.com',
       'https://www.fretiko.com', // Add www subdomain
       'exp://*', // Expo development
-      'https://fretiko-backend.onrender.com' // Render backend
+      'https://fretiko-backend.onrender.com', // Render backend
     ],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],

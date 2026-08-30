@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException, CanActivate, ExecutionContext } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ForbiddenException, CanActivate, ExecutionContext } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 
@@ -31,14 +31,14 @@ export class AdminGuard implements CanActivate {
       .single();
 
     if (error || !profile) {
-      throw new UnauthorizedException('User profile not found');
+      throw new ForbiddenException('User profile not found');
     }
 
-    // Check if user has admin role
-    const isAdmin = profile.role === 'admin' || profile.preferences?.isAdmin === true;
+    const adminRoles = ['admin', 'super_admin', 'superadmin'];
+    const isAdmin = adminRoles.includes(profile.role) || profile.preferences?.isAdmin === true;
 
     if (!isAdmin) {
-      throw new UnauthorizedException('Admin access required');
+      throw new ForbiddenException('Admin access required');
     }
 
     return true;

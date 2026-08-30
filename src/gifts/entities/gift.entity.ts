@@ -10,6 +10,21 @@ export interface VirtualGift {
   credit_value: number;
   is_active: boolean;
   sort_order: number;
+  display_lottie_url: string | null;
+  lottie_config: any;
+  sound_id: string | null;
+  sound_url?: string;
+  animation_type: 'lottie_single' | 'lottie_combo' | 'lottie_overlap';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Sound {
+  id: string;
+  name: string;
+  sound_url: string;
+  is_active: boolean;
+  sort_order: number;
   created_at: string;
   updated_at: string;
 }

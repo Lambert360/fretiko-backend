@@ -45,6 +45,7 @@ export interface RiderProfile {
   trustScore?: number;
   completionRate?: number;
   deliveryPromise?: string;
+  isCurrentlyDelivering?: boolean; // NEW: Indicates if rider is currently on an active delivery
 }
 
 @Controller('riders')

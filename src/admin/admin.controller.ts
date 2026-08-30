@@ -34,7 +34,7 @@ export class AdminController {
         message: result.message,
       };
     } catch (error) {
-      throw new BadRequestException(error.message);
+      throw new BadRequestException(error instanceof Error ? error.message : 'An error occurred');
     }
   }
 
@@ -54,7 +54,7 @@ export class AdminController {
         message: result.message,
       };
     } catch (error) {
-      throw new BadRequestException(error.message);
+      throw new BadRequestException(error instanceof Error ? error.message : 'An error occurred');
     }
   }
 
@@ -163,6 +163,26 @@ export class AdminController {
 
     const dateRange = start && end ? { start, end } : undefined;
     return this.adminService.getAuctionAnalyticsSummary(req.user.sub, dateRange);
+  }
+
+  /**
+   * Get conversion metrics (time to first purchase)
+   * GET /admin/analytics/conversion-metrics
+   */
+  @Get('analytics/conversion-metrics')
+  @UseGuards(StaffJwtAuthGuard)
+  async getConversionMetrics(@Request() req) {
+    return this.adminService.getConversionMetricsForStaff(req.user.sub);
+  }
+
+  /**
+   * Get top vendors by completed orders (order-count-based ranking)
+   * GET /admin/analytics/vendors-by-orders
+   */
+  @Get('analytics/vendors-by-orders')
+  @UseGuards(StaffJwtAuthGuard)
+  async getTopVendorsByOrders(@Request() req) {
+    return this.adminService.getTopVendorsByOrdersForStaff(req.user.sub);
   }
 
   /**

@@ -99,6 +99,12 @@ export class StoriesController {
     );
   }
 
+  // Public endpoint: Get story preview for deep linking (no auth required)
+  @Get('public/:id')
+  async getPublicStory(@Param('id', ParseUUIDPipe) id: string) {
+    return await this.storiesService.getStoryById(id, '', undefined);
+  }
+
   @Put(':id')
   async updateStory(
     @Request() req,

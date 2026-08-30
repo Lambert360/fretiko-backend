@@ -23,7 +23,8 @@ export enum NotificationType {
   AI_CHECKIN = 'ai_checkin',
   AI_REMINDER = 'ai_reminder',
   AI_ENGAGEMENT = 'ai_engagement',
-  USER_WARNING = 'user_warning'
+  USER_WARNING = 'user_warning',
+  SCHEDULE = 'schedule'
 }
 
 export enum NotificationPriority {
@@ -42,10 +43,10 @@ export enum ActionButtonType {
 // ============================================
 export class ActionButtonDto {
   @IsString()
-  label: string;
+  label!: string;
 
   @IsEnum(ActionButtonType)
-  type: ActionButtonType;
+  type!: ActionButtonType;
 }
 
 // ============================================
@@ -53,16 +54,16 @@ export class ActionButtonDto {
 // ============================================
 export class CreateNotificationDto {
   @IsUUID()
-  user_id: string;
+  user_id!: string;
 
   @IsEnum(NotificationType)
-  type: NotificationType;
+  type!: NotificationType;
 
   @IsString()
-  title: string;
+  title!: string;
 
   @IsString()
-  message: string;
+  message!: string;
 
   @IsOptional()
   @IsObject()
@@ -114,7 +115,7 @@ export class UpdateNotificationDto {
 export class BulkUpdateNotificationsDto {
   @IsArray()
   @IsUUID('4', { each: true })
-  notification_ids: string[];
+  notification_ids!: string[];
 
   @IsOptional()
   @IsBoolean()
@@ -233,72 +234,78 @@ export class UpdateNotificationSettingsDto {
   @IsArray()
   @IsString({ each: true })
   expo_push_tokens?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  voip_push_tokens?: string[];
 }
 
 // ============================================
 // RESPONSE DTOs
 // ============================================
 export class NotificationResponseDto {
-  id: string;
-  user_id: string;
-  type: NotificationType;
-  title: string;
-  message: string;
+  id!: string;
+  user_id!: string;
+  type!: NotificationType;
+  title!: string;
+  message!: string;
   data?: Record<string, any>;
   avatar_url?: string;
   badge?: string;
-  priority: NotificationPriority;
-  is_read: boolean;
-  is_deleted: boolean;
-  has_actions: boolean;
+  priority!: NotificationPriority;
+  is_read!: boolean;
+  is_deleted!: boolean;
+  has_actions!: boolean;
   action_buttons?: ActionButtonDto[];
-  created_at: Date;
-  updated_at: Date;
+  created_at!: Date;
+  updated_at!: Date;
   expires_at?: Date;
 }
 
 export class NotificationStatsResponseDto {
-  total_notifications: number;
-  unread_count: number;
-  unread_orders: number;
-  unread_social: number;
-  unread_live: number;
-  unread_delivery: number;
-  unread_payment: number;
-  unread_chat: number;
+  total_notifications!: number;
+  unread_count!: number;
+  unread_orders!: number;
+  unread_social!: number;
+  unread_live!: number;
+  unread_delivery!: number;
+  unread_payment!: number;
+  unread_chat!: number;
   latest_notification_at?: Date;
 }
 
 export class NotificationSettingsResponseDto {
-  id: string;
-  user_id: string;
-  push_enabled: boolean;
-  email_enabled: boolean;
-  in_app_enabled: boolean;
-  order_notifications: boolean;
-  social_notifications: boolean;
-  promotion_notifications: boolean;
-  system_notifications: boolean;
-  delivery_notifications: boolean;
-  live_notifications: boolean;
-  payment_notifications: boolean;
-  chat_notifications: boolean;
-  quiet_hours_enabled: boolean;
+  id!: string;
+  user_id!: string;
+  push_enabled!: boolean;
+  email_enabled!: boolean;
+  in_app_enabled!: boolean;
+  order_notifications!: boolean;
+  social_notifications!: boolean;
+  promotion_notifications!: boolean;
+  system_notifications!: boolean;
+  delivery_notifications!: boolean;
+  live_notifications!: boolean;
+  payment_notifications!: boolean;
+  chat_notifications!: boolean;
+  quiet_hours_enabled!: boolean;
   quiet_start_time?: string;
   quiet_end_time?: string;
-  quiet_timezone: string;
-  expo_push_tokens: string[];
-  created_at: Date;
-  updated_at: Date;
+  quiet_timezone!: string;
+  expo_push_tokens!: string[];
+  voip_push_tokens!: string[];
+  created_at!: Date;
+  updated_at!: Date;
 }
 
 // ============================================
 // PAGINATED RESPONSE DTO
 // ============================================
 export class PaginatedNotificationsResponseDto {
-  notifications: NotificationResponseDto[];
-  total: number;
-  limit: number;
-  offset: number;
-  has_more: boolean;
+  notifications!: NotificationResponseDto[];
+  total!: number;
+  limit!: number;
+  offset!: number;
+  has_more!: boolean;
 }

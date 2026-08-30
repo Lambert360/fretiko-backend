@@ -4,6 +4,20 @@ import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { RiderAvailabilityRequest, OrderDetails, RiderProfile } from './riders.controller';
 
+interface RiderLocationData {
+  user_id: string;
+  current_order_id?: string;
+  is_available?: boolean;
+}
+
+interface OrderData {
+  id: string;
+  source: string;
+  status: string;
+  created_at: string;
+  metadata: any;
+}
+
 @Injectable()
 export class RidersService {
   private supabase;
@@ -150,6 +164,25 @@ export class RidersService {
         .select('user_id, rider_trust_score, completed_orders')
         .in('user_id', riderIds);
 
+      // Get rider_locations for active order detection (new feature)
+      const { data: riderLocationsData } = await this.supabase
+        .from('rider_locations')
+        .select('user_id, current_order_id, is_available')
+        .in('user_id', riderIds) as { data: RiderLocationData[] | null };
+
+      // Get active order details for riders with current_order_id
+      const ridersWithActiveOrders = riderLocationsData?.filter((rl) => rl.current_order_id);
+      const activeOrderIds = ridersWithActiveOrders?.map((rl) => rl.current_order_id) || [];
+
+      let activeOrders: OrderData[] = [];
+      if (activeOrderIds.length > 0) {
+        const { data: ordersData } = await this.supabase
+          .from('orders')
+          .select('id, source, status, created_at, metadata')
+          .in('id', activeOrderIds) as { data: OrderData[] | null };
+        activeOrders = ordersData || [];
+      }
+
       // Live-fetch current pricing_config from partner companies (authoritative source)
       const companyIds = [...new Set(verifiedRiders.map(r => r.company_id).filter(Boolean))];
       const { data: partnerPricingData } = await this.supabase
@@ -161,12 +194,18 @@ export class RidersService {
         if (p.pricing_config) companyPricing[p.id] = p.pricing_config;
       });
 
+      // Create rider location lookup map for efficient access
+      const riderLocationMap = new Map<string, RiderLocationData>(
+        riderLocationsData?.map((rl) => [rl.user_id, rl]) || []
+      );
+
       // Transform database riders to RiderProfile format
       const riders: RiderProfile[] = await Promise.all(
         verifiedRiders.map(async (vr) => {
           const profile = userProfiles?.find(p => p.id === vr.user_id);
           const trustData = trustScores?.find(ts => ts.user_id === vr.user_id);
           const riderProfileData = riderProfilesData?.find(rp => rp.user_id === vr.user_id);
+          const riderLocation = riderLocationMap.get(vr.user_id);
 
           // Mock distance calculation (in real app, use geolocation)
           const distance = Math.random() * 5; // 0-5km
@@ -174,6 +213,13 @@ export class RidersService {
           // verified_riders.vehicle_type is authoritative (set during official verification)
           const vehicleType = vr.vehicle_type || riderProfileData?.vehicle_type || profile?.preferences?.vehicleType || 'bike';
           const isOnline = riderProfileData?.is_online ?? (Math.random() > 0.3);
+
+          // Check if rider is currently delivering an active order
+          const isCurrentlyDelivering = this.isRiderCurrentlyDelivering(
+            riderLocation?.current_order_id ?? null,
+            activeOrders,
+            request.itemTypes
+          );
 
           // Price = company's live pricing_config if set, otherwise flat 2 Freti
           let price: number;
@@ -209,7 +255,8 @@ export class RidersService {
             isOnline,
             trustScore: trustData?.rider_trust_score || 750,
             completionRate: Math.min(99, 85 + (trustData?.completed_orders || 0) / 10),
-            deliveryPromise: deliveryPromise, // Add delivery promise
+            deliveryPromise: deliveryPromise,
+            isCurrentlyDelivering, // NEW: Active order status
           };
         })
       );
@@ -218,6 +265,10 @@ export class RidersService {
       return riders
         .filter(rider => rider.isOnline)
         .sort((a, b) => {
+          // NEW: Deprioritize riders currently delivering active orders
+          if (a.isCurrentlyDelivering !== b.isCurrentlyDelivering) {
+            return a.isCurrentlyDelivering ? 1 : -1;
+          }
           // Prioritize available riders
           if (a.isAvailable !== b.isAvailable) return a.isAvailable ? -1 : 1;
           // Then by distance
@@ -226,6 +277,79 @@ export class RidersService {
 
     } catch (error) {
       console.error('❌ Error in findNearbyRiders:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get a list of users whose role is rider for the Search screen.
+   * Includes any user marked as a rider — whether verified by a logistics partner or not.
+   */
+  async getRidersForSearch(limit: number = 20, query?: string): Promise<RiderProfile[]> {
+    try {
+      let builder: any = this.supabase
+        .from('user_profiles')
+        .select('id, username, avatar_url, location, preferences, is_rider, role')
+        .or('role.eq.rider,preferences->>isRider.eq.true,is_rider.eq.true')
+        .limit(limit);
+
+      if (query?.trim()) {
+        builder = builder.ilike('username', `%${query.trim()}%`);
+      }
+
+      const { data: riderUsers, error } = await builder;
+      if (error) {
+        console.error('❌ Error fetching riders for search:', error);
+        return [];
+      }
+      if (!riderUsers?.length) return [];
+
+      const riderIds = riderUsers.map((r: any) => r.id);
+
+      const [{ data: riderProfilesData }, { data: trustScores }] = await Promise.all([
+        this.supabase.from('rider_profiles').select('*').in('user_id', riderIds),
+        this.supabase.from('trust_scores').select('user_id, rider_trust_score, completed_orders').in('user_id', riderIds),
+      ]);
+
+      const specialtiesByVehicle: Record<string, string[]> = {
+        wheelbarrow: ['Small packages', 'Local errands'],
+        bike: ['Fast delivery', 'Light packages'],
+        car: ['Urban delivery', 'Fragile items'],
+        van: ['Furniture', 'Bulk items'],
+        truck: ['Heavy cargo', 'Interstate'],
+      };
+
+      const riders: RiderProfile[] = riderUsers.map((profile: any) => {
+        const trustData = trustScores?.find(ts => ts.user_id === profile.id);
+        const riderProfileData = riderProfilesData?.find(rp => rp.user_id === profile.id);
+
+        const vehicleType = riderProfileData?.vehicle_type || 'bike';
+        const distance = Math.random() * 5;
+        const trustScore = trustData?.rider_trust_score || 750;
+        const completed = trustData?.completed_orders || 0;
+        const rating = Math.min(5, Math.max(0, (trustScore / 1000) * 5));
+
+        return {
+          id: profile.id,
+          name: profile?.username || profile?.preferences?.fullName || 'Unknown Rider',
+          avatar: profile?.avatar_url || `https://picsum.photos/100/100?random=${profile.id}`,
+          rating: Math.round(rating * 10) / 10,
+          totalDeliveries: completed,
+          vehicleType: ['wheelbarrow', 'bike', 'car', 'van', 'truck'].includes(vehicleType) ? vehicleType as any : 'bike',
+          price: 2,
+          distanceFromPickup: Math.round(distance * 10) / 10,
+          estimatedArrival: Math.max(3, Math.round(distance * 3)),
+          isAvailable: riderProfileData?.is_available ?? true,
+          specialties: specialtiesByVehicle[this.normalizeVehicleType(vehicleType)] || ['Local delivery'],
+          isOnline: riderProfileData?.is_online ?? false,
+          trustScore,
+          completionRate: Math.min(99, 85 + completed / 10),
+        };
+      });
+
+      return riders.sort((a, b) => b.rating - a.rating);
+    } catch (error) {
+      console.error('❌ Error in getRidersForSearch:', error);
       return [];
     }
   }
@@ -710,6 +834,45 @@ export class RidersService {
   }
 
   // Helper methods
+  private isRiderCurrentlyDelivering(
+    currentOrderId: string | null,
+    activeOrders: OrderData[],
+    itemTypes?: string[],
+  ): boolean {
+    if (!currentOrderId) return false;
+
+    const activeOrder = activeOrders.find(o => o.id === currentOrderId);
+    if (!activeOrder) return false;
+
+    // Check order status - only consider active delivery statuses
+    const activeStatuses = ['pending', 'confirmed', 'in_transit', 'out_for_delivery'];
+    if (!activeStatuses.includes(activeOrder.status)) return false;
+
+    const now = new Date();
+    const orderCreated = new Date(activeOrder.created_at);
+    const hoursSinceCreation = (now.getTime() - orderCreated.getTime()) / (1000 * 60 * 60);
+
+    // Service orders: check scheduled time from metadata
+    if (activeOrder.source === 'service' || (itemTypes && itemTypes.includes('service'))) {
+      const scheduledDate = activeOrder.metadata?.scheduled_date;
+      const scheduledTime = activeOrder.metadata?.scheduled_time;
+      
+      if (scheduledDate && scheduledTime) {
+        const scheduledDateTime = new Date(`${scheduledDate}T${scheduledTime}`);
+        const hoursUntilScheduled = (scheduledDateTime.getTime() - now.getTime()) / (1000 * 60 * 60);
+        
+        // Only consider active if scheduled within next 2 hours or currently running (within 1 hour after scheduled time)
+        return (hoursUntilScheduled <= 2 && hoursUntilScheduled >= -1);
+      }
+      
+      // Fallback for service orders without clear scheduling - active if within 2 hours
+      return hoursSinceCreation <= 2;
+    }
+
+    // Product orders: active if created within last 4 hours
+    return hoursSinceCreation <= 4;
+  }
+
   private checkAvailability(vehicleType: string, orderDetails: OrderDetails): boolean {
     switch (vehicleType) {
       case 'wheelbarrow':

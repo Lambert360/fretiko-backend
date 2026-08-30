@@ -1,4 +1,4 @@
-import { IsString, IsEnum, IsOptional, IsNumber, IsInt, IsUUID, IsArray, ArrayMinSize, ValidateNested, IsPositive, Min, Max, IsBoolean } from 'class-validator';
+import { IsString, IsEnum, IsOptional, IsNumber, IsInt, IsUUID, IsArray, ArrayMinSize, ValidateNested, IsPositive, Min, Max, IsBoolean, IsObject } from 'class-validator';
 import { Type } from 'class-transformer';
 
 /**
@@ -6,14 +6,14 @@ import { Type } from 'class-transformer';
  */
 export class CreateGiftDto {
   @IsString()
-  name: string;
+  name!: string;
 
   @IsString()
-  emoji: string;
+  emoji!: string;
 
   @IsNumber()
   @IsPositive()
-  credit_value: number;
+  credit_value!: number;
 
   @IsOptional()
   @IsNumber()
@@ -22,6 +22,22 @@ export class CreateGiftDto {
   @IsOptional()
   @IsBoolean()
   is_active?: boolean;
+
+  @IsOptional()
+  @IsString()
+  display_lottie_url?: string;
+
+  @IsOptional()
+  @IsObject()
+  lottie_config?: any;
+
+  @IsOptional()
+  @IsUUID()
+  sound_id?: string;
+
+  @IsOptional()
+  @IsEnum(['lottie_single', 'lottie_combo', 'lottie_overlap'])
+  animation_type?: 'lottie_single' | 'lottie_combo' | 'lottie_overlap';
 }
 
 /**
@@ -48,6 +64,22 @@ export class UpdateGiftDto {
   @IsOptional()
   @IsBoolean()
   is_active?: boolean;
+
+  @IsOptional()
+  @IsString()
+  display_lottie_url?: string;
+
+  @IsOptional()
+  @IsObject()
+  lottie_config?: any;
+
+  @IsOptional()
+  @IsUUID()
+  sound_id?: string;
+
+  @IsOptional()
+  @IsEnum(['lottie_single', 'lottie_combo', 'lottie_overlap'])
+  animation_type?: 'lottie_single' | 'lottie_combo' | 'lottie_overlap';
 }
 
 /**
@@ -55,20 +87,20 @@ export class UpdateGiftDto {
  */
 export class GiftPurchaseItem {
   @IsUUID()
-  gift_id: string;
+  gift_id!: string;
 
   @IsNumber()
   @IsPositive()
   @Min(1)
   @Max(100)
-  quantity: number;
+  quantity!: number;
 }
 
 export class PurchaseGiftsDto {
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => GiftPurchaseItem)
-  purchases: GiftPurchaseItem[];
+  purchases!: GiftPurchaseItem[];
 }
 
 /**
@@ -76,11 +108,11 @@ export class PurchaseGiftsDto {
  */
 export class ConvertGiftItemDto {
   @IsUUID()
-  user_gift_id: string; // user_gifts.id
+  user_gift_id!: string; // user_gifts.id
 
   @IsInt()
   @Min(1)
-  quantity: number; // How many to convert (must be <= user's current quantity)
+  quantity!: number; // How many to convert (must be <= user's current quantity)
 }
 
 /**
@@ -91,7 +123,7 @@ export class ConvertGiftsDto {
   @ArrayMinSize(1)
   @ValidateNested({ each: true })
   @Type(() => ConvertGiftItemDto)
-  gifts: ConvertGiftItemDto[]; // Array of { user_gift_id, quantity }
+  gifts!: ConvertGiftItemDto[]; // Array of { user_gift_id, quantity }
 }
 
 /**
@@ -99,22 +131,22 @@ export class ConvertGiftsDto {
  */
 export class SendGiftDto {
   @IsUUID()
-  gift_id: string; // virtual_gifts.id
+  gift_id!: string; // virtual_gifts.id
 
   @IsNumber()
   @IsPositive()
   @Min(1)
   @Max(10)
-  quantity: number;
+  quantity!: number;
 
   @IsUUID()
-  recipient_id: string;
+  recipient_id!: string;
 
   @IsEnum(['call', 'stream', 'auction'])
-  session_type: 'call' | 'stream' | 'auction';
+  session_type!: 'call' | 'stream' | 'auction';
 
   @IsUUID()
-  session_id: string;
+  session_id!: string;
 
   @IsOptional()
   @IsString()
@@ -160,8 +192,52 @@ export interface UserGiftsResponse {
     total_value: number;
     source: string;
     received_at: string;
+    display_lottie_url?: string;
+    lottie_config?: any;
+    sound_id?: string;
+    sound_url?: string;
+    animation_type?: string;
   }>;
   total_gifts: number;
   total_value: number;
 }
 
+/**
+ * DTO for creating a sound asset (Admin only)
+ */
+export class CreateSoundDto {
+  @IsString()
+  name!: string;
+
+  @IsString()
+  sound_url!: string;
+
+  @IsOptional()
+  @IsNumber()
+  sort_order?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  is_active?: boolean;
+}
+
+/**
+ * DTO for updating a sound asset (Admin only)
+ */
+export class UpdateSoundDto {
+  @IsOptional()
+  @IsString()
+  name?: string;
+
+  @IsOptional()
+  @IsString()
+  sound_url?: string;
+
+  @IsOptional()
+  @IsNumber()
+  sort_order?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  is_active?: boolean;
+}

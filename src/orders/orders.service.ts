@@ -1301,34 +1301,6 @@ export class OrdersService {
         }
       }
 
-      // Stop escrow auto-release
-      const { error: escrowUpdateError } = await supabase
-        .from('escrows')
-        .update({
-          status: 'dispute',
-          auto_release_at: null, // Stop auto-release
-          dispute_reason: reason,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', escrow.id);
-
-      if (escrowUpdateError) {
-        throw new Error('Failed to update escrow status');
-      }
-
-      // Update order status
-      const { error: orderUpdateError } = await supabase
-        .from('orders')
-        .update({
-          status: 'cancelled',
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', orderId);
-
-      if (orderUpdateError) {
-        console.error('Failed to update order status (non-critical):', orderUpdateError);
-      }
-
       // Create dispute record (if disputes table exists)
       try {
         await supabase
@@ -1346,61 +1318,32 @@ export class OrdersService {
         console.error('Failed to create dispute record (non-critical):', disputeError);
       }
 
-      // Calculate refund amount (total - rider fee, rider keeps their fee)
-      const refundAmount = parseFloat(order.total_amount) - parseFloat(order.delivery_fee || '0');
-
-      // Process refund to buyer (buyer gets total - rider fee)
-      try {
-        const refundResult = await this.walletService.processWalletTransaction(
-          userId,
-          WalletTransactionType.ESCROW_REFUND,
-          refundAmount,
-          `Refund for order ${order.order_number} (issue reported)`,
-          orderId,
-          'order',
-        );
-
-        if (!refundResult.success) {
-          console.error('Failed to process refund:', refundResult.error);
-          throw new Error(`Failed to process refund: ${refundResult.error}`);
+      // ✅ ATOMIC FIX: Stop auto-release, cancel order, refund buyer, pay rider,
+      // and mark escrow as disputed are now one Postgres transaction.
+      const { data: issueResult, error: issueRpcError } = await supabase.rpc(
+        'resolve_order_issue_atomic',
+        {
+          p_order_id: orderId,
+          p_reason: reason,
+          p_user_id: userId,
+          p_description: description,
         }
+      );
 
-        console.log(`✅ Refunded ₣${refundAmount} to buyer ${userId}`);
-      } catch (refundError) {
-        console.error('Refund processing error:', refundError);
-        throw refundError;
+      if (issueRpcError) {
+        console.error('resolve_order_issue_atomic RPC error:', issueRpcError);
+        throw new Error(`Failed to resolve order issue: ${issueRpcError.message}`);
       }
 
-      // Pay rider / partner their delivery fee
-      if (order.rider_id && order.delivery_fee && parseFloat(order.delivery_fee) > 0) {
-        try {
-          const deliveryAmount = parseFloat(order.delivery_fee);
-          const partnerCredit = await this.partnersWalletService.creditPartnerForDelivery(
-            order.rider_id,
-            deliveryAmount,
-            `Delivery fee for order ${order.order_number}`,
-          );
-
-          if (!partnerCredit.credited) {
-            // Independent rider — credit Freti wallet as before
-            const riderPaymentResult = await this.walletService.processWalletTransaction(
-              order.rider_id,
-              WalletTransactionType.DELIVERY_PAYMENT,
-              deliveryAmount,
-              `Delivery fee for order ${order.order_number}`,
-              orderId,
-              'order',
-            );
-            if (!riderPaymentResult.success) {
-              console.error('Failed to pay rider (non-critical):', riderPaymentResult.error);
-            } else {
-              console.log(`✅ Paid rider ${order.rider_id} delivery fee: ₣${order.delivery_fee}`);
-            }
-          }
-        } catch (riderPaymentError) {
-          console.error('Rider payment error (non-critical):', riderPaymentError);
-        }
+      if (!issueResult || !issueResult.success) {
+        throw new Error(`Failed to resolve order issue: ${issueResult?.error || 'Unknown error'}`);
       }
+
+      const resolvedOrder = issueResult.order;
+
+      console.log(
+        `✅ Order issue resolved for ${resolvedOrder.order_number}: refund=₣${issueResult.escrow.refund_amount}, rider=₣${issueResult.escrow.rider_paid}`
+      );
 
       // ✅ REVERSE REWARDS IF USED
       const { data: orderWithRewards } = await supabase
@@ -1453,8 +1396,8 @@ export class OrdersService {
 
       return {
         success: true,
-        message: `Issue reported successfully. You have been refunded ₣${refundAmount.toFixed(2)} (order total minus delivery fee). The rider has been paid for their service.`,
-        refundAmount: refundAmount,
+        message: `Issue reported successfully. You have been refunded ₣${Number(issueResult.escrow.refund_amount).toFixed(2)} (order total minus delivery fee). The rider has been paid for their service.`,
+        refundAmount: issueResult.escrow.refund_amount,
       };
     } catch (error) {
       console.error('Error reporting issue:', error);

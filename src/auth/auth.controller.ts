@@ -63,7 +63,8 @@ export class AuthController {
       lastName: req.body?.lastName,
       dateOfBirth: req.body?.dateOfBirth || null, // Handle undefined
       gender: req.body?.gender || null, // Handle undefined
-      hasAcceptedTerms: req.body?.hasAcceptedTerms
+      hasAcceptedTerms: req.body?.hasAcceptedTerms,
+      referralCode: req.body?.referralCode || null,
     };
     
     console.log(' Manual parsed DTO:', signUpDto);
@@ -138,7 +139,8 @@ export class AuthController {
         lastName: req.body?.lastName,
         dateOfBirth: req.body?.dateOfBirth || null,
         gender: req.body?.gender || null,
-        hasAcceptedTerms: req.body?.hasAcceptedTerms
+        hasAcceptedTerms: req.body?.hasAcceptedTerms,
+        referralCode: req.body?.referralCode || null,
       };
       
       console.log(' Manual parsed DTO:', signUpDto);

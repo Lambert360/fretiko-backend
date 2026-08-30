@@ -1,6 +1,9 @@
-import { Controller, Get, Post, Body, UseGuards, Req, Param, Put, Delete, Query } from '@nestjs/common';
+import { Controller, Get, Post, Body, UseGuards, Req, Param, Put, Delete, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
-import { AdminGuard } from '../auth/admin.guard';
+import { StaffJwtAuthGuard } from '../staff/guards/staff-jwt-auth.guard';
+import { PermissionsGuard } from '../staff/guards/permissions.guard';
+import { Permissions } from '../staff/decorators/permissions.decorator';
 import { GiftService } from './gift.service';
 import {
   CreateGiftDto,
@@ -8,6 +11,8 @@ import {
   PurchaseGiftsDto,
   ConvertGiftsDto,
   SendGiftDto,
+  CreateSoundDto,
+  UpdateSoundDto,
 } from './dto/gift.dto';
 
 @Controller('gifts')
@@ -69,7 +74,8 @@ export class GiftController {
    * GET /gifts/admin/wallet
    */
   @Get('admin/wallet')
-  @UseGuards(AdminGuard)
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
   async getAdminGiftWallet(@Req() req) {
     return await this.giftService.getAdminGiftWalletBalance();
   }
@@ -79,7 +85,8 @@ export class GiftController {
    * GET /gifts/admin/stats
    */
   @Get('admin/stats')
-  @UseGuards(AdminGuard)
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
   async getGiftStats(@Req() req) {
     return await this.giftService.getGiftStats();
   }
@@ -89,7 +96,8 @@ export class GiftController {
    * GET /gifts/admin/user-gift-holdings?page=1&limit=20&search=
    */
   @Get('admin/user-gift-holdings')
-  @UseGuards(AdminGuard)
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
   async getUserGiftHoldings(
     @Req() req,
     @Query('page') page?: string,
@@ -109,7 +117,9 @@ export class GiftController {
    * Allows both admin role and staff with view_revenue permission
    */
   @Post('admin')
-    async createGift(@Req() req, @Body() dto: CreateGiftDto) {
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
+  async createGift(@Req() req, @Body() dto: CreateGiftDto) {
     return await this.giftService.createGift(dto);
   }
 
@@ -119,7 +129,9 @@ export class GiftController {
    * Allows both admin role and staff with view_revenue permission
    */
   @Put('admin/:id')
-    async updateGift(@Req() req, @Param('id') id: string, @Body() dto: UpdateGiftDto) {
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
+  async updateGift(@Req() req, @Param('id') id: string, @Body() dto: UpdateGiftDto) {
     return await this.giftService.updateGift(id, dto);
   }
 
@@ -129,7 +141,9 @@ export class GiftController {
    * Allows both admin role and staff with view_revenue permission
    */
   @Delete('admin/:id')
-    async deleteGift(@Req() req, @Param('id') id: string) {
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
+  async deleteGift(@Req() req, @Param('id') id: string) {
     await this.giftService.deleteGift(id);
     return { success: true, message: 'Gift deleted successfully' };
   }
@@ -140,8 +154,74 @@ export class GiftController {
    * Allows both admin role and staff with view_revenue permission
    */
   @Get('admin/all')
-    async getAllGifts(@Req() req) {
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
+  async getAllGifts(@Req() req) {
     return await this.giftService.getAllGiftsForAdmin();
+  }
+
+  /**
+   * Admin: Upload a gift asset (lottie or sound)
+   * POST /gifts/admin/upload
+   */
+  @Post('admin/upload')
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadGiftAsset(
+    @Req() req,
+    @UploadedFile() file: Express.Multer.File,
+    @Body('type') type: 'lottie' | 'sound',
+  ) {
+    if (!file || !type || !['lottie', 'sound'].includes(type)) {
+      return { success: false, message: 'Missing file or invalid type' };
+    }
+    return await this.giftService.uploadAsset(file, type);
+  }
+
+  /**
+   * Admin: List sounds
+   * GET /gifts/admin/sounds
+   */
+  @Get('admin/sounds')
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
+  async getSounds(@Req() req) {
+    return await this.giftService.getSounds();
+  }
+
+  /**
+   * Admin: Create a sound
+   * POST /gifts/admin/sounds
+   */
+  @Post('admin/sounds')
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
+  async createSound(@Req() req, @Body() dto: CreateSoundDto) {
+    return await this.giftService.createSound(dto);
+  }
+
+  /**
+   * Admin: Update a sound
+   * PUT /gifts/admin/sounds/:id
+   */
+  @Put('admin/sounds/:id')
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
+  async updateSound(@Req() req, @Param('id') id: string, @Body() dto: UpdateSoundDto) {
+    return await this.giftService.updateSound(id, dto);
+  }
+
+  /**
+   * Admin: Delete a sound
+   * DELETE /gifts/admin/sounds/:id
+   */
+  @Delete('admin/sounds/:id')
+  @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
+  @Permissions('view_revenue')
+  async deleteSound(@Req() req, @Param('id') id: string) {
+    await this.giftService.deleteSound(id);
+    return { success: true, message: 'Sound deleted successfully' };
   }
 }
 

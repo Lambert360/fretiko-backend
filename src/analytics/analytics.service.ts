@@ -636,6 +636,9 @@ export class AnalyticsService implements OnModuleDestroy {
         totalSpent: c.totalSpent,
       }));
 
+      // Get conversion metrics (time to first purchase)
+      const conversionMetrics = await this.getTimeToFirstPurchaseMetrics(userId, supabaseClient);
+
       return {
         totalCustomers,
         newCustomers: newCustomers.size,
@@ -643,6 +646,7 @@ export class AnalyticsService implements OnModuleDestroy {
         customerRetentionRate: Math.round(customerRetentionRate * 10) / 10,
         averageOrdersPerCustomer: Math.round(averageOrdersPerCustomer * 10) / 10,
         topCustomers,
+        conversionMetrics,
       };
     } catch (error) {
       if (error instanceof AnalyticsError || error instanceof HttpException) {
@@ -687,6 +691,163 @@ export class AnalyticsService implements OnModuleDestroy {
     } catch (error) {
       console.error('Error fetching customer first order dates:', error);
       return new Map();
+    }
+  }
+
+  /**
+   * Helper method to calculate time-to-first-purchase metrics
+   * Returns conversion metrics including average time to first purchase
+   */
+  private async getTimeToFirstPurchaseMetrics(
+    userId: string,
+    supabaseClient: any
+  ): Promise<{
+    averageTimeToFirstPurchaseHours: number;
+    medianTimeToFirstPurchaseHours: number;
+    conversionRate: number;
+    totalUsers: number;
+    purchasers: number;
+    nonPurchasers: number;
+    timeBuckets: {
+      within24Hours: number;
+      within7Days: number;
+      within30Days: number;
+      over30Days: number;
+    };
+  }> {
+    try {
+      // Get all user profiles (registration dates)
+      const { data: users, error: usersError } = await supabaseClient
+        .from('user_profiles')
+        .select('id, created_at')
+        .limit(this.MAX_QUERY_RESULTS);
+
+      if (usersError) {
+        console.error('Error fetching user profiles:', usersError);
+        throw new AnalyticsError(
+          'Failed to fetch user profiles for conversion metrics',
+          'USER_PROFILES_FETCH_ERROR',
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
+      }
+
+      if (!users || users.length === 0) {
+        return {
+          averageTimeToFirstPurchaseHours: 0,
+          medianTimeToFirstPurchaseHours: 0,
+          conversionRate: 0,
+          totalUsers: 0,
+          purchasers: 0,
+          nonPurchasers: 0,
+          timeBuckets: {
+            within24Hours: 0,
+            within7Days: 0,
+            within30Days: 0,
+            over30Days: 0,
+          },
+        };
+      }
+
+      // Get first order dates for all users
+      const { data: allOrders, error: ordersError } = await supabaseClient
+        .from('orders')
+        .select('buyer_id, created_at')
+        .order('created_at', { ascending: true })
+        .limit(this.MAX_QUERY_RESULTS);
+
+      if (ordersError) {
+        console.error('Error fetching orders for conversion metrics:', ordersError);
+        throw new AnalyticsError(
+          'Failed to fetch orders for conversion metrics',
+          'ORDERS_FETCH_ERROR',
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
+      }
+
+      // Build first order map
+      const firstOrderMap = new Map<string, Date>();
+      allOrders?.forEach(order => {
+        const buyerId = order.buyer_id;
+        if (!buyerId) return;
+
+        if (!firstOrderMap.has(buyerId)) {
+          firstOrderMap.set(buyerId, new Date(order.created_at));
+        }
+      });
+
+      // Calculate time to first purchase for each user
+      const timeToPurchaseArray: number[] = [];
+      const timeBuckets = {
+        within24Hours: 0,
+        within7Days: 0,
+        within30Days: 0,
+        over30Days: 0,
+      };
+
+      users.forEach(user => {
+        const registrationDate = new Date(user.created_at);
+        const firstOrderDate = firstOrderMap.get(user.id);
+
+        if (firstOrderDate) {
+          const timeDiffHours = (firstOrderDate.getTime() - registrationDate.getTime()) / (1000 * 60 * 60);
+          
+          // Only include positive time differences (order after registration)
+          if (timeDiffHours > 0) {
+            timeToPurchaseArray.push(timeDiffHours);
+
+            // Categorize into time buckets
+            if (timeDiffHours <= 24) {
+              timeBuckets.within24Hours++;
+            } else if (timeDiffHours <= 168) { // 7 days = 168 hours
+              timeBuckets.within7Days++;
+            } else if (timeDiffHours <= 720) { // 30 days = 720 hours
+              timeBuckets.within30Days++;
+            } else {
+              timeBuckets.over30Days++;
+            }
+          }
+        }
+      });
+
+      const totalUsers = users.length;
+      const purchasers = timeToPurchaseArray.length;
+      const nonPurchasers = totalUsers - purchasers;
+      const conversionRate = totalUsers > 0 ? (purchasers / totalUsers) * 100 : 0;
+
+      // Calculate average
+      const averageTimeToFirstPurchaseHours = purchasers > 0
+        ? timeToPurchaseArray.reduce((sum, time) => sum + time, 0) / purchasers
+        : 0;
+
+      // Calculate median
+      let medianTimeToFirstPurchaseHours = 0;
+      if (purchasers > 0) {
+        const sorted = [...timeToPurchaseArray].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        medianTimeToFirstPurchaseHours = sorted.length % 2 !== 0
+          ? sorted[mid]
+          : (sorted[mid - 1] + sorted[mid]) / 2;
+      }
+
+      return {
+        averageTimeToFirstPurchaseHours: Math.round(averageTimeToFirstPurchaseHours * 100) / 100,
+        medianTimeToFirstPurchaseHours: Math.round(medianTimeToFirstPurchaseHours * 100) / 100,
+        conversionRate: Math.round(conversionRate * 100) / 100,
+        totalUsers,
+        purchasers,
+        nonPurchasers,
+        timeBuckets,
+      };
+    } catch (error) {
+      if (error instanceof AnalyticsError) {
+        throw error;
+      }
+      console.error('Error calculating time-to-first-purchase metrics:', error);
+      throw new AnalyticsError(
+        'An unexpected error occurred while calculating conversion metrics',
+        'CONVERSION_METRICS_ERROR',
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
     }
   }
 

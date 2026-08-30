@@ -251,8 +251,19 @@ export class CallsService {
         .eq('call_session_id', callSessionId)
         .is('left_at', null);
 
-      // If no active participants, end the call
-      if (!activeParticipants || activeParticipants.length === 0) {
+      // If the call is still ringing and someone leaves, end the call for everyone
+      const { data: callSession } = await client
+        .from('chat_call_sessions')
+        .select('status')
+        .eq('id', callSessionId)
+        .single();
+
+      // If no active participants, or the call is still in the ringing state, end the call
+      if (
+        !activeParticipants ||
+        activeParticipants.length === 0 ||
+        callSession?.status === CallStatus.CALLING
+      ) {
         await this.endCall(callSessionId, 'all_participants_left');
       } else {
         // Notify remaining participants
@@ -277,7 +288,7 @@ export class CallsService {
       // Get call session details
       const { data: callSession } = await client
         .from('chat_call_sessions')
-        .select('started_at, answered_at, conversation_id')
+        .select('started_at, answered_at, conversation_id, initiator_id')
         .eq('id', callSessionId)
         .single();
 
@@ -508,6 +519,7 @@ export class CallsService {
       let conversationId: string | undefined;
       let callType: CallType | undefined;
       let initiatorId: string | undefined;
+      let eventData: any = undefined;
 
       // Check if third argument is a string (conversation ID) or an object (old style data)
       if (typeof conversationIdOrData === 'string') {
@@ -516,6 +528,7 @@ export class CallsService {
         initiatorId = initiatorIdOrUndefined;
       } else {
         // Old style call - third argument is data object, need to fetch call session
+        eventData = conversationIdOrData;
         conversationId = undefined;
         callType = undefined;
         initiatorId = undefined;
@@ -611,13 +624,55 @@ export class CallsService {
               this.logger.warn(`Push to callee ${user_id} failed: ${err.message}`)
             ),
           );
-          await Promise.all(pushPromises);
+
+          const voipPromises = callees.map(({ user_id }) =>
+            this.pushNotificationService.sendVoipPush(user_id, {
+              type: 'call_incoming',
+              conversationId: conversationId!,
+              callSessionId,
+              callType,
+              callerName,
+              callerAvatar: initiatorData?.avatar_url || null,
+            }).catch(err =>
+              this.logger.warn(`VoIP push to callee ${user_id} failed: ${err.message}`)
+            ),
+          );
+
+          await Promise.all([...pushPromises, ...voipPromises]);
+        }
+      } else if (eventType === 'call_ended' && conversationId) {
+        // Notify all conversation participants that the call ended, so background
+        // devices can dismiss the native incoming-call UI and notification.
+        const { data: participants } = await this.supabase
+          .from('chat_participants')
+          .select('user_id')
+          .eq('conversation_id', conversationId!);
+
+        if (participants && participants.length > 0) {
+          const endPushPromises = participants.map(({ user_id }) =>
+            this.pushNotificationService.sendPushNotification(user_id, {
+              title: 'Call ended',
+              body: `The ${callType === CallType.VIDEO ? 'video' : 'voice'} call has ended`,
+              priority: 'high',
+              channelId: 'calls',
+              data: {
+                type: 'call_ended',
+                conversationId: conversationId!,
+                callSessionId,
+                callType,
+                reason: eventData?.reason,
+              },
+            }).catch(err =>
+              this.logger.warn(`Push end-call to ${user_id} failed: ${err.message}`)
+            ),
+          );
+          await Promise.all(endPushPromises);
         }
       }
 
       this.logger.log(`✅ Successfully notified participants of ${eventType} for call ${callSessionId}`);
     } catch (error) {
-      this.logger.error(`❌ Error notifying call participants:`, error.stack || error.message);
+      this.logger.error(`❌ Error notifying call participants:`, error instanceof Error ? error.stack || error.message : String(error));
     }
   }
 

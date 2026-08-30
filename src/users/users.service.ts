@@ -288,7 +288,7 @@ export class UsersService {
         .eq('id', userId);
 
       return avatarUrl;
-    } catch (error) {
+    } catch (error: any) {
       throw new BadRequestException(`Avatar upload failed: ${error.message}`);
     }
   }
@@ -325,7 +325,7 @@ export class UsersService {
         .eq('id', userId);
 
       return bgPicUrl;
-    } catch (error) {
+    } catch (error: any) {
       throw new BadRequestException(`Background upload failed: ${error.message}`);
     }
   }
@@ -335,7 +335,8 @@ export class UsersService {
       .from('user_profiles')
       .select('id, username, bio, avatar_url, location, is_seller, created_at, display_name')
       .or(`username.ilike.%${query}%,bio.ilike.%${query}%`)
-      .not('id', 'in', '("00000000-0000-4000-8000-000000000002","00000000-0000-4000-8000-000000000003")')
+      // Exclude system accounts: Iko AI assistant, platform wallet, marketing/gift wallet
+      .not('id', 'in', '("00000000-0000-4000-8000-000000000001","00000000-0000-4000-8000-000000000002","00000000-0000-4000-8000-000000000003")')
       .limit(limit)
       .order('created_at', { ascending: false });
 

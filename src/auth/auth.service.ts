@@ -23,7 +23,7 @@ export class AuthService {
   }
 
   async createVerifiedUser(signUpDto: SignUpDto): Promise<AuthResponse> {
-    const { email, user_role, is_seller, is_rider } = signUpDto;
+    const { email, user_role, is_seller, is_rider, referralCode } = signUpDto;
 
     // Debug logging to track incoming data
     console.log('🔍 createVerifiedUser received data:', {
@@ -125,6 +125,7 @@ export class AuthService {
       terms_accepted_at: originalTermsAcceptedAt, // Use original timestamp from signup
       terms_accepted_ip: ipAddress || null,
       terms_accepted_user_agent: userAgent || null,
+      ...(referralCode && { referred_by_code: referralCode }),
     };
 
     console.log('🔍 Updating user profile with data:', {
@@ -204,7 +205,7 @@ export class AuthService {
   }
 
   async signUp(signUpDto: SignUpDto): Promise<AuthResponse> {
-    const { email, password, firstName, lastName, dateOfBirth, gender, hasAcceptedTerms, ipAddress, userAgent } = signUpDto;
+    const { email, password, firstName, lastName, dateOfBirth, gender, hasAcceptedTerms, ipAddress, userAgent, referralCode } = signUpDto;
 
     // Validate age requirement (18+)
     if (!signUpDto.dateOfBirth) {
@@ -262,6 +263,7 @@ export class AuthService {
       termsAcceptedAt: hasAcceptedTerms ? new Date().toISOString() : null,
       ipAddress,
       userAgent,
+      referralCode: referralCode || null,
     };
 
     console.log('🔍 Storing verification metadata:', { email, token, expiresAt: verificationMetadata.expiresAt });

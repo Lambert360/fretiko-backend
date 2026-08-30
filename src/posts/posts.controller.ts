@@ -414,4 +414,14 @@ export class PostsController {
       },
     };
   }
+
+  // Public endpoint: Get post preview for deep linking (no auth required)
+  @Get('public/:id')
+  async getPublicPost(@Param('id') id: string) {
+    const post = await this.postsService.findById(id, undefined);
+    return {
+      success: true,
+      data: post,
+    };
+  }
 }

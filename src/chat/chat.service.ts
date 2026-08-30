@@ -920,6 +920,68 @@ export class ChatService {
     }
   }
 
+  /**
+   * Update message metadata and broadcast the change to conversation participants.
+   * This is intended for service-level updates (e.g. gift card status changes).
+   */
+  async updateMessageMetadata(messageId: string, metadata: any): Promise<any> {
+    this.logger.log(`Updating message metadata: ${messageId}`);
+
+    try {
+      const { data: existingMessage, error: fetchError } = await this.supabase
+        .from('chat_messages')
+        .select('id, conversation_id, sender_id, metadata')
+        .eq('id', messageId)
+        .single();
+
+      if (fetchError || !existingMessage) {
+        throw new NotFoundException('Message not found');
+      }
+
+      const mergedMetadata = { ...existingMessage.metadata, ...metadata };
+
+      const { data: updatedMessage, error: updateError } = await this.supabase
+        .from('chat_messages')
+        .update({
+          metadata: mergedMetadata,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', messageId)
+        .select()
+        .single();
+
+      if (updateError) {
+        this.logger.error('Failed to update message metadata:', updateError);
+        throw new Error(`Database error: ${updateError.message}`);
+      }
+
+      // Broadcast updated message via WebSocket
+      try {
+        const { data: userProfile } = await this.supabase
+          .from('user_profiles')
+          .select('id, username, avatar_url')
+          .eq('id', existingMessage.sender_id)
+          .single();
+
+        const userProfiles = userProfile ? [userProfile] : [];
+        const messageForBroadcast = this.mapMessageResponse(updatedMessage, MessageStatus.SENT, userProfiles);
+        await this.realtimeGateway.notifyMessageUpdate(
+          existingMessage.conversation_id,
+          messageForBroadcast,
+          existingMessage.sender_id,
+        );
+        this.logger.log(`📡 Message metadata update broadcast for message: ${messageId}`);
+      } catch (broadcastError) {
+        this.logger.error('❌ Failed to broadcast message metadata update:', broadcastError);
+      }
+
+      return updatedMessage;
+    } catch (error) {
+      this.logger.error('Error updating message metadata:', error);
+      throw error;
+    }
+  }
+
   // =============================================================================
   // EMOJI REACTION METHODS
   // =============================================================================

@@ -9,6 +9,7 @@ import { WishlistService } from '../wishlist/wishlist.service';
 import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
 import { AuctionsService } from '../auctions/auctions.service';
+import { GiftCardService } from '../gift-cards/gift-cards.service';
 
 @Injectable()
 export class CheckoutService {
@@ -28,6 +29,8 @@ export class CheckoutService {
     private walletService: WalletService,
     @Inject(forwardRef(() => AuctionsService))
     private auctionsService: AuctionsService,
+    @Inject(forwardRef(() => GiftCardService))
+    private giftCardService: GiftCardService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
     this.PLATFORM_COMMISSION_RATE = parseFloat(
@@ -1045,28 +1048,15 @@ export class CheckoutService {
       }
     }
 
-    // Validate payment method and balance if wallet
-    if (orderData.paymentMethodId === 'wallet') {
-      const { data: wallet } = await client
-        .from('wallets')
-        .select('available_balance')
-        .eq('user_id', userId)
-        .single();
+    // Build gift card payload for the atomic RPC (validation and redemption happen inside the DB)
+    let giftCardPayload: { card_number: string; pin: string; requested_amount: number | null } | null = null;
 
-      // Calculate actual total with rider pricing
-      let actualTotal = summary.total;
-      if (orderData.selectedRider) {
-        if (orderData.selectedRider.riderId === 'pickup') {
-          actualTotal = summary.subtotal + summary.tax + (orderData.useEscrow ? summary.escrowFee : 0);
-        } else {
-          actualTotal = summary.subtotal + orderData.selectedRider.deliveryPrice + summary.tax + 
-                       (orderData.useEscrow ? summary.escrowFee : 0);
-        }
-      }
-
-      if (!wallet || wallet.available_balance < actualTotal) {
-        throw new HttpException('Insufficient wallet balance', HttpStatus.BAD_REQUEST);
-      }
+    if (orderData.giftCard) {
+      giftCardPayload = {
+        card_number: orderData.giftCard.cardNumber,
+        pin: orderData.giftCard.pin,
+        requested_amount: orderData.giftCard.amount || null,
+      };
     }
 
     // Generate order number
@@ -1139,21 +1129,39 @@ export class CheckoutService {
       deliveryType: isInterstateDelivery ? 'interstate_delivery' : (orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery')
     });
 
+    // Validate wallet balance before the atomic RPC (accounting for gift card and rewards)
+    if (orderData.paymentMethodId === 'wallet' && actualTotal > 0) {
+      const estimatedRewards = orderData.useRewards ? (orderData.rewardsAmount || 0) : 0;
+      const requestedGift = giftCardPayload?.requested_amount ?? 0;
+      const effectiveGift = Math.min(requestedGift, Math.max(0, actualTotal - estimatedRewards));
+      const walletPortion = Math.max(0, actualTotal - effectiveGift - estimatedRewards);
+
+      const { data: wallet } = await client
+        .from('wallets')
+        .select('available_balance')
+        .eq('user_id', userId)
+        .single();
+
+      if (!wallet || wallet.available_balance < walletPortion) {
+        throw new HttpException('Insufficient wallet balance', HttpStatus.BAD_REQUEST);
+      }
+    }
+
     // Create order with correct schema
     const orderToInsert = {
-      buyer_id: userId,              // ✅ Correct column name
-      vendor_id: vendorId,           // ✅ Required field
+      buyer_id: userId,
+      vendor_id: vendorId,
       order_number: orderNumber,
-      status: 'pending',             // ✅ Start as pending so vendor can accept
-      escrow_enabled: orderData.useEscrow || false,  // ✅ Correct column name
+      status: 'pending',
+      escrow_enabled: orderData.useEscrow || false,
       total_amount: actualTotal,
-      delivery_fee: actualDeliveryFee,  // ✅ Correct column name
-      platform_fee: isAuctionOrder && summary.commissionFee 
-        ? summary.commissionFee 
-        : actualTotal * 0.02, // 2% for regular orders, auction commission rate for auction orders
+      delivery_fee: actualDeliveryFee,
+      platform_fee: isAuctionOrder && summary.commissionFee
+        ? summary.commissionFee
+        : summary.total * 0.02,
       rider_id: riderId,
-      delivery_type: isInterstateDelivery 
-        ? 'interstate_delivery' 
+      delivery_type: isInterstateDelivery
+        ? 'interstate_delivery'
         : (orderData.selectedRider?.riderId === 'pickup' ? 'pickup' : 'delivery'),
       delivery_address: {
         fullName: orderData.deliveryAddress.fullName,
@@ -1167,9 +1175,9 @@ export class CheckoutService {
       delivery_instructions: orderData.deliveryInstructions,
       estimated_delivery: isInterstateDelivery
         ? new Date(Date.now() + (estimatedDeliveryDays || 3) * 24 * 60 * 60 * 1000).toISOString()
-        : (riderId 
+        : (riderId
           ? new Date(Date.now() + (orderData.selectedRider?.estimatedArrival || 30) * 60 * 1000).toISOString()
-          : new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()), // 24 hours for pickup
+          : new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()),
       rider_info: orderData.selectedRider ? {
         riderId: orderData.selectedRider.riderId,
         riderName: orderData.selectedRider.riderName,
@@ -1177,15 +1185,13 @@ export class CheckoutService {
         deliveryPrice: orderData.selectedRider.deliveryPrice,
         estimatedArrival: orderData.selectedRider.estimatedArrival,
       } : null,
-      source: orderSource,  // ✅ Track order source
+      source: orderSource,
       metadata: {
-        // Store additional details in metadata JSONB
         subtotal: summary.subtotal,
         tax_amount: summary.tax,
         escrow_fee: orderData.useEscrow ? summary.escrowFee : 0,
         payment_method: orderData.paymentMethodId,
         original_shipping: summary.shipping,
-        // Interstate delivery metadata
         ...(isInterstateDelivery ? {
           interstate_delivery: {
             companyId: interstateCompanyId,
@@ -1195,59 +1201,35 @@ export class CheckoutService {
             isInternational: isInternationalDelivery,
           },
         } : {}),
-        // Add auction_id to metadata for easier querying
         ...(isAuctionOrder && orderData.auctionCheckout ? {
           auction_id: orderData.auctionCheckout.auctionId,
         } : {}),
-        // Add invoice_id to metadata for invoice tracking
         ...(orderSource === 'invoice' && orderData.invoiceCheckout ? {
           invoiceId: orderData.invoiceCheckout.invoiceId,
           invoiceNumber: orderData.invoiceCheckout.invoiceNumber,
         } : {}),
-        // Add wishlist_item_ids to metadata for cleanup
         ...(orderSource === 'wishlist' && orderData.wishlistItemIds ? {
           wishlist_item_ids: orderData.wishlistItemIds,
         } : {}),
       },
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
     };
 
-    const { data: order, error: orderError } = await client
-      .from('orders')
-      .insert(orderToInsert)
-      .select()
-      .single();
-
-    if (orderError) {
-      console.error('Order creation error:', orderError);
-      throw new HttpException('Failed to create order', HttpStatus.INTERNAL_SERVER_ERROR);
-    }
-    
-    // ✅ Verify order source was saved correctly
-    console.log(`✅ Order created: ${order.order_number}, source: ${order.source}, isAuctionOrder: ${isAuctionOrder}`);
-    if (isAuctionOrder && order.source !== 'auction') {
-      console.error(`❌ WARNING: Order ${order.order_number} was created as auction but source is '${order.source}' instead of 'auction'!`);
-    }
-
-    // Create order items - handle BOTH products AND services AND auctions
-    const orderItems = summary.items.map(item => {
+    // Build order items for the atomic RPC
+    const p_items = summary.items.map(item => {
       const isService = item.itemType === 'service';
       const isAuction = item.itemType === 'auction';
       const isInvoiceOrder = orderSource === 'invoice';
-      
-      // Ensure unit_price is never null - use 0 as fallback if price is missing
+
       const unitPrice = item.price || 0;
       if (!item.price || item.price <= 0) {
         console.warn(`⚠️ Warning: Item "${item.name}" has invalid price: ${item.price}. Using 0 as fallback.`);
       }
-      
+
       return {
-        order_id: order.id,
         product_id: isService || isAuction || isInvoiceOrder ? null : item.id,
         service_id: (isService && !isInvoiceOrder) ? item.id : null,
         product_name: item.name,
-        category: item.category || 'General',  // ✅ Store category for countdown calculation
+        category: item.category || 'General',
         quantity: item.quantity,
         unit_price: unitPrice,
         total_price: unitPrice * item.quantity,
@@ -1260,81 +1242,149 @@ export class CheckoutService {
           auction_lot: item.product_metadata?.auction_lot,
           description: item.product_metadata?.description,
         } : null,
-        created_at: new Date().toISOString(),
       };
     });
 
-    const { error: itemsError } = await client
-      .from('order_items')
-      .insert(orderItems);
-
-    if (itemsError) {
-      console.error('Order items creation error:', itemsError);
-      // Try to rollback order creation
-      await client.from('orders').delete().eq('id', order.id);
-      throw new HttpException('Failed to create order items', HttpStatus.INTERNAL_SERVER_ERROR);
-    }
-
-    // ✅ HANDLE REWARDS REDEMPTION
+    // ✅ HANDLE REWARDS REDEMPTION (before the atomic RPC)
     let rewardsUsed = 0;
-    let finalPaymentAmount = actualTotal;
+    let rewardsTransactionId: string | null = null;
 
     if (orderData.useRewards && orderData.rewardsAmount > 0) {
-      console.log(`🎁 User wants to use ${orderData.rewardsAmount} rewards for order ${order.id}`);
-      
+      console.log(`🎁 User wants to use ${orderData.rewardsAmount} rewards`);
+
+      const redemptionResult = await this.rewardsService.redeemRewards(
+        userId,
+        orderData.rewardsAmount,
+      );
+
+      if (!redemptionResult.success) {
+        throw new HttpException('Failed to redeem rewards', HttpStatus.INTERNAL_SERVER_ERROR);
+      }
+
+      rewardsUsed = orderData.rewardsAmount;
+      rewardsTransactionId = redemptionResult.transaction_id ?? null;
+
+      console.log(`✅ Redeemed ${rewardsUsed} rewards`);
+    }
+
+    // Build escrow breakdown
+    const orderCommissionRate = orderToInsert.platform_fee && actualTotal > 0
+      ? orderToInsert.platform_fee / actualTotal
+      : undefined;
+    const escrowBreakdown = this.calculateEscrowBreakdown(actualTotal, riderId, orderCommissionRate);
+    const p_escrow = {
+      total_amount: escrowBreakdown.totalAmount,
+      vendor_amount: escrowBreakdown.vendorAmount,
+      rider_amount: escrowBreakdown.riderAmount,
+      platform_amount: escrowBreakdown.platformAmount,
+    };
+
+    // Call the atomic product order RPC
+    const { data: rpcData, error: rpcError } = await this.supabase.rpc(
+      'create_product_order_atomic',
+      {
+        p_buyer_id: userId,
+        p_order: orderToInsert,
+        p_items: p_items,
+        p_escrow: p_escrow,
+        p_gift_card: giftCardPayload,
+        p_rewards_amount: rewardsUsed,
+        p_admin_gift_user_id: this.configService.get<string>('PLATFORM_GIFT_WALLET_USER_ID', '00000000-0000-4000-8000-000000000003'),
+        p_user_ip: null,
+      }
+    );
+
+    if (rpcError) {
+      console.error('create_product_order_atomic RPC error:', rpcError);
+      if (rewardsUsed > 0) {
+        await this.rewardsService.reverseRewardsRedemption(userId, rewardsUsed);
+      }
+      throw new HttpException(
+        rpcError.message || 'Order creation failed',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+
+    const rpcResult = rpcData as any;
+    if (!rpcResult || !rpcResult.success) {
+      console.error('create_product_order_atomic failed:', rpcResult?.error);
+      if (rewardsUsed > 0) {
+        await this.rewardsService.reverseRewardsRedemption(userId, rewardsUsed);
+      }
+      throw new HttpException(
+        rpcResult?.error || 'Order creation failed',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+
+    // Merge the returned order fields with the local payload
+    const order = { ...orderToInsert, ...rpcResult.order } as any;
+
+    console.log(`✅ Order created: ${order.order_number}, source: ${order.source}, isAuctionOrder: ${isAuctionOrder}`);
+    if (isAuctionOrder && order.source !== 'auction') {
+      console.error(`❌ WARNING: Order ${order.order_number} was created as auction but source is '${order.source}' instead of 'auction'!`);
+    }
+
+    // Update rewards transaction with the new order id
+    if (rewardsTransactionId) {
       try {
-        // Verify user has sufficient rewards
-        const rewardsBalance = await this.rewardsService.getUserRewardsBalance(userId);
-        if (!rewardsBalance || rewardsBalance.available_rewards < orderData.rewardsAmount) {
-          throw new HttpException(
-            `Insufficient rewards balance. Available: ${rewardsBalance?.available_rewards || 0}, Requested: ${orderData.rewardsAmount}`,
-            HttpStatus.BAD_REQUEST
-          );
-        }
-        
-        // Redeem rewards
-        const redemptionResult = await this.rewardsService.redeemRewards(
-          userId,
-          orderData.rewardsAmount,
-          order.id
-        );
-        
-        if (!redemptionResult.success) {
-          throw new HttpException('Failed to redeem rewards', HttpStatus.INTERNAL_SERVER_ERROR);
-        }
-        
-        rewardsUsed = orderData.rewardsAmount;
-        finalPaymentAmount = Math.max(0, actualTotal - rewardsUsed);
-        
-        console.log(`✅ Redeemed ${rewardsUsed} rewards for order ${order.id}`);
-        console.log(`💰 Final payment amount: ${finalPaymentAmount} (original: ${actualTotal})`);
-      } catch (rewardsError) {
-        console.error('Rewards redemption error:', rewardsError);
-        // Rollback order creation
-        await client.from('orders').delete().eq('id', order.id);
-        throw rewardsError;
+        await client
+          .from('rewards_transactions')
+          .update({
+            reference_id: order.id,
+            metadata: { order_id: order.id, redeemed_amount: rewardsUsed },
+          })
+          .eq('id', rewardsTransactionId);
+        console.log(`✅ Rewards transaction ${rewardsTransactionId} linked to order ${order.id}`);
+      } catch (error) {
+        console.error('Failed to update rewards transaction with order id:', error);
       }
     }
 
-    // Update order with rewards used
-    if (rewardsUsed > 0) {
-      const { error: updateError } = await client
-        .from('orders')
-        .update({ 
-          rewards_used: rewardsUsed,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', order.id);
-      
-      if (updateError) {
-        console.error('Failed to update order with rewards_used:', updateError);
-        // Non-critical, continue with order
-      }
-    }
+    // ✅ SEND PINs VIA NOTIFICATIONS
+    try {
+      const { data: vendorProfile } = await client
+        .from('user_profiles')
+        .select('username')
+        .eq('id', order.vendor_id)
+        .single();
 
-    // Process payment if wallet (use final amount after rewards discount)
-    if (orderData.paymentMethodId === 'wallet') {
-      await this.processWalletPayment(userId, order.id, finalPaymentAmount, vendorId, riderId, client);
+      if (order.delivery_type === 'pickup') {
+        await this.notificationHelper.notifyVendorSelfPickupPin(order.vendor_id, {
+          id: order.id,
+          orderNumber: order.order_number,
+          deliveryPin: order.delivery_pin,
+          buyerName: 'Buyer',
+        });
+        console.log(`✅ Sent self-pickup PIN to vendor ${order.vendor_id}`);
+
+        await this.notificationHelper.notifyBuyerSelfPickupPin(userId, {
+          id: order.id,
+          orderNumber: order.order_number,
+          deliveryPin: order.delivery_pin,
+          vendorName: vendorProfile?.username,
+        });
+        console.log(`✅ Sent self-pickup PIN to buyer ${userId}`);
+      } else {
+        if (order.rider_id) {
+          await this.notificationHelper.notifyRiderPickupPin(order.rider_id, {
+            id: order.id,
+            orderNumber: order.order_number,
+            pickupPin: order.pickup_pin,
+            vendorName: vendorProfile?.username,
+          });
+          console.log(`✅ Sent pickup PIN to rider ${order.rider_id}`);
+        }
+
+        await this.notificationHelper.notifyBuyerDeliveryPin(userId, {
+          id: order.id,
+          orderNumber: order.order_number,
+          deliveryPin: order.delivery_pin,
+        });
+        console.log(`✅ Sent delivery PIN to buyer ${userId}`);
+      }
+    } catch (notifyError) {
+      console.error('Failed to send PIN notifications (non-critical):', notifyError);
     }
 
     // ✅ Link invoice to order if this order came from an invoice (after payment is processed)
@@ -1410,34 +1460,7 @@ export class CheckoutService {
       }
     }
 
-    // Update product stock (only for products, not services, and not auctions)
-    if (!isAuctionOrder) {
-      for (const item of summary.items) {
-        // Skip services - they don't have stock
-        if (item.itemType === 'service') {
-          continue;
-        }
-        
-        // Fetch current quantity for products
-        const { data: product } = await client
-          .from('products')
-          .select('quantity')
-          .eq('id', item.id)
-          .single();
-
-        if (product) {
-          const newQuantity = Math.max(0, product.quantity - item.quantity);
-          
-          await client
-            .from('products')
-            .update({
-              quantity: newQuantity,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', item.id);
-        }
-      }
-    }
+    // Product stock is now decremented atomically inside create_product_order_atomic.
 
     // Handle auction-specific logic
     if (isAuctionOrder && orderData.auctionCheckout) {
@@ -1686,6 +1709,7 @@ export class CheckoutService {
   }
 
   // Process wallet payment
+  /* ==== OLD CODE — processWalletPayment, kept for reference; not executed ====
   private async processWalletPayment(
     userId: string,
     orderId: string,
@@ -1700,45 +1724,63 @@ export class CheckoutService {
     // - Creating proper wallet_ledger entries
     // - Atomic transaction safety
     // - Validating both RPC error and return value success field
-    const result = await this.walletService.processWalletTransaction(
-      userId,
-      WalletTransactionType.PURCHASE_HOLD,
-      amount,
-      `Payment for order ${orderId}`,
-      orderId,
-      'order',
-    );
-
-    if (!result.success) {
-      console.error('❌ Wallet transaction failed:', result.error);
-      throw new HttpException(
-        result.error || 'Payment processing failed',
-        HttpStatus.INTERNAL_SERVER_ERROR
-      );
-    }
-
-    console.log(`✅ Wallet payment processed successfully:`, {
-      transactionId: result.transactionId,
-    });
-
-    // ✅ Payment processed - money now in escrow
-    // Status stays 'pending' so vendor can accept the order
-    // (Don't change status to 'paid' - vendor needs to accept first)
-
+    //
+    // Note: `amount` here is only the wallet portion of the order total. If the
+    // order is fully covered by a gift card, `amount` will be 0 and this hold is
+    // skipped entirely - the gift card portion is already held in the buyer's
+    // escrow balance by GiftCardService.applyToCheckout().
     // ✅ GENERATE HANDOFF PINS (3-digit)
     // For self-pickup: only delivery PIN needed (buyer shows to vendor)
     // For regular delivery: both PINs needed (pickup PIN for rider→vendor, delivery PIN for rider→buyer)
     const pickupPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
     const deliveryPin = Math.floor(100 + Math.random() * 900).toString(); // 3-digit (100-999)
-    
-    await client
-      .from('orders')
-      .update({
-        pickup_pin: pickupPin,
-        delivery_pin: deliveryPin,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', orderId);
+
+    if (amount > 0) {
+      // ✅ ATOMIC FIX: Hold and set pins in one Postgres transaction.
+      const { data: holdResult, error: holdRpcError } = await client.rpc(
+        'complete_purchase_hold_atomic',
+        {
+          p_order_id: orderId,
+          p_buyer_id: userId,
+          p_amount: amount,
+          p_description: `Payment for order ${orderId}`,
+          p_pickup_pin: pickupPin,
+          p_delivery_pin: deliveryPin,
+        }
+      );
+
+      if (holdRpcError) {
+        console.error('complete_purchase_hold_atomic RPC error:', holdRpcError);
+        throw new HttpException(
+          holdRpcError.message || 'Payment processing failed',
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
+      }
+
+      if (!holdResult || !holdResult.success) {
+        console.error('complete_purchase_hold_atomic failed:', holdResult?.error);
+        throw new HttpException(
+          holdResult?.error || 'Payment processing failed',
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
+      }
+
+      console.log(`✅ Wallet payment processed successfully:`, {
+        transactionId: holdResult.hold_transaction_id,
+      });
+    } else {
+      console.log(`ℹ️ No wallet portion to hold for order ${orderId} - fully covered by gift card`);
+
+      // Still save the pins for gift-card-only orders
+      await client
+        .from('orders')
+        .update({
+          pickup_pin: pickupPin,
+          delivery_pin: deliveryPin,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', orderId);
+    }
     
     console.log(`✅ Generated handoff PINs for order ${orderId}`);
     
@@ -1826,9 +1868,19 @@ export class CheckoutService {
       
       console.log(`💰 Escrow commission rate for order ${orderId}: ${orderCommissionRate ? (orderCommissionRate * 100).toFixed(1) + '%' : 'default 2%'} (source: ${orderData?.source || 'unknown'})`);
       
-      const escrowBreakdown = this.calculateEscrowBreakdown(amount, riderId, orderCommissionRate);
-      const escrow = await this.escrowService.createEscrow(orderId, escrowBreakdown);
-      console.log(`✅ Escrow created for order ${orderId}: ₣${amount}`);
+      // ✅ FIX: Escrow must be created for the FULL order total (wallet + gift card
+      // portions), not just the wallet portion (`amount`). The gift card portion is
+      // already held in the buyer's escrow balance (see GiftCardService.applyToCheckout),
+      // so vendor/rider/platform amounts must be computed off the full total to avoid
+      // under-paying the vendor when a gift card was used.
+      const escrowTotal = orderData?.total_amount ?? amount;
+      const escrowBreakdown = this.calculateEscrowBreakdown(escrowTotal, riderId, orderCommissionRate);
+      const escrow = await this.escrowService.createEscrow(orderId, {
+        ...escrowBreakdown,
+        paymentSource: orderData?.payment_source || 'wallet',
+        giftCardAmount: orderData?.gift_card_applied_amount || 0
+      });
+      console.log(`✅ Escrow created for order ${orderId}: ₣${escrowTotal}`);
       return escrow;
     } catch (escrowError) {
       console.error('❌ CRITICAL: Failed to create escrow after payment:', escrowError);
@@ -1840,6 +1892,7 @@ export class CheckoutService {
       );
     }
   }
+  ==== OLD CODE END ==== */
 
   // Calculate escrow breakdown (platform fee: varies by order type - 10% auctions, 5% live sales, 2% regular, delivery fee: 10% if rider)
   // ✅ FIX: Round amounts to 6 decimal places (matching DECIMAL(18,6)) and validate sum
@@ -1909,197 +1962,167 @@ export class CheckoutService {
     return Object.values(groups);
   }
 
-  // Create single order within a group
-  private async createSingleOrderInGroup(
-    userId: string,
-    orderGroupId: string,
-    vendorGroup: any,
-    riderAssignment: any,
-    orderData: any,
-    sequence: number,
-    userToken?: string
-  ) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-    
-    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
-    
-    const orderToInsert = {
-      buyer_id: userId,
-      vendor_id: vendorGroup.vendorId,
-      order_number: orderNumber,
-      status: 'pending',
-      escrow_enabled: orderData.useEscrow || false,
-      total_amount: vendorGroup.subtotal,
-      delivery_fee: riderAssignment.pricing.total / riderAssignment.vendorIds.length, // Split delivery fee
-      platform_fee: vendorGroup.subtotal * 0.02, // 2% platform fee
-      rider_id: riderAssignment.rider.id,
-      delivery_type: 'delivery',
-      delivery_address: orderData.deliveryAddress,
-      delivery_instructions: orderData.deliveryInstructions,
-      estimated_delivery: new Date(Date.now() + riderAssignment.route.estimatedTime * 60 * 1000).toISOString(),
-      rider_info: {
-        riderId: riderAssignment.rider.id,
-        riderName: riderAssignment.rider.name,
-        vehicleType: riderAssignment.vehicleType,
-        deliveryPrice: riderAssignment.pricing.total / riderAssignment.vendorIds.length,
-        estimatedArrival: riderAssignment.route.estimatedTime,
-        multiStop: riderAssignment.vendorIds.length > 1,
-        stopSequence: riderAssignment.vendorIds.indexOf(vendorGroup.vendorId) + 1,
-      },
-      source: (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) ? 'wishlist' : 'regular',
-      pickup_pin: this.generatePIN(),
-      delivery_pin: this.generatePIN(),
-      order_group_id: orderGroupId,
-      is_grouped: true,
-      group_sequence: sequence,
-      metadata: {
-        // Add wishlist_item_ids to metadata for cleanup (only for wishlist orders)
-        ...(orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0 ? {
-          wishlist_item_ids: orderData.wishlistItemIds,
-        } : {}),
-      },
-    };
-    
-    const { data: order, error } = await client
-      .from('orders')
-      .insert(orderToInsert)
-      .select()
-      .single();
-      
-    if (error) throw new HttpException('Failed to create order in group', HttpStatus.INTERNAL_SERVER_ERROR);
-    
-    // Create order items - handle BOTH products AND services
-    const orderItems = vendorGroup.items.map(item => {
-      const isService = item.itemType === 'service';
-      
-      return {
-        order_id: order.id,
-        product_id: isService ? null : item.id,
-        service_id: isService ? item.id : null,
-        product_name: item.name,
-        category: item.category || 'General',  // ✅ Store category for countdown calculation
-        quantity: item.quantity,
-        unit_price: item.price,
-        total_price: item.price * item.quantity,
-        scheduled_date: isService ? item.serviceDate : null,
-        scheduled_time: isService ? item.serviceTime : null,
-        service_notes: isService ? item.serviceNotes : null,
-      };
-    });
-    
-    await client.from('order_items').insert(orderItems);
-    
-    // Update stock - only for products, not services
-    for (const item of vendorGroup.items) {
-      // Skip services
-      if (item.itemType === 'service') {
-        continue;
-      }
-      
-      await client.rpc('decrement_product_stock', {
-        p_product_id: item.id,
-        p_quantity: item.quantity,
-      });
-    }
-    
-    return order;
-  }
-
-  // Deduct wallet balance for entire group
-  private async deductWalletForGroup(
-    userId: string,
-    totalAmount: number,
-    orderGroupId: string,
-    userToken?: string
-  ) {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-    
-    // Get wallet ID first
-    const { data: walletData } = await client
-      .from('wallets')
-      .select('id, available_balance')
-      .eq('user_id', userId)
-      .single();
-
-    if (!walletData) {
-      throw new HttpException('Wallet not found', HttpStatus.NOT_FOUND);
-    }
-
-    // Deduct from wallet
-    const { error: walletError } = await client
-      .from('wallets')
-      .update({
-        available_balance: walletData.available_balance - totalAmount,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('user_id', userId);
-      
-    if (walletError) throw new HttpException('Failed to deduct wallet balance', HttpStatus.INTERNAL_SERVER_ERROR);
-    
-    // Log transaction in wallet_ledger
-    await client.from('wallet_ledger').insert({
-      wallet_id: walletData.id,
-      transaction_type: 'purchase_hold',
-      amount: totalAmount,
-      balance_after: walletData.available_balance - totalAmount,
-      description: `Multi-vendor order group payment`,
-      reference_id: orderGroupId,
-      reference_type: 'order_group',
-    });
-  }
-
   // Create grouped order (main method)
   async createGroupedOrder(userId: string, orderData: any, userToken?: string) {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-    
-    let orderGroupId = null;
+    let orderGroupId: string | null = null;
+    let rewardsUsed = 0;
+    let rewardsTransactionId: string | null = null;
     let createdOrderIds: string[] = [];
-    let walletDeducted = false;
-    let totalAmount = 0; // Define outside try block for rollback access
-    
+
     try {
-      // Get cart summary OR wishlist summary
       let summary;
       if (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) {
-        // ✅ Handle wishlist source for grouped orders
-        console.log('💖 Backend createGroupedOrder - Wishlist checkout with itemIds:', orderData.wishlistItemIds);
-        summary = await this.getWishlistCheckoutSummary(
-          userId,
-          orderData.wishlistItemIds,
-          userToken,
-        );
+        console.log('Backend createGroupedOrder - Wishlist checkout with itemIds:', orderData.wishlistItemIds);
+        summary = await this.getWishlistCheckoutSummary(userId, orderData.wishlistItemIds, userToken);
       } else {
-        summary = await this.getCheckoutSummary(userId, userToken);
+        console.log('Backend createGroupedOrder - Cart checkout with selectedItemIds:', orderData.selectedItemIds);
+        summary = await this.getCheckoutSummary(userId, userToken, orderData.selectedItemIds);
       }
-      
-      // Group items by vendor (sellerId)
+
       const vendorGroups = this.groupItemsByVendor(summary.items);
-      
+
       if (vendorGroups.length === 1) {
-        // Single vendor - use existing flow
         return this.createOrder(userId, orderData, userToken);
       }
-      
-      // Multi-vendor flow
-      // 1. Generate group number
-      const groupNumber = `GRP-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
-      
-      // 2. Calculate total across all vendors
-      totalAmount = summary.subtotal + summary.tax + orderData.totalRiderFee + 
-                   (orderData.useEscrow ? summary.escrowFee : 0);
-      
-      // 3. Validate wallet balance (single deduction for entire group)
-      const { data: wallet } = await client
-        .from('wallets')
-        .select('available_balance')
-        .eq('user_id', userId)
-        .single();
-        
-      if (!wallet || wallet.available_balance < totalAmount) {
-        throw new HttpException('Insufficient wallet balance', HttpStatus.BAD_REQUEST);
+
+      const pGroups: any[] = [];
+      const groupNumber = 'GRP-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4).toUpperCase();
+
+      for (let i = 0; i < vendorGroups.length; i++) {
+        const group = vendorGroups[i];
+        const riderAssignment = orderData.riderAssignments?.[i] || null;
+        const riderId = riderAssignment?.rider?.id || null;
+        const deliveryFee = riderAssignment?.pricing?.total
+          ? Math.round((riderAssignment.pricing.total / (riderAssignment.vendorIds?.length || 1)) * 100) / 100
+          : 0;
+        const groupSubtotal = group.subtotal;
+        const groupTax = this.calculateTax(groupSubtotal);
+        const groupEscrowFee = orderData.useEscrow ? this.calculateEscrowFee(groupSubtotal + deliveryFee + groupTax) : 0;
+        const groupTotal = groupSubtotal + deliveryFee + groupTax + groupEscrowFee;
+        const orderNumber = 'ORD-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4).toUpperCase() + '-' + (i + 1);
+        const escrowBreakdown = this.calculateEscrowBreakdown(groupTotal, riderId, groupTotal > 0 ? groupTotal * 0.02 / groupTotal : 0.02);
+
+        const orderToInsert = {
+          buyer_id: userId,
+          vendor_id: group.vendorId,
+          order_number: orderNumber,
+          status: 'pending',
+          escrow_enabled: orderData.useEscrow || false,
+          total_amount: groupTotal,
+          delivery_fee: deliveryFee,
+          platform_fee: escrowBreakdown.platformAmount,
+          rider_id: riderId,
+          delivery_type: 'delivery',
+          delivery_address: orderData.deliveryAddress,
+          delivery_instructions: orderData.deliveryInstructions,
+          estimated_delivery: riderAssignment?.route?.estimatedTime
+            ? new Date(Date.now() + riderAssignment.route.estimatedTime * 60 * 1000).toISOString()
+            : new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+          rider_info: riderAssignment ? {
+            riderId: riderAssignment.rider.id,
+            riderName: riderAssignment.rider.name,
+            vehicleType: riderAssignment.vehicleType,
+            deliveryPrice: deliveryFee,
+            estimatedArrival: riderAssignment.route.estimatedTime,
+            multiStop: (riderAssignment.vendorIds?.length || 1) > 1,
+            stopSequence: (riderAssignment.vendorIds?.indexOf(group.vendorId) || 0) + 1,
+          } : null,
+          source: (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) ? 'wishlist' : 'regular',
+          order_group_id: orderGroupId,
+          is_grouped: true,
+          group_sequence: i + 1,
+          metadata: {
+            subtotal: groupSubtotal,
+            tax_amount: groupTax,
+            escrow_fee: groupEscrowFee,
+            payment_method: orderData.paymentMethodId,
+            original_shipping: deliveryFee,
+            ...(orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0 ? {
+              wishlist_item_ids: orderData.wishlistItemIds,
+            } : {}),
+          },
+        };
+
+        const pItems = group.items.map((item: any) => {
+          const isService = item.itemType === 'service';
+          const isProduct = !isService;
+          const unitPrice = item.price || 0;
+          return {
+            product_id: isProduct ? item.id : null,
+            service_id: isService ? item.id : null,
+            product_name: item.name,
+            category: item.category || 'General',
+            quantity: item.quantity,
+            unit_price: unitPrice,
+            total_price: unitPrice * item.quantity,
+            scheduled_date: isService ? item.serviceDate : null,
+            scheduled_time: isService ? item.serviceTime : null,
+            service_notes: isService ? item.serviceNotes : null,
+            product_metadata: null,
+          };
+        });
+
+        const stockUpdates = group.items
+          .filter((item: any) => item.itemType !== 'service')
+          .map((item: any) => ({
+            product_id: item.id,
+            quantity: item.quantity,
+          }));
+
+        pGroups.push({
+          order: orderToInsert,
+          items: pItems,
+          escrow: {
+            total_amount: escrowBreakdown.totalAmount,
+            vendor_amount: escrowBreakdown.vendorAmount,
+            rider_amount: escrowBreakdown.riderAmount,
+            platform_amount: escrowBreakdown.platformAmount,
+          },
+          stock_updates: stockUpdates,
+        });
       }
-      
-      // 4. Create order group record
+
+      const totalAmount = pGroups.reduce((sum, g) => sum + g.order.total_amount, 0);
+
+      let giftCardPayload: { card_number: string; pin: string; requested_amount: number | null } | null = null;
+      if (orderData.giftCard) {
+        giftCardPayload = {
+          card_number: orderData.giftCard.cardNumber,
+          pin: orderData.giftCard.pin,
+          requested_amount: orderData.giftCard.amount || null,
+        };
+      }
+
+      if (orderData.useRewards && orderData.rewardsAmount > 0) {
+        const redemptionResult = await this.rewardsService.redeemRewards(userId, orderData.rewardsAmount);
+        if (!redemptionResult.success) {
+          throw new HttpException('Failed to redeem rewards', HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+        rewardsUsed = orderData.rewardsAmount;
+        rewardsTransactionId = redemptionResult.transaction_id ?? null;
+      }
+
+      if (orderData.paymentMethodId === 'wallet' && totalAmount > 0) {
+        const estimatedRewards = rewardsUsed;
+        const requestedGift = giftCardPayload?.requested_amount ?? 0;
+        const effectiveGift = Math.min(requestedGift, Math.max(0, totalAmount - estimatedRewards));
+        const walletPortion = Math.max(0, totalAmount - effectiveGift - estimatedRewards);
+
+        const { data: wallet } = await client
+          .from('wallets')
+          .select('available_balance')
+          .eq('user_id', userId)
+          .single();
+
+        if (!wallet || wallet.available_balance < walletPortion) {
+          if (rewardsUsed > 0) {
+            await this.rewardsService.reverseRewardsRedemption(userId, rewardsUsed);
+          }
+          throw new HttpException('Insufficient wallet balance', HttpStatus.BAD_REQUEST);
+        }
+      }
+
       const { data: orderGroup, error: groupError } = await client
         .from('order_groups')
         .insert({
@@ -2111,56 +2134,73 @@ export class CheckoutService {
         })
         .select()
         .single();
-        
-      if (groupError) throw new HttpException('Failed to create order group', HttpStatus.INTERNAL_SERVER_ERROR);
-      
-      orderGroupId = orderGroup.id;
-      
-      // 5. Create individual orders for each vendor
-      const orders: any[] = [];
-      for (let i = 0; i < vendorGroups.length; i++) {
-        const group = vendorGroups[i];
-        const riderAssignment = orderData.riderAssignments[i]; // From rider optimization
-        
-        const order = await this.createSingleOrderInGroup(
-          userId,
-          orderGroup.id,
-          group,
-          riderAssignment,
-          orderData,
-          i + 1, // sequence
-          userToken
-        );
-        
-        orders.push(order);
-        createdOrderIds.push(order.id);
-      }
-      
-      // 6. Deduct wallet balance ONCE for entire group
-      await this.deductWalletForGroup(userId, totalAmount, orderGroup.id, userToken);
-      walletDeducted = true;
-      
-      // 7. Create escrows per vendor if enabled
-      if (orderData.useEscrow) {
-        for (const order of orders) {
-          // Calculate rider commission (10% of rider earnings)
-          const riderCommission = order.rider_id && order.delivery_fee > 0
-            ? order.delivery_fee * this.PLATFORM_COMMISSION_RATE
-            : 0;
 
-          const breakdown = {
-            totalAmount: order.total_amount,
-            vendorAmount: order.total_amount - order.delivery_fee - order.platform_fee,
-            riderAmount: order.delivery_fee - riderCommission, // Rider gets delivery fee minus platform commission
-            platformAmount: order.platform_fee + riderCommission, // Platform gets vendor commission + rider commission
-          };
-          await this.escrowService.createEscrow(order.id, breakdown);
+      if (groupError) throw new HttpException('Failed to create order group', HttpStatus.INTERNAL_SERVER_ERROR);
+
+      orderGroupId = orderGroup.id;
+
+      pGroups.forEach((g: any) => {
+        g.order.order_group_id = orderGroupId;
+      });
+
+      const { data: rpcData, error: rpcError } = await this.supabase.rpc('create_grouped_order_atomic', {
+        p_buyer_id: userId,
+        p_groups: pGroups,
+        p_gift_card: giftCardPayload,
+        p_rewards_amount: rewardsUsed,
+        p_admin_gift_user_id: this.configService.get<string>('PLATFORM_GIFT_WALLET_USER_ID', '00000000-0000-4000-8000-000000000003'),
+        p_user_ip: null,
+      });
+
+      if (rpcError) {
+        console.error('create_grouped_order_atomic RPC error:', rpcError);
+        if (rewardsUsed > 0) {
+          await this.rewardsService.reverseRewardsRedemption(userId, rewardsUsed);
+        }
+        throw new HttpException(rpcError.message || 'Grouped order creation failed', HttpStatus.INTERNAL_SERVER_ERROR);
+      }
+
+      const rpcResult = rpcData as any;
+      if (!rpcResult || !rpcResult.success) {
+        console.error('create_grouped_order_atomic failed:', rpcResult?.error);
+        if (rewardsUsed > 0) {
+          await this.rewardsService.reverseRewardsRedemption(userId, rewardsUsed);
+        }
+        throw new HttpException(rpcResult?.error || 'Grouped order creation failed', HttpStatus.INTERNAL_SERVER_ERROR);
+      }
+
+      createdOrderIds = rpcResult.orders || [];
+
+      const { data: orders, error: ordersError } = await client
+        .from('orders')
+        .select('*')
+        .in('id', createdOrderIds)
+        .order('group_sequence', { ascending: true });
+
+      if (ordersError) {
+        console.error('Failed to fetch created grouped orders:', ordersError);
+        if (rewardsUsed > 0) {
+          await this.rewardsService.reverseRewardsRedemption(userId, rewardsUsed);
+        }
+        throw new HttpException('Failed to fetch created orders', HttpStatus.INTERNAL_SERVER_ERROR);
+      }
+
+      if (rewardsTransactionId) {
+        try {
+          await client
+            .from('rewards_transactions')
+            .update({
+              reference_id: createdOrderIds[0],
+              metadata: { order_id: createdOrderIds[0], order_group_id: orderGroupId, redeemed_amount: rewardsUsed },
+            })
+            .eq('id', rewardsTransactionId);
+        } catch (error) {
+          console.error('Failed to update rewards transaction:', error);
         }
       }
-      
-      // 8. Send notifications to all vendors and riders
+
       try {
-        for (const order of orders) {
+        for (const order of orders || []) {
           await this.notificationHelper.notifyVendorNewOrder(order.vendor_id, {
             id: order.id,
             orderNumber: order.order_number,
@@ -2175,65 +2215,48 @@ export class CheckoutService {
           }
         }
       } catch (notifError) {
-        console.warn('⚠️ Notification sending failed (non-critical):', notifError);
+        console.warn('Notification sending failed (non-critical):', notifError);
       }
-      
-      // ✅ Remove purchased items from wishlist after grouped order creation
+
       if (orderData.wishlistItemIds && orderData.wishlistItemIds.length > 0) {
         try {
-          await this.wishlistService.removePurchasedItems(
-            userId,
-            orderData.wishlistItemIds,
-            userToken,
-          );
-          console.log(`✅ Removed ${orderData.wishlistItemIds.length} items from wishlist after grouped order creation`);
+          await this.wishlistService.removePurchasedItems(userId, orderData.wishlistItemIds, userToken);
+          console.log('Removed ' + orderData.wishlistItemIds.length + ' items from wishlist after grouped order creation');
         } catch (error) {
           console.error('Failed to remove wishlist items (non-critical):', error);
-          // Don't throw - wishlist cleanup is not critical to order creation
         }
+      } else if (!orderData.selectedItemIds || orderData.selectedItemIds.length === 0) {
+        console.log('Backend: Clearing entire cart (full cart checkout)');
+        await client.from('cart_items').delete().eq('user_id', userId);
+      } else {
+        console.log('Backend: Skipping cart clear (selective checkout - ' + orderData.selectedItemIds.length + ' items selected)');
       }
-      
+
       return {
-        orderGroup: orderGroup,
-        orders: orders,
+        orderGroup,
+        orders: orders || [],
       };
-      
+
     } catch (error) {
-      console.error('❌ Grouped order creation failed, rolling back:', error);
-      
-      // Rollback: Delete created orders
+      console.error('Grouped order creation failed:', error);
+
       if (createdOrderIds.length > 0) {
         await client.from('orders').delete().in('id', createdOrderIds);
         await client.from('order_items').delete().in('order_id', createdOrderIds);
       }
-      
-      // Rollback: Delete order group
+
       if (orderGroupId) {
         await client.from('order_groups').delete().eq('id', orderGroupId);
       }
-      
-      // Rollback: Refund wallet if deducted using helper function
-      if (walletDeducted) {
-        try {
-          const refundResult = await this.walletService.processWalletTransaction(
-            userId,
-            WalletTransactionType.ESCROW_REFUND,
-            totalAmount,
-            `Refund for failed order group creation`,
-            orderGroupId || undefined,
-            'order_group',
-          );
 
-          if (!refundResult.success) {
-            console.error('❌ Failed to refund wallet during rollback:', refundResult.error);
-          } else {
-            console.log('✅ Wallet refunded during rollback:', refundResult.transactionId);
-          }
-        } catch (refundError) {
-          console.error('❌ Error during wallet refund rollback:', refundError);
+      if (rewardsUsed > 0 && createdOrderIds.length === 0) {
+        try {
+          await this.rewardsService.reverseRewardsRedemption(userId, rewardsUsed);
+        } catch (rewardError) {
+          console.error('Failed to reverse rewards redemption:', rewardError);
         }
       }
-      
+
       throw error;
     }
   }

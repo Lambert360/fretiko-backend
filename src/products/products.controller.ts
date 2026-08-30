@@ -87,6 +87,13 @@ export class ProductsController {
     return this.productsService.getProduct(id);
   }
 
+  // Public endpoint: Get product preview for deep linking (no auth required)
+  @Get('public/:id')
+  async getPublicProduct(@Param('id') id: string) {
+    console.log('📦 Fetching public product:', id);
+    return this.productsService.getProduct(id);
+  }
+
   @Post()
   @UseGuards(JwtAuthGuard)
   async createProduct(@Request() req, @Body() createProductDto: CreateProductDto) {

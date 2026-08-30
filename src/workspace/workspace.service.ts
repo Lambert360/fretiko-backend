@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { EscrowService } from '../escrow/escrow.service';
+import { ScheduleRemindersService } from './schedule-reminders.service';
 
 @Injectable()
 export class WorkspaceService {
@@ -14,6 +15,7 @@ export class WorkspaceService {
     private notificationHelper: NotificationHelperService,
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
+    private scheduleReminders: ScheduleRemindersService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService); // Service role client
@@ -925,6 +927,14 @@ export class WorkspaceService {
         console.error('Failed to notify buyer (non-critical):', notifyError);
       }
 
+      // ✅ CREATE SCHEDULE REMINDERS FOR SERVICE ORDERS
+      try {
+        await this.scheduleReminders.createRemindersForAcceptedOrder(orderId);
+        console.log(`✅ Schedule reminders created for order ${orderId}`);
+      } catch (reminderError) {
+        console.error('Failed to create schedule reminders (non-critical):', reminderError);
+      }
+
       return { success: true, message: 'Order accepted successfully' };
     } catch (error) {
       console.error('Error accepting order:', error);
@@ -1046,6 +1056,14 @@ export class WorkspaceService {
       } catch (escrowError: any) {
         // Don't block order rejection if refund fails; log for reconciliation
         console.error(' [DECLINE] Failed to refund escrow on decline (requires review):', escrowError?.message || escrowError);
+      }
+
+      // ✅ CANCEL SCHEDULE REMINDERS FOR DECLINED ORDER
+      try {
+        await this.scheduleReminders.cancelRemindersForOrder(orderId);
+        console.log(` [DECLINE] Schedule reminders cancelled for order ${orderId}`);
+      } catch (reminderError) {
+        console.error(' [DECLINE] Failed to cancel schedule reminders (non-critical):', reminderError);
       }
 
       return { success: true, message: 'Order declined successfully' };
@@ -2196,6 +2214,214 @@ export class WorkspaceService {
       };
     } catch (error) {
       console.error('Error fetching live stream analytics:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get orders for a specific date or month (for calendar view)
+   * Returns accepted service orders with scheduled dates
+   */
+  async getOrdersByDate(userId: string, date: string, month?: string, userToken?: string) {
+    const supabaseClient = userToken
+      ? createUserSupabaseClient(this.configService, userToken)
+      : this.supabase;
+
+    try {
+      console.log(`📅 [SCHEDULE] Fetching orders for date: ${date}, month: ${month}`);
+
+      let startDate: string;
+      let endDate: string;
+
+      if (date) {
+        // Fetch orders for specific date
+        startDate = `${date}T00:00:00.000Z`;
+        endDate = `${date}T23:59:59.999Z`;
+      } else if (month) {
+        // Fetch orders for entire month
+        const [year, monthNum] = month.split('-').map(Number);
+        startDate = new Date(year, monthNum - 1, 1).toISOString();
+        endDate = new Date(year, monthNum, 0, 23, 59, 59, 999).toISOString();
+      } else {
+        throw new Error('Either date or month parameter is required');
+      }
+
+      // Fetch orders with service items and scheduled dates
+      const { data: orders, error } = await supabaseClient
+        .from('orders')
+        .select(`
+          id,
+          order_number,
+          status,
+          total_amount,
+          created_at,
+          updated_at,
+          buyer_id,
+          vendor_id,
+          delivery_address,
+          source,
+          metadata,
+          order_items(
+            id,
+            product_id,
+            service_id,
+            product_name,
+            unit_price,
+            quantity,
+            total_price,
+            product_metadata,
+            scheduled_date,
+            scheduled_time,
+            service_notes
+          )
+        `)
+        .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+        .not('status', 'eq.cancelled')
+        .not('status', 'eq.rejected')
+        .gte('created_at', startDate)
+        .lte('created_at', endDate)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        throw new Error(`Failed to fetch orders by date: ${error.message}`);
+      }
+
+      if (!orders || orders.length === 0) {
+        return [];
+      }
+
+      // Filter for service orders with scheduled dates
+      const serviceOrders = orders.filter(order => {
+        const hasServiceItem = order.order_items?.some(item => item.service_id || item.scheduled_date);
+        const isLiveStreamService = order.source === 'live_stream' && order.metadata?.booking_type === 'service';
+        return hasServiceItem || isLiveStreamService;
+      });
+
+      // Fetch buyer profiles
+      const buyerIds = [...new Set(serviceOrders.map(o => o.buyer_id).filter(Boolean))];
+      const buyerProfiles: Record<string, any> = {};
+      
+      if (buyerIds.length > 0) {
+        const { data: profiles } = await supabaseClient
+          .from('user_profiles')
+          .select('id, username, avatar_url, display_name, phone')
+          .in('id', buyerIds);
+        
+        profiles?.forEach(p => {
+          buyerProfiles[p.id] = p;
+        });
+      }
+
+      // Transform to scheduled order format
+      const scheduledOrders = serviceOrders.map(order => {
+        const serviceItem = order.order_items?.find(item => item.service_id || item.scheduled_date);
+        
+        return {
+          id: order.id,
+          orderNumber: order.order_number,
+          serviceId: serviceItem?.service_id || null,
+          serviceName: serviceItem?.product_name || 'Service',
+          scheduledDate: serviceItem?.scheduled_date || order.metadata?.scheduled_date || null,
+          scheduledTime: serviceItem?.scheduled_time || order.metadata?.scheduled_time || null,
+          status: order.status,
+          customerName: buyerProfiles[order.buyer_id]?.username || buyerProfiles[order.buyer_id]?.display_name || 'Unknown Customer',
+          customerPhone: buyerProfiles[order.buyer_id]?.phone || null,
+          total: order.total_amount,
+          location: order.delivery_address,
+          createdAt: order.created_at,
+          metadata: order.metadata,
+        };
+      });
+
+      // Sort by scheduled date and time
+      scheduledOrders.sort((a, b) => {
+        if (!a.scheduledDate || !b.scheduledDate) return 0;
+        if (a.scheduledDate !== b.scheduledDate) return a.scheduledDate.localeCompare(b.scheduledDate);
+        if (!a.scheduledTime || !b.scheduledTime) return 0;
+        return a.scheduledTime.localeCompare(b.scheduledTime);
+      });
+
+      console.log(`📅 [SCHEDULE] Found ${scheduledOrders.length} scheduled orders`);
+      return scheduledOrders;
+    } catch (error) {
+      console.error('Error fetching orders by date:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get month summary for calendar indicators
+   * Returns count of orders per day for the month
+   */
+  async getMonthSummary(userId: string, month: string, userToken?: string) {
+    const supabaseClient = userToken
+      ? createUserSupabaseClient(this.configService, userToken)
+      : this.supabase;
+
+    try {
+      console.log(`📅 [SCHEDULE] Fetching month summary for: ${month}`);
+
+      const [year, monthNum] = month.split('-').map(Number);
+      const startDate = new Date(year, monthNum - 1, 1).toISOString();
+      const endDate = new Date(year, monthNum, 0, 23, 59, 59, 999).toISOString();
+
+      // Fetch all orders for the month
+      const { data: orders, error } = await supabaseClient
+        .from('orders')
+        .select(`
+          id,
+          created_at,
+          status,
+          source,
+          metadata,
+          order_items(
+            scheduled_date,
+            service_id
+          )
+        `)
+        .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+        .not('status', 'eq.cancelled')
+        .not('status', 'eq.rejected')
+        .gte('created_at', startDate)
+        .lte('created_at', endDate);
+
+      if (error) {
+        throw new Error(`Failed to fetch month summary: ${error.message}`);
+      }
+
+      if (!orders || orders.length === 0) {
+        return {};
+      }
+
+      // Initialize summary object with all days of the month
+      const summary: Record<string, number> = {};
+      const daysInMonth = new Date(year, monthNum, 0).getDate();
+      
+      for (let day = 1; day <= daysInMonth; day++) {
+        const dateStr = `${year}-${String(monthNum).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        summary[dateStr] = 0;
+      }
+
+      // Count orders per day
+      orders.forEach(order => {
+        const serviceItem = order.order_items?.find(item => item.service_id || item.scheduled_date);
+        const isLiveStreamService = order.source === 'live_stream' && order.metadata?.booking_type === 'service';
+        
+        if (serviceItem?.scheduled_date || order.metadata?.scheduled_date || isLiveStreamService) {
+          const scheduledDate = serviceItem?.scheduled_date || order.metadata?.scheduled_date;
+          if (scheduledDate) {
+            const dateStr = scheduledDate.split('T')[0]; // Extract YYYY-MM-DD
+            if (summary.hasOwnProperty(dateStr)) {
+              summary[dateStr]++;
+            }
+          }
+        }
+      });
+
+      console.log(`📅 [SCHEDULE] Month summary complete: ${Object.keys(summary).length} days with orders`);
+      return summary;
+    } catch (error) {
+      console.error('Error fetching month summary:', error);
       throw error;
     }
   }

@@ -115,6 +115,14 @@ export class AuctionsController {
   }
 
   /**
+   * Public endpoint: Get auction preview for deep linking (no auth required)
+   */
+  @Get('public/:id')
+  async getPublicAuction(@Param('id') id: string) {
+    return this.auctionsService.findById(id, undefined);
+  }
+
+  /**
    * Track auction view (increment viewer count)
    * Requires authentication for unique user tracking
    */

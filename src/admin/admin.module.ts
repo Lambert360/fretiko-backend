@@ -14,6 +14,8 @@ import { PartnershipsController } from '../partnerships/partnerships.controller'
 import { OrdersController } from './orders.controller';
 import { DisputesController } from './disputes.controller';
 import { AdminNotificationsController } from './admin-notifications.controller';
+import { GiftCardAdminController } from './gift-card-admin.controller';
+import { LiveSalesGamificationAdminController } from './live-sales-gamification-admin.controller';
 import { AdminService } from './admin.service';
 import { AdminNotificationsGateway } from './admin-notifications.gateway';
 import { AdminNotificationsService } from './admin-notifications.service';
@@ -31,6 +33,8 @@ import { PartnershipsModule } from '../partnerships/partnerships.module';
 import { WebsiteContentModule } from '../website-content/website-content.module';
 import { AuthModule } from '../auth/auth.module';
 import { PartnersModule } from '../partners/partners.module';
+import { GiftCardsModule } from '../gift-cards/gift-cards.module';
+import { LiveSalesModule } from '../live-sales/live-sales.module';
 
 @Module({
   imports: [
@@ -56,6 +60,8 @@ import { PartnersModule } from '../partners/partners.module';
     PartnershipsModule, // For partnership applications management
     WebsiteContentModule, // For website content management
     PartnersModule, // For partner (logistics company) wallet crediting in refunds
+    forwardRef(() => GiftCardsModule), // NEW: Gift card management
+    forwardRef(() => LiveSalesModule), // NEW: Live sales gamification
   ],
   controllers: [
     AdminController, 
@@ -70,6 +76,8 @@ import { PartnersModule } from '../partners/partners.module';
     OrdersController, 
     DisputesController,
     AdminNotificationsController, // REST endpoints for admin notifications
+    GiftCardAdminController, // NEW: Gift card management endpoints
+    LiveSalesGamificationAdminController, // NEW: Live sales gamification admin
   ],
   providers: [
     AdminService,

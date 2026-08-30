@@ -1310,6 +1310,105 @@ export class NotificationHelperService {
   }
 
   // ============================================
+  // SCHEDULE REMINDER NOTIFICATIONS
+  // ============================================
+
+  /**
+   * Notify vendor of daily digest - all orders scheduled for today
+   */
+  async notifyVendorDailyDigest(vendorId: string, orders: any[]): Promise<void> {
+    try {
+      const orderCount = orders.length;
+      const orderList = orders.map(o => `• ${o.serviceName} at ${o.scheduledTime} - ${o.customerName}`).join('\n');
+      
+      const notification: CreateNotificationDto = {
+        user_id: vendorId,
+        type: NotificationType.SCHEDULE,
+        title: `Today's Schedule 📅`,
+        message: `You have ${orderCount} service order${orderCount > 1 ? 's' : ''} scheduled for today:\n\n${orderList}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'SCHEDULE',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Calendar', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          recipient_role: 'vendor',
+          target_screen: 'ScheduleCalendar',
+          order_count: orderCount,
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Created daily digest notification for vendor ${vendorId} (${orderCount} orders)`);
+    } catch (error) {
+      this.logger.error('Failed to create daily digest notification:', error);
+    }
+  }
+
+  /**
+   * Notify vendor 1 hour before scheduled service time
+   */
+  async notifyVendorHourlyReminder(vendorId: string, order: any): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: vendorId,
+        type: NotificationType.SCHEDULE,
+        title: `Upcoming Service in 1 Hour ⏰`,
+        message: `${order.serviceName} is scheduled for ${order.scheduledTime} with ${order.customerName}. Order #${order.orderNumber}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'REMINDER',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: order.id,
+          order_number: order.orderNumber,
+          recipient_role: 'vendor',
+          target_screen: 'VendorOrderDetails'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Created hourly reminder for vendor ${vendorId} for order ${order.orderNumber}`);
+    } catch (error) {
+      this.logger.error('Failed to create hourly reminder for vendor:', error);
+    }
+  }
+
+  /**
+   * Notify buyer 1 hour before scheduled service time
+   */
+  async notifyBuyerHourlyReminder(buyerId: string, order: any): Promise<void> {
+    try {
+      const notification: CreateNotificationDto = {
+        user_id: buyerId,
+        type: NotificationType.SCHEDULE,
+        title: `Your Service is in 1 Hour ⏰`,
+        message: `Your ${order.serviceName} appointment is scheduled for ${order.scheduledTime}. Order #${order.orderNumber}`,
+        priority: NotificationPriority.HIGH,
+        badge: 'REMINDER',
+        has_actions: true,
+        action_buttons: [
+          { label: 'View Order', type: ActionButtonType.PRIMARY }
+        ],
+        data: {
+          order_id: order.id,
+          order_number: order.orderNumber,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
+        }
+      };
+
+      await this.createAndSendNotification(notification);
+      this.logger.log(`Created hourly reminder for buyer ${buyerId} for order ${order.orderNumber}`);
+    } catch (error) {
+      this.logger.error('Failed to create hourly reminder for buyer:', error);
+    }
+  }
+
+  // ============================================
   // PRIVATE HELPER METHOD
   // ============================================
 

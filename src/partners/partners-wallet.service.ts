@@ -234,21 +234,19 @@ export class PartnersWalletService {
     partnerId: string,
     dto: { amount: number; bankAccountId: string }
   ): Promise<{ success: boolean; message: string; withdrawal?: PartnerWithdrawal }> {
-    const { data: wallet, error: wErr } = await this.supabase
+    if (dto.amount <= 0) return { success: false, message: 'Amount must be greater than zero.' };
+
+    const { data: wallet } = await this.supabase
       .from('partner_wallets')
-      .select('id, available_balance, preferred_currency')
+      .select('id, preferred_currency')
       .eq('partner_id', partnerId)
       .single();
 
-    if (wErr || !wallet) return { success: false, message: 'Wallet not found.' };
-    if (dto.amount <= 0) return { success: false, message: 'Amount must be greater than zero.' };
-    if (dto.amount > wallet.available_balance) {
-      return { success: false, message: `Insufficient balance. Available: ${wallet.preferred_currency} ${wallet.available_balance.toFixed(2)}` };
-    }
+    if (!wallet) return { success: false, message: 'Wallet not found.' };
 
     const { data: bankAccount } = await this.supabase
       .from('partner_bank_accounts')
-      .select('id')
+      .select('id, account_name, bank_name, account_number')
       .eq('id', dto.bankAccountId)
       .eq('partner_id', partnerId)
       .eq('is_active', true)
@@ -256,41 +254,32 @@ export class PartnersWalletService {
 
     if (!bankAccount) return { success: false, message: 'Bank account not found.' };
 
-    // Fetch current pending_withdrawal so we can increment it
-    const currentPending = parseFloat(wallet.pending_withdrawal ?? 0);
-
-    // Deduct from available, add to pending
-    await this.supabase
-      .from('partner_wallets')
-      .update({
-        available_balance: wallet.available_balance - dto.amount,
-        pending_withdrawal: currentPending + dto.amount,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('partner_id', partnerId);
-
     const reference = `PWD-${Date.now()}-${partnerId.substring(0, 8).toUpperCase()}`;
+    const idempotencyKey = `${reference}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
 
-    const { data: withdrawal, error: wdErr } = await this.supabase
-      .from('partner_withdrawals')
-      .insert({
-        partner_id: partnerId,
-        wallet_id: wallet.id,
-        bank_account_id: dto.bankAccountId,
-        amount: dto.amount,
-        currency: wallet.preferred_currency,
-        status: 'pending',
-        reference,
-      })
-      .select()
-      .single();
+    const { data: rpcData, error: rpcError } = await this.supabase.rpc(
+      'create_partner_withdrawal_atomic',
+      {
+        p_partner_id: partnerId,
+        p_bank_account_id: dto.bankAccountId,
+        p_amount: dto.amount,
+        p_currency: wallet.preferred_currency,
+        p_reference: reference,
+        p_description: null,
+        p_idempotency_key: idempotencyKey,
+      },
+    );
 
-    if (wdErr) return { success: false, message: 'Failed to create withdrawal request.' };
+    if (rpcError || !rpcData || !rpcData.success) {
+      const message = rpcData?.error || rpcError?.message || 'Failed to create withdrawal request.';
+      return { success: false, message };
+    }
 
+    const raw = { ...rpcData.withdrawal, partner_bank_accounts: bankAccount };
     return {
       success: true,
       message: 'Withdrawal request submitted. Funds will be transferred within 1–3 business days.',
-      withdrawal: this.mapWithdrawal(withdrawal),
+      withdrawal: this.mapWithdrawal(raw),
     };
   }
 
@@ -318,25 +307,24 @@ export class PartnersWalletService {
 
       await this.ensureWalletExists(rider.company_id);
 
-      const { data: wallet } = await this.supabase
-        .from('partner_wallets')
-        .select('available_balance, total_earned')
-        .eq('partner_id', rider.company_id)
-        .single();
+      if (amount <= 0) return { credited: false };
 
-      if (!wallet) return { credited: false };
+      const idempotencyKey = `credit-${riderId}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
 
-      const { error } = await this.supabase
-        .from('partner_wallets')
-        .update({
-          available_balance: parseFloat(wallet.available_balance) + amount,
-          total_earned: parseFloat(wallet.total_earned) + amount,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('partner_id', rider.company_id);
+      const { data: rpcData, error: rpcError } = await this.supabase.rpc(
+        'credit_partner_wallet_atomic',
+        {
+          p_partner_id: rider.company_id,
+          p_amount: amount,
+          p_description: description,
+          p_reference_type: 'delivery',
+          p_reference_id: null,
+          p_idempotency_key: idempotencyKey,
+        },
+      );
 
-      if (error) {
-        this.logger.error(`Failed to credit partner wallet (rider ${riderId}): ${error.message}`);
+      if (rpcError || !rpcData || !rpcData.success) {
+        this.logger.error(`Failed to credit partner wallet (rider ${riderId}): ${rpcError?.message || rpcData?.error}`);
         return { credited: false };
       }
 

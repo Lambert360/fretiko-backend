@@ -1,6 +1,8 @@
 import { Module, forwardRef } from '@nestjs/common';
 import { LiveSalesController } from './live-sales.controller';
 import { LiveSalesService } from './live-sales.service';
+import { LiveSalesGamificationService } from './live-sales-gamification.service';
+import { LiveSalesGamificationController } from './live-sales-gamification.controller';
 import { LiveStreamGateway } from './live-stream.gateway';
 import { AnalyticsModule } from '../analytics/analytics.module';
 import { EscrowModule } from '../escrow/escrow.module';
@@ -9,6 +11,8 @@ import { WalletModule } from '../wallet/wallet.module';
 import { UsersModule } from '../users/users.module';
 import { GiftModule } from '../gifts/gift.module';
 import { AuthModule } from '../auth/auth.module';
+import { GiftCardsModule } from '../gift-cards/gift-cards.module';
+import { RewardsModule } from '../rewards/rewards.module';
 
 /**
  * Live Sales Module
@@ -28,10 +32,12 @@ import { AuthModule } from '../auth/auth.module';
     GiftModule,
     WalletModule,
     UsersModule,
+    forwardRef(() => GiftCardsModule),
+    RewardsModule,
   ],
-  controllers: [LiveSalesController],
-  providers: [LiveSalesService, LiveStreamGateway],
+  controllers: [LiveSalesController, LiveSalesGamificationController],
+  providers: [LiveSalesService, LiveSalesGamificationService, LiveStreamGateway],
 
-  exports: [LiveSalesService],
+  exports: [LiveSalesService, LiveSalesGamificationService],
 })
 export class LiveSalesModule {}

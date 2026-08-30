@@ -233,6 +233,33 @@ export class NotificationsController {
     return { success };
   }
 
+  /**
+   * POST /notifications/voip-push-token - Register an iOS VoIP (PushKit) token
+   */
+  @Post('voip-push-token')
+  @HttpCode(HttpStatus.CREATED)
+  async registerVoipPushToken(
+    @Request() req: any,
+    @Body() body: { token: string }
+  ): Promise<{ success: boolean }> {
+    this.logger.log(`Registering VoIP push token for user ${req.user.sub}`);
+    const success = await this.pushNotificationService.registerVoipToken(req.user.sub, body.token);
+    return { success };
+  }
+
+  /**
+   * DELETE /notifications/voip-push-token - Unregister an iOS VoIP (PushKit) token
+   */
+  @Delete('voip-push-token')
+  async unregisterVoipPushToken(
+    @Request() req: any,
+    @Body() body: { token: string }
+  ): Promise<{ success: boolean }> {
+    this.logger.log(`Unregistering VoIP push token for user ${req.user.sub}`);
+    const success = await this.pushNotificationService.unregisterVoipToken(req.user.sub, body.token);
+    return { success };
+  }
+
   // ============================================
   // ADMIN/SYSTEM ENDPOINTS
   // ============================================

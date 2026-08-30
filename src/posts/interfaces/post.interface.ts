@@ -21,6 +21,7 @@ export enum InteractionType {
 export enum FeedItemType {
   POST = 'post',
   SERVICE = 'service',
+  LIVE_STREAM = 'live_stream',
 }
 
 export interface Post {
@@ -84,6 +85,29 @@ export interface PostBookmark {
   createdAt: Date;
 }
 
+export interface LiveStreamData {
+  id: string;
+  vendorId: string;
+  vendor: UserInfo;
+  title: string;
+  description: string | null;
+  thumbnailUrl: string | null;
+  streamUrl: string | null;
+  streamType: 'products' | 'services';
+  status: 'setup' | 'live' | 'ended' | 'paused';
+  viewerCount: number;
+  currentViewers: number;
+  totalViewers: number;
+  totalReactions: number;
+  totalGifts: number;
+  totalSales: number;
+  totalTransactions: number;
+  price?: number;
+  previewVideoUrl: string | null;
+  createdAt: Date;
+  startedAt: Date | null;
+}
+
 export interface UnifiedFeedItem {
   id: string;
   type: FeedItemType;
@@ -95,6 +119,8 @@ export interface UnifiedFeedItem {
   postData?: Post;
   // For services (will be populated by service
   serviceData?: any;
+  // For live streams
+  liveStreamData?: LiveStreamData;
 }
 
 export interface UserInfo {

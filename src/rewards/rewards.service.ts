@@ -561,6 +561,55 @@ export class RewardsService {
   }
 
   /**
+   * Credit live watch reward to user's rewards balance
+   * Used by the live sales gamification system
+   */
+  async creditLiveWatchReward(
+    userId: string,
+    amount: number,
+    streamId: string,
+    streamTitle?: string,
+  ): Promise<{ success: boolean; transaction_id?: string }> {
+    try {
+      if (!amount || amount <= 0) {
+        return { success: false };
+      }
+
+      const balance = await this.getUserRewardsBalance(userId);
+      if (!balance) throw new Error('Rewards balance not found');
+
+      const { data, error } = await this.supabase
+        .from('rewards_transactions')
+        .insert({
+          user_id: userId,
+          transaction_type: 'live_watch_reward',
+          available_delta: amount,
+          pending_delta: 0,
+          available_balance_after: balance.available_rewards + amount,
+          pending_balance_after: balance.pending_rewards,
+          reference_type: 'live_stream',
+          reference_id: streamId,
+          description: `You earned ⭐${this.formatRewards(amount)} freti for watching ${streamTitle || 'a live stream'}`,
+          metadata: {
+            stream_id: streamId,
+            stream_title: streamTitle,
+            credited_freti: amount,
+          },
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      this.logger.log(`Credited ⭐${this.formatRewards(amount)} freti to user ${userId} for watching stream ${streamId}`);
+      return { success: true, transaction_id: data.id };
+    } catch (error) {
+      this.logger.error(`Error crediting live watch reward to user ${userId}:`, error);
+      return { success: false };
+    }
+  }
+
+  /**
    * Format rewards amount for display (as stars)
    */
   formatRewards(amount: number): string {

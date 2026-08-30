@@ -14,11 +14,18 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { WishlistService } from './wishlist.service';
 
 @Controller('wishlist')
-@UseGuards(JwtAuthGuard)
 export class WishlistController {
   constructor(private readonly wishlistService: WishlistService) {}
 
+  // Public endpoint: Get shared wishlist for deep linking (no auth required)
+  @Get('public/:ownerId')
+  async getPublicWishlist(@Param('ownerId') ownerId: string) {
+    console.log('💖 Getting public wishlist for owner:', ownerId);
+    return this.wishlistService.getSharedWishlistItems('', ownerId, undefined);
+  }
+
   @Get()
+  @UseGuards(JwtAuthGuard)
   async getWishlistItems(@Request() req) {
     console.log('💖 Fetching wishlist items for user:', req.user.sub);
     return this.wishlistService.getWishlistItems(req.user.sub, req.supabaseToken);

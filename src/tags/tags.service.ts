@@ -215,4 +215,113 @@ export class TagsService {
 
     return (data || []) as TagRecord[];
   }
+
+  async getTagContent(rawTag: string, limit: number = 50, offset: number = 0): Promise<any[]> {
+    try {
+      const tagName = this.normalizeTag(rawTag);
+      const { data: tag, error: tagError } = await this.serviceSupabase
+        .from('tags')
+        .select('id')
+        .eq('name', tagName)
+        .single();
+
+      if (tagError || !tag) {
+        this.logger.warn(`Tag not found: ${rawTag}`);
+        return [];
+      }
+
+      const { data: taggings, error: taggingsError } = await this.serviceSupabase
+        .from('taggings')
+        .select('taggable_id, taggable_type')
+        .eq('tag_id', tag.id)
+        .neq('taggable_type', 'chat_message');
+
+      if (taggingsError) {
+        throw new Error(`Failed to fetch taggings: ${taggingsError.message}`);
+      }
+
+      if (!taggings?.length) {
+        return [];
+      }
+
+      const idsByType: Record<string, string[]> = {};
+      for (const t of taggings as any[]) {
+        if (!idsByType[t.taggable_type]) {
+          idsByType[t.taggable_type] = [];
+        }
+        idsByType[t.taggable_type].push(t.taggable_id);
+      }
+
+      const tableMap: Record<string, { table: string; titleField: string; imageField: string; contentField: string; authorField: string }> = {
+        post: { table: 'posts', titleField: 'content', imageField: 'media_urls', contentField: 'content', authorField: 'user_id' },
+        product: { table: 'products', titleField: 'name', imageField: 'primary_image_url', contentField: 'description', authorField: 'seller_id' },
+        service: { table: 'services', titleField: 'title', imageField: 'images', contentField: 'description', authorField: 'provider_id' },
+        story: { table: 'stories', titleField: 'caption', imageField: 'media_url', contentField: 'caption', authorField: 'user_id' },
+      };
+
+      const allItems: any[] = [];
+
+      for (const [type, ids] of Object.entries(idsByType)) {
+        const config = tableMap[type];
+        if (!config) {
+          this.logger.warn(`Unknown taggable type encountered: ${type}`);
+          continue;
+        }
+
+        const { data, error } = await this.serviceSupabase
+          .from(config.table)
+          .select('*')
+          .in('id', ids);
+
+        if (error || !data) {
+          this.logger.warn(`Failed to fetch ${type} content:`, error?.message);
+          continue;
+        }
+
+        for (const row of data as any[]) {
+          if (type === 'post' && row.is_deleted) continue;
+          if (type === 'story' && (row.is_active === false || (row.expires_at && new Date(row.expires_at) < new Date()))) continue;
+
+          let rawTitle = row[config.titleField];
+          let rawContent = row[config.contentField];
+
+          if (type === 'post') {
+            rawTitle = (rawTitle || '').toString().slice(0, 80);
+            rawContent = (rawContent || '').toString().slice(0, 120);
+          }
+
+          const title = typeof rawTitle === 'string' && rawTitle.length ? rawTitle : type.charAt(0).toUpperCase() + type.slice(1);
+          const content = typeof rawContent === 'string' ? rawContent : '';
+          const image = this.resolveTagImage(row, config.imageField);
+
+          allItems.push({
+            id: row.id,
+            type,
+            title,
+            content,
+            image,
+            createdAt: row.created_at,
+            authorId: row[config.authorField],
+          });
+        }
+      }
+
+      allItems.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      return allItems.slice(offset, offset + limit);
+    } catch (error: any) {
+      this.logger.error('Failed to get tag content:', error);
+      throw error;
+    }
+  }
+
+  private resolveTagImage(row: any, imageField: string): string | undefined {
+    const value = row[imageField];
+    if (Array.isArray(value) && value.length > 0) {
+      return value[0];
+    }
+    if (typeof value === 'string' && value.length > 0) {
+      return value;
+    }
+    return undefined;
+  }
 }

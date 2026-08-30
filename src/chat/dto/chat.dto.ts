@@ -13,6 +13,7 @@ export enum MessageType {
   SYSTEM = 'system',
   INVOICE = 'invoice', // Keep invoice as it's already in the database
   WISHLIST = 'wishlist', // Wishlist sharing message type
+  GIFT_CARD = 'gift_card', // Gift card message type
 }
 
 export enum MessageStatus {

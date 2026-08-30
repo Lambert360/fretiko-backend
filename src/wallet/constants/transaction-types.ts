@@ -25,11 +25,13 @@ export enum WalletTransactionType {
   WITHDRAWAL_BURN = 'withdrawal_burn',
   FEE_DEDUCTION = 'fee_deduction',
   GIFT_PURCHASE = 'gift_purchase',
+  GIFT_CARD_PURCHASE = 'gift_card_purchase', // signed: negative = debit, positive = credit (marketing wallet reserve funding)
 
   // Transfers between balance types
   PURCHASE_HOLD = 'purchase_hold', // available → escrow
   WITHDRAWAL_REQUEST = 'withdrawal_request', // available → pending
   ESCROW_RELEASE_TO_PLATFORM = 'escrow_release_to_platform', // escrow → platform
+  GIFT_CARD_ESCROW_HOLD = 'gift_card_escrow_hold', // signed, escrow-only delta: holds/releases gift card reserve funds in the buyer's escrow balance
 }
 
 /**
@@ -64,6 +66,8 @@ export const TRANSACTION_TYPE_DESCRIPTIONS: Record<WalletTransactionType, string
   [WalletTransactionType.WITHDRAWAL_REQUEST]: 'Funds moved to pending withdrawal',
   [WalletTransactionType.ESCROW_RELEASE_TO_PLATFORM]: 'Escrow released to platform',
   [WalletTransactionType.GIFT_PURCHASE]: 'Gift purchase (debit from user wallet)',
+  [WalletTransactionType.GIFT_CARD_PURCHASE]: 'Gift card purchase/reserve funding (signed: debit from buyer or admin, credit to marketing wallet)',
+  [WalletTransactionType.GIFT_CARD_ESCROW_HOLD]: 'Gift card reserve funds held/released in buyer escrow balance',
 };
 
 /**

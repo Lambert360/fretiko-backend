@@ -12,6 +12,7 @@ import { WishlistModule } from '../wishlist/wishlist.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { AuctionsModule } from '../auctions/auctions.module';
 import { AuthModule } from '../auth/auth.module';
+import { GiftCardsModule } from '../gift-cards/gift-cards.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { AuthModule } from '../auth/auth.module';
     WishlistModule,
     WalletModule,
     forwardRef(() => AuctionsModule), // For marking auction wins as checked out
+    forwardRef(() => GiftCardsModule), // For gift card payment integration
   ],
   controllers: [CheckoutController],
   providers: [CheckoutService],

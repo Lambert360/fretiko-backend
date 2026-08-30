@@ -89,6 +89,12 @@ export class ServicesController {
     return this.servicesService.getService(id);
   }
 
+  // Public endpoint: Get service preview for deep linking (no auth required)
+  @Get('public/:id')
+  async getPublicService(@Param('id') id: string) {
+    return this.servicesService.getService(id);
+  }
+
   @Put(':id')
   @UseGuards(JwtAuthGuard)
   async updateService(

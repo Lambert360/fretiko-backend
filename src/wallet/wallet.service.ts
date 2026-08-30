@@ -4468,63 +4468,38 @@ export class WalletService {
 
 
 
-        // Update deposit record
+        // ✅ ATOMIC FIX: Credit the wallet AND mark the deposit completed
+        // in a single Postgres transaction via complete_deposit_credit().
+        // This replaces the previous two-step sequence (update deposit to
+        // 'completed', then separately call createLedgerEntry) which had a
+        // window where a ledger failure left the deposit permanently marked
+        // completed with the wallet never credited. It also replaces the
+        // `deposit_${txRef}_${Date.now()}` idempotency key, which was
+        // different on every webhook/retry and therefore could not prevent
+        // double-credits on concurrent deliveries.
+        const { data: completionResult, error: completionError } = await this.supabase.rpc(
+          'complete_deposit_credit',
+          {
+            p_deposit_id: txRef,
+            p_freti_amount: fretiAmount,
+            p_external_payment_id: externalPaymentId || null,
+            p_exchange_rate: exchangeRate,
+            p_local_amount: localAmount,
+            p_local_currency: localCurrency,
+            p_webhook_data: webhookData,
+          }
+        );
 
-        await this.supabase
+        if (completionError || !completionResult?.success) {
+          const errMsg = completionError?.message || completionResult?.error_message || completionResult?.error || 'Unknown error';
+          this.logger.error(`❌ complete_deposit_credit failed for deposit ${txRef}: ${errMsg}`);
+          throw new Error(`Failed to complete deposit credit: ${errMsg}`);
+        }
 
-          .from('deposits')
-
-          .update({
-
-            freti_amount: fretiAmount,
-
-            exchange_rate: exchangeRate,
-
-            status: 'completed',
-
-            external_payment_id: externalPaymentId,
-
-            webhook_data: webhookData,
-
-            completed_at: new Date().toISOString(),
-
-          })
-
-          .eq('id', txRef);
-
-
-
-        // Get wallet
-
-        const wallet = await this.getWallet(deposit.user_id);
-
-
-
-        // Create ledger entry to credit wallet
-
-        await this.createLedgerEntry({
-
-          walletId: wallet.id,
-
-          transactionType: 'deposit_mint',
-
-          availableDelta: fretiAmount,
-
-          escrowDelta: 0,
-
-          pendingWithdrawalDelta: 0,
-
-          referenceType: 'deposit',
-
-          referenceId: txRef,
-
-          idempotencyKey: `deposit_${txRef}_${Date.now()}`,
-
-          description: `Deposit: ${data.amount} ${data.currency} → ₣${fretiAmount} FRETI`,
-
-        }, deposit.user_id);
-
-
+        if (completionResult.already_processed) {
+          console.log(`⚠️ Deposit ${txRef} was already processed (idempotent), skipping notification.`);
+          return;
+        }
 
         // Send notification
 
@@ -5938,85 +5913,37 @@ export class WalletService {
 
 
 
-        // Update payout record with actual amounts and exchange rate
+        // ✅ ATOMIC FIX: Perform the ledger burn AND the payout status
+        // transition in a single Postgres transaction via
+        // complete_withdrawal_transfer(). This replaces the previous
+        // two-step sequence (update payout to 'paid', then separately
+        // call createLedgerEntry) which had a window where a failure
+        // in the second step left the payout permanently marked 'paid'
+        // with funds still stuck in pending_withdrawal (the idempotency
+        // guard above would then treat any retry as already-processed).
+        const { data: completionResult, error: completionError } = await this.supabase.rpc(
+          'complete_withdrawal_transfer',
+          {
+            p_payout_id: payout.id,
+            p_event_status: 'paid',
+            p_transfer_id: transferId || null,
+            p_local_amount: localAmount,
+            p_local_currency: localCurrency,
+            p_exchange_rate: exchangeRate,
+            p_webhook_data: webhookData,
+          }
+        );
 
-        await this.supabase
+        if (completionError || !completionResult?.success) {
+          const errMsg = completionError?.message || completionResult?.error_message || completionResult?.error || 'Unknown error';
+          this.logger.error(`❌ complete_withdrawal_transfer failed for payout ${payout.id}: ${errMsg}`);
+          throw new Error(`Failed to complete withdrawal transfer: ${errMsg}`);
+        }
 
-          .from('payout_requests')
-
-          .update({
-
-            estimated_local_amount: localAmount,
-
-            local_currency: localCurrency,
-
-            status: 'paid',
-
-            external_payout_id: transferId || payout.external_payout_id, // Use transfer ID if available
-
-            webhook_data: webhookData,
-
-            paid_at: new Date().toISOString(),
-
-            metadata: {
-
-              ...payout.metadata,
-
-              exchange_rate: exchangeRate,
-
-              usd_amount: usdAmount,
-
-              local_amount_actual: localAmount,
-
-              webhook_processed_at: new Date().toISOString(),
-
-            }
-
-          })
-
-          .eq('id', payout.id);
-
-
-
-        // Get wallet
-
-        const wallet = await this.getWallet(payout.user_id);
-
-
-
-        // Remove funds from pending_withdrawal (burn completion)
-
-        // Note: Initial withdrawal already created withdrawal_burn to move funds to pending
-
-        // This entry completes the process by removing from pending
-
-        // Use transfer ID in idempotency key for better deduplication
-
-        const completedIdempotencyKey = `withdrawal_completed_${payout.id}_${transferId || 'webhook'}`;
-
-        await this.createLedgerEntry({
-
-          walletId: wallet.id,
-
-          transactionType: 'withdrawal_burn', // Burn funds from pending_withdrawal
-
-          availableDelta: 0,
-
-          escrowDelta: 0,
-
-          pendingWithdrawalDelta: -payout.freti_amount, // Remove from pending (burn)
-
-          referenceType: 'payout_request',
-
-          referenceId: payout.id,
-
-          idempotencyKey: completedIdempotencyKey,
-
-          description: `Withdrawal completed: ₣${payout.freti_amount} FRETI → ${localAmount} ${localCurrency}`,
-
-        }, payout.user_id);
-
-
+        if (completionResult.already_processed) {
+          console.log(`⚠️ Payout ${payout.id} was already processed (idempotent), skipping notification.`);
+          return;
+        }
 
         // Send notification
 
@@ -6080,73 +6007,32 @@ export class WalletService {
 
 
 
-        // Get wallet
+        // ✅ ATOMIC FIX: Same as the success branch above - perform the
+        // ledger refund AND the payout status transition in a single
+        // Postgres transaction via complete_withdrawal_transfer(), so a
+        // failure partway through cannot leave the payout and the
+        // ledger disagreeing about whether the refund happened.
+        const { data: failureCompletionResult, error: failureCompletionError } = await this.supabase.rpc(
+          'complete_withdrawal_transfer',
+          {
+            p_payout_id: payout.id,
+            p_event_status: 'failed',
+            p_transfer_id: transferId || null,
+            p_failure_reason: failureReason,
+            p_webhook_data: webhookData,
+          }
+        );
 
-        const wallet = await this.getWallet(payout.user_id);
+        if (failureCompletionError || !failureCompletionResult?.success) {
+          const errMsg = failureCompletionError?.message || failureCompletionResult?.error_message || failureCompletionResult?.error || 'Unknown error';
+          this.logger.error(`❌ complete_withdrawal_transfer (failed path) error for payout ${payout.id}: ${errMsg}`);
+          throw new Error(`Failed to complete withdrawal failure handling: ${errMsg}`);
+        }
 
-
-
-        // Refund from pending_withdrawal to available_balance
-
-        // Use transfer ID in idempotency key if available for better deduplication
-
-        const refundIdempotencyKey = `withdrawal_refund_${payout.id}_${transferId || 'webhook'}_failed`;
-
-        await this.createLedgerEntry({
-
-          walletId: wallet.id,
-
-          transactionType: 'withdrawal_burn',
-
-          availableDelta: payout.freti_amount, // Refund
-
-          escrowDelta: 0,
-
-          pendingWithdrawalDelta: -payout.freti_amount, // Remove from pending
-
-          referenceType: 'payout_request',
-
-          referenceId: payout.id,
-
-          idempotencyKey: refundIdempotencyKey,
-
-          description: `Withdrawal failed - funds refunded to available balance. Reason: ${failureReason}`,
-
-        }, payout.user_id);
-
-
-
-        // Update payout status
-
-        await this.supabase
-
-          .from('payout_requests')
-
-          .update({
-
-            status: 'failed',
-
-            failure_reason: failureReason,
-
-            external_payout_id: transferId || payout.external_payout_id, // Store transfer ID if available
-
-            webhook_data: webhookData,
-
-            metadata: {
-
-              ...payout.metadata,
-
-              webhook_processed_at: new Date().toISOString(),
-
-              failure_reason_details: data.complete_message || data.message || 'Transfer failed',
-
-            }
-
-          })
-
-          .eq('id', payout.id);
-
-
+        if (failureCompletionResult.already_processed) {
+          console.log(`⚠️ Payout ${payout.id} was already processed (idempotent), skipping notification.`);
+          return;
+        }
 
         // Send notification
 

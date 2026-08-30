@@ -65,7 +65,7 @@ export class SocialAuthService {
    * Existing social users log in. New users must accept terms and complete the profile.
    */
   async authenticateWithSocialProvider(socialAuthDto: SocialAuthDto, ipAddress?: string, userAgent?: string): Promise<SocialAuthResponse> {
-    const { provider, accessToken, idToken, code, redirectUri, hasAcceptedTerms, dateOfBirth, gender, user_role, is_seller, is_rider, firstName, lastName } = socialAuthDto;
+    const { provider, accessToken, idToken, code, redirectUri, hasAcceptedTerms, dateOfBirth, gender, user_role, is_seller, is_rider, firstName, lastName, referralCode } = socialAuthDto;
 
     if (provider !== 'google' && provider !== 'apple') {
       this.logger.warn(`Unsupported social provider received: ${provider}`);
@@ -157,6 +157,7 @@ export class SocialAuthService {
           terms_accepted_at: new Date().toISOString(),
           terms_accepted_ip: ipAddress || null,
           terms_accepted_user_agent: userAgent || null,
+          ...(referralCode && { referred_by_code: referralCode }),
           preferences: {
             ...(profileData?.preferences || {}),
             auth_provider: provider,

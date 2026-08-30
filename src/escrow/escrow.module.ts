@@ -9,6 +9,7 @@ import { ConnectionsModule } from '../connections/connections.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { AuthModule } from '../auth/auth.module';
 import { PartnersModule } from '../partners/partners.module';
+import { GiftCardsModule } from '../gift-cards/gift-cards.module';
 
 @Module({
   imports: [
@@ -19,6 +20,7 @@ import { PartnersModule } from '../partners/partners.module';
     PartnersModule,
     forwardRef(() => RealtimeModule),
     forwardRef(() => ConnectionsModule),
+    forwardRef(() => GiftCardsModule),
   ],
   controllers: [EscrowController],
   providers: [EscrowService, EscrowSchedulerService],

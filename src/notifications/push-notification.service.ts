@@ -5,6 +5,8 @@
 
 import { Injectable, Logger } from '@nestjs/common';
 import { Expo, ExpoPushMessage, ExpoPushTicket, ExpoPushReceiptId } from 'expo-server-sdk';
+import { connect } from 'http2';
+import { sign } from 'jsonwebtoken';
 import { NotificationsService } from './notifications.service';
 
 @Injectable()
@@ -223,6 +225,102 @@ export class PushNotificationService {
     }
   }
 
+  /**
+   * Register an iOS VoIP (PushKit) token for a user
+   */
+  async registerVoipToken(userId: string, token: string): Promise<boolean> {
+    try {
+      if (!token || token.length < 10) {
+        this.logger.warn(`Invalid VoIP push token: ${token}`);
+        return false;
+      }
+
+      const settings = await this.notificationsService.getUserSettings(userId);
+      const existingTokens = settings.voip_push_tokens || [];
+
+      if (!existingTokens.includes(token)) {
+        const updatedTokens = [...existingTokens, token];
+        await this.notificationsService.updateUserSettings(userId, {
+          voip_push_tokens: updatedTokens
+        });
+        this.logger.log(`Registered VoIP push token for user ${userId}`);
+      }
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to register VoIP push token for user ${userId}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Unregister an iOS VoIP (PushKit) token for a user
+   */
+  async unregisterVoipToken(userId: string, token: string): Promise<boolean> {
+    try {
+      const settings = await this.notificationsService.getUserSettings(userId);
+      const existingTokens = settings.voip_push_tokens || [];
+      const updatedTokens = existingTokens.filter(t => t !== token);
+
+      if (updatedTokens.length !== existingTokens.length) {
+        await this.notificationsService.updateUserSettings(userId, {
+          voip_push_tokens: updatedTokens
+        });
+        this.logger.log(`Unregistered VoIP push token for user ${userId}`);
+      }
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to unregister VoIP push token for user ${userId}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Send a VoIP (PushKit) push to all of a user's iOS VoIP tokens.
+   * This bypasses Expo because APNs requires direct HTTP/2 delivery for
+   * the `com.apple.pushkit` payload.
+   */
+  async sendVoipPush(userId: string, payload: any): Promise<boolean> {
+    try {
+      const rawApnsKey = process.env.APN_VOIP_KEY || '';
+      const apnsKey = rawApnsKey.replace(/\\n/g, '\n');
+      const keyId = process.env.APN_VOIP_KEY_ID;
+      const teamId = process.env.APN_VOIP_TEAM_ID;
+      const bundleId = process.env.APN_VOIP_BUNDLE_ID;
+
+      if (!apnsKey || !keyId || !teamId || !bundleId) {
+        this.logger.warn('APNs VoIP credentials not configured; skipping VoIP push');
+        return false;
+      }
+
+      const settings = await this.notificationsService.getUserSettings(userId);
+      const voipTokens = settings.voip_push_tokens || [];
+
+      if (voipTokens.length === 0) {
+        return false;
+      }
+
+      const authToken = sign({}, apnsKey, {
+        algorithm: 'ES256',
+        keyid: keyId,
+        issuer: teamId,
+        expiresIn: '1h',
+      });
+
+      const host = process.env.APN_VOIP_HOST || 'api.sandbox.push.apple.com';
+      const results = await Promise.all(
+        voipTokens.map(token => this.sendVoipApn(token, payload, host, bundleId, authToken))
+      );
+      const successCount = results.filter(Boolean).length;
+      this.logger.log(`Sent ${successCount}/${voipTokens.length} VoIP push notifications to user ${userId}`);
+      return successCount > 0;
+    } catch (error) {
+      this.logger.error(`Failed to send VoIP push to user ${userId}:`, error);
+      return false;
+    }
+  }
+
   // ============================================
   // PRIVATE HELPER METHODS
   // ============================================
@@ -346,6 +444,61 @@ export class PushNotificationService {
       default:
         return { emoji: '🔔', channel: 'general' };
     }
+  }
+
+  /**
+   * Send a single VoIP APN to a device token over HTTP/2.
+   */
+  private async sendVoipApn(
+    token: string,
+    payload: any,
+    host: string,
+    bundleId: string,
+    authToken: string
+  ): Promise<boolean> {
+    const body = JSON.stringify(payload);
+    const client = connect(`https://${host}`);
+
+    return new Promise<boolean>((resolve) => {
+      try {
+        const req = client.request({
+          ':method': 'POST',
+          ':path': `/3/device/${token}`,
+          ':scheme': 'https',
+          ':authority': host,
+          'authorization': `bearer ${authToken}`,
+          'apns-topic': bundleId,
+          'apns-push-type': 'voip',
+          'apns-priority': '10',
+          'content-length': Buffer.byteLength(body),
+        });
+
+        let responseData = '';
+        req.setEncoding('utf8');
+        req.on('data', (chunk) => { responseData += chunk; });
+        req.on('end', () => {
+          client.close();
+          if (responseData.trim() === '') {
+            resolve(true);
+          } else {
+            this.logger.warn(`APNs response for token ${token}: ${responseData}`);
+            resolve(false);
+          }
+        });
+        req.on('error', (error) => {
+          this.logger.error(`APNs request error for token ${token}:`, error);
+          client.close();
+          resolve(false);
+        });
+
+        req.write(body);
+        req.end();
+      } catch (error) {
+        this.logger.error(`APNs connection error for token ${token}:`, error);
+        client.close();
+        resolve(false);
+      }
+    });
   }
 
   /**

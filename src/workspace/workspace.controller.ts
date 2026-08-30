@@ -265,4 +265,30 @@ export class WorkspaceController {
       req.supabaseToken,
     );
   }
+
+  @Get('schedule/orders-by-date')
+  async getOrdersByDate(
+    @Request() req,
+    @Query('date') date: string,
+    @Query('month') month?: string,
+  ) {
+    return await this.workspaceService.getOrdersByDate(
+      req.user.sub,
+      date,
+      month,
+      req.supabaseToken,
+    );
+  }
+
+  @Get('schedule/month-summary')
+  async getMonthSummary(
+    @Request() req,
+    @Query('month') month: string,
+  ) {
+    return await this.workspaceService.getMonthSummary(
+      req.user.sub,
+      month,
+      req.supabaseToken,
+    );
+  }
 }

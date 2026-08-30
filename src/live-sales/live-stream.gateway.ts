@@ -49,7 +49,7 @@ import { createServiceSupabaseClient } from '../shared/supabase.client';
 })
 export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
-  server: Server;
+  server!: Server;
 
   private readonly logger = new Logger(LiveStreamGateway.name);
   private connectedUsers = new Map<string, { userId: string; streamId?: string; role: string; accessToken?: string }>();
@@ -77,7 +77,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       if (!vendorId) return null;
       this.streamVendorCache.set(streamId, vendorId);
       return vendorId;
-    } catch (error) {
+    } catch (error: any) {
       this.logger.warn(`Could not resolve vendor for stream ${streamId}: ${error?.message || error}`);
       return null;
     }
@@ -156,7 +156,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
             client.emit('authenticated', authData);
             this.logger.log(`Authentication event emitted to client ${client.id} for user: ${decoded.sub} (role: ${authData.role})`);
           }
-        } catch (authError) {
+        } catch (authError: any) {
           this.logger.warn(`Auth error on connection: ${client.id}`, authError.message);
           this.connectedUsers.set(client.id, {
             userId: 'anonymous',
@@ -172,7 +172,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         this.logger.log(`Anonymous connection: ${client.id} - authentication required`);
       }
 
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Connection error: ${error.message}`);
       client.disconnect();
     }
@@ -212,7 +212,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
               reason: 'vendor_disconnected',
               timestamp: new Date().toISOString(),
             });
-          } catch (endError) {
+          } catch (endError: any) {
             this.logger.error(`Failed to end stream on vendor disconnect: ${endError.message}`);
           }
         } else {
@@ -242,7 +242,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
 
       this.connectedUsers.delete(client.id);
       this.logger.log(`Client disconnected: ${client.id}`);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Disconnect error: ${error.message}`);
     }
   }
@@ -321,7 +321,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
 
       client.emit('authenticated', authData);
       this.logger.log(`Authentication event emitted to client ${client.id} for user: ${decoded.sub} (role: ${authData.role})`);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Authentication error: ${client.id}`, error);
       client.emit('authentication_error', { 
         message: error instanceof Error ? error.message : 'Authentication failed' 
@@ -354,7 +354,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
           client.join(`vendor:${userInfo.userId}`);
           this.logger.log(`✅ User ${userInfo.userId} is the stream owner - joined as vendor`);
         }
-      } catch (err) {
+      } catch (err: any) {
         this.logger.warn(`Could not check stream ownership: ${err.message}`);
       }
 
@@ -421,7 +421,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       this.logger.log(`User ${userInfo.userId} joined stream ${data.streamId} as ${userInfo.role}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -527,7 +527,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       client.emit('left_stream', { streamId: data.streamId, success: true });
       
       this.logger.log(`User ${userInfo.userId} left stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -601,7 +601,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       this.logger.log(`Comment sent by ${userInfo.userId} in stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -656,7 +656,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       await this.emitToVendorByStreamId(data.streamId, 'analytics_update', realtimeAnalytics);
 
       this.logger.log(`Reaction ${data.reactionType} sent by ${userInfo.userId} in stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -701,9 +701,14 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       let resolvedGiftType = data.giftType;
       let unitValue = 0;
 
+      let giftMetadata: any = null;
+
       const { data: virtualGiftById } = await this.supabase
         .from('virtual_gifts')
-        .select('id, name, emoji, credit_value, is_active')
+        .select(`
+          *,
+          sound:sounds ( sound_url )
+        `)
         .eq('id', data.giftType)
         .eq('is_active', true)
         .single();
@@ -712,10 +717,17 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         giftEmoji = virtualGiftById.emoji || giftEmoji;
         resolvedGiftType = virtualGiftById.name || resolvedGiftType;
         unitValue = virtualGiftById.credit_value || 0;
+        giftMetadata = {
+          ...virtualGiftById,
+          sound_url: virtualGiftById.sound?.sound_url,
+        };
       } else {
         const { data: virtualGiftByName } = await this.supabase
           .from('virtual_gifts')
-          .select('id, name, emoji, credit_value, is_active')
+          .select(`
+            *,
+            sound:sounds ( sound_url )
+          `)
           .eq('name', data.giftType)
           .eq('is_active', true)
           .single();
@@ -724,6 +736,10 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
           giftEmoji = virtualGiftByName.emoji || giftEmoji;
           resolvedGiftType = virtualGiftByName.name || resolvedGiftType;
           unitValue = virtualGiftByName.credit_value || 0;
+          giftMetadata = {
+            ...virtualGiftByName,
+            sound_url: virtualGiftByName.sound?.sound_url,
+          };
         }
       }
 
@@ -751,6 +767,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         message: data.message,
         amount: totalAmount,
         timestamp: new Date().toISOString(),
+        giftMetadata,
       });
 
       // Notify vendor about the gift
@@ -771,7 +788,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       client.emit('gift_sent', { success: true });
       
       this.logger.log(`Gift ${resolvedGiftType} x${data.quantity} sent by ${userInfo.userId} in stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -806,7 +823,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
           client.emit('error', { message: 'Can only showcase items during live streams' });
           return;
         }
-      } catch (error) {
+      } catch (error: any) {
         if (error instanceof NotFoundException) {
           client.emit('error', { message: 'Stream not found' });
         } else {
@@ -824,7 +841,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       this.logger.log(`Item showcased by ${userInfo.userId} in stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Error showcasing item: ${error.message}`);
       client.emit('error', { message: error.message });
     }
@@ -863,7 +880,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
           client.emit('error', { message: 'Can only highlight items during live streams' });
           return;
         }
-      } catch (error) {
+      } catch (error: any) {
         if (error instanceof NotFoundException) {
           client.emit('error', { message: 'Stream not found' });
         } else {
@@ -895,7 +912,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       this.logger.log(`📡 highlight_item broadcast sent to stream:${data.streamId} room (excluding sender ${client.id})`);
 
       this.logger.log(`✅ Item highlighted by ${userInfo.userId} in stream ${data.streamId} (type: ${data.type}, item: ${data.item ? 'present' : 'dismissed'})`);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Error highlighting item: ${error.message}`);
       client.emit('error', { message: error.message });
     }
@@ -968,7 +985,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       client.emit('purchase_initiated', { success: true });
       
       this.logger.log(`Product purchase initiated by ${userInfo.userId} in stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -1029,7 +1046,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       client.emit('booking_initiated', { success: true });
       
       this.logger.log(`Service booking initiated by ${userInfo.userId} in stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -1081,7 +1098,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       this.logger.log(`Vendor message sent in stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -1129,7 +1146,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         soldCount: inventory.soldCount,
         lastUpdated: new Date().toISOString(),
       });
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Error getting inventory: ${error.message}`);
       client.emit('error', { message: error.message });
     }
@@ -1201,7 +1218,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       this.logger.log(`Stock reserved by ${userInfo.userId} for product ${data.productId}: ${reservationResult.reservationId}`);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Error reserving stock: ${error.message}`);
       client.emit('error', { message: error.message });
     }
@@ -1267,7 +1284,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       this.logger.log(`Reservation confirmed by ${userInfo.userId}: ${data.reservationId}`);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Error confirming reservation: ${error.message}`);
       client.emit('error', { message: error.message });
     }
@@ -1333,7 +1350,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       this.logger.log(`Reservation cancelled by ${userInfo.userId}: ${data.reservationId}`);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Error cancelling reservation: ${error.message}`);
       client.emit('error', { message: error.message });
     }
@@ -1361,7 +1378,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       client.emit('analytics_data', realtimeAnalytics);
 
       this.logger.log(`Analytics requested for stream ${data.streamId} by ${userInfo.userId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -1386,7 +1403,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       client.emit('analytics_subscribed', realtimeAnalytics);
 
       this.logger.log(`User ${userInfo.userId} subscribed to analytics for stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -1403,7 +1420,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       client.emit('analytics_unsubscribed', { streamId: data.streamId });
 
       this.logger.log(`Client unsubscribed from analytics for stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -1442,7 +1459,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       });
 
       this.logger.log(`Vendor ${userInfo.userId} joined stream ${data.streamId}`);
-    } catch (error) {
+    } catch (error: any) {
       client.emit('error', { message: error.message });
     }
   }
@@ -1492,7 +1509,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
     try {
       const realtimeAnalytics = await this.analyticsService.getRealTimeLiveStreamAnalytics(streamId);
       this.broadcastAnalyticsUpdate(streamId, realtimeAnalytics);
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error(`Error triggering analytics update for stream ${streamId}: ${error.message}`);
     }
   }

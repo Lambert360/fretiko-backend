@@ -140,6 +140,15 @@ export class SocialAuthDto {
     return value;
   })
   is_rider?: boolean;
+
+  @ApiProperty({
+    description: 'Referral code from referral link',
+    required: false,
+    example: 'ABC123',
+  })
+  @IsString()
+  @IsOptional()
+  referralCode?: string;
 }
 
 export class SocialAuthResponse {

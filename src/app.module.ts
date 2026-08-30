@@ -52,8 +52,11 @@ import { PartnershipsModule } from './partnerships/partnerships.module';
 import { PartnersModule } from './partners/partners.module';
 import { GeneralPartnershipsModule } from './general-partnerships/general-partnerships.module';
 import { WebsiteContentModule } from './website-content/website-content.module';
+import { SignPostsModule } from './sign-posts/sign-posts.module';
 import { VideoProcessingModule } from './video-processing/video-processing.module';
 import { AiModule } from './ai/ai.module';
+import { ReferralsModule } from './referrals/referrals.module';
+import { GiftCardsModule } from './gift-cards/gift-cards.module';
 
 @Module({
   imports: [
@@ -109,8 +112,11 @@ import { AiModule } from './ai/ai.module';
     PartnersModule,
     GeneralPartnershipsModule,
     WebsiteContentModule,
+    SignPostsModule,
     VideoProcessingModule,
     AiModule,
+    ReferralsModule,
+    GiftCardsModule,
   ],
   controllers: [AppController, ExchangeRateController, HealthController],
   providers: [

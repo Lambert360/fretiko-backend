@@ -5,7 +5,7 @@ import { TagsService } from '../tags/tags.service';
 import { MentionsService } from '../mentions/mentions.service';
 import { ServicesService } from '../services/services.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
-import { Post, PostInteraction, PostMedia, UnifiedFeedItem, UserInfo, InteractionType, MediaType, PrivacyLevel, FeedItemType } from './interfaces/post.interface';
+import { Post, PostInteraction, PostMedia, UnifiedFeedItem, LiveStreamData, UserInfo, InteractionType, MediaType, PrivacyLevel, FeedItemType } from './interfaces/post.interface';
 import { CreatePostDto } from './dto/create-post.dto';
 import { UpdatePostDto } from './dto/update-post.dto';
 import { CreateInteractionDto } from './dto/interaction.dto';
@@ -339,8 +339,86 @@ export class PostsService {
       console.error('Failed to load service videos for unified feed:', serviceError);
     }
 
-    // Merge candidates from both sources — no fixed ratio between posts and services
-    let feedItems: UnifiedFeedItem[] = [...postFeedItems, ...serviceFeedItems];
+    // Get active live streams to mix into the unified feed
+    let liveStreamFeedItems: UnifiedFeedItem[] = [];
+    try {
+      const { data: liveStreams, error: liveError } = await this.supabase
+        .from('live_stream_stats')
+        .select(`
+          id,
+          vendor_id,
+          title,
+          description,
+          stream_type,
+          status,
+          viewer_count,
+          total_viewers,
+          total_sales,
+          current_viewers,
+          total_comments,
+          total_reactions,
+          total_gifts,
+          total_transactions,
+          thumbnail_url,
+          preview_video_url,
+          stream_url,
+          created_at,
+          started_at,
+          vendor:user_profiles!vendor_id (
+            id,
+            username,
+            avatar_url,
+            is_verified,
+            display_name
+          )
+        `)
+        .eq('status', 'live')
+        .order('viewer_count', { ascending: false })
+        .order('started_at', { ascending: false })
+        .range(0, Math.min(candidatePoolSize, 20));
+
+      if (!liveError && liveStreams) {
+        // Bulk-fetch the lowest live price for product streams
+        const liveStreamIds = liveStreams.map((s: any) => s.id);
+        let lowestProductPrices = new Map<string, number>();
+
+        if (liveStreamIds.length > 0) {
+          const { data: productPrices, error: priceError } = await this.supabase
+            .from('live_stream_products')
+            .select('stream_id, live_price')
+            .in('stream_id', liveStreamIds);
+
+          if (!priceError && productPrices) {
+            productPrices.forEach((p: any) => {
+              const current = lowestProductPrices.get(p.stream_id) ?? Infinity;
+              if (typeof p.live_price === 'number' && p.live_price < current) {
+                lowestProductPrices.set(p.stream_id, p.live_price);
+              }
+            });
+          }
+        }
+
+        liveStreamFeedItems = liveStreams.map((stream: any) => {
+          const lowestPrice = lowestProductPrices.get(stream.id);
+          const mappedStream = this.mapToLiveStreamData(stream, lowestPrice);
+          return {
+            id: `live-stream-${stream.id}`,
+            type: FeedItemType.LIVE_STREAM,
+            itemId: stream.id,
+            score: this.calculateLiveStreamScore(mappedStream),
+            isSeen: false,
+            createdAt: mappedStream.startedAt || mappedStream.createdAt,
+            liveStreamData: mappedStream,
+          };
+        });
+      }
+    } catch (liveStreamError) {
+      // Live streams are non-critical to the feed; log and continue
+      console.error('Failed to load live streams for unified feed:', liveStreamError);
+    }
+
+    // Merge candidates from all sources — no fixed ratio
+    let feedItems: UnifiedFeedItem[] = [...postFeedItems, ...serviceFeedItems, ...liveStreamFeedItems];
 
     // Soft-downrank items the user has already seen recently/repeatedly, so
     // unseen/fresh content is prioritized (Facebook-style "unread bump")
@@ -467,6 +545,7 @@ export class PostsService {
 
   private getAuthorId(item: UnifiedFeedItem): string | null {
     if (item.type === FeedItemType.POST) return item.postData?.userId || null;
+    if (item.type === FeedItemType.LIVE_STREAM) return item.liveStreamData?.vendorId || null;
     return item.serviceData?.userId || null;
   }
 
@@ -1443,6 +1522,65 @@ export class PostsService {
     }
 
     return score;
+  }
+
+  private calculateLiveStreamScore(stream: LiveStreamData): number {
+    let score = 0;
+
+    // Time decay — live streams are time-sensitive, but not as heavily weighted as before
+    const hoursOld = stream.startedAt
+      ? (Date.now() - stream.startedAt.getTime()) / (1000 * 60 * 60)
+      : 0;
+    score += Math.max(0, 100 - hoursOld * 2);
+
+    // Engagement weighting
+    score += (stream.viewerCount || 0) * 3;
+    score += (stream.currentViewers || 0) * 6;
+    score += (stream.totalReactions || 0) * 10;
+    score += (stream.totalSales || 0) * 25;
+    score += (stream.totalTransactions || 0) * 20;
+    score += (stream.totalGifts || 0) * 15;
+
+    // Soft live boost — makes them more discoverable without dominating the feed
+    score *= 1.2;
+
+    if (hoursOld <= PostsService.COLD_START_WINDOW_HOURS) {
+      score += PostsService.COLD_START_BOOST;
+    }
+
+    return score;
+  }
+
+  private mapToLiveStreamData(data: any, lowestProductPrice?: number): LiveStreamData {
+    const fallbackVendor: UserInfo = {
+      id: data.vendor_id,
+      username: 'Unknown',
+      avatarUrl: null,
+      isVerified: false,
+    };
+
+    return {
+      id: data.id,
+      vendorId: data.vendor_id,
+      vendor: data.vendor ? this.mapToUserInfo(data.vendor) : fallbackVendor,
+      title: data.title || 'Live Stream',
+      price: data.stream_type === 'products' ? lowestProductPrice : undefined,
+      description: data.description || null,
+      thumbnailUrl: data.thumbnail_url || data.vendor?.avatar_url || null,
+      previewVideoUrl: data.preview_video_url || null,
+      streamUrl: data.stream_url || null,
+      streamType: data.stream_type,
+      status: data.status,
+      viewerCount: data.viewer_count || 0,
+      currentViewers: data.current_viewers || 0,
+      totalViewers: data.total_viewers || 0,
+      totalReactions: data.total_reactions || 0,
+      totalGifts: data.total_gifts || 0,
+      totalSales: data.total_sales || 0,
+      totalTransactions: data.total_transactions || 0,
+      createdAt: new Date(data.created_at),
+      startedAt: data.started_at ? new Date(data.started_at) : null,
+    };
   }
 
   // Mapping methods
