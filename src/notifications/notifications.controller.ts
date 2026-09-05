@@ -213,10 +213,10 @@ export class NotificationsController {
   @HttpCode(HttpStatus.CREATED)
   async registerPushToken(
     @Request() req: any,
-    @Body() body: { token: string }
+    @Body() body: { token: string; type?: string }
   ): Promise<{ success: boolean }> {
     this.logger.log(`Registering push token for user ${req.user.sub}`);
-    const success = await this.pushNotificationService.registerPushToken(req.user.sub, body.token);
+    const success = await this.pushNotificationService.registerPushToken(req.user.sub, body.token, body.type);
     return { success };
   }
 
@@ -226,10 +226,10 @@ export class NotificationsController {
   @Delete('push-token')
   async unregisterPushToken(
     @Request() req: any,
-    @Body() body: { token: string }
+    @Body() body: { token: string; type?: string }
   ): Promise<{ success: boolean }> {
     this.logger.log(`Unregistering push token for user ${req.user.sub}`);
-    const success = await this.pushNotificationService.unregisterPushToken(req.user.sub, body.token);
+    const success = await this.pushNotificationService.unregisterPushToken(req.user.sub, body.token, body.type);
     return { success };
   }
 

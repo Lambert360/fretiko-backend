@@ -7,6 +7,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Expo, ExpoPushMessage, ExpoPushTicket, ExpoPushReceiptId } from 'expo-server-sdk';
 import { connect } from 'http2';
 import { sign } from 'jsonwebtoken';
+import axios from 'axios';
 import { NotificationsService } from './notifications.service';
 
 @Injectable()
@@ -103,12 +104,175 @@ export class PushNotificationService {
         await this.removeInvalidTokens(userId, invalidTokens);
       }
 
-      this.logger.log(`Sent ${successCount}/${validTokens.length} push notifications to user ${userId}`);
-      return successCount > 0;
+      const fcmSent = await this.sendFcmNotification(userId, notification);
+
+      this.logger.log(`Sent ${successCount}/${validTokens.length} Expo and FCM=${fcmSent} push notifications to user ${userId}`);
+      return successCount > 0 || fcmSent;
 
     } catch (error) {
       this.logger.error(`Failed to send push notification to user ${userId}:`, error);
       return false;
+    }
+  }
+
+  /**
+   * Send FCM (Firebase Cloud Messaging) v1 notification to a user's Android tokens.
+   */
+  private async sendFcmNotification(
+    userId: string,
+    notification: {
+      title?: string;
+      body?: string;
+      data?: any;
+      badge?: number;
+      sound?: 'default' | null;
+      priority?: 'default' | 'normal' | 'high';
+      channelId?: string;
+      _contentAvailable?: boolean;
+    }
+  ): Promise<boolean> {
+    try {
+      const settings = await this.notificationsService.getUserSettings(userId);
+      const fcmTokens = settings.fcm_push_tokens || [];
+
+      if (fcmTokens.length === 0) {
+        return false;
+      }
+
+      const isCall = ['call_incoming', 'call_ended'].includes(notification.data?.type);
+
+      const data: Record<string, string> = {};
+      if (notification.data) {
+        Object.entries(notification.data).forEach(([key, value]) => {
+          data[key] = typeof value === 'string' ? value : JSON.stringify(value);
+        });
+      }
+      if (!data.dataString && notification.data) {
+        data.dataString = JSON.stringify(notification.data);
+      }
+
+      const android: any = {
+        priority: notification.priority === 'high' ? 'HIGH' : 'NORMAL',
+      };
+
+      // Show a notification for non-call payloads. Call payloads are data-only
+      // so the mobile FCM handler can trigger the native incoming-call UI.
+      if (!isCall && (notification.title || notification.body)) {
+        android.notification = {
+          channelId: notification.channelId || 'default',
+          sound: notification.sound === null ? undefined : 'default',
+        };
+      }
+
+      // Collapse call push payloads per call session so a later call_ended
+      // replaces a still-queued call_incoming when the device is offline.
+      const collapseKey = notification.data?.callSessionId
+        ? `call_${notification.data.callSessionId}`
+        : notification.data?.uuid
+          ? `call_${notification.data.uuid}`
+          : undefined;
+
+      const fcmPayload: any = {
+        data,
+        android,
+        notification: !isCall && (notification.title || notification.body)
+          ? {
+              title: notification.title,
+              body: notification.body,
+            }
+          : undefined,
+        apns: !isCall
+          ? { payload: { aps: { 'content-available': 1 } } }
+          : undefined,
+      };
+
+      if (collapseKey) {
+        fcmPayload.collapseKey = collapseKey;
+      }
+
+      return await this.sendFcmToTokens(fcmTokens, fcmPayload);
+    } catch (error) {
+      this.logger.error(`Failed to send FCM notification to user ${userId}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Send a single FCM v1 payload to a list of device tokens.
+   */
+  private async sendFcmToTokens(tokens: string[], payload: any): Promise<boolean> {
+    const accessToken = await this.getFcmAccessToken();
+    if (!accessToken) {
+      this.logger.warn('FCM access token not available; skipping FCM send');
+      return false;
+    }
+
+    const serviceAccount = this.getFcmServiceAccount();
+    if (!serviceAccount) {
+      this.logger.warn('FIREBASE_SERVICE_ACCOUNT not configured; skipping FCM send');
+      return false;
+    }
+
+    const url = `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`;
+
+    const results = await Promise.allSettled(
+      tokens.map(async (token) => {
+        try {
+          const message = { ...payload, token };
+          await axios.post(url, { message }, { headers: { Authorization: `Bearer ${accessToken}` } });
+          return true;
+        } catch (error: any) {
+          this.logger.error(`FCM send failed for token ${token}:`, error?.response?.data || error.message);
+          return false;
+        }
+      })
+    );
+
+    return results.some((r) => r.status === 'fulfilled' && r.value);
+  }
+
+  /**
+   * Get an OAuth2 access token for the FCM v1 API from a service account.
+   */
+  private async getFcmAccessToken(): Promise<string | null> {
+    const serviceAccount = this.getFcmServiceAccount();
+    if (!serviceAccount) return null;
+
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const jwt = sign(
+        {
+          iss: serviceAccount.client_email,
+          sub: serviceAccount.client_email,
+          scope: 'https://www.googleapis.com/auth/firebase.messaging',
+          aud: 'https://oauth2.googleapis.com/token',
+          iat: now,
+          exp: now + 3600,
+        },
+        serviceAccount.private_key,
+        { algorithm: 'RS256' }
+      );
+
+      const { data } = await axios.post('https://oauth2.googleapis.com/token', {
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion: jwt,
+      });
+
+      return data.access_token || null;
+    } catch (error: any) {
+      this.logger.error('Failed to get FCM access token:', error?.response?.data || error.message);
+      return null;
+    }
+  }
+
+  private getFcmServiceAccount(): { client_email: string; private_key: string; project_id: string } | null {
+    const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      this.logger.warn('FIREBASE_SERVICE_ACCOUNT is not valid JSON');
+      return null;
     }
   }
 
@@ -173,27 +337,35 @@ export class PushNotificationService {
   }
 
   /**
-   * Register a new push token for a user
+   * Register a new push token for a user.
+   * type can be 'expo' or 'fcm'. Defaults to 'expo' for backwards compatibility.
    */
-  async registerPushToken(userId: string, token: string): Promise<boolean> {
+  async registerPushToken(userId: string, token: string, type = 'expo'): Promise<boolean> {
     try {
-      if (!Expo.isExpoPushToken(token)) {
+      const field = type === 'fcm' ? 'fcm_push_tokens' : 'expo_push_tokens';
+
+      if (type === 'expo' && !Expo.isExpoPushToken(token)) {
         this.logger.warn(`Invalid Expo push token: ${token}`);
         return false;
       }
 
+      if (type === 'fcm' && !token) {
+        this.logger.warn('FCM token is empty');
+        return false;
+      }
+
       const settings = await this.notificationsService.getUserSettings(userId);
-      const existingTokens = settings.expo_push_tokens || [];
+      const existingTokens = settings[field] || [];
 
       // Add token if not already exists
       if (!existingTokens.includes(token)) {
         const updatedTokens = [...existingTokens, token];
-        
+
         await this.notificationsService.updateUserSettings(userId, {
-          expo_push_tokens: updatedTokens
+          [field]: updatedTokens
         });
 
-        this.logger.log(`Registered push token for user ${userId}`);
+        this.logger.log(`Registered ${type} push token for user ${userId}`);
       }
 
       return true;
@@ -206,18 +378,19 @@ export class PushNotificationService {
   /**
    * Unregister a push token for a user
    */
-  async unregisterPushToken(userId: string, token: string): Promise<boolean> {
+  async unregisterPushToken(userId: string, token: string, type = 'expo'): Promise<boolean> {
     try {
+      const field = type === 'fcm' ? 'fcm_push_tokens' : 'expo_push_tokens';
       const settings = await this.notificationsService.getUserSettings(userId);
-      const existingTokens = settings.expo_push_tokens || [];
+      const existingTokens = settings[field] || [];
       const updatedTokens = existingTokens.filter(t => t !== token);
 
       if (updatedTokens.length !== existingTokens.length) {
         await this.notificationsService.updateUserSettings(userId, {
-          expo_push_tokens: updatedTokens
+          [field]: updatedTokens
         });
 
-        this.logger.log(`Unregistered push token for user ${userId}`);
+        this.logger.log(`Unregistered ${type} push token for user ${userId}`);
       }
 
       return true;
@@ -283,10 +456,40 @@ export class PushNotificationService {
    * This bypasses Expo because APNs requires direct HTTP/2 delivery for
    * the `com.apple.pushkit` payload.
    */
+  /**
+   * Normalize an EC private key from an env var into valid PEM format.
+   * Handles keys stored with literal "\n" escape sequences, or as a single
+   * unbroken line (header + base64 body + footer with no line breaks at all),
+   * both of which are invalid PEM and will fail crypto/jsonwebtoken parsing.
+   */
+  private normalizeApnsPrivateKey(rawKey: string): string {
+    let key = rawKey.trim().replace(/\\n/g, '\n');
+
+    const alreadyValid = /-----BEGIN (?:EC )?PRIVATE KEY-----\r?\n/.test(key);
+    if (alreadyValid) {
+      return key;
+    }
+
+    // Key has no (or insufficient) line breaks between header/body/footer.
+    // Rebuild it from the base64 body regardless of original formatting.
+    const match = key.match(
+      /-----BEGIN (EC )?PRIVATE KEY-----([\s\S]*?)-----END (EC )?PRIVATE KEY-----/
+    );
+    if (!match) {
+      return key;
+    }
+
+    const keyKind = match[1] ? 'EC PRIVATE KEY' : 'PRIVATE KEY';
+    const base64Body = match[2].replace(/\s+/g, '');
+    const wrappedBody = base64Body.match(/.{1,64}/g)?.join('\n') || base64Body;
+
+    return `-----BEGIN ${keyKind}-----\n${wrappedBody}\n-----END ${keyKind}-----\n`;
+  }
+
   async sendVoipPush(userId: string, payload: any): Promise<boolean> {
     try {
       const rawApnsKey = process.env.APN_VOIP_KEY || '';
-      const apnsKey = rawApnsKey.replace(/\\n/g, '\n');
+      const apnsKey = this.normalizeApnsPrivateKey(rawApnsKey);
       const keyId = process.env.APN_VOIP_KEY_ID;
       const teamId = process.env.APN_VOIP_TEAM_ID;
       const bundleId = process.env.APN_VOIP_BUNDLE_ID;
@@ -318,7 +521,7 @@ export class PushNotificationService {
       this.logger.log(`Sent ${successCount}/${voipTokens.length} VoIP push notifications to user ${userId}`);
       return successCount > 0;
     } catch (error) {
-      this.logger.error(`Failed to send VoIP push to user ${userId}:`, error);
+      this.logger.error(`Failed to send VoIP push to user ${userId}: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
   }
@@ -463,16 +666,34 @@ export class PushNotificationService {
 
     return new Promise<boolean>((resolve) => {
       try {
-        const req = client.request({
+        // Collapse VoIP pushes for the same call session so a later
+        // call_ended replaces a still-queued call_incoming on the device.
+        const collapseId = payload?.callSessionId
+          ? `call_${payload.callSessionId}`
+          : payload?.uuid
+            ? `call_${payload.uuid}`
+            : undefined;
+
+        const headers: any = {
           ':method': 'POST',
           ':path': `/3/device/${token}`,
           ':scheme': 'https',
           ':authority': host,
           'authorization': `bearer ${authToken}`,
-          'apns-topic': bundleId,
+          'apns-topic': bundleId.endsWith('.voip') ? bundleId : `${bundleId}.voip`,
           'apns-push-type': 'voip',
           'apns-priority': '10',
           'content-length': Buffer.byteLength(body),
+        };
+        if (collapseId) {
+          headers['apns-collapse-id'] = collapseId;
+        }
+
+        const req = client.request(headers);
+
+        let statusCode: number | undefined;
+        req.on('response', (headers) => {
+          statusCode = Number(headers[':status']);
         });
 
         let responseData = '';
@@ -480,10 +701,12 @@ export class PushNotificationService {
         req.on('data', (chunk) => { responseData += chunk; });
         req.on('end', () => {
           client.close();
-          if (responseData.trim() === '') {
+          if (statusCode === 200) {
             resolve(true);
           } else {
-            this.logger.warn(`APNs response for token ${token}: ${responseData}`);
+            this.logger.error(
+              `APNs VoIP push failed for token ${token}: status=${statusCode} body=${responseData}`
+            );
             resolve(false);
           }
         });

@@ -607,8 +607,9 @@ export class GiftService {
             }
 
             if (callSession?.conversation_id) {
-              // Broadcast gift animation to everyone in the call room
-              this.realtimeGateway.server.to(`conversation_${callSession.conversation_id}`).emit('call_signal', {
+              const conversationRoom = `conversation_${callSession.conversation_id}`;
+              const recipientRoom = `user_${dto.recipient_id}`;
+              const payload = {
                 callSessionId: dto.session_id,
                 signalType: 'gift_animation',
                 data: {
@@ -623,9 +624,24 @@ export class GiftService {
                 },
                 conversationId: callSession.conversation_id,
                 from: senderId,
-              });
+              };
 
-              this.logger.log(`[GiftService] 🎁 Emitted gift_animation event to conversation ${callSession.conversation_id} for call ${dto.session_id}`);
+              // Broadcast to the conversation room, and also to the recipient's
+              // personal user room. The user-room fallback guarantees delivery even
+              // when the recipient's socket is not currently joined to the
+              // conversation room. Socket.IO unions the rooms, so a socket in both
+              // receives the event only once.
+              this.realtimeGateway.server
+                .to(conversationRoom)
+                .to(recipientRoom)
+                .emit('call_signal', payload);
+
+              this.logger.log(`[GiftService] 🎁 Emitted gift_animation event to ${conversationRoom} and ${recipientRoom} for call ${dto.session_id}`, {
+                sessionId: dto.session_id,
+                conversationId: callSession.conversation_id,
+                recipientId: dto.recipient_id,
+                senderId,
+              });
             } else {
               this.logger.warn(`[GiftService] ⚠️ Could not find conversation_id for call session ${dto.session_id}`);
             }

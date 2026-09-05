@@ -4673,7 +4673,7 @@ export class LiveSalesService {
         created_at: service.created_at,
         images: (service.images || []).map((img: any) => ({
           id: img.id,
-          url: img.image_url,
+          image_url: img.image_url,
           caption: img.caption,
           display_order: img.display_order || 0,
           is_primary: img.is_primary || false,

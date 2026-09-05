@@ -229,12 +229,24 @@ export class CallsService {
     }
   }
 
-  async leaveCall(userId: string, callSessionId: string, userToken?: string): Promise<void> {
-    this.logger.log(`User ${userId} leaving call: ${callSessionId}`);
+  async leaveCall(userId: string, callSessionId: string, userToken?: string, reason: string = 'all_participants_left'): Promise<void> {
+    this.logger.log(`User ${userId} leaving call: ${callSessionId} (reason: ${reason})`);
 
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     try {
+      // If the call is already ended, don't end it again — prevents repeated broadcasts.
+      const { data: callSession } = await client
+        .from('chat_call_sessions')
+        .select('status')
+        .eq('id', callSessionId)
+        .single();
+
+      if (callSession?.status === CallStatus.ENDED) {
+        this.logger.warn(`Call ${callSessionId} already ended, skipping leave broadcast`);
+        return;
+      }
+
       // Update participant record
       await client
         .from('call_participants')
@@ -251,20 +263,13 @@ export class CallsService {
         .eq('call_session_id', callSessionId)
         .is('left_at', null);
 
-      // If the call is still ringing and someone leaves, end the call for everyone
-      const { data: callSession } = await client
-        .from('chat_call_sessions')
-        .select('status')
-        .eq('id', callSessionId)
-        .single();
-
       // If no active participants, or the call is still in the ringing state, end the call
       if (
         !activeParticipants ||
         activeParticipants.length === 0 ||
         callSession?.status === CallStatus.CALLING
       ) {
-        await this.endCall(callSessionId, 'all_participants_left');
+        await this.endCall(callSessionId, reason);
       } else {
         // Notify remaining participants
         await this.notifyCallParticipants(callSessionId, 'participant_left', {
@@ -288,9 +293,14 @@ export class CallsService {
       // Get call session details
       const { data: callSession } = await client
         .from('chat_call_sessions')
-        .select('started_at, answered_at, conversation_id, initiator_id')
+        .select('started_at, answered_at, conversation_id, initiator_id, status')
         .eq('id', callSessionId)
         .single();
+
+      if (callSession?.status === CallStatus.ENDED) {
+        this.logger.warn(`Call ${callSessionId} is already ended, skipping`);
+        return;
+      }
 
       if (!callSession) {
         this.logger.warn(`Call session ${callSessionId} not found`);
@@ -327,10 +337,21 @@ export class CallsService {
         .eq('call_session_id', callSessionId)
         .is('left_at', null);
 
-      // Create system message
-      const durationText = duration > 60 
+      // Create a system message that accurately reflects the call outcome.
+      const durationText = duration > 60
         ? `${Math.floor(duration / 60)}m ${duration % 60}s`
         : `${duration}s`;
+
+      let content: string;
+      if (reason === 'missed' || reason === 'timeout') {
+        content = '📞 Call not answered';
+      } else if (reason === 'declined') {
+        content = '📞 Call declined';
+      } else if (reason === 'cancelled') {
+        content = '📞 Call cancelled';
+      } else {
+        content = `📞 Call ended - Duration: ${durationText}`;
+      }
 
       await client
         .from('chat_messages')
@@ -338,7 +359,7 @@ export class CallsService {
           conversation_id: callSession.conversation_id,
           sender_id: callSession.initiator_id, // Use system ID in production
           message_type: 'system',
-          content: `📞 Call ended - Duration: ${durationText}`,
+          content,
         });
 
       // Notify participants
@@ -554,14 +575,14 @@ export class CallsService {
         }
       }
 
-      // Get initiator details if this is an incoming call
+      // Get initiator details if available (used for incoming/missed call notifications)
       let initiatorData: {
         id: string;
         username: string;
         full_name: string;
         avatar_url?: string | null;
       } | null = null;
-      if (eventType === 'incoming_call' && initiatorId) {
+      if (initiatorId) {
         const { data: profile } = await this.supabase
           .from('user_profiles')
           .select('id, username, avatar_url')
@@ -592,6 +613,7 @@ export class CallsService {
         callSessionId,
         callType,
         initiator: initiatorData,
+        ...(eventData || {}),
       });
 
       // For incoming_call, also send a high-priority push notification so the callee
@@ -613,9 +635,14 @@ export class CallsService {
             callerName,
             callerAvatar: initiatorData?.avatar_url || null,
           };
+          // Silent/data-only push: no title/body so the OS never auto-displays a
+          // plain system notification for this call. Native ringing is handled
+          // separately by VoIP (iOS) and FCM data messages (Android).
           const pushPromises = callees.map(({ user_id }) =>
             this.pushNotificationService.sendPushNotification(user_id, {
+              sound: 'default',
               priority: 'high',
+              channelId: 'calls',
               _contentAvailable: true,
               data: {
                 ...callIncomingData,
@@ -658,10 +685,9 @@ export class CallsService {
             callType,
             reason: eventData?.reason,
           };
+          // Silent/data-only push, same reasoning as call_incoming above.
           const endPushPromises = participants.map(({ user_id }) =>
             this.pushNotificationService.sendPushNotification(user_id, {
-              title: 'Call ended',
-              body: `The ${callType === CallType.VIDEO ? 'video' : 'voice'} call has ended`,
               priority: 'high',
               channelId: 'calls',
               _contentAvailable: false,
@@ -686,6 +712,54 @@ export class CallsService {
             ),
           );
           await Promise.all([...endPushPromises, ...endVoipPromises]);
+
+          // For missed/declined/timeout calls, also send a visible missed-call
+          // notification to the callee(s) who never joined.
+          const isMissedReason = ['missed', 'timeout', 'declined', 'not_answered', 'cancelled'].includes(
+            eventData?.reason,
+          );
+          if (isMissedReason) {
+            const { data: callParticipants } = await this.supabase
+              .from('call_participants')
+              .select('user_id, joined_at')
+              .eq('call_session_id', callSessionId);
+
+            const missedParticipants = (callParticipants || []).filter(
+              (p: any) =>
+                p.user_id !== initiatorId && (!p.joined_at || p.joined_at === null),
+            );
+
+            if (missedParticipants.length > 0) {
+              const callKind = callType === 'video' ? 'Video' : 'Voice';
+              const missedCallData = {
+                type: 'missed_call',
+                conversationId: conversationId!,
+                callSessionId,
+                callType,
+                reason: eventData?.reason,
+                callerName: initiatorData?.full_name || initiatorData?.username || 'Someone',
+              };
+              await Promise.all(
+                missedParticipants.map(({ user_id }: any) =>
+                  this.pushNotificationService
+                    .sendPushNotification(user_id, {
+                      title: 'Missed call',
+                      body: `You missed a ${callKind.toLowerCase()} call from ${missedCallData.callerName}`,
+                      priority: 'high',
+                      channelId: 'calls',
+                      data: {
+                        ...missedCallData,
+                        dataString: JSON.stringify(missedCallData),
+                        categoryId: 'missed_call',
+                      },
+                    })
+                    .catch(err =>
+                      this.logger.warn(`Missed-call notification to ${user_id} failed: ${err.message}`),
+                    ),
+                ),
+              );
+            }
+          }
         }
       }
 

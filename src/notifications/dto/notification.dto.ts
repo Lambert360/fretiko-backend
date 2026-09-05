@@ -239,6 +239,11 @@ export class UpdateNotificationSettingsDto {
   @IsArray()
   @IsString({ each: true })
   voip_push_tokens?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  fcm_push_tokens?: string[];
 }
 
 // ============================================
@@ -295,6 +300,7 @@ export class NotificationSettingsResponseDto {
   quiet_timezone!: string;
   expo_push_tokens!: string[];
   voip_push_tokens!: string[];
+  fcm_push_tokens!: string[];
   created_at!: Date;
   updated_at!: Date;
 }

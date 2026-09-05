@@ -12,7 +12,6 @@ import { ReferralsService, ReferralData } from './referrals.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 
 @Controller('referrals')
-@UseGuards(JwtAuthGuard)
 export class ReferralsController {
   constructor(
     private readonly referralsService: ReferralsService,
@@ -22,6 +21,7 @@ export class ReferralsController {
    * Get current user's referral data (code, URL, stats)
    */
   @Get('me')
+  @UseGuards(JwtAuthGuard)
   async getMyReferralData(@Request() req) {
     const userId = req.user.id;
     return this.referralsService.getUserReferralData(userId);
@@ -41,8 +41,8 @@ export class ReferralsController {
    */
   @Post('track-click')
   @HttpCode(HttpStatus.OK)
-  async trackReferralClick(@Body() body: { code: string }) {
-    return this.referralsService.trackReferralClick(body.code);
+  async trackReferralClick(@Body() body: { code?: string; referralCode?: string }) {
+    return this.referralsService.trackReferralClick(body.code ?? body.referralCode ?? '');
   }
 
   /**
@@ -63,6 +63,7 @@ export class ReferralsController {
    * Get referral history for current user
    */
   @Get('history')
+  @UseGuards(JwtAuthGuard)
   async getReferralHistory(@Request() req) {
     const userId = req.user.id;
     return this.referralsService.getReferralHistory(userId);

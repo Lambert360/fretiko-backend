@@ -572,14 +572,15 @@ export class ChatController {
   async leaveCall(
     @Param('callSessionId') callSessionId: string,
     @Headers('authorization') authHeader: string,
+    @Body() body: { reason?: string } = {},
   ) {
     this.logger.log(`POST /chat/calls/${callSessionId}/leave`);
-    
+
     const userId = this.getUserIdFromToken(authHeader);
     const token = authHeader.split(' ')[1];
-    
+
     try {
-      await this.callsService.leaveCall(userId, callSessionId, token);
+      await this.callsService.leaveCall(userId, callSessionId, token, body.reason || 'all_participants_left');
       
       this.logger.log(`User left call successfully: ${callSessionId}`);
       return {
