@@ -255,22 +255,10 @@ export class CheckoutService {
       throw new HttpException('Wishlist item IDs are required', HttpStatus.BAD_REQUEST);
     }
 
-    // Fetch wishlist items with product details
+    // Fetch wishlist items
     const { data: wishlistItems, error: wishlistError } = await client
       .from('wishlist')
-      .select(`
-        id,
-        product_id,
-        products (
-          id,
-          name,
-          price,
-          user_id,
-          status,
-          quantity,
-          location
-        )
-      `)
+      .select('id, product_id')
       .eq('user_id', userId)
       .in('id', wishlistItemIds);
 
@@ -283,12 +271,24 @@ export class CheckoutService {
       throw new HttpException('No wishlist items found', HttpStatus.NOT_FOUND);
     }
 
-    // Filter out items with deleted or inactive products
-    const validItems = wishlistItems.filter(item => 
-      item.products && 
-      item.products.status === 'active' &&
-      item.products.quantity > 0
-    );
+    // Fetch products separately to avoid FK join issues and ensure active/in-stock
+    const productIds = [...new Set(wishlistItems.map((w: any) => w.product_id).filter(Boolean))];
+    const { data: products, error: productsError } = await client
+      .from('products')
+      .select('id, name, price, user_id, status, quantity, location')
+      .in('id', productIds)
+      .eq('status', 'active')
+      .gt('quantity', 0);
+
+    if (productsError) {
+      console.error('Error fetching wishlist products:', productsError);
+      throw new HttpException('Failed to fetch wishlist products', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    const productMap = new Map(products?.map((p: any) => [p.id, p]) || []);
+    const validItems = wishlistItems
+      .map((w: any) => ({ ...w, product: productMap.get(w.product_id) }))
+      .filter((w: any) => w.product);
 
     if (validItems.length === 0) {
       throw new HttpException('No valid products found in wishlist items', HttpStatus.BAD_REQUEST);
@@ -296,13 +296,13 @@ export class CheckoutService {
 
     // Build items array for checkout summary
     const items = validItems.map(item => ({
-      id: item.products.id,
-      name: item.products.name,
-      price: item.products.price,
+      id: item.product.id,
+      name: item.product.name,
+      price: item.product.price,
       quantity: 1, // Wishlist items are always quantity 1
-      sellerId: item.products.user_id,
+      sellerId: item.product.user_id,
       requiresEscrow: true, // Wishlist purchases always use escrow
-      itemLocation: item.products?.location || undefined,
+      itemLocation: item.product?.location || undefined,
     }));
 
     // Attach seller location so mobile can pass vendor state/country to rider filter
@@ -521,7 +521,7 @@ export class CheckoutService {
       .from('auction_sales')
       .select('payment_status, payment_transaction_id')
       .eq('auction_id', auctionId)
-      .single();
+      .maybeSingle();
 
     // If payment is already completed, don't allow checkout
     if (existingSale?.payment_status === 'completed') {
@@ -668,9 +668,10 @@ export class CheckoutService {
     const subtotal = winningBid;
     const shipping = this.calculateShipping(subtotal, items);
     const tax = this.calculateTax(subtotal);
-    // ✅ FIX: All auction orders use 10% platform commission (not the auction.commission_rate from DB)
-    const AUCTION_COMMISSION_RATE = 10; // 10% for all auction orders
-    const commissionFee = Math.round(subtotal * (AUCTION_COMMISSION_RATE / 100));
+    // Use the auction's configured commission rate (seller-funded, not added to buyer total)
+    const auctionCommissionRate = Number(auction.commission_rate ?? 0.10);
+    const commissionRatePercent = parseFloat((auctionCommissionRate * 100).toFixed(2));
+    const commissionFee = parseFloat((subtotal * auctionCommissionRate).toFixed(6));
     const escrowFee = this.calculateEscrowFee(subtotal + shipping + tax);
     const total = subtotal + shipping + tax + escrowFee;
 
@@ -681,7 +682,7 @@ export class CheckoutService {
       tax,
       escrowFee,
       commissionFee,
-      commissionRate: AUCTION_COMMISSION_RATE, // Always 10% for auctions
+      commissionRate: commissionRatePercent,
       total,
       auctionId: auction.id,
       sellerId: auction.seller_id,
@@ -1501,7 +1502,7 @@ export class CheckoutService {
 
       // Update auction sale record to link to order and mark as completed
       // The sale record was created as 'pending' when auction ended
-      await client
+      const saleUpdate = client
         .from('auction_sales')
         .update({
           payment_status: 'completed',
@@ -1509,6 +1510,12 @@ export class CheckoutService {
         })
         .eq('auction_id', orderData.auctionCheckout.auctionId)
         .eq('buyer_id', userId);
+
+      if (orderData.auctionCheckout?.itemId) {
+        await saleUpdate.eq('item_id', orderData.auctionCheckout.itemId);
+      } else {
+        await saleUpdate.is('item_id', null);
+      }
     }
 
     // ✅ NOTIFY VENDOR OF NEW ORDER

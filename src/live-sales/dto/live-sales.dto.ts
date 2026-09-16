@@ -1,4 +1,4 @@
-import { IsString, IsEnum, IsOptional, IsNumber, IsUUID, IsArray, ValidateNested, IsPositive, IsDateString, MinLength, MaxLength, IsBoolean } from 'class-validator';
+import { IsString, IsEnum, IsOptional, IsNumber, IsUUID, IsArray, ValidateNested, IsPositive, IsDateString, MinLength, MaxLength, IsBoolean, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 
 export enum StreamType {
@@ -148,6 +148,25 @@ export class LiveGiftCardDto {
   amount?: number; // Optional: manually specify how much of the card balance to use
 }
 
+// DTO for interstate/international logistics company used in live product purchases
+export class LiveInterstateCompanyDto {
+  @IsUUID()
+  companyId!: string;
+
+  @IsString()
+  companyName!: string;
+
+  @IsNumber()
+  @Min(0)
+  deliveryPrice!: number;
+
+  @IsNumber()
+  estimatedDeliveryDays!: number;
+
+  @IsBoolean()
+  isInternational!: boolean;
+}
+
 // DTO for live product purchase
 export class LiveProductPurchaseDto {
   @IsUUID()
@@ -173,6 +192,11 @@ export class LiveProductPurchaseDto {
   rider_id?: string;
 
   @IsOptional()
+  @IsNumber()
+  @Min(0)
+  deliveryPrice?: number;
+
+  @IsOptional()
   delivery_address?: any; // JSON object for delivery details
 
   @IsOptional()
@@ -183,6 +207,11 @@ export class LiveProductPurchaseDto {
   @ValidateNested()
   @Type(() => LiveGiftCardDto)
   giftCard?: LiveGiftCardDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LiveInterstateCompanyDto)
+  interstateCompany?: LiveInterstateCompanyDto;
 }
 
 // DTO for live service booking
@@ -204,6 +233,65 @@ export class LiveServiceBookingDto {
   @IsOptional()
   @IsBoolean()
   continue_watching?: boolean;
+
+  @IsOptional()
+  @IsUUID()
+  rider_id?: string;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  deliveryPrice?: number;
+
+  @IsOptional()
+  delivery_address?: any; // JSON object for delivery details
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LiveInterstateCompanyDto)
+  interstateCompany?: LiveInterstateCompanyDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LiveGiftCardDto)
+  giftCard?: LiveGiftCardDto;
+}
+
+// DTO for live portfolio service booking
+export class LivePortfolioBookingDto {
+  @IsUUID()
+  stream_id!: string;
+
+  @IsUUID()
+  portfolio_id!: string;
+
+  @IsDateString()
+  service_date!: string;
+
+  @IsString()
+  service_time!: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  service_notes?: string;
+
+  @IsOptional()
+  @IsUUID()
+  rider_id?: string;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  deliveryPrice?: number;
+
+  @IsOptional()
+  delivery_address?: any; // JSON object for delivery details
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LiveInterstateCompanyDto)
+  interstateCompany?: LiveInterstateCompanyDto;
 
   @IsOptional()
   @ValidateNested()
@@ -232,6 +320,11 @@ export interface LiveStreamResponse {
     username: string;
     profile_pic_url?: string;
     is_verified?: boolean;
+    location?: {
+      state?: string;
+      country?: string;
+      city?: string;
+    };
   };
   title: string;
   description?: string;

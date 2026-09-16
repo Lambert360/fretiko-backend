@@ -75,65 +75,76 @@ export class AuctionsService {
    * Get auctions with filtering and pagination
    */
   async findAuctions(filters: AuctionFilterDto, userId?: string): Promise<{ auctions: AuctionWithDetails[]; total: number }> {
+    const applyFilters = (q: any) => {
+      if (filters.search) {
+        q = q.or(`title.ilike.%${filters.search}%,description.ilike.%${filters.search}%`);
+      }
+
+      if (filters.category_id) {
+        q = q.eq('category_id', filters.category_id);
+      }
+
+      if (filters.category_slug) {
+        q = q.eq('category_slug', filters.category_slug);
+      }
+
+      if (filters.status) {
+        q = q.eq('status', filters.status);
+      }
+
+      if (filters.auction_type) {
+        q = q.eq('auction_type', filters.auction_type);
+      }
+
+      if (filters.min_price) {
+        q = q.gte('current_bid', filters.min_price);
+      }
+
+      if (filters.max_price) {
+        q = q.lte('current_bid', filters.max_price);
+      }
+
+      if (filters.time_filter) {
+        const now = new Date();
+        switch (filters.time_filter) {
+          case 'ending_soon':
+            // Ending within next 2 hours
+            const twoHoursFromNow = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+            q = q.lte('end_time', twoHoursFromNow.toISOString()).eq('status', 'active');
+            break;
+          case 'just_started':
+            // Started within last 2 hours
+            const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+            q = q.gte('start_time', twoHoursAgo.toISOString()).eq('status', 'active');
+            break;
+          case 'upcoming':
+            q = q.eq('time_status', 'upcoming');
+            break;
+        }
+      }
+
+      if (filters.no_reserve) {
+        q = q.is('reserve_price', null);
+      }
+
+      if (filters.seller_id) {
+        q = q.eq('seller_id', filters.seller_id);
+      }
+
+      return q;
+    };
+
+    // Build count query (same filters, no pagination/sort)
+    let countQuery = this.supabase
+      .from('auction_summary')
+      .select('*', { count: 'exact', head: true });
+    countQuery = applyFilters(countQuery);
+
+    // Build data query
     let query = this.supabase
       .from('auction_summary')
       .select('*');
-
-    // Apply filters
-    if (filters.search) {
-      query = query.or(`title.ilike.%${filters.search}%,description.ilike.%${filters.search}%`);
-    }
-
-    if (filters.category_id) {
-      query = query.eq('category_id', filters.category_id);
-    }
-
-    if (filters.category_slug) {
-      query = query.eq('category_slug', filters.category_slug);
-    }
-
-    if (filters.status) {
-      query = query.eq('status', filters.status);
-    }
-
-    if (filters.auction_type) {
-      query = query.eq('auction_type', filters.auction_type);
-    }
-
-    if (filters.min_price) {
-      query = query.gte('current_bid', filters.min_price);
-    }
-
-    if (filters.max_price) {
-      query = query.lte('current_bid', filters.max_price);
-    }
-
-    if (filters.time_filter) {
-      const now = new Date();
-      switch (filters.time_filter) {
-        case 'ending_soon':
-          // Ending within next 2 hours
-          const twoHoursFromNow = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-          query = query.lte('end_time', twoHoursFromNow.toISOString()).eq('status', 'active');
-          break;
-        case 'just_started':
-          // Started within last 2 hours
-          const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000);
-          query = query.gte('start_time', twoHoursAgo.toISOString()).eq('status', 'active');
-          break;
-        case 'upcoming':
-          query = query.eq('time_status', 'upcoming');
-          break;
-      }
-    }
-
-    if (filters.no_reserve) {
-      query = query.is('reserve_price', null);
-    }
-
-    if (filters.seller_id) {
-      query = query.eq('seller_id', filters.seller_id);
-    }
+    query = applyFilters(query);
 
     // Apply sorting
     switch (filters.sort) {
@@ -159,9 +170,7 @@ export class AuctionsService {
     }
 
     // Get total count for pagination
-    const { count } = await this.supabase
-      .from('auction_summary')
-      .select('*', { count: 'exact', head: true });
+    const { count } = await countQuery;
 
     // Apply pagination
     const limit = filters.limit || 20;
@@ -261,6 +270,42 @@ export class AuctionsService {
     // If userId is not provided (unauthenticated), don't increment view count
 
     return auction;
+  }
+
+  /**
+   * Get the seller ID of an auction without side effects
+   * Used by guards to avoid incrementing view counts
+   */
+  async getAuctionSellerId(auctionId: string): Promise<string | null> {
+    const { data, error } = await this.serviceSupabase
+      .from('auctions')
+      .select('seller_id')
+      .eq('id', auctionId)
+      .single();
+
+    if (error || !data) {
+      return null;
+    }
+
+    return data.seller_id;
+  }
+
+  /**
+   * Get auction status/time fields without view-count side effects
+   * Used by guards to avoid incrementing views
+   */
+  async getAuctionForGuard(auctionId: string): Promise<any | null> {
+    const { data, error } = await this.serviceSupabase
+      .from('auctions')
+      .select('id, status, start_time, end_time, seller_id, bid_increment, auction_type, current_item_id')
+      .eq('id', auctionId)
+      .single();
+
+    if (error || !data) {
+      return null;
+    }
+
+    return data;
   }
 
   /**
@@ -802,6 +847,7 @@ export class AuctionsService {
 
     // Get auction details
     const auction = await this.findById(placeBidDto.auction_id);
+    const itemId = auction.auction_type === 'live' ? (auction as any).current_item_id : null;
 
     // Validate auction status
     if (auction.status !== 'active') {
@@ -819,8 +865,22 @@ export class AuctionsService {
       throw new BadRequestException(`Minimum bid is ${minimumBid} Freti`);
     }
 
-    // ✅ BUG FIX: Removed redundant balance check - validation happens atomically at payment time
-    // This prevents race conditions where balance could change between check and payment processing
+    // Validate wallet balance (the bidder must be able to cover their maximum commitment)
+    const walletCheckAmount = placeBidDto.max_bid_amount ?? placeBidDto.amount;
+    const { data: wallet, error: walletError } = await this.serviceSupabase
+      .from('wallets')
+      .select('available_balance')
+      .eq('user_id', userId)
+      .single();
+
+    if (walletError || !wallet) {
+      throw new BadRequestException('Insufficient wallet balance to place this bid. Please add funds to your wallet.');
+    }
+
+    const availableBalance = parseFloat(wallet.available_balance ?? 0);
+    if (availableBalance < walletCheckAmount) {
+      throw new BadRequestException(`Insufficient wallet balance to place this bid. Available: ₣${availableBalance.toFixed(2)}, required: ₣${walletCheckAmount.toFixed(2)}`);
+    }
 
     // For proxy bids, validate max_bid_amount
     if (placeBidDto.bid_type === 'proxy' && placeBidDto.max_bid_amount) {
@@ -863,6 +923,7 @@ export class AuctionsService {
     const bidData = {
       auction_id: placeBidDto.auction_id,
       bidder_id: userId,
+      item_id: itemId,
       amount: placeBidDto.amount,
       bid_type: placeBidDto.bid_type || 'manual',
       max_bid_amount: placeBidDto.max_bid_amount,
@@ -909,9 +970,10 @@ export class AuctionsService {
     // Process proxy bids for ANY bid type (both manual and proxy bids should trigger proxy processing)
     // This allows proxy bidders to counter-bid when other proxy bids are placed
     // Only skip if we're already processing proxy bids for this auction (prevents recursion loops)
-    if (!this.processingProxyBids.has(placeBidDto.auction_id)) {
+    const proxyKey = `${placeBidDto.auction_id}:${itemId || 'none'}`;
+    if (!this.processingProxyBids.has(proxyKey)) {
       // Process proxy bids asynchronously (don't block the response)
-      this.processProxyBids(placeBidDto.auction_id, data.amount, data.bidder_id, data.id).catch(err => {
+      this.processProxyBids(placeBidDto.auction_id, data.amount, data.bidder_id, data.id, itemId).catch(err => {
         console.error(`[Auction ${placeBidDto.auction_id}] Error processing proxy bids:`, err);
         // Don't throw - proxy bid processing failure shouldn't fail the original bid
       });
@@ -930,148 +992,132 @@ export class AuctionsService {
     newBidAmount: number,
     newBidderId: string,
     newBidId: string,
-    isRecursive: boolean = false, // Track if this is a recursive call
+    itemId: string | null = null,
+    isRecursive: boolean = false,
   ): Promise<void> {
-    // Prevent concurrent processing from different initial calls (but allow recursion)
-    if (!isRecursive && this.processingProxyBids.has(auctionId)) {
-      return; // Another process is already handling proxy bids for this auction
+    const proxyKey = `${auctionId}:${itemId || 'none'}`;
+
+    if (!isRecursive && this.processingProxyBids.has(proxyKey)) {
+      return;
     }
 
     if (!isRecursive) {
-      this.processingProxyBids.add(auctionId);
+      this.processingProxyBids.add(proxyKey);
     }
 
     try {
-      // Get auction details for bid_increment and current state
       const auction = await this.findById(auctionId);
       if (!auction || auction.status !== 'active') {
-        return; // Auction is no longer active
+        return;
       }
 
-      const bidIncrement = auction.bid_increment;
+      let bidIncrement = auction.bid_increment;
+      let currentBid = auction.current_bid;
+      let startingPrice = auction.starting_price;
+
+      if (itemId) {
+        const item = await this.getAuctionItem(itemId);
+        if (item) {
+          bidIncrement = item.bid_increment;
+          currentBid = item.current_bid;
+          startingPrice = item.starting_price;
+        }
+      }
+
       const minimumCounterBid = newBidAmount + bidIncrement;
 
-      // Get current winning bidder to exclude them (they're already winning, no need to counter-bid)
-      const { data: currentWinningBid } = await this.serviceSupabase
+      const winningBidQuery = this.serviceSupabase
         .from('auction_bids')
         .select('bidder_id, amount')
         .eq('auction_id', auctionId)
         .eq('is_winning', true)
-        .eq('is_valid', true)
-        .maybeSingle();
-
+        .eq('is_valid', true);
+      if (itemId) winningBidQuery.eq('item_id', itemId);
+      else winningBidQuery.is('item_id', null);
+      const { data: currentWinningBid } = await winningBidQuery.maybeSingle();
       const currentWinningBidderId = currentWinningBid?.bidder_id;
 
-      // Find the highest active ORIGINAL proxy bid where max_bid_amount >= minimum counter bid
-      // We only look at original proxy bids (proxy_bid_parent_id IS NULL), not system-generated counter-bids
-      // Exclude:
-      //   - The bidder who just placed this bid
-      //   - The current winning bidder (they're already winning, no need to counter-bid)
-      // Only get the highest one (we'll process one at a time to avoid race conditions)
       let proxyBidsQuery = this.serviceSupabase
         .from('auction_bids')
         .select('id, bidder_id, max_bid_amount, bidder_display_id')
         .eq('auction_id', auctionId)
         .eq('is_proxy_bid', true)
         .eq('is_valid', true)
-        .is('proxy_bid_parent_id', null) // Only original proxy bids (not system-generated counter-bids)
-        .neq('bidder_id', newBidderId) // Exclude the current bidder
-        .gte('max_bid_amount', minimumCounterBid); // Only those who can outbid
+        .is('proxy_bid_parent_id', null)
+        .neq('bidder_id', newBidderId)
+        .gte('max_bid_amount', minimumCounterBid);
 
-      // Exclude current winning bidder if they exist
+      if (itemId) proxyBidsQuery = proxyBidsQuery.eq('item_id', itemId);
+      else proxyBidsQuery = proxyBidsQuery.is('item_id', null);
+
       if (currentWinningBidderId) {
         proxyBidsQuery = proxyBidsQuery.neq('bidder_id', currentWinningBidderId);
       }
 
       const { data: proxyBids, error: findError } = await proxyBidsQuery
         .order('max_bid_amount', { ascending: false })
-        .limit(1); // Only process the highest proxy bidder
+        .limit(1);
 
       if (findError || !proxyBids || proxyBids.length === 0) {
-        return; // No proxy bids to process
+        return;
       }
 
       const proxyBid = proxyBids[0];
-
-      // Calculate counter-bid: minimum to beat new bid, but don't exceed proxy max
       const counterBidAmount = Math.min(minimumCounterBid, proxyBid.max_bid_amount);
 
-      // Double-check: only proceed if counter-bid is actually higher
       if (counterBidAmount <= newBidAmount) {
         return;
       }
 
-      // ✅ BUG FIX: Removed redundant balance check - validation happens atomically at payment time
-      // This prevents race conditions where balance could change between check and payment processing
-      // Note: If proxy bidder has insufficient balance at payment time, the payment will fail and be handled appropriately
-
-      // Fetch the latest auction state to ensure we have the correct current_bid
-      // (This accounts for any bids that may have been placed since we started processing)
-      const currentAuction = await this.findById(auctionId);
-      const currentMinBid = currentAuction.current_bid + currentAuction.bid_increment;
-
-      // Calculate the final counter-bid amount based on current auction state
-      // Use the higher of: calculated counterBidAmount OR current minimum bid
-      // But never exceed the proxy bidder's max_bid_amount
+      const currentMinBid = currentBid + bidIncrement;
       const finalCounterBid = Math.min(
         Math.max(counterBidAmount, currentMinBid),
-        proxyBid.max_bid_amount
+        proxyBid.max_bid_amount,
       );
 
-      // Validate: counter-bid must be higher than current winning bid
-      if (finalCounterBid <= currentAuction.current_bid) {
-        return; // Proxy bidder's max is no longer sufficient to beat current bid
+      if (finalCounterBid <= currentBid || finalCounterBid < startingPrice) {
+        return;
       }
 
-      // Validate: counter-bid must be at least the minimum required
-      if (finalCounterBid < currentMinBid) {
-        return; // Counter-bid doesn't meet minimum requirement
-        }
-
-        // Place counter-bid using the service client (bypasses RLS)
-        await this.placeBidInternal(
-          proxyBid.bidder_id,
-          auctionId,
+      await this.placeBidInternal(
+        proxyBid.bidder_id,
+        auctionId,
+        itemId,
         finalCounterBid,
-          proxyBid.max_bid_amount,
-          proxyBid.bidder_display_id,
-          proxyBid.id, // parent proxy bid id
+        proxyBid.max_bid_amount,
+        proxyBid.bidder_display_id,
+        proxyBid.id,
+      );
+
+      let counterQuery = this.serviceSupabase
+        .from('auction_bids')
+        .select('id, amount, bidder_id')
+        .eq('auction_id', auctionId)
+        .eq('bidder_id', proxyBid.bidder_id)
+        .eq('proxy_bid_parent_id', proxyBid.id);
+      if (itemId) counterQuery = counterQuery.eq('item_id', itemId);
+      else counterQuery = counterQuery.is('item_id', null);
+
+      const { data: counterBid } = await counterQuery
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (counterBid && counterBid.amount > newBidAmount) {
+        await this.processProxyBids(
+          auctionId,
+          counterBid.amount,
+          counterBid.bidder_id,
+          counterBid.id,
+          itemId,
+          true,
         );
-
-      // Recursively process proxy bids for the new counter-bid
-      // (in case there are other proxy bidders who can outbid this counter-bid)
-      // Get the new current bid amount
-      const updatedAuction = await this.findById(auctionId);
-      if (updatedAuction.current_bid > newBidAmount) {
-        // Find the counter-bid we just placed
-        const { data: counterBid } = await this.serviceSupabase
-          .from('auction_bids')
-          .select('id, amount, bidder_id')
-          .eq('auction_id', auctionId)
-          .eq('bidder_id', proxyBid.bidder_id)
-          .eq('proxy_bid_parent_id', proxyBid.id)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .single();
-
-        if (counterBid) {
-          // Recursively process proxy bids (pass isRecursive=true to allow recursion)
-          await this.processProxyBids(
-            auctionId,
-            counterBid.amount,
-            counterBid.bidder_id,
-            counterBid.id,
-            true, // Mark as recursive call
-          );
-        }
       }
     } catch (error) {
       console.error(`[Auction ${auctionId}] Error in processProxyBids:`, error);
-      // Don't throw - proxy bid processing failure shouldn't fail the original bid
     } finally {
-      // Only remove from set if this was the initial (non-recursive) call
       if (!isRecursive) {
-        this.processingProxyBids.delete(auctionId);
+        this.processingProxyBids.delete(proxyKey);
       }
     }
   }
@@ -1083,16 +1129,18 @@ export class AuctionsService {
   private async placeBidInternal(
     bidderId: string,
     auctionId: string,
+    itemId: string | null,
     amount: number,
     maxBidAmount: number,
     bidderDisplayId: string,
     proxyBidParentId: string,
   ): Promise<AuctionBid> {
-    const bidData = {
+    const bidData: any = {
       auction_id: auctionId,
       bidder_id: bidderId,
+      item_id: itemId,
       amount: amount,
-      bid_type: 'proxy' as const,
+      bid_type: 'proxy',
       max_bid_amount: maxBidAmount,
       is_proxy_bid: true,
       bidder_display_id: bidderDisplayId,
@@ -1109,9 +1157,6 @@ export class AuctionsService {
       throw new Error(`Failed to place proxy counter-bid: ${error.message}`);
     }
 
-    // Broadcast WebSocket event for proxy counter-bid
-    // Query auction stats directly from auctions table using serviceSupabase
-    // (same client = same connection = consistent reads, bypasses RLS, ensures fresh data)
     try {
       const { data: auctionStats, error: statsError } = await this.serviceSupabase
         .from('auctions')
@@ -1120,21 +1165,20 @@ export class AuctionsService {
         .single();
 
       if (!statsError && auctionStats) {
-      await this.auctionGateway.broadcastBidUpdate(auctionId, {
-        amount: amount,
-        bidder_display_id: bidderDisplayId,
+        await this.auctionGateway.broadcastBidUpdate(auctionId, {
+          amount: amount,
+          bidder_display_id: bidderDisplayId,
           current_bid: auctionStats.current_bid,
           total_bids: auctionStats.total_bids,
           unique_bidders: auctionStats.unique_bidders,
           view_count: auctionStats.view_count,
           watch_count: auctionStats.watch_count,
-        is_winning: true,
-        is_proxy_bid: true,
-      });
+          is_winning: true,
+          is_proxy_bid: true,
+        });
       }
     } catch (error) {
       console.error(`[Auction ${auctionId}] Error broadcasting proxy bid update:`, error);
-      // Don't throw - WebSocket broadcast failure shouldn't fail the bid
     }
 
     return data;
@@ -2204,17 +2248,19 @@ export class AuctionsService {
       return; // Already ended
     }
 
-    // Get highest bidder for this item
+    // Get highest bidder for this item (scoped to item_id)
     const { data: highestBid, error: bidError } = await this.serviceSupabase
       .from('auction_bids')
       .select('bidder_id, amount, bidder_display_id')
       .eq('auction_id', auctionId)
+      .eq('item_id', itemId)
       .order('amount', { ascending: false })
       .order('created_at', { ascending: false })
       .limit(1)
-      .single();
+      .maybeSingle();
 
-    const hasValidBid = highestBid && highestBid.amount >= item.starting_price;
+    const reserveMet = !item.reserve_price || (highestBid ? highestBid.amount >= item.reserve_price : false);
+    const hasValidBid = highestBid && highestBid.amount >= item.starting_price && reserveMet;
     const winner = hasValidBid ? {
       bidder_id: highestBid.bidder_id,
       amount: highestBid.amount,
@@ -2284,7 +2330,7 @@ export class AuctionsService {
       throw new BadRequestException('Failed to mark item as sold');
     }
 
-    // Save win to database if there's a winner
+    // Save win and sale records if there's a winner
     if (item.winner_id && item.winning_bid) {
       try {
         await this.saveAuctionWin(
@@ -2293,9 +2339,32 @@ export class AuctionsService {
           item.winning_bid,
           itemId,
         );
+
+        // Create auction_sales record for this live item (idempotent)
+        const existingSale = await this.serviceSupabase
+          .from('auction_sales')
+          .select('id')
+          .eq('auction_id', auctionId)
+          .eq('item_id', itemId)
+          .eq('buyer_id', item.winner_id)
+          .maybeSingle();
+
+        if (!existingSale.data) {
+          const commissionRate = Number((auction as any).commission_rate ?? 0.10);
+          await this.serviceSupabase.from('auction_sales').insert({
+            auction_id: auctionId,
+            seller_id: auction.seller_id,
+            buyer_id: item.winner_id,
+            item_id: itemId,
+            final_bid_amount: item.winning_bid,
+            commission_amount: Number((item.winning_bid * commissionRate).toFixed(6)),
+            buyer_premium_amount: 0,
+            total_amount: item.winning_bid,
+            payment_status: 'pending',
+          });
+        }
       } catch (error) {
-        console.error('Failed to save auction win:', error);
-        // Don't throw - win saving failure shouldn't block the sale
+        console.error('Failed to save auction win/sale:', error);
       }
     }
 
@@ -2306,10 +2375,11 @@ export class AuctionsService {
         .from('auction_bids')
         .select('bidder_display_id')
         .eq('auction_id', auctionId)
+        .eq('item_id', itemId)
         .eq('bidder_id', item.winner_id)
         .order('amount', { ascending: false })
         .limit(1)
-        .single();
+        .maybeSingle();
       bidderDisplayId = winnerBid?.bidder_display_id || 'Winner';
     }
 

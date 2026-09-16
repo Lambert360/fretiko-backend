@@ -20,6 +20,7 @@ import {
   SendGiftDto,
   LiveProductPurchaseDto,
   LiveServiceBookingDto,
+  LivePortfolioBookingDto,
   JoinStreamDto,
   LeaveStreamDto,
   LiveStreamProductDto,
@@ -303,7 +304,8 @@ export class LiveSalesService {
             username,
             avatar_url,
             is_verified,
-            display_name
+            display_name,
+            location
           )
         `)
         .eq('id', streamId)
@@ -696,7 +698,7 @@ export class LiveSalesService {
 
       const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
-        .select('status')
+        .select('status, vendor_id')
         .eq('id', streamId)
         .single();
 
@@ -705,6 +707,12 @@ export class LiveSalesService {
       }
 
       this.logger.log(`📊 Stream ${streamId} status from DB: ${stream.status}`);
+
+      // Host is not a viewer
+      if (stream.vendor_id === userId) {
+        this.logger.log(`Host ${userId} joining their own stream; not tracking as viewer`);
+        return;
+      }
 
       // ✅ RETRY LOGIC: Handle race condition between updateStreamStatus and joinStream
       if (stream.status !== StreamStatus.LIVE && retryCount < 3) {
@@ -1426,10 +1434,15 @@ export class LiveSalesService {
       const platformFee = subtotal * platformFeeRate;
       const vendorAmount = subtotal - platformFee;
 
-      // Calculate delivery fee if rider selected
+      // Calculate delivery fee if rider or interstate logistics company selected
       let deliveryFee = 0;
-      if (purchaseDto.rider_id) {
-        deliveryFee = 10.00; // Base delivery fee - could be dynamic
+      if (purchaseDto.interstateCompany) {
+        deliveryFee = purchaseDto.interstateCompany.deliveryPrice;
+      } else if (purchaseDto.rider_id) {
+        const providedDeliveryPrice = purchaseDto.deliveryPrice;
+        deliveryFee = providedDeliveryPrice !== undefined && providedDeliveryPrice !== null
+          ? Number(providedDeliveryPrice)
+          : 10.00;
       }
 
       const totalAmount = subtotal + deliveryFee;
@@ -1468,7 +1481,7 @@ export class LiveSalesService {
       }
 
       // 6. Build the atomic RPC payload
-      const riderCommission = purchaseDto.rider_id && deliveryFee > 0
+      const riderCommission = (purchaseDto.rider_id || purchaseDto.interstateCompany) && deliveryFee > 0
         ? deliveryFee * this.PLATFORM_COMMISSION_RATE
         : 0;
 
@@ -1490,7 +1503,7 @@ export class LiveSalesService {
         status: 'pending',
         escrow_enabled: true,
         rider_id: purchaseDto.rider_id || null,
-        delivery_type: purchaseDto.rider_id ? 'delivery' : 'pickup',
+        delivery_type: purchaseDto.rider_id || purchaseDto.interstateCompany ? 'delivery' : 'pickup',
         delivery_address: purchaseDto.delivery_address || null,
         metadata: {
           stream_id: purchaseDto.stream_id,
@@ -1499,6 +1512,9 @@ export class LiveSalesService {
           subtotal: subtotal,
           unit_price: unitPrice,
           continue_watching: purchaseDto.continue_watching || false,
+          ...(purchaseDto.interstateCompany ? {
+            interstate_company: purchaseDto.interstateCompany,
+          } : {}),
         },
       };
 
@@ -1599,7 +1615,12 @@ export class LiveSalesService {
           .eq('id', productVendorId)
           .single();
 
-        const deliveryType = purchaseDto.rider_id ? 'delivery' : 'pickup';
+        let deliveryType = 'pickup';
+        if (purchaseDto.interstateCompany) {
+          deliveryType = 'interstate';
+        } else if (purchaseDto.rider_id) {
+          deliveryType = 'delivery';
+        }
 
         if (deliveryType === 'pickup') {
           await this.notificationHelper.notifyVendorSelfPickupPin(productVendorId, {
@@ -2084,17 +2105,13 @@ export class LiveSalesService {
         throw new NotFoundException('Service not found in this stream');
       }
 
-      // 4. Validate booking date and time
+      // 4. Validate booking date is not in the past. The time is flexible:
+      // the viewer proposes any future date/time and the vendor accepts or
+      // rejects later, so we no longer enforce booking_window / max_advance.
       const requestedDateTime = new Date(`${bookingDto.service_date}T${bookingDto.service_time}`);
       const now = new Date();
-      const daysDifference = Math.ceil((requestedDateTime.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-
-      if (daysDifference < liveService.booking_window_days) {
-        throw new BadRequestException(`Bookings must be made at least ${liveService.booking_window_days} days in advance`);
-      }
-
-      if (daysDifference > liveService.max_advance_days) {
-        throw new BadRequestException(`Bookings cannot be made more than ${liveService.max_advance_days} days in advance`);
+      if (requestedDateTime <= now) {
+        throw new BadRequestException('Service booking must be scheduled for a future date and time');
       }
 
       // 5. Calculate pricing
@@ -2103,13 +2120,32 @@ export class LiveSalesService {
       const platformFee = servicePrice * platformFeeRate;
       const vendorAmount = servicePrice - platformFee;
 
+      // Calculate delivery fee if rider or interstate logistics company selected.
+      // Services can be location_type = 'in_person', in which case the buyer may
+      // want the provider (or their materials) delivered rather than picking up.
+      let deliveryFee = 0;
+      if (bookingDto.interstateCompany) {
+        deliveryFee = bookingDto.interstateCompany.deliveryPrice;
+      } else if (bookingDto.rider_id) {
+        const providedDeliveryPrice = bookingDto.deliveryPrice;
+        deliveryFee = providedDeliveryPrice !== undefined && providedDeliveryPrice !== null
+          ? Number(providedDeliveryPrice)
+          : 10.00;
+      }
+
+      const totalAmount = servicePrice + deliveryFee;
+      const riderCommission = (bookingDto.rider_id || bookingDto.interstateCompany) && deliveryFee > 0
+        ? deliveryFee * this.PLATFORM_COMMISSION_RATE
+        : 0;
+
       this.logEvent('log', 'service_booking_calculation', {
         bookingId,
         userId,
         servicePrice,
         platformFee,
         vendorAmount,
-        totalAmount: servicePrice,
+        deliveryFee,
+        totalAmount,
       });
 
       // 6. Wallet balance pre-check
@@ -2123,7 +2159,7 @@ export class LiveSalesService {
         throw new NotFoundException('Customer wallet not found');
       }
 
-      if (customerWallet.available_balance < servicePrice) {
+      if (customerWallet.available_balance < totalAmount) {
         throw new BadRequestException('Insufficient wallet balance for service booking');
       }
 
@@ -2134,15 +2170,15 @@ export class LiveSalesService {
         order_number: orderNumber,
         buyer_id: userId,
         vendor_id: stream.vendor_id,
-        total_amount: servicePrice,
-        delivery_fee: 0,
+        total_amount: totalAmount,
+        delivery_fee: deliveryFee,
         platform_fee: platformFee,
         status: 'pending',
         escrow_enabled: true,
         source: 'live_stream',
-        delivery_type: 'service',
-        rider_id: null,
-        delivery_address: null,
+        delivery_type: bookingDto.rider_id || bookingDto.interstateCompany ? 'delivery' : 'pickup',
+        rider_id: bookingDto.rider_id || null,
+        delivery_address: bookingDto.delivery_address || null,
         metadata: {
           stream_id: bookingDto.stream_id,
           booking_type: 'service',
@@ -2154,6 +2190,9 @@ export class LiveSalesService {
           location_type: liveService.service.location_type,
           transaction_id: transactionId,
           special_notes: bookingDto.service_notes,
+          ...(bookingDto.interstateCompany ? {
+            interstate_company: bookingDto.interstateCompany,
+          } : {}),
         },
       };
 
@@ -2168,6 +2207,7 @@ export class LiveSalesService {
           scheduled_time: bookingDto.service_time,
           service_notes: bookingDto.service_notes || null,
           product_metadata: {
+            is_service: true,
             description: liveService.service.description,
             duration_minutes: liveService.service.duration_minutes,
             location_type: liveService.service.location_type,
@@ -2177,10 +2217,10 @@ export class LiveSalesService {
       ];
 
       const pEscrow = {
-        total_amount: servicePrice,
+        total_amount: totalAmount,
         vendor_amount: vendorAmount,
-        rider_amount: 0,
-        platform_amount: platformFee,
+        rider_amount: deliveryFee - riderCommission,
+        platform_amount: platformFee + riderCommission,
       };
 
       const pSlot = {
@@ -2198,12 +2238,12 @@ export class LiveSalesService {
         service_date: bookingDto.service_date,
         service_time: bookingDto.service_time,
         service_notes: bookingDto.service_notes || null,
-        total_amount: servicePrice,
-        platform_fee: platformFee,
-        rider_fee: 0,
+        total_amount: totalAmount,
+        platform_fee: pEscrow.platform_amount,
+        rider_fee: pEscrow.rider_amount,
         status: 'pending',
-        rider_id: null,
-        delivery_address: null,
+        rider_id: bookingDto.rider_id || null,
+        delivery_address: bookingDto.delivery_address || null,
         continue_watching: false,
         order_id: null,
       };
@@ -2230,6 +2270,9 @@ export class LiveSalesService {
           p_rewards_amount: 0,
           p_admin_gift_user_id: this.configService.get<string>('PLATFORM_GIFT_WALLET_USER_ID', '00000000-0000-4000-8000-000000000003'),
           p_user_ip: null,
+          // Service bookings now allow the viewer to propose any future time;
+          // the vendor accepts or rejects later, so no hard slot is reserved here.
+          p_skip_slot_booking: true,
         },
       );
 
@@ -2262,7 +2305,7 @@ export class LiveSalesService {
         await this.notificationHelper.notifyVendorNewOrder(stream.vendor_id, {
           id: order.id,
           orderNumber: order.order_number,
-          totalAmount: servicePrice,
+          totalAmount: totalAmount,
           itemCount: 1,
           buyerName: 'Service Customer',
         });
@@ -2281,12 +2324,13 @@ export class LiveSalesService {
       }
 
       // 8. Log analytics
-      await this.logAnalytics(bookingDto.stream_id, 'service_booking', servicePrice, {
+      await this.logAnalytics(bookingDto.stream_id, 'service_booking', totalAmount, {
         customer_id: userId,
         service_id: liveService.service_id,
         booking_date: bookingDto.service_date,
         booking_time: bookingDto.service_time,
         service_price: servicePrice,
+        delivery_fee: deliveryFee,
         booking_type: bookingDto.continue_watching ? 'instant' : 'checkout',
       });
 
@@ -2297,7 +2341,7 @@ export class LiveSalesService {
         userId,
         vendorId: stream.vendor_id,
         serviceId: liveService.service_id,
-        amount: servicePrice,
+        amount: totalAmount,
       });
 
       this.logEvent('log', 'service_booking_completed', {
@@ -2309,7 +2353,7 @@ export class LiveSalesService {
         serviceName: liveService.service.name,
         bookingDate: bookingDto.service_date,
         bookingTime: bookingDto.service_time,
-        amount: servicePrice,
+        amount: totalAmount,
         orderId: order.id,
         orderNumber: order.order_number,
         duration,
@@ -2319,7 +2363,7 @@ export class LiveSalesService {
         id: rpcResult.live_transaction.id,
         stream_id: bookingDto.stream_id,
         transaction_type: TransactionType.SERVICE,
-        total_amount: servicePrice,
+        total_amount: totalAmount,
         status: TransactionStatus.ESCROW,
         service: {
           date: bookingDto.service_date,
@@ -4697,14 +4741,7 @@ export class LiveSalesService {
    */
   async bookPortfolioService(
     userId: string,
-    bookingDto: {
-      stream_id: string;
-      portfolio_id: string;
-      service_date: string;
-      service_time: string;
-      service_notes?: string;
-      giftCard?: { cardNumber: string; pin: string; amount?: number };
-    },
+    bookingDto: LivePortfolioBookingDto,
   ): Promise<TransactionResponse> {
     const startTime = Date.now();
     const bookingId = `portfolio_booking_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -4869,13 +4906,30 @@ export class LiveSalesService {
       const platformFee = servicePrice * platformFeeRate;
       const vendorAmount = servicePrice - platformFee;
 
+      // Calculate delivery fee if rider or interstate logistics company selected.
+      let deliveryFee = 0;
+      if (bookingDto.interstateCompany) {
+        deliveryFee = bookingDto.interstateCompany.deliveryPrice;
+      } else if (bookingDto.rider_id) {
+        const providedDeliveryPrice = bookingDto.deliveryPrice;
+        deliveryFee = providedDeliveryPrice !== undefined && providedDeliveryPrice !== null
+          ? Number(providedDeliveryPrice)
+          : 10.00;
+      }
+
+      const totalAmount = servicePrice + deliveryFee;
+      const riderCommission = (bookingDto.rider_id || bookingDto.interstateCompany) && deliveryFee > 0
+        ? deliveryFee * this.PLATFORM_COMMISSION_RATE
+        : 0;
+
       this.logEvent('log', 'portfolio_booking_calculation', {
         bookingId,
         userId,
         servicePrice,
         platformFee,
         vendorAmount,
-        totalAmount: servicePrice,
+        deliveryFee,
+        totalAmount,
       });
 
       // 5. Wallet balance pre-check
@@ -4889,7 +4943,7 @@ export class LiveSalesService {
         throw new NotFoundException('Customer wallet not found');
       }
 
-      if (customerWallet.available_balance < servicePrice) {
+      if (customerWallet.available_balance < totalAmount) {
         throw new BadRequestException('Insufficient wallet balance for portfolio service booking');
       }
 
@@ -4900,15 +4954,15 @@ export class LiveSalesService {
         order_number: orderNumber,
         buyer_id: userId,
         vendor_id: stream.vendor_id,
-        total_amount: servicePrice,
-        delivery_fee: 0,
+        total_amount: totalAmount,
+        delivery_fee: deliveryFee,
         platform_fee: platformFee,
         status: 'pending',
         escrow_enabled: true,
         source: 'live_stream',
-        delivery_type: 'service',
-        rider_id: null,
-        delivery_address: null,
+        delivery_type: bookingDto.rider_id || bookingDto.interstateCompany ? 'delivery' : 'pickup',
+        rider_id: bookingDto.rider_id || null,
+        delivery_address: bookingDto.delivery_address || null,
         metadata: {
           stream_id: bookingDto.stream_id,
           booking_type: 'portfolio',
@@ -4918,6 +4972,9 @@ export class LiveSalesService {
           booking_time: bookingDto.service_time,
           transaction_id: transactionId,
           service_notes: bookingDto.service_notes,
+          ...(bookingDto.interstateCompany ? {
+            interstate_company: bookingDto.interstateCompany,
+          } : {}),
         },
       };
 
@@ -4932,6 +4989,7 @@ export class LiveSalesService {
           scheduled_time: bookingDto.service_time,
           service_notes: bookingDto.service_notes || null,
           product_metadata: {
+            is_service: true,
             portfolio_id: bookingDto.portfolio_id,
             portfolio_title: portfolioService.title,
             portfolio_category: portfolioService.category,
@@ -4944,10 +5002,10 @@ export class LiveSalesService {
       ];
 
       const pEscrow = {
-        total_amount: servicePrice,
+        total_amount: totalAmount,
         vendor_amount: vendorAmount,
-        rider_amount: 0,
-        platform_amount: platformFee,
+        rider_amount: deliveryFee - riderCommission,
+        platform_amount: platformFee + riderCommission,
       };
 
       const pSlot = {
@@ -4961,16 +5019,18 @@ export class LiveSalesService {
         buyer_id: userId,
         vendor_id: stream.vendor_id,
         transaction_type: 'service',
-        service_id: portfolioService.id,
+        // Portfolio items are not real services(id) rows, so service_id is NULL.
+        // Migration 206 relaxes the valid_product_transaction check to allow this.
+        service_id: null,
         service_date: bookingDto.service_date,
         service_time: bookingDto.service_time,
         service_notes: bookingDto.service_notes || null,
-        total_amount: servicePrice,
-        platform_fee: platformFee,
-        rider_fee: 0,
+        total_amount: totalAmount,
+        platform_fee: pEscrow.platform_amount,
+        rider_fee: pEscrow.rider_amount,
         status: 'pending',
-        rider_id: null,
-        delivery_address: null,
+        rider_id: bookingDto.rider_id || null,
+        delivery_address: bookingDto.delivery_address || null,
         continue_watching: false,
         order_id: null,
       };
@@ -4990,13 +5050,17 @@ export class LiveSalesService {
           p_order: pOrder,
           p_items: pItems,
           p_escrow: pEscrow,
-          p_live_service_id: portfolioService.id,
+          // Portfolio items are not live_stream_services rows and the viewer
+          // proposes the time (vendor accepts/rejects later), so skip slot
+          // reservation entirely for this booking type.
+          p_live_service_id: null,
           p_slot: pSlot,
           p_live_transaction: pLiveTransaction,
           p_gift_card: pGiftCard,
           p_rewards_amount: 0,
           p_admin_gift_user_id: this.configService.get<string>('PLATFORM_GIFT_WALLET_USER_ID', '00000000-0000-4000-8000-000000000003'),
           p_user_ip: null,
+          p_skip_slot_booking: true,
         },
       );
 
@@ -5029,7 +5093,7 @@ export class LiveSalesService {
         await this.notificationHelper.notifyVendorNewOrder(stream.vendor_id, {
           id: order.id,
           orderNumber: order.order_number,
-          totalAmount: servicePrice,
+          totalAmount: totalAmount,
           itemCount: 1,
           buyerName: 'Portfolio Customer',
         });
@@ -5040,7 +5104,8 @@ export class LiveSalesService {
         }, notifyError instanceof Error ? notifyError : new Error(String(notifyError)));
       }
 
-      // Send PIN notifications
+      // Send PIN notifications: pickup PIN flow for self-pickup, rider PIN flow
+      // for delivery, matching the live product purchase notification pattern.
       try {
         const { data: vendorProfile } = await this.supabase
           .from('user_profiles')
@@ -5054,19 +5119,28 @@ export class LiveSalesService {
           .eq('id', userId)
           .single();
 
-        await this.notificationHelper.notifyVendorSelfPickupPin(stream.vendor_id, {
-          id: order.id,
-          orderNumber: order.order_number,
-          deliveryPin: order.delivery_pin,
-          buyerName: buyerProfile?.username || buyerProfile?.display_name || 'Portfolio Customer',
-        });
+        if (pOrder.delivery_type === 'pickup') {
+          await this.notificationHelper.notifyVendorSelfPickupPin(stream.vendor_id, {
+            id: order.id,
+            orderNumber: order.order_number,
+            deliveryPin: order.delivery_pin,
+            buyerName: buyerProfile?.username || buyerProfile?.display_name || 'Portfolio Customer',
+          });
 
-        await this.notificationHelper.notifyBuyerSelfPickupPin(userId, {
-          id: order.id,
-          orderNumber: order.order_number,
-          deliveryPin: order.delivery_pin,
-          vendorName: vendorProfile?.username || vendorProfile?.display_name,
-        });
+          await this.notificationHelper.notifyBuyerSelfPickupPin(userId, {
+            id: order.id,
+            orderNumber: order.order_number,
+            deliveryPin: order.delivery_pin,
+            vendorName: vendorProfile?.username || vendorProfile?.display_name,
+          });
+        } else if (bookingDto.rider_id) {
+          await this.notificationHelper.notifyRiderPickupPin(bookingDto.rider_id, {
+            id: order.id,
+            orderNumber: order.order_number,
+            pickupPin: order.pickup_pin,
+            vendorName: vendorProfile?.username || vendorProfile?.display_name,
+          });
+        }
       } catch (pinNotifyError) {
         this.logEvent('warn', 'portfolio_pin_notification_failed', {
           orderId: order.id,
@@ -5075,12 +5149,13 @@ export class LiveSalesService {
       }
 
       // 7. Log analytics
-      await this.logAnalytics(bookingDto.stream_id, 'portfolio_booking', servicePrice, {
+      await this.logAnalytics(bookingDto.stream_id, 'portfolio_booking', totalAmount, {
         customer_id: userId,
         portfolio_id: bookingDto.portfolio_id,
         booking_date: bookingDto.service_date,
         booking_time: bookingDto.service_time,
         service_price: servicePrice,
+        delivery_fee: deliveryFee,
       });
 
       const duration = Date.now() - startTime;
@@ -5093,7 +5168,7 @@ export class LiveSalesService {
         portfolioTitle: portfolioService.title,
         bookingDate: bookingDto.service_date,
         bookingTime: bookingDto.service_time,
-        amount: servicePrice,
+        amount: totalAmount,
         orderId: order.id,
         orderNumber: order.order_number,
         duration,
@@ -5103,7 +5178,7 @@ export class LiveSalesService {
         id: rpcResult.live_transaction.id,
         stream_id: bookingDto.stream_id,
         transaction_type: TransactionType.SERVICE,
-        total_amount: servicePrice,
+        total_amount: totalAmount,
         status: TransactionStatus.ESCROW,
         service: {
           date: bookingDto.service_date,

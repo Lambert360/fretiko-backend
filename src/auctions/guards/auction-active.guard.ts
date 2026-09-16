@@ -19,7 +19,7 @@ export class AuctionActiveGuard implements CanActivate {
     }
 
     try {
-      const auction = await this.auctionsService.findById(auctionId);
+      const auction = await this.auctionsService.getAuctionForGuard(auctionId);
 
       if (!auction) {
         throw new BadRequestException('Auction not found');

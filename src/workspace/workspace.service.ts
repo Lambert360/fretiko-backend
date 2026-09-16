@@ -2230,23 +2230,16 @@ export class WorkspaceService {
     try {
       console.log(`📅 [SCHEDULE] Fetching orders for date: ${date}, month: ${month}`);
 
-      let startDate: string;
-      let endDate: string;
-
-      if (date) {
-        // Fetch orders for specific date
-        startDate = `${date}T00:00:00.000Z`;
-        endDate = `${date}T23:59:59.999Z`;
-      } else if (month) {
-        // Fetch orders for entire month
-        const [year, monthNum] = month.split('-').map(Number);
-        startDate = new Date(year, monthNum - 1, 1).toISOString();
-        endDate = new Date(year, monthNum, 0, 23, 59, 59, 999).toISOString();
-      } else {
+      if (!date && !month) {
         throw new Error('Either date or month parameter is required');
       }
 
-      // Fetch orders with service items and scheduled dates
+      // Fetch orders with service items and scheduled dates.
+      // NOTE: We deliberately do NOT filter this query by created_at (when the
+      // order was placed) - a service can be booked well in advance of the day
+      // it's actually scheduled for. Instead we filter below by scheduled_date
+      // (when the service is scheduled to happen), which is what this calendar
+      // is meant to represent.
       const { data: orders, error } = await supabaseClient
         .from('orders')
         .select(`
@@ -2278,8 +2271,6 @@ export class WorkspaceService {
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
         .not('status', 'eq.cancelled')
         .not('status', 'eq.rejected')
-        .gte('created_at', startDate)
-        .lte('created_at', endDate)
         .order('created_at', { ascending: false });
 
       if (error) {
@@ -2312,16 +2303,18 @@ export class WorkspaceService {
         });
       }
 
-      // Transform to scheduled order format
+      // Transform to scheduled order format (scheduledDate normalized to YYYY-MM-DD,
+      // since it may come from a plain `date` column or an ISO timestamp in metadata)
       const scheduledOrders = serviceOrders.map(order => {
         const serviceItem = order.order_items?.find(item => item.service_id || item.scheduled_date);
-        
+        const rawScheduledDate = serviceItem?.scheduled_date || order.metadata?.scheduled_date || null;
+
         return {
           id: order.id,
           orderNumber: order.order_number,
           serviceId: serviceItem?.service_id || null,
           serviceName: serviceItem?.product_name || 'Service',
-          scheduledDate: serviceItem?.scheduled_date || order.metadata?.scheduled_date || null,
+          scheduledDate: rawScheduledDate ? rawScheduledDate.split('T')[0] : null,
           scheduledTime: serviceItem?.scheduled_time || order.metadata?.scheduled_time || null,
           status: order.status,
           customerName: buyerProfiles[order.buyer_id]?.username || buyerProfiles[order.buyer_id]?.display_name || 'Unknown Customer',
@@ -2333,16 +2326,24 @@ export class WorkspaceService {
         };
       });
 
+      // Filter down to the requested date/month based on the service's scheduled
+      // date - not when the order was created.
+      const filteredOrders = scheduledOrders.filter(order => {
+        if (!order.scheduledDate) return false;
+        if (date) return order.scheduledDate === date;
+        return order.scheduledDate.startsWith(month!);
+      });
+
       // Sort by scheduled date and time
-      scheduledOrders.sort((a, b) => {
+      filteredOrders.sort((a, b) => {
         if (!a.scheduledDate || !b.scheduledDate) return 0;
         if (a.scheduledDate !== b.scheduledDate) return a.scheduledDate.localeCompare(b.scheduledDate);
         if (!a.scheduledTime || !b.scheduledTime) return 0;
         return a.scheduledTime.localeCompare(b.scheduledTime);
       });
 
-      console.log(`📅 [SCHEDULE] Found ${scheduledOrders.length} scheduled orders`);
-      return scheduledOrders;
+      console.log(`📅 [SCHEDULE] Found ${filteredOrders.length} scheduled orders`);
+      return filteredOrders;
     } catch (error) {
       console.error('Error fetching orders by date:', error);
       throw error;
@@ -2362,10 +2363,12 @@ export class WorkspaceService {
       console.log(`📅 [SCHEDULE] Fetching month summary for: ${month}`);
 
       const [year, monthNum] = month.split('-').map(Number);
-      const startDate = new Date(year, monthNum - 1, 1).toISOString();
-      const endDate = new Date(year, monthNum, 0, 23, 59, 59, 999).toISOString();
 
-      // Fetch all orders for the month
+      // NOTE: We deliberately do NOT filter this query by created_at (when the
+      // order was placed) - a service can be booked well in advance of the day
+      // it's actually scheduled for. We fetch all of this user's active orders
+      // and bucket them below by scheduled_date (when the service is scheduled
+      // to happen), which is what this calendar is meant to represent.
       const { data: orders, error } = await supabaseClient
         .from('orders')
         .select(`
@@ -2381,9 +2384,7 @@ export class WorkspaceService {
         `)
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
         .not('status', 'eq.cancelled')
-        .not('status', 'eq.rejected')
-        .gte('created_at', startDate)
-        .lte('created_at', endDate);
+        .not('status', 'eq.rejected');
 
       if (error) {
         throw new Error(`Failed to fetch month summary: ${error.message}`);

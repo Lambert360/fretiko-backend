@@ -30,6 +30,7 @@ import {
   SendGiftDto,
   LiveProductPurchaseDto,
   LiveServiceBookingDto,
+  LivePortfolioBookingDto,
   JoinStreamDto,
   LeaveStreamDto,
   LiveStreamProductDto,
@@ -579,14 +580,7 @@ export class LiveSalesController {
   @HttpCode(HttpStatus.CREATED)
   async bookPortfolioService(
     @Request() req: any,
-    @Body() bookingData: {
-      stream_id: string;
-      portfolio_id: string;
-      service_date: string;
-      service_time: string;
-      service_notes?: string;
-      giftCard?: { cardNumber: string; pin: string; amount?: number };
-    },
+    @Body() bookingData: LivePortfolioBookingDto,
   ) {
     const userId = req.user?.sub;
     if (!userId) {

@@ -46,6 +46,17 @@ export class UsersController {
     return this.usersService.updateProfile(req.user.sub, updateData, token);
   }
 
+  /**
+   * Sync the current user's device timezone (used to send schedule reminders
+   * - daily digest, hourly reminder - at the correct local time).
+   * Merges into preferences server-side rather than overwriting it.
+   */
+  @Put('timezone')
+  @UseGuards(JwtAuthGuard)
+  async updateTimezone(@Request() req, @Body() body: { timezone: string }) {
+    return this.usersService.updateTimezone(req.user.sub, body.timezone);
+  }
+
   @Post('avatar')
   @UseGuards(JwtAuthGuard)
   @UseInterceptors(FileInterceptor('avatar', {

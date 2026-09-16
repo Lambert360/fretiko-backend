@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
+import { DateTime } from 'luxon';
 
 interface ScheduledOrder {
   id: string;
@@ -23,6 +24,7 @@ interface ScheduledOrder {
 @Injectable()
 export class ScheduleRemindersService {
   private readonly logger = new Logger(ScheduleRemindersService.name);
+  private readonly DEFAULT_TIMEZONE = 'Africa/Lagos';
   private supabase;
 
   constructor(
@@ -32,312 +34,273 @@ export class ScheduleRemindersService {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
 
-  /**
-   * Daily digest reminder - runs at 8 AM daily
-   * Sends vendors a summary of all orders scheduled for today
-   */
-  @Cron('0 8 * * *', {
-    timeZone: 'Africa/Lagos', // Adjust to your timezone
-  })
-  async sendDailyDigest() {
-    this.logger.log('📅 Running daily digest reminder...');
-    
+  private async getVendorTimezone(vendorId: string): Promise<string> {
     try {
-      const today = new Date().toISOString().split('T')[0];
-      const startTime = `${today}T00:00:00.000Z`;
-      const endTime = `${today}T23:59:59.999Z`;
+      const { data, error } = await this.supabase
+        .from('user_profiles')
+        .select('preferences')
+        .eq('id', vendorId)
+        .single();
 
-      // Fetch all service orders scheduled for today
-      const { data: orders, error } = await this.supabase
-        .from('orders')
-        .select(`
-          id,
-          order_number,
-          status,
-          total_amount,
-          buyer_id,
-          vendor_id,
-          delivery_address,
-          metadata,
-          order_items(
-            id,
-            service_id,
-            product_name,
-            scheduled_date,
-            scheduled_time,
-            service_notes
-          )
-        `)
-        .not('status', 'eq.cancelled')
-        .not('status', 'eq.rejected')
-        .gte('created_at', startTime)
-        .lte('created_at', endTime);
+      if (error) throw error;
 
-      if (error) {
-        this.logger.error(`Failed to fetch daily digest orders: ${error.message}`);
-        return;
+      const tz = data?.preferences?.timezone;
+      if (tz && typeof tz === 'string' && tz.length > 0) {
+        return tz;
       }
-
-      if (!orders || orders.length === 0) {
-        this.logger.log('No orders scheduled for today');
-        return;
-      }
-
-      // Filter for service orders with scheduled dates today
-      const todayServiceOrders = orders.filter(order => {
-        const serviceItem = order.order_items?.find(item => item.service_id || item.scheduled_date);
-        const isLiveStreamService = order.source === 'live_stream' && order.metadata?.booking_type === 'service';
-        const scheduledDate = serviceItem?.scheduled_date || order.metadata?.scheduled_date;
-        
-        if (!scheduledDate) return false;
-        return scheduledDate.startsWith(today);
-      });
-
-      this.logger.log(`Found ${todayServiceOrders.length} service orders for today`);
-
-      // Group orders by vendor
-      const ordersByVendor = new Map<string, ScheduledOrder[]>();
-      
-      for (const order of todayServiceOrders) {
-        const serviceItem = order.order_items?.find(item => item.service_id || item.scheduled_date);
-        const isLiveStreamService = order.source === 'live_stream' && order.metadata?.booking_type === 'service';
-        
-        const scheduledOrder: ScheduledOrder = {
-          id: order.id,
-          orderNumber: order.order_number,
-          serviceId: serviceItem?.service_id || null,
-          serviceName: serviceItem?.product_name || 'Service',
-          scheduledDate: serviceItem?.scheduled_date || order.metadata?.scheduled_date || null,
-          scheduledTime: serviceItem?.scheduled_time || order.metadata?.scheduled_time || null,
-          status: order.status,
-          customerName: 'Customer', // Will be populated from profiles
-          customerPhone: undefined,
-          location: order.delivery_address,
-          vendorId: order.vendor_id,
-          buyerId: order.buyer_id,
-          total: order.total_amount,
-        };
-
-        if (!ordersByVendor.has(order.vendor_id)) {
-          ordersByVendor.set(order.vendor_id, []);
-        }
-        ordersByVendor.get(order.vendor_id)?.push(scheduledOrder);
-      }
-
-      // Fetch buyer profiles and enrich orders
-      const buyerIds = [...new Set(todayServiceOrders.map(o => o.buyer_id).filter(Boolean))];
-      const buyerProfiles: Record<string, any> = {};
-      
-      if (buyerIds.length > 0) {
-        const { data: profiles } = await this.supabase
-          .from('user_profiles')
-          .select('id, username, display_name, phone')
-          .in('id', buyerIds);
-        
-        profiles?.forEach(p => {
-          buyerProfiles[p.id] = p;
-        });
-      }
-
-      // Enrich orders with customer names
-      ordersByVendor.forEach((orders, vendorId) => {
-        orders.forEach(order => {
-          order.customerName = buyerProfiles[order.buyerId]?.username || 
-                               buyerProfiles[order.buyerId]?.display_name || 
-                               'Customer';
-          order.customerPhone = buyerProfiles[order.buyerId]?.phone || undefined;
-        });
-      });
-
-      // Send daily digest to each vendor
-      for (const [vendorId, vendorOrders] of ordersByVendor) {
-        try {
-          await this.notificationHelper.notifyVendorDailyDigest(vendorId, vendorOrders);
-          this.logger.log(`✅ Sent daily digest to vendor ${vendorId} (${vendorOrders.length} orders)`);
-          
-          // Create reminder records
-          for (const order of vendorOrders) {
-            await this.createReminderRecord(order, 'daily_digest', vendorId, order.buyerId);
-          }
-        } catch (notifyError) {
-          this.logger.error(`Failed to send daily digest to vendor ${vendorId}:`, notifyError);
-        }
-      }
-
-      this.logger.log(`✅ Daily digest complete: ${ordersByVendor.size} vendors notified`);
     } catch (error) {
-      this.logger.error('Error in daily digest:', error);
+      this.logger.warn(`Could not load timezone for vendor ${vendorId}: ${error instanceof Error ? error.message : error}`);
     }
+    return this.DEFAULT_TIMEZONE;
   }
 
   /**
-   * Hourly reminder - runs every hour
-   * Sends reminders 1 hour before scheduled service time
+   * Recompute a reminder's trigger time in a vendor's *current* timezone.
+   * Vendors' timezone can change (e.g. they travel) between when an order
+   * was accepted (when the reminder row was first created) and when the
+   * reminder is actually due, so we can't trust a timezone baked in at
+   * creation time - we have to re-derive it from the local wall-clock
+   * scheduledDate/scheduledTime every time.
    */
-  @Cron('0 * * * *')
-  async sendHourlyReminders() {
-    this.logger.log('⏰ Running hourly reminder check...');
-    
-    try {
-      const now = new Date();
-      const oneHourLater = new Date(now.getTime() + 60 * 60 * 1000);
-      const oneHourLaterISO = oneHourLater.toISOString();
-      const oneHourFromNow = oneHourLaterISO.slice(0, 16); // YYYY-MM-DDTHH:MM
-
-      // Fetch service orders scheduled 1 hour from now
-      const { data: orders, error } = await this.supabase
-        .from('orders')
-        .select(`
-          id,
-          order_number,
-          status,
-          total_amount,
-          buyer_id,
-          vendor_id,
-          delivery_address,
-          metadata,
-          order_items(
-            id,
-            service_id,
-            product_name,
-            scheduled_date,
-            scheduled_time,
-            service_notes
-          )
-        `)
-        .not('status', 'eq.cancelled')
-        .not('status', 'eq.rejected')
-        .in('status', ['pending', 'processing', 'ready_for_pickup']);
-
-      if (error) {
-        this.logger.error(`Failed to fetch hourly reminder orders: ${error.message}`);
-        return;
-      }
-
-      if (!orders || orders.length === 0) {
-        this.logger.log('No orders for hourly reminder check');
-        return;
-      }
-
-      // Filter for orders scheduled 1 hour from now
-      const upcomingOrders = orders.filter(order => {
-        const serviceItem = order.order_items?.find(item => item.service_id || item.scheduled_date);
-        const isLiveStreamService = order.source === 'live_stream' && order.metadata?.booking_type === 'service';
-        const scheduledDate = serviceItem?.scheduled_date || order.metadata?.scheduled_date;
-        const scheduledTime = serviceItem?.scheduled_time || order.metadata?.scheduled_time;
-        
-        if (!scheduledDate || !scheduledTime) return false;
-        
-        const scheduledDateTime = `${scheduledDate}T${scheduledTime}`;
-        const scheduledHour = scheduledDateTime.slice(0, 16); // YYYY-MM-DDTHH:MM
-        
-        // Check if scheduled time is within 1 hour from now
-        const scheduledDateObj = new Date(scheduledDateTime);
-        const timeDiff = scheduledDateObj.getTime() - now.getTime();
-        const isWithinOneHour = timeDiff > 0 && timeDiff <= 60 * 60 * 1000;
-        const isExactHour = scheduledHour === oneHourFromNow;
-        
-        return isWithinOneHour || isExactHour;
-      });
-
-      this.logger.log(`Found ${upcomingOrders.length} orders for hourly reminder`);
-
-      // Fetch buyer profiles
-      const buyerIds = [...new Set(upcomingOrders.map(o => o.buyer_id).filter(Boolean))];
-      const buyerProfiles: Record<string, any> = {};
-      
-      if (buyerIds.length > 0) {
-        const { data: profiles } = await this.supabase
-          .from('user_profiles')
-          .select('id, username, display_name, phone')
-          .in('id', buyerIds);
-        
-        profiles?.forEach(p => {
-          buyerProfiles[p.id] = p;
-        });
-      }
-
-      // Send hourly reminders
-      for (const order of upcomingOrders) {
-        const serviceItem = order.order_items?.find(item => item.service_id || item.scheduled_date);
-        const isLiveStreamService = order.source === 'live_stream' && order.metadata?.booking_type === 'service';
-        
-        const scheduledOrder: ScheduledOrder = {
-          id: order.id,
-          orderNumber: order.order_number,
-          serviceId: serviceItem?.service_id || null,
-          serviceName: serviceItem?.product_name || 'Service',
-          scheduledDate: serviceItem?.scheduled_date || order.metadata?.scheduled_date || null,
-          scheduledTime: serviceItem?.scheduled_time || order.metadata?.scheduled_time || null,
-          status: order.status,
-          customerName: buyerProfiles[order.buyerId]?.username || 
-                       buyerProfiles[order.buyerId]?.display_name || 
-                       'Customer',
-          customerPhone: buyerProfiles[order.buyerId]?.phone || undefined,
-          location: order.delivery_address,
-          vendorId: order.vendor_id,
-          buyerId: order.buyer_id,
-          total: order.total_amount,
-        };
-
-        try {
-          // Notify vendor
-          await this.notificationHelper.notifyVendorHourlyReminder(order.vendorId, scheduledOrder);
-          this.logger.log(`✅ Sent hourly reminder to vendor for order ${order.orderNumber}`);
-          
-          // Notify buyer
-          await this.notificationHelper.notifyBuyerHourlyReminder(order.buyerId, scheduledOrder);
-          this.logger.log(`✅ Sent hourly reminder to buyer for order ${order.orderNumber}`);
-          
-          // Create reminder record
-          await this.createReminderRecord(scheduledOrder, 'hourly_reminder', order.vendor_id, order.buyerId);
-        } catch (notifyError) {
-          this.logger.error(`Failed to send hourly reminder for order ${order.orderNumber}:`, notifyError);
-        }
-      }
-
-      this.logger.log(`✅ Hourly reminders complete: ${upcomingOrders.length} orders processed`);
-    } catch (error) {
-      this.logger.error('Error in hourly reminders:', error);
-    }
-  }
-
-  /**
-   * Create a reminder record in the database
-   */
-  private async createReminderRecord(
-    order: ScheduledOrder,
+  private computeTriggerTime(
     reminderType: 'daily_digest' | 'hourly_reminder',
-    vendorId: string,
-    buyerId: string,
-  ): Promise<void> {
-    try {
-      const scheduledFor = reminderType === 'daily_digest' 
-        ? `${order.scheduledDate}T08:00:00Z`
-        : new Date(`${order.scheduledDate}T${order.scheduledTime}`).toISOString();
+    scheduledDate: string,
+    scheduledTime: string,
+    timezone: string,
+  ): DateTime | null {
+    const scheduledDateTime = DateTime.fromISO(`${scheduledDate}T${scheduledTime}`, { zone: timezone });
+    if (!scheduledDateTime.isValid) return null;
 
-      const { error } = await this.supabase
+    return reminderType === 'daily_digest'
+      ? scheduledDateTime.startOf('day').set({ hour: 8 })
+      : scheduledDateTime.minus({ hours: 1 });
+  }
+
+  /**
+   * Re-sync any not-yet-due reminders' `scheduled_for` against each
+   * vendor's *current* timezone, so a vendor who travels before their
+   * appointment still gets reminders at the right new local time instead
+   * of the time that was correct when they accepted the order.
+   */
+  private async resyncPendingReminderTimes(): Promise<void> {
+    const nowIso = new Date().toISOString();
+
+    const { data: upcoming, error } = await this.supabase
+      .from('schedule_reminders')
+      .select('id, vendor_id, reminder_type, scheduled_for, metadata')
+      .eq('status', 'pending')
+      .gt('scheduled_for', nowIso);
+
+    if (error) {
+      this.logger.error(`Failed to fetch upcoming reminders for timezone resync: ${error.message}`);
+      return;
+    }
+
+    if (!upcoming || upcoming.length === 0) return;
+
+    const vendorIds = [...new Set<string>(upcoming.map(r => r.vendor_id))];
+    const vendorTimezones = new Map<string, string>();
+    await Promise.all(vendorIds.map(async vendorId => {
+      vendorTimezones.set(vendorId, await this.getVendorTimezone(vendorId));
+    }));
+
+    for (const reminder of upcoming) {
+      const scheduledDate = reminder.metadata?.scheduledDate;
+      const scheduledTime = reminder.metadata?.scheduledTime;
+      if (!scheduledDate || !scheduledTime) continue;
+
+      const timezone = vendorTimezones.get(reminder.vendor_id) || this.DEFAULT_TIMEZONE;
+      const recomputed = this.computeTriggerTime(
+        reminder.reminder_type,
+        scheduledDate,
+        scheduledTime,
+        timezone,
+      );
+      if (!recomputed) continue;
+
+      const existing = DateTime.fromISO(reminder.scheduled_for);
+      // Only write back if the recomputed time actually moved (i.e. the
+      // vendor's timezone changed) - avoids a pointless write every minute.
+      if (Math.abs(recomputed.toUTC().diff(existing.toUTC()).as('seconds')) > 60) {
+        const { error: updateError } = await this.supabase
+          .from('schedule_reminders')
+          .update({ scheduled_for: recomputed.toUTC().toISO() })
+          .eq('id', reminder.id);
+
+        if (updateError) {
+          this.logger.error(`Failed to resync reminder ${reminder.id} to new timezone: ${updateError.message}`);
+        } else {
+          this.logger.log(`🌍 Resynced reminder ${reminder.id} to vendor's current timezone (${timezone})`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Process all pending reminders that are due
+   * Runs every minute so each vendor gets their notification at the right local time
+   */
+  @Cron(CronExpression.EVERY_MINUTE)
+  async processScheduledReminders() {
+    this.logger.log('⏰ Running scheduled reminders check...');
+
+    try {
+      await this.resyncPendingReminderTimes();
+
+      const now = new Date().toISOString();
+
+      const { data: reminders, error } = await this.supabase
         .from('schedule_reminders')
-        .insert({
-          order_id: order.id,
-          vendor_id: vendorId,
-          buyer_id: buyerId,
-          reminder_type: reminderType,
-          scheduled_for: scheduledFor,
-          status: 'pending',
-          metadata: {
-            orderNumber: order.orderNumber,
-            serviceName: order.serviceName,
-            scheduledDate: order.scheduledDate,
-            scheduledTime: order.scheduledTime,
-          },
-        });
+        .select('id, order_id, vendor_id, buyer_id, reminder_type, scheduled_for, metadata')
+        .eq('status', 'pending')
+        .lte('scheduled_for', now);
 
       if (error) {
-        this.logger.error(`Failed to create reminder record for order ${order.id}:`, error);
+        this.logger.error(`Failed to fetch scheduled reminders: ${error.message}`);
+        return;
       }
+
+      if (!reminders || reminders.length === 0) {
+        this.logger.log('No pending reminders due');
+        return;
+      }
+
+      const orderIds = [...new Set(reminders.map(r => r.order_id))];
+
+      const { data: orders, error: ordersError } = await this.supabase
+        .from('orders')
+        .select(`
+          id,
+          order_number,
+          status,
+          total_amount,
+          buyer_id,
+          vendor_id,
+          delivery_address,
+          source,
+          metadata,
+          order_items(
+            id,
+            service_id,
+            product_name,
+            scheduled_date,
+            scheduled_time,
+            service_notes
+          )
+        `)
+        .in('id', orderIds);
+
+      if (ordersError) {
+        this.logger.error(`Failed to fetch orders for reminders: ${ordersError.message}`);
+        return;
+      }
+
+      const buyerIds = [...new Set((orders || []).map(o => o.buyer_id).filter(Boolean))];
+      const buyerProfiles: Record<string, any> = {};
+
+      if (buyerIds.length > 0) {
+        const { data: profiles } = await this.supabase
+          .from('user_profiles')
+          .select('id, username, display_name, phone')
+          .in('id', buyerIds);
+
+        profiles?.forEach(p => {
+          buyerProfiles[p.id] = p;
+        });
+      }
+
+      const orderMap = new Map<string, ScheduledOrder>();
+      for (const order of orders || []) {
+        const serviceItem = order.order_items?.find(item => item.service_id || item.scheduled_date);
+        const rawScheduledDate = serviceItem?.scheduled_date || order.metadata?.scheduled_date || null;
+        const rawScheduledTime = serviceItem?.scheduled_time || order.metadata?.scheduled_time || null;
+
+        if (!rawScheduledDate) continue;
+
+        orderMap.set(order.id, {
+          id: order.id,
+          orderNumber: order.order_number,
+          serviceId: serviceItem?.service_id || null,
+          serviceName: serviceItem?.product_name || 'Service',
+          scheduledDate: rawScheduledDate.split('T')[0],
+          scheduledTime: rawScheduledTime,
+          status: order.status,
+          customerName: buyerProfiles[order.buyer_id]?.username || buyerProfiles[order.buyer_id]?.display_name || 'Unknown Customer',
+          customerPhone: buyerProfiles[order.buyer_id]?.phone || undefined,
+          location: order.delivery_address,
+          vendorId: order.vendor_id,
+          buyerId: order.buyer_id,
+          total: order.total_amount,
+        });
+      }
+
+      const dailyGroups = new Map<string, { vendorId: string; orders: ScheduledOrder[]; ids: string[] }>();
+      const sentIds: string[] = [];
+      const failedIds: string[] = [];
+
+      for (const reminder of reminders) {
+        const scheduledOrder = orderMap.get(reminder.order_id);
+        if (!scheduledOrder) {
+          failedIds.push(reminder.id);
+          continue;
+        }
+
+        if (reminder.reminder_type === 'daily_digest') {
+          const key = `${reminder.vendor_id}:${scheduledOrder.scheduledDate}`;
+          const group: { vendorId: string; orders: ScheduledOrder[]; ids: string[] } =
+            dailyGroups.get(key) || { vendorId: reminder.vendor_id, orders: [], ids: [] };
+          group.orders.push(scheduledOrder);
+          group.ids.push(reminder.id);
+          dailyGroups.set(key, group);
+        } else if (reminder.reminder_type === 'hourly_reminder') {
+          try {
+            await this.notificationHelper.notifyVendorHourlyReminder(reminder.vendor_id, scheduledOrder);
+            await this.notificationHelper.notifyBuyerHourlyReminder(reminder.buyer_id, scheduledOrder);
+            this.logger.log(`✅ Sent hourly reminder for order ${scheduledOrder.orderNumber}`);
+            sentIds.push(reminder.id);
+          } catch (error) {
+            this.logger.error(`Failed to send hourly reminder for order ${scheduledOrder.orderNumber}:`, error);
+            failedIds.push(reminder.id);
+          }
+        }
+      }
+
+      for (const group of dailyGroups.values()) {
+        try {
+          await this.notificationHelper.notifyVendorDailyDigest(group.vendorId, group.orders);
+          this.logger.log(`✅ Sent daily digest to vendor ${group.vendorId} (${group.orders.length} orders)`);
+          sentIds.push(...group.ids);
+        } catch (error) {
+          this.logger.error(`Failed to send daily digest to vendor ${group.vendorId}:`, error);
+          failedIds.push(...group.ids);
+        }
+      }
+
+      if (sentIds.length > 0) {
+        const { error: updateError } = await this.supabase
+          .from('schedule_reminders')
+          .update({ status: 'sent', sent_at: new Date().toISOString() })
+          .in('id', sentIds);
+
+        if (updateError) {
+          this.logger.error(`Failed to mark reminders as sent: ${updateError.message}`);
+        }
+      }
+
+      if (failedIds.length > 0) {
+        const { error: updateError } = await this.supabase
+          .from('schedule_reminders')
+          .update({ status: 'failed' })
+          .in('id', failedIds);
+
+        if (updateError) {
+          this.logger.error(`Failed to mark reminders as failed: ${updateError.message}`);
+        }
+      }
+
+      this.logger.log(`✅ Reminder processing complete: ${sentIds.length} sent, ${failedIds.length} failed`);
     } catch (error) {
-      this.logger.error('Error creating reminder record:', error);
+      this.logger.error('Error in scheduled reminders:', error);
     }
   }
 
@@ -347,10 +310,9 @@ export class ScheduleRemindersService {
    */
   async createRemindersForAcceptedOrder(orderId: string): Promise<void> {
     try {
-      // Fetch order details
       const { data: order } = await this.supabase
         .from('orders')
-        .select('id, order_number, vendor_id, buyer_id, created_at, metadata')
+        .select('id, order_number, vendor_id, buyer_id, created_at, source, metadata')
         .eq('id', orderId)
         .single();
 
@@ -359,7 +321,6 @@ export class ScheduleRemindersService {
         return;
       }
 
-      // Fetch service item to get scheduled date/time
       const { data: orderItems } = await this.supabase
         .from('order_items')
         .select('scheduled_date, scheduled_time, service_id, product_name')
@@ -367,7 +328,7 @@ export class ScheduleRemindersService {
 
       const serviceItem = orderItems?.find(item => item.service_id || item.scheduled_date);
       const isLiveStreamService = order.source === 'live_stream' && order.metadata?.booking_type === 'service';
-      
+
       if (!serviceItem && !isLiveStreamService) {
         this.logger.log(`Order ${orderId} is not a service order, skipping reminder creation`);
         return;
@@ -381,48 +342,63 @@ export class ScheduleRemindersService {
         return;
       }
 
-      // Calculate reminder times
-      const dailyDigestTime = `${scheduledDate}T08:00:00Z`;
-      const scheduledDateTime = new Date(`${scheduledDate}T${scheduledTime}`);
-      const hourlyReminderTime = new Date(scheduledDateTime.getTime() - 60 * 60 * 1000).toISOString();
+      const vendorTimezone = await this.getVendorTimezone(order.vendor_id);
 
-      // Create daily digest reminder
-      await this.supabase
-        .from('schedule_reminders')
-        .insert({
-          order_id: order.id,
-          vendor_id: order.vendor_id,
-          buyer_id: order.buyer_id,
-          reminder_type: 'daily_digest',
-          scheduled_for: dailyDigestTime,
-          status: 'pending',
-          metadata: {
-            orderNumber: order.order_number,
-            serviceName: serviceItem?.product_name || 'Service',
-            scheduledDate,
-            scheduledTime,
-          },
-        });
+      const dailyDigestTime = this.computeTriggerTime('daily_digest', scheduledDate, scheduledTime, vendorTimezone);
+      const hourlyReminderTime = this.computeTriggerTime('hourly_reminder', scheduledDate, scheduledTime, vendorTimezone);
 
-      // Create hourly reminder
-      await this.supabase
-        .from('schedule_reminders')
-        .insert({
-          order_id: order.id,
-          vendor_id: order.vendor_id,
-          buyer_id: order.buyer_id,
-          reminder_type: 'hourly_reminder',
-          scheduled_for: hourlyReminderTime,
-          status: 'pending',
-          metadata: {
-            orderNumber: order.order_number,
-            serviceName: serviceItem?.product_name || 'Service',
-            scheduledDate,
-            scheduledTime,
-          },
-        });
+      if (!dailyDigestTime || !hourlyReminderTime) {
+        this.logger.warn(`Order ${orderId} has invalid scheduled date/time in ${vendorTimezone}: ${scheduledDate}T${scheduledTime}`);
+        return;
+      }
 
-      this.logger.log(`✅ Created reminders for accepted order ${order.orderNumber}`);
+      // NOTE: scheduled_for is re-synced every minute against the vendor's
+      // *current* timezone (see resyncPendingReminderTimes) in case they
+      // travel between now and when the reminder is due, so this initial
+      // computation only needs to be correct as of right now.
+      const now = DateTime.now().toUTC();
+
+      const serviceName = serviceItem?.product_name || 'Service';
+
+      if (dailyDigestTime > now) {
+        await this.supabase
+          .from('schedule_reminders')
+          .insert({
+            order_id: order.id,
+            vendor_id: order.vendor_id,
+            buyer_id: order.buyer_id,
+            reminder_type: 'daily_digest',
+            scheduled_for: dailyDigestTime.toISO(),
+            status: 'pending',
+            metadata: {
+              orderNumber: order.order_number,
+              serviceName,
+              scheduledDate,
+              scheduledTime,
+            },
+          });
+      }
+
+      if (hourlyReminderTime > now) {
+        await this.supabase
+          .from('schedule_reminders')
+          .insert({
+            order_id: order.id,
+            vendor_id: order.vendor_id,
+            buyer_id: order.buyer_id,
+            reminder_type: 'hourly_reminder',
+            scheduled_for: hourlyReminderTime.toISO(),
+            status: 'pending',
+            metadata: {
+              orderNumber: order.order_number,
+              serviceName,
+              scheduledDate,
+              scheduledTime,
+            },
+          });
+      }
+
+      this.logger.log(`✅ Created reminders for accepted order ${order.order_number} in ${vendorTimezone} (daily: ${dailyDigestTime.toISO()}, hourly: ${hourlyReminderTime.toISO()})`);
     } catch (error) {
       this.logger.error(`Error creating reminders for order ${orderId}:`, error);
     }

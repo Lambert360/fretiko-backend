@@ -33,123 +33,18 @@ export class AuctionPaymentService {
    * NEW: Creates a pending sale record instead of processing payment immediately
    * Payment will be processed when winner completes checkout
    */
+  /**
+   * DEPRECATED: Timed auction end now creates sale records inside end_auction_atomic.
+   * Left as a no-op for compatibility. Safe to remove after live testing.
+   */
   async processWinningBidPayment(auctionId: string): Promise<{ success: boolean; message: string }> {
-    try {
-      // Get auction details
-      const { data: auction, error: auctionError } = await this.supabase
-        .from('auctions')
-        .select('*')
-        .eq('id', auctionId)
-        .single();
-
-      if (auctionError || !auction) {
-        return { success: false, message: 'Auction not found' };
-      }
-
-      if (!auction.winner_id || !auction.winning_bid) {
-        return { success: false, message: 'No winner to process payment for' };
-      }
-
-      // Check if already processed
-      const { data: existingSale } = await this.supabase
-        .from('auction_sales')
-        .select('payment_status')
-        .eq('auction_id', auctionId)
-        .single();
-
-      if (existingSale?.payment_status === 'completed') {
-        return { success: true, message: 'Payment already processed' };
-      }
-
-      // Check if order already exists for this auction (prevent duplicate)
-      const { data: existingOrder } = await this.supabase
-        .from('orders')
-        .select('id, status, order_number')
-        .eq('source', 'auction')
-        .eq('metadata->>auction_id', auctionId)
-        .single();
-
-      if (existingOrder) {
-        console.log(`Order already exists for auction ${auctionId}: ${existingOrder.order_number}`);
-        // Update auction_sales to link to existing order if not already linked
-        if (existingSale && !existingSale.payment_transaction_id) {
-          await this.supabase
-            .from('auction_sales')
-            .update({
-              payment_status: existingOrder.status === 'paid' ? 'completed' : 'pending',
-              payment_transaction_id: existingOrder.id,
-            })
-            .eq('auction_id', auctionId);
-        }
-        return { success: true, message: 'Order already exists for this auction' };
-      }
-
-      // Calculate amounts
-      const commissionAmount = auction.winning_bid * (auction.commission_rate / 100);
-
-      console.log(`📋 Creating pending sale for auction ${auctionId} - Winner must complete checkout`);
-
-      // Create/update auction sale record with PENDING status (not completed)
-      // This allows the winner to go through checkout to provide delivery details
-      const { data: saleData, error: saleError } = await this.supabase
-        .from('auction_sales')
-        .upsert({
-          auction_id: auctionId,
-          seller_id: auction.seller_id,
-          buyer_id: auction.winner_id,
-          final_bid_amount: auction.winning_bid,
-          commission_amount: commissionAmount,
-          total_amount: auction.winning_bid,
-          payment_status: 'pending', // PENDING - will be completed after checkout
-          payment_transaction_id: null, // Will be set when order is created during checkout
-        })
-        .select()
-        .single();
-
-      if (saleError) {
-        console.error('Error creating pending sale record:', saleError);
-        return { success: false, message: 'Failed to create sale record' };
-      }
-
-      // Notify buyer that they won and need to complete checkout
-      try {
-        await this.notificationHelper.notifyOrderCreated(auction.winner_id, {
-          id: null, // No order yet
-          order_number: null,
-          total_amount: auction.winning_bid,
-        });
-
-        console.log(`✅ Buyer ${auction.winner_id} notified to complete checkout for auction win`);
-      } catch (notifyError) {
-        console.error('⚠️  Failed to notify buyer (non-critical):', notifyError);
-      }
-
-      // Notify seller that auction sold (but payment pending)
-      try {
-        await this.notificationHelper.notifyVendorNewOrder(auction.seller_id, {
-          id: null, // No order yet
-          orderNumber: null,
-          totalAmount: auction.winning_bid,
-          itemCount: 1,
-          buyerName: 'Auction Winner',
-        });
-
-        console.log(`✅ Seller ${auction.seller_id} notified of auction sale (awaiting checkout)`);
-      } catch (notifyError) {
-        console.error('⚠️  Failed to notify seller (non-critical):', notifyError);
-      }
-
-      console.log(`✅ Auction ${auctionId} - Pending sale created. Winner must complete checkout.`);
-      return { success: true, message: 'Pending sale created - winner must complete checkout' };
-
-    } catch (error) {
-      console.error('Error creating pending sale:', error);
-      return { success: false, message: 'Failed to create pending sale' };
-    }
+    console.log(`[DEPRECATED] processWinningBidPayment called for auction ${auctionId} - no action taken`);
+    return { success: true, message: 'Deprecated - sale records are created by end_auction_atomic' };
   }
 
   /**
-   * Process commission payment to platform
+   * DEPRECATED: Commission is now transferred to the platform wallet inside release_escrow_atomic.
+   * Left as a read-only no-op for compatibility. Safe to remove after live testing.
    */
   async processCommissionPayment(auctionId: string): Promise<{ success: boolean; amount: number }> {
     try {
@@ -157,19 +52,17 @@ export class AuctionPaymentService {
         .from('auction_sales')
         .select('commission_amount, payment_status')
         .eq('auction_id', auctionId)
-        .single();
+        .maybeSingle();
 
       if (!sale || sale.payment_status !== 'completed') {
         return { success: false, amount: 0 };
       }
 
-      // TODO: Transfer commission to platform wallet
-      // This would integrate with your existing wallet system
-
+      console.log(`[DEPRECATED] processCommissionPayment called for auction ${auctionId} - no separate transfer; commission already moved via escrow release`);
       return { success: true, amount: sale.commission_amount };
 
-    } catch (error) {
-      console.error('Error processing commission payment:', error);
+    } catch (error: any) {
+      console.error('Error reading auction sale for commission:', error);
       return { success: false, amount: 0 };
     }
   }

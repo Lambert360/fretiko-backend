@@ -343,135 +343,51 @@ export class AuctionSchedulerService {
 
   /**
    * End an individual auction
+   * All state transitions and sale/win creation now happen inside the
+   * end_auction_atomic Postgres function to avoid the stale-winner race.
    */
   private async endAuction(auction: any) {
     try {
-      let newStatus = 'ended';
-      let eventMessage = 'Auction has ended.';
-
-      // Check if auction has bids, reserve price is met, AND minimum 2 unique bidders
-      if (auction.current_bid > 0) {
-        const reserveMet = !auction.reserve_price || auction.current_bid >= auction.reserve_price;
-        const hasMinimumBidders = (auction.unique_bidders || 0) >= 2;
-
-        if (reserveMet && hasMinimumBidders) {
-          newStatus = 'sold';
-          eventMessage = `Auction sold! Winning bid: ${auction.current_bid} Freti`;
-
-          // Create sale record
-          await this.supabase
-            .from('auction_sales')
-            .insert({
-              auction_id: auction.id,
-              seller_id: auction.seller_id,
-              buyer_id: auction.winner_id,
-              final_bid_amount: auction.current_bid,
-              commission_amount: auction.current_bid * (auction.commission_rate / 100), // Use auction's commission_rate
-              total_amount: auction.current_bid,
-              payment_status: 'pending',
-            });
-
-          // Save win to user_auction_wins (for timed auctions, no item_id)
-          if (auction.winner_id) {
-            try {
-              // Check if win already exists (prevent duplicates)
-              const { data: existingWin } = await this.supabase
-                .from('user_auction_wins')
-                .select('id')
-                .eq('user_id', auction.winner_id)
-                .eq('auction_id', auction.id)
-                .is('item_id', null)
-                .maybeSingle();
-
-              if (!existingWin) {
-                // Insert new win (unique indexes will prevent duplicates)
-                await this.supabase
-                  .from('user_auction_wins')
-                  .insert({
-                    user_id: auction.winner_id,
-                    auction_id: auction.id,
-                    item_id: null, // Timed auctions have no item_id
-                    winning_bid: auction.current_bid,
-                    status: 'pending_checkout',
-                    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), // 7 days
-                  });
-              }
-            } catch (error) {
-              console.error(`Failed to save auction win for auction ${auction.id}:`, error);
-              // Don't throw - win saving failure shouldn't block the auction end
-            }
-          }
-        } else {
-          if (!reserveMet) {
-          eventMessage = `Auction ended. Reserve price not met.`;
-          } else if (!hasMinimumBidders) {
-            eventMessage = `Auction ended. Minimum 2 bidders required (only ${auction.unique_bidders || 0} bidder(s) participated).`;
-          }
-        }
-      }
-
-      // Update auction status
-      const { error } = await this.supabase
-        .from('auctions')
-        .update({
-          status: newStatus,
-          winning_bid: auction.current_bid,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', auction.id);
+      const { data: result, error } = await this.supabase
+        .rpc('end_auction_atomic', {
+          p_auction_id: auction.id,
+        });
 
       if (error) {
         console.error(`Error ending auction ${auction.id}:`, error);
         return;
       }
 
-      // Log auction end event
-      await this.supabase
-        .from('auction_events')
-        .insert({
-          auction_id: auction.id,
-          event_type: newStatus === 'sold' ? 'sold' : 'auction_ended',
-          event_data: {
-            final_bid: auction.current_bid,
-            winner_id: auction.winner_id,
-            reserve_met: newStatus === 'sold',
-          },
-          auctioneer_message: eventMessage,
-        });
+      if (!result || !result.success) {
+        console.warn(`end_auction_atomic returned failure for ${auction.id}:`, result?.error || 'Unknown error');
+        return;
+      }
+
+      const newStatus = result.new_status;
+      const eventMessage = result.message;
+      const finalBid = result.winning_bid;
+      const winnerId = result.winner_id;
+      const sellerId = result.seller_id;
 
       // Broadcast auction end
       await this.auctionGateway.broadcastAuctionStatusChange(auction.id, newStatus, {
         message: eventMessage,
-        final_bid: auction.current_bid,
-        winner_id: auction.winner_id,
-        seller_id: auction.seller_id,
+        final_bid: finalBid,
+        winner_id: winnerId,
+        seller_id: sellerId,
       });
 
       // Send notifications if auction was sold
-      if (newStatus === 'sold' && auction.winner_id) {
+      if (newStatus === 'sold' && winnerId) {
         try {
-          // Notify winner
-          await this.sendWinnerNotification(auction.id, auction.winner_id, auction.title, auction.current_bid);
-
-          // Notify seller
-          await this.sendSellerNotification(auction.id, auction.seller_id, auction.title, auction.current_bid);
+          await this.sendWinnerNotification(auction.id, winnerId, auction.title, finalBid);
+          await this.sendSellerNotification(auction.id, sellerId, auction.title, finalBid);
         } catch (error) {
           console.error(`Failed to send auction end notifications for ${auction.id}:`, error);
         }
       }
 
-      // Process payment if auction was sold
-      if (newStatus === 'sold') {
-        try {
-          const paymentResult = await this.auctionPaymentService.processWinningBidPayment(auction.id);
-          console.log(`Payment processing for auction ${auction.id}:`, paymentResult.message);
-        } catch (error) {
-          console.error(`Failed to process payment for auction ${auction.id}:`, error);
-        }
-      }
-
       console.log(`Ended auction: ${auction.id} with status: ${newStatus}`);
-
     } catch (error) {
       console.error(`Error ending auction ${auction.id}:`, error);
     }

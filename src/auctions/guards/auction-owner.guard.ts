@@ -20,18 +20,21 @@ export class AuctionOwnerGuard implements CanActivate {
     }
 
     try {
-      const auction = await this.auctionsService.findById(auctionId);
+      const sellerId = await this.auctionsService.getAuctionSellerId(auctionId);
 
-      if (!auction) {
+      if (!sellerId) {
         throw new ForbiddenException('Auction not found');
       }
 
-      if (auction.seller_id !== user.sub) {
+      if (sellerId !== user.sub) {
         throw new ForbiddenException('You can only modify your own auctions');
       }
 
       return true;
     } catch (error) {
+      if (error instanceof ForbiddenException) {
+        throw error;
+      }
       throw new ForbiddenException('Access denied');
     }
   }

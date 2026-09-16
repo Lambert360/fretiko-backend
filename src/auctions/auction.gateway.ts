@@ -37,7 +37,7 @@ import { AuctionsService } from './auctions.service';
 })
 export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
-  server: Server;
+  server!: Server;
 
   private readonly logger = new Logger(AuctionGateway.name);
 
@@ -297,29 +297,31 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   @UseGuards(JwtAuthGuard)
   async handlePlaceBid(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { auction_id: string; amount: number; bid_type?: string },
+    @MessageBody() data: { auction_id: string; amount: number; bid_type?: 'manual' | 'proxy'; max_bid_amount?: number },
   ) {
-    try {
-      // This would integrate with the auctions service
-      // For now, just emit to the room
-      const roomName = `auction_${data.auction_id}`;
+    const user = (client as any).user;
+    if (!user?.sub) {
+      client.emit('bid_error', {
+        auction_id: data.auction_id,
+        message: 'Authentication required to place a bid',
+      });
+      return;
+    }
 
-      // Broadcast new bid to all room members
-      this.server.to(roomName).emit('new_bid', {
+    try {
+      const bid = await this.auctionsService.placeBid(user.sub, {
         auction_id: data.auction_id,
         amount: data.amount,
-        bidder_display_id: 'Bidder #42', // Would come from service
-        timestamp: new Date().toISOString(),
-        is_winning: true,
+        bid_type: data.bid_type || 'manual',
+        max_bid_amount: data.max_bid_amount,
       });
 
-      // Send personal confirmation to bidder
       client.emit('bid_confirmed', {
         auction_id: data.auction_id,
-        amount: data.amount,
-        status: 'winning',
+        amount: bid.amount,
+        bidder_display_id: bid.bidder_display_id,
+        status: bid.is_winning ? 'winning' : 'outbid',
       });
-
     } catch (error) {
       this.logger.error(`Failed to place bid in auction ${data.auction_id}`, {
         clientId: client.id,
@@ -329,7 +331,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       });
       client.emit('bid_error', {
         auction_id: data.auction_id,
-        message: 'Failed to place bid. Please check your connection and try again.',
+        message: error instanceof Error ? error.message : 'Failed to place bid. Please check your connection and try again.',
       });
     }
   }
@@ -364,11 +366,15 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   async broadcastBidUpdate(auctionId: string, bidData: any) {
     const roomName = `auction_${auctionId}`;
 
-    this.server.to(roomName).emit('new_bid', {
+    const payload = {
       auction_id: auctionId,
       ...bidData,
       timestamp: new Date().toISOString(),
-    });
+    };
+
+    // Emit under both names for mobile/client compatibility
+    this.server.to(roomName).emit('new_bid', payload);
+    this.server.to(roomName).emit('bid_placed', payload);
   }
 
   /**
@@ -571,18 +577,19 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
    * Handle reaction from viewer
    */
   @SubscribeMessage('send_reaction')
+  @UseGuards(JwtAuthGuard)
   async handleSendReaction(
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { auction_id: string; reaction_type: string },
   ) {
-    try {
-      const connection = this.activeConnections.get(client.id);
-      if (!connection || !connection.userId) {
-        client.emit('error', { message: 'User not authenticated' });
-        return;
-      }
+    const user = (client as any).user;
+    if (!user?.sub) {
+      client.emit('error', { message: 'User not authenticated' });
+      return;
+    }
 
-      const userId = connection.userId;
+    try {
+      const userId = user.sub;
       const reactionType = data.reaction_type;
 
       const validReactionTypes = ['heart', 'thumbs_up', 'applause', 'fire'];

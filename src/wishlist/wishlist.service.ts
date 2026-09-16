@@ -44,6 +44,7 @@ export class WishlistService {
         products (
           name,
           price,
+          quantity,
           images,
           primary_image_url,
           status,
@@ -85,7 +86,7 @@ export class WishlistService {
         sellerName: item.products?.user_profiles?.username || item.products?.user_profiles?.display_name || 'Unknown Seller',
         category: item.products?.product_categories?.name || 'Uncategorized',
         createdAt: item.created_at,
-        isAvailable: item.products?.status === 'active',
+        isAvailable: item.products?.status === 'active' && (item.products?.quantity || 0) > 0,
         productDeleted: item.products === null
       })) || [];
   }
@@ -1068,28 +1069,25 @@ export class WishlistService {
       }
     });
 
-    // If no connections or chats, return empty array
-    if (connectedUserIds.size === 0) {
-      return [];
-    }
-
-    // Build query to get connected/chatting users
+    // Build query to get users to share with
     let query = client
       .from('user_profiles')
       .select('id, username, avatar_url')
-      .in('id', Array.from(connectedUserIds));
+      .neq('id', userId)
+      .order('username', { ascending: true });
 
-    // Add search filter if provided
     if (searchQuery && searchQuery.trim()) {
+      // When searching, allow any verified user by username
       query = query.ilike('username', `%${searchQuery.trim()}%`);
+    } else {
+      // No search: only show connected/following users or active chats
+      if (connectedUserIds.size === 0) {
+        return [];
+      }
+      query = query.in('id', Array.from(connectedUserIds));
     }
 
-    // Add limit and order
-    query = query
-      .order('username', { ascending: true })
-      .limit(limit);
-
-    const { data: users, error } = await query;
+    const { data: users, error } = await query.limit(limit);
 
     if (error) {
       console.error('Search users query error:', error);

@@ -219,21 +219,15 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
           // Regular viewer disconnecting
           await this.liveSalesService.leaveStream(userInfo.streamId, userInfo.userId);
           
-          // Send updated viewer count after disconnect
-          let roomSize = this.streamViewerCounts.get(userInfo.streamId)?.size || 0;
-          
-          // Try to use adapter if available (more accurate)
-          if (this.server?.sockets?.adapter?.rooms) {
-            const adapterRoomSize = this.server.sockets.adapter.rooms.get(`stream:${userInfo.streamId}`)?.size || 0;
-            roomSize = adapterRoomSize;
-          }
+          // Send updated viewer count after disconnect (vendors excluded)
+          const roomSize = this.streamViewerCounts.get(userInfo.streamId)?.size || 0;
 
           // Emit to both stream viewers AND vendor/broadcaster
-          this.server.to(`stream:${userInfo.streamId}`).emit('viewer_count_update', {
+          this.server.to(`stream:${userInfo.streamId}`).emit('view_count_updated', {
             streamId: userInfo.streamId,
             count: roomSize,
           });
-          await this.emitToVendorByStreamId(userInfo.streamId, 'viewer_count_update', {
+          await this.emitToVendorByStreamId(userInfo.streamId, 'view_count_updated', {
             streamId: userInfo.streamId,
             count: roomSize,
           });
@@ -365,47 +359,42 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       userInfo.streamId = data.streamId;
       this.connectedUsers.set(client.id, userInfo);
 
-      // Add to fallback viewer tracking
-      if (!this.streamViewerCounts.has(data.streamId)) {
-        this.streamViewerCounts.set(data.streamId, new Set());
+      // Track viewer joins (vendors are not viewers)
+      if (userInfo.role !== 'vendor') {
+        // Add to fallback viewer tracking
+        if (!this.streamViewerCounts.has(data.streamId)) {
+          this.streamViewerCounts.set(data.streamId, new Set());
+        }
+        this.streamViewerCounts.get(data.streamId)!.add(userInfo.userId);
+
+        // Update database
+        await this.liveSalesService.joinStream(data.streamId, userInfo.userId, userInfo.accessToken);
+
+        // Track analytics event
+        await this.analyticsService.recordAnalyticsEvent({
+          streamId: data.streamId,
+          userId: userInfo.userId,
+          eventType: 'viewer_join',
+          metadata: { timestamp: new Date().toISOString() },
+        });
+
+        // Notify others in the stream
+        client.to(`stream:${data.streamId}`).emit('viewer_joined', {
+          userId: userInfo.userId,
+          timestamp: new Date().toISOString(),
+        });
       }
-      this.streamViewerCounts.get(data.streamId)!.add(userInfo.userId);
 
-      // Update database
-      await this.liveSalesService.joinStream(data.streamId, userInfo.userId, userInfo.accessToken);
-
-      // Track analytics event
-      await this.analyticsService.recordAnalyticsEvent({
-        streamId: data.streamId,
-        userId: userInfo.userId,
-        eventType: 'viewer_join',
-        metadata: { timestamp: new Date().toISOString() },
-      });
-
-      // Notify others in the stream
-      client.to(`stream:${data.streamId}`).emit('viewer_joined', {
-        userId: userInfo.userId,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Calculate viewer count using fallback Map
-      let roomSize = this.streamViewerCounts.get(data.streamId)?.size || 0;
-      
-      // Try to use adapter if available (more accurate)
-      if (this.server?.sockets?.adapter?.rooms) {
-        const adapterRoomSize = this.server.sockets.adapter.rooms.get(`stream:${data.streamId}`)?.size || 0;
-        this.logger.log(`📊 Room size - Adapter: ${adapterRoomSize}, Fallback: ${roomSize}`);
-        roomSize = adapterRoomSize; // Prefer adapter if available
-      } else {
-        this.logger.log(`📊 Using fallback viewer count: ${roomSize}`);
-      }
+      // Calculate viewer count (vendors excluded)
+      const roomSize = this.streamViewerCounts.get(data.streamId)?.size || 0;
+      this.logger.log(`📊 Viewer count for stream ${data.streamId}: ${roomSize}`);
 
       // Emit to both stream viewers AND vendor/broadcaster
-      this.server.to(`stream:${data.streamId}`).emit('viewer_count_update', {
+      this.server.to(`stream:${data.streamId}`).emit('view_count_updated', {
         streamId: data.streamId,
         count: roomSize,
       });
-      await this.emitToVendorByStreamId(data.streamId, 'viewer_count_update', {
+      await this.emitToVendorByStreamId(data.streamId, 'view_count_updated', {
         streamId: data.streamId,
         count: roomSize,
       });
@@ -502,24 +491,16 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
         }
       }
 
-      // Calculate viewer count using fallback Map
-      let roomSize = this.streamViewerCounts.get(data.streamId)?.size || 0;
-      
-      // Try to use adapter if available (more accurate)
-      if (this.server?.sockets?.adapter?.rooms) {
-        const adapterRoomSize = this.server.sockets.adapter.rooms.get(`stream:${data.streamId}`)?.size || 0;
-        this.logger.log(`📊 Room size after leave - Adapter: ${adapterRoomSize}, Fallback: ${roomSize}`);
-        roomSize = adapterRoomSize; // Prefer adapter if available
-      } else {
-        this.logger.log(`📊 Using fallback viewer count after leave: ${roomSize}`);
-      }
+      // Calculate viewer count (vendors excluded)
+      const roomSize = this.streamViewerCounts.get(data.streamId)?.size || 0;
+      this.logger.log(`📊 Viewer count after leave for stream ${data.streamId}: ${roomSize}`);
 
       // Emit to both stream viewers AND vendor/broadcaster
-      this.server.to(`stream:${data.streamId}`).emit('viewer_count_update', {
+      this.server.to(`stream:${data.streamId}`).emit('view_count_updated', {
         streamId: data.streamId,
         count: roomSize,
       });
-      await this.emitToVendorByStreamId(data.streamId, 'viewer_count_update', {
+      await this.emitToVendorByStreamId(data.streamId, 'view_count_updated', {
         streamId: data.streamId,
         count: roomSize,
       });

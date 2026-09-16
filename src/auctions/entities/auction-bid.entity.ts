@@ -8,6 +8,9 @@ export interface AuctionBid {
   auction_id: string;
   bidder_id: string;
 
+  // Live multi-item bid attribution (null for timed auctions)
+  item_id?: string;
+
   // Bid Details
   amount: number;
   bid_type: 'manual' | 'proxy' | 'auto';

@@ -830,4 +830,54 @@ export class UsersService {
       latestAppeal,
     };
   }
+
+  /**
+   * Update the current user's IANA timezone (e.g. "Africa/Lagos", "America/New_York").
+   * Merges into the existing `preferences` JSONB column instead of overwriting it,
+   * since `preferences` also holds unrelated flags (isSuspended, isVendor, fullName, etc.)
+   * managed elsewhere (see admin.service.ts).
+   */
+  async updateTimezone(userId: string, timezone: string): Promise<{ timezone: string }> {
+    if (!timezone || typeof timezone !== 'string' || timezone.length > 100) {
+      throw new BadRequestException('A valid timezone is required');
+    }
+
+    // Validate it's a real IANA timezone identifier
+    try {
+      Intl.DateTimeFormat(undefined, { timeZone: timezone });
+    } catch {
+      throw new BadRequestException(`Invalid timezone: ${timezone}`);
+    }
+
+    const { data: profile, error: fetchError } = await this.serviceSupabase
+      .from('user_profiles')
+      .select('preferences')
+      .eq('id', userId)
+      .single();
+
+    if (fetchError) {
+      throw new Error(`Failed to load profile for timezone update: ${fetchError.message}`);
+    }
+
+    // No-op if unchanged, to avoid an unnecessary write on every app open
+    if (profile?.preferences?.timezone === timezone) {
+      return { timezone };
+    }
+
+    const updatedPreferences = {
+      ...(profile?.preferences || {}),
+      timezone,
+    };
+
+    const { error: updateError } = await this.serviceSupabase
+      .from('user_profiles')
+      .update({ preferences: updatedPreferences, updated_at: new Date().toISOString() })
+      .eq('id', userId);
+
+    if (updateError) {
+      throw new Error(`Failed to update timezone: ${updateError.message}`);
+    }
+
+    return { timezone };
+  }
 }

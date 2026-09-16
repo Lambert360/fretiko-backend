@@ -11,13 +11,16 @@ import {
   Request,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { Public } from '../auth/public.decorator';
 import { WishlistService } from './wishlist.service';
 
+@UseGuards(JwtAuthGuard)
 @Controller('wishlist')
 export class WishlistController {
   constructor(private readonly wishlistService: WishlistService) {}
 
   // Public endpoint: Get shared wishlist for deep linking (no auth required)
+  @Public()
   @Get('public/:ownerId')
   async getPublicWishlist(@Param('ownerId') ownerId: string) {
     console.log('💖 Getting public wishlist for owner:', ownerId);
@@ -37,6 +40,7 @@ export class WishlistController {
     return this.wishlistService.getWishlistCount(req.user.sub, req.supabaseToken);
   }
 
+  @UseGuards(JwtAuthGuard)
   @Post()
   async addToWishlist(@Request() req, @Body() wishlistData: { 
     productId: string; 
@@ -60,6 +64,7 @@ export class WishlistController {
     return this.wishlistService.clearWishlist(req.user.sub, req.supabaseToken);
   }
 
+  @UseGuards(JwtAuthGuard)
   @Get('check/:productId')
   async checkIsInWishlist(@Request() req, @Param('productId') productId: string) {
     console.log('💖 Checking if product is in wishlist:', productId);

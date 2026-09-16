@@ -616,13 +616,14 @@ export class EscrowService {
     try {
       this.logger.log('🕐 Checking for escrows ready for auto-release...');
 
-      // Find escrows ready for auto-release
+      // Find escrows ready for auto-release (exclude auction orders - they need delivery confirmation)
       const { data: escrows, error } = await this.supabase
         .from('escrows')
-        .select('id, auto_release_at')
+        .select('id, auto_release_at, order_id, orders!inner(source)')
         .eq('status', 'held')
         .not('auto_release_at', 'is', null)
-        .lte('auto_release_at', new Date().toISOString());
+        .lte('auto_release_at', new Date().toISOString())
+        .neq('orders.source', 'auction');
 
       if (error) {
         this.logger.error('Failed to fetch escrows for auto-release:', error);

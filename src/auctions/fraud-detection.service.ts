@@ -197,13 +197,8 @@ export class AuctionFraudDetectionService {
         );
       }
 
-      // Update auction status to flagged (if not already ended)
-      await this.supabase
-        .from('auctions')
-        .update({ 
-          metadata: this.supabase.raw(`metadata || '{"fraud_flagged": true}'::jsonb`),
-        })
-        .eq('id', auctionId);
+      // Auction-level flag is intentionally NOT written to a non-existent metadata column.
+      // The risk_flags record above is the source of truth for auction fraud.
 
       // Send notification to admin/support staff
       try {
