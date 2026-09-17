@@ -2,71 +2,47 @@
   "feeds": {
     "science_technology": [
       {
-        "name": "TechCrunch",
-        "url": "https://techcrunch.com/feed/",
-        "category": "Technology",
+        "name": "TechCabal",
+        "url": "https://techcabal.com/feed",
+        "category": "African Technology",
         "active": true
       },
       {
-        "name": "MIT Technology Review",
-        "url": "https://www.technologyreview.com/feed/",
-        "category": "Science & Technology",
+        "name": "Technext24",
+        "url": "https://technext24.com/feed/",
+        "category": "African Technology",
         "active": true
       },
       {
-        "name": "Wired",
-        "url": "https://www.wired.com/feed/rss",
-        "category": "Technology",
+        "name": "Disrupt Africa",
+        "url": "https://disrupt-africa.com/feed/",
+        "category": "African Technology",
         "active": true
       },
       {
-        "name": "The Verge",
-        "url": "https://www.theverge.com/rss/index.xml",
-        "category": "Technology",
-        "active": true
-      },
-      {
-        "name": "ScienceDaily",
-        "url": "https://www.sciencedaily.com/rss/all.xml",
-        "category": "Science",
-        "active": true
-      },
-      {
-        "name": "Ars Technica",
-        "url": "https://feeds.arstechnica.com/arstechnica/index",
-        "category": "Technology",
+        "name": "IT News Africa",
+        "url": "https://itnewsafrica.com/feed/",
+        "category": "African Technology",
         "active": true
       }
     ],
     "ai": [
       {
-        "name": "OpenAI Blog",
-        "url": "https://openai.com/blog/rss.xml",
-        "category": "AI",
+        "name": "TechCabal",
+        "url": "https://techcabal.com/feed",
+        "category": "African Technology",
         "active": true
       },
       {
-        "name": "MIT News - Artificial Intelligence",
-        "url": "https://news.mit.edu/topic/mitartificial-intelligence2-rss.xml",
-        "category": "AI",
+        "name": "Technext24",
+        "url": "https://technext24.com/feed/",
+        "category": "African Technology",
         "active": true
       },
       {
-        "name": "AI News",
-        "url": "https://www.artificialintelligence-news.com/feed/",
-        "category": "AI",
-        "active": true
-      },
-      {
-        "name": "VentureBeat AI",
-        "url": "https://venturebeat.com/category/ai/feed/",
-        "category": "AI",
-        "active": true
-      },
-      {
-        "name": "Google AI Blog",
-        "url": "https://blog.google/technology/ai/rss/",
-        "category": "AI",
+        "name": "Disrupt Africa",
+        "url": "https://disrupt-africa.com/feed/",
+        "category": "African Technology",
         "active": true
       }
     ],
@@ -105,33 +81,27 @@
     ],
     "gadgets": [
       {
-        "name": "Engadget",
-        "url": "https://www.engadget.com/rss.xml",
-        "category": "Gadgets",
+        "name": "WeeTracker",
+        "url": "https://weetracker.com/feed/",
+        "category": "African Technology",
         "active": true
       },
       {
-        "name": "Gizmodo",
-        "url": "https://gizmodo.com/rss",
-        "category": "Gadgets",
+        "name": "Nairametrics Tech",
+        "url": "https://nairametrics.com/category/tech-news/feed/",
+        "category": "African Technology",
         "active": true
       },
       {
-        "name": "CNET",
-        "url": "https://www.cnet.com/rss/news/",
-        "category": "Gadgets",
+        "name": "IT News Africa",
+        "url": "https://itnewsafrica.com/feed/",
+        "category": "African Technology",
         "active": true
       },
       {
-        "name": "Android Authority",
-        "url": "https://www.androidauthority.com/feed/",
-        "category": "Gadgets",
-        "active": true
-      },
-      {
-        "name": "TechRadar",
-        "url": "https://www.techradar.com/rss",
-        "category": "Gadgets",
+        "name": "TechCabal",
+        "url": "https://techcabal.com/feed",
+        "category": "African Technology",
         "active": true
       }
     ],
@@ -341,24 +311,6 @@
         "url": "https://www.skysports.com/rss/12040",
         "category": "Football",
         "active": true
-      },
-      {
-        "name": "ESPN NBA",
-        "url": "https://www.espn.com/espn/rss/nba/news",
-        "category": "Basketball",
-        "active": true
-      },
-      {
-        "name": "CBS Sports NBA",
-        "url": "https://www.cbssports.com/rss/headlines/nba/",
-        "category": "Basketball",
-        "active": true
-      },
-      {
-        "name": "BBC Sport",
-        "url": "http://feeds.bbci.co.uk/sport/rss.xml",
-        "category": "Sports",
-        "active": true
       }
     ],
     "business_entrepreneurship": [
@@ -389,59 +341,81 @@
     ],
     "culture_entertainment": [
       {
-        "name": "NotJustOk",
-        "url": "https://notjustok.com/feed/",
-        "category": "Music",
+        "name": "Legit.ng Entertainment",
+        "url": "https://www.legit.ng/rss/entertainment.rss",
+        "category": "Culture",
         "active": true
       },
       {
         "name": "BellaNaija",
         "url": "https://www.bellanaija.com/feed/",
-        "category": "Entertainment",
+        "category": "Culture",
+        "active": true
+      }
+    ],
+    "afrobeats_music": [
+      {
+        "name": "NotJustOk",
+        "url": "https://notjustok.com/feed/",
+        "category": "Afrobeats",
         "active": true
       },
       {
-        "name": "Rolling Stone Music",
-        "url": "https://www.rollingstone.com/music/music-news/feed/",
-        "category": "Music",
+        "name": "The Native Mag",
+        "url": "https://thenativemag.com/feed/",
+        "category": "Afrobeats",
         "active": true
       },
       {
-        "name": "Pitchfork",
-        "url": "https://pitchfork.com/rss/news/",
-        "category": "Music",
+        "name": "BellaNaija",
+        "url": "https://www.bellanaija.com/feed/",
+        "category": "Afrobeats",
+        "active": true
+      }
+    ],
+    "nollywood": [
+      {
+        "name": "Kemi Filani Movies",
+        "url": "https://kemifilani.com/category/movies/feed",
+        "category": "Nollywood",
         "active": true
       },
       {
-        "name": "Billboard",
-        "url": "https://www.billboard.com/feed/",
-        "category": "Music",
+        "name": "Nollyrated",
+        "url": "https://nollyrated.com/feed/",
+        "category": "Nollywood",
         "active": true
       }
     ],
     "food_travel": [
       {
-        "name": "Cond\u00e9 Nast Traveler",
-        "url": "https://www.cntraveler.com/feed/rss",
-        "category": "Travel",
+        "name": "9jafoodie",
+        "url": "https://www.9jafoodie.com/feed",
+        "category": "Nigerian Food",
         "active": true
       },
       {
-        "name": "Eater",
-        "url": "https://www.eater.com/rss/index.xml",
-        "category": "Food",
+        "name": "All Nigerian Foods",
+        "url": "https://www.allnigerianfoods.com/feed",
+        "category": "Nigerian Food",
         "active": true
       },
       {
-        "name": "Bon Appetit",
-        "url": "https://www.bonappetit.com/feed/rss",
-        "category": "Food",
+        "name": "Dobby's Signature",
+        "url": "https://www.dobbyssignature.com/feed",
+        "category": "Nigerian Food",
         "active": true
       },
       {
-        "name": "The Kitchn",
-        "url": "https://www.thekitchn.com/main.rss",
-        "category": "Food",
+        "name": "Kitchen Butterfly",
+        "url": "https://www.kitchenbutterfly.com/feed",
+        "category": "Nigerian Food",
+        "active": true
+      },
+      {
+        "name": "Chef Lola's Kitchen",
+        "url": "https://cheflolaskitchen.com/feed",
+        "category": "Nigerian Food",
         "active": true
       }
     ],
@@ -517,6 +491,8 @@
       "sports",
       "business_entrepreneurship",
       "culture_entertainment",
+      "afrobeats_music",
+      "nollywood",
       "food_travel",
       "health_fitness",
       "education_career"

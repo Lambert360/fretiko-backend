@@ -46,7 +46,8 @@ const englishFemale = ['Grace Williams', 'Patience Edwards', 'Mercy Johnson', 'B
 
 const niches = [
   'science_technology', 'ai', 'space', 'gadgets', 'fashion_lifestyle', 'nature_environment', 'animals_wildlife',
-  'nigeria_news', 'sports', 'business_entrepreneurship', 'culture_entertainment', 'food_travel', 'health_fitness', 'education_career',
+  'nigeria_news', 'sports', 'business_entrepreneurship', 'culture_entertainment', 'afrobeats_music', 'nollywood',
+  'food_travel', 'health_fitness', 'education_career',
 ];
 
 const CONTENT_BOT_COUNT = 200;
