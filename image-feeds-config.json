@@ -1,23 +1,17 @@
 {
   "niches": {
-    "science_technology": {
-      "search_terms": [
-        "technology",
-        "computer science",
-        "electronics",
-        "coding setup",
-        "innovation lab"
-      ],
-      "captions": [
-        "this is giving future \u2728",
-        "the setup we're all manifesting \ud83d\udcbb",
-        "okay but this is actually so cool",
-        "tech that hits different \ud83d\udd0b",
-        "living for this energy",
-        "we're so back",
-        "not me staring at this for 10 minutes"
-      ]
-    },
+  "science_technology": {
+    "search_terms": ["african startup office", "lagos tech hub", "african tech conference", "african developer coding", "innovation hub africa"],
+    "captions": ["this is giving future ✨", "naija tech scene is not playing", "okay but this is actually so cool", "african tech that hits different 🔋", "living for this energy", "we're so back", "not me staring at this for 10 minutes"]
+  },
+  "ai": {
+    "search_terms": ["african startup office", "lagos tech hub", "african developer coding", "digital art abstract", "innovation hub africa"],
+    "captions": ["the future is loading... 🤖", "africa building the future rn", "this is what tomorrow looks like", "no thoughts just vibes and algorithms", "this hit different at 2am"]
+  },
+  "gadgets": {
+    "search_terms": ["african startup office", "smartphone africa", "gadget flatlay", "african tech conference", "innovation hub africa"],
+    "captions": ["adding this to cart rn 🛒", "the aesthetic is unmatched", "why is this so satisfying to look at", "naija tech flatlay of the day", "need this in my life immediately"]
+  },
     "ai": {
       "search_terms": [
         "artificial intelligence",
@@ -187,6 +181,40 @@
         "afrobeats to the world \ud83c\udf0d",
         "had to share this moment",
         "the rhythm got everybody"
+      ]
+    },
+    "afrobeats_music": {
+      "search_terms": [
+        "afrobeat performance",
+        "nigerian music concert",
+        "african dj set",
+        "afrobeats artist portrait",
+        "live music stage africa"
+      ],
+      "captions": [
+        "afrobeats to the world \ud83c\udf0d",
+        "this beat is a whole mood",
+        "the sound of the streets",
+        "naija music no dey rest",
+        "vibes on repeat \ud83c\udfa7",
+        "the culture sound different"
+      ]
+    },
+    "nollywood": {
+      "search_terms": [
+        "nollywood film set",
+        "nigerian movie premiere",
+        "african cinema",
+        "nollywood actor portrait",
+        "movie theatre africa"
+      ],
+      "captions": [
+        "nollywood dey do the most \ud83c\udfac",
+        "this storyline got me",
+        "our movies keep getting better",
+        "cinema night was worth it",
+        "the industry is growing fast",
+        "naija films to the world"
       ]
     },
     "food_travel": {
