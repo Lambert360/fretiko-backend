@@ -113,14 +113,35 @@ export class PostsService {
   }
 
   // Upload media to Supabase storage
-  async uploadMedia(userId: string, file: Express.Multer.File): Promise<{ url: string; path: string; thumbnailUrl?: string }> {
+  async uploadMedia(
+    userId: string,
+    file: Express.Multer.File,
+    options?: { filterId?: string; filterIntensity?: number },
+  ): Promise<{ url: string; path: string; thumbnailUrl?: string }> {
     try {
+      let fileBuffer = file.buffer;
+
+      // If a filter is specified and this is a video, apply the filter server-side
+      if (options?.filterId && options.filterId !== 'none' && file.mimetype?.startsWith('video/')) {
+        try {
+          fileBuffer = await this.applyVideoFilter(
+            file.buffer,
+            options.filterId,
+            options.filterIntensity ?? 100,
+          );
+          console.log(`✅ Video filter "${options.filterId}" applied successfully`);
+        } catch (filterError) {
+          console.error('⚠️ Video filter baking failed, uploading original:', filterError);
+          // Fall back to original video if filter baking fails
+        }
+      }
+
       const fileExt = file.originalname.split('.').pop() || 'jpg';
       const fileName = `${userId}/posts/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
-      
+
       const { data, error } = await this.supabase.storage
         .from('posts-media')
-        .upload(fileName, file.buffer, {
+        .upload(fileName, fileBuffer, {
           contentType: file.mimetype,
           cacheControl: '3600',
           upsert: false,
@@ -138,7 +159,7 @@ export class PostsService {
       // Generate a JPG thumbnail for videos at the 1-second mark
       let thumbnailUrl: string | undefined;
       if (file.mimetype?.startsWith('video/')) {
-        thumbnailUrl = await this.generateVideoThumbnail(file.buffer, userId);
+        thumbnailUrl = await this.generateVideoThumbnail(fileBuffer, userId);
       }
 
       return {
@@ -149,6 +170,79 @@ export class PostsService {
     } catch (error) {
       console.error('Media upload error:', error);
       throw error;
+    }
+  }
+
+  // Apply a color filter to a video using FFmpeg
+  private async applyVideoFilter(
+    videoBuffer: Buffer,
+    filterId: string,
+    intensity: number,
+  ): Promise<Buffer> {
+    const tempDir = os.tmpdir();
+    const timestamp = Date.now();
+    const inputPath = path.join(tempDir, `filter-input-${timestamp}.mp4`);
+    const outputPath = path.join(tempDir, `filter-output-${timestamp}.mp4`);
+
+    try {
+      // Write input video
+      fs.writeFileSync(inputPath, videoBuffer);
+
+      // Build FFmpeg filter chain based on filter ID
+      const filterChain = this.buildFFmpegFilterChain(filterId, intensity);
+      const ffmpegCommand = `ffmpeg -i "${inputPath}" -vf "${filterChain}" -c:a copy -y "${outputPath}"`;
+
+      console.log(`🎬 Applying video filter: ffmpeg -vf "${filterChain}"`);
+      await execAsync(ffmpegCommand, { timeout: 60000 }); // 60s timeout
+
+      if (!fs.existsSync(outputPath)) {
+        throw new Error('FFmpeg did not produce output file');
+      }
+
+      const filteredBuffer = fs.readFileSync(outputPath);
+      return filteredBuffer;
+    } finally {
+      // Cleanup temp files
+      try { fs.unlinkSync(inputPath); } catch {}
+      try { fs.unlinkSync(outputPath); } catch {}
+    }
+  }
+
+  // Build FFmpeg filter chain for a given filter ID
+  private buildFFmpegFilterChain(filterId: string, intensity: number): string {
+    const t = intensity / 100; // normalized 0-1
+
+    switch (filterId) {
+      case 'vivid':
+        return `eq=saturation=${1 + 0.35 * t}:contrast=${1 + 0.15 * t}:brightness=${0.05 * t}`;
+      case 'warm':
+        return `eq=saturation=${1 + 0.1 * t}:brightness=${0.05 * t},colorbalance=rs=${0.15 * t}:bs=${-0.15 * t}`;
+      case 'cool':
+        return `eq=saturation=${1 + 0.1 * t}:contrast=${1 + 0.05 * t},colorbalance=rs=${-0.15 * t}:bs=${0.15 * t}`;
+      case 'vintage':
+        return `eq=saturation=${1 - 0.2 * t}:contrast=${1 - 0.1 * t},colorbalance=rs=${0.1 * t}:gs=${0.05 * t},curves=preset=vintage,vignette=PI*${0.3 * t}`;
+      case 'bw':
+        return `hue=s=0,eq=contrast=${1 + 0.2 * t}`;
+      case 'sepia':
+        return `colorchannelmixer=0.393:0.769:0.189:0:0.349:0.686:0.168:0:0.272:0.534:0.131:0,eq=saturation=${1 - 0.6 * t}`;
+      case 'fade':
+        return `eq=saturation=${1 - 0.15 * t}:contrast=${1 - 0.15 * t}:brightness=${0.05 * t},curves=all='0/${0.15 * t}+0.85'`;
+      case 'drama':
+        return `eq=contrast=${1 + 0.4 * t}:saturation=${1 + 0.2 * t}:brightness=${-0.05 * t},vignette=PI*${0.4 * t}`;
+      case 'mono':
+        return `hue=s=0,eq=contrast=${1 + 0.35 * t}:brightness=${-0.05 * t}`;
+      case 'noir':
+        return `hue=s=0,eq=contrast=${1 + 0.5 * t}:brightness=${-0.1 * t},vignette=PI*${0.5 * t}`;
+      case 'chrome':
+        return `eq=saturation=${1 + 0.15 * t}:contrast=${1 + 0.25 * t}:brightness=${0.1 * t}`;
+      case 'golden':
+        return `eq=saturation=${1 + 0.25 * t}:brightness=${0.1 * t}:contrast=${1 + 0.1 * t},colorbalance=rs=${0.15 * t}:gs=${0.05 * t},vignette=PI*${0.15 * t}`;
+      case 'ocean':
+        return `eq=saturation=${1 + 0.2 * t}:contrast=${1 + 0.15 * t},colorbalance=bs=${0.15 * t}:gs=${0.05 * t}`;
+      case 'sunset':
+        return `eq=saturation=${1 + 0.3 * t}:contrast=${1 + 0.1 * t},colorbalance=rs=${0.2 * t}:gs=${0.05 * t},vignette=PI*${0.2 * t}`;
+      default:
+        return 'null'; // no filter
     }
   }
 

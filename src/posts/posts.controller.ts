@@ -60,13 +60,28 @@ export class PostsController {
           type: 'string',
           format: 'binary',
         },
+        filterId: {
+          type: 'string',
+          description: 'Optional filter ID to apply to video (server-side baking)',
+        },
+        filterIntensity: {
+          type: 'number',
+          description: 'Filter intensity 0-100 (default: 100)',
+        },
       },
     },
   })
   @ApiResponse({ status: HttpStatus.CREATED, description: 'Media uploaded successfully' })
-  async uploadMedia(@UploadedFile() file: Express.Multer.File, @Request() req) {
-    console.log('📤 uploadMedia called:', { userId: req.user.id, fileName: file?.originalname, size: file?.size });
-    const result = await this.postsService.uploadMedia(req.user.id, file);
+  async uploadMedia(
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: { filterId?: string; filterIntensity?: number },
+    @Request() req,
+  ) {
+    console.log('📤 uploadMedia called:', { userId: req.user.id, fileName: file?.originalname, size: file?.size, filterId: body.filterId });
+    const result = await this.postsService.uploadMedia(req.user.id, file, {
+      filterId: body.filterId,
+      filterIntensity: body.filterIntensity,
+    });
     return {
       success: true,
       data: result,
