@@ -137,4 +137,8 @@ export class AuthResponse {
   refreshToken: string;
   isSuspended?: boolean; // Industry standard: allow suspended users to authenticate
   requiresEmailVerification?: boolean; // New flag for email verification requirement
+  mfaRequired?: boolean; // True when password was correct but a verified TOTP factor still needs a code
+  mfaFactorId?: string; // Factor to challenge, only set when mfaRequired is true
+  supabaseAccessToken?: string; // Short-lived, only used to complete /auth/mfa/login-verify
+  supabaseRefreshToken?: string; // Short-lived, only used to complete /auth/mfa/login-verify
 }
