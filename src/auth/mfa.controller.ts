@@ -1,7 +1,8 @@
-import { Controller, Post, Body, UseGuards } from '@nestjs/common';
+import { Controller, Post, Body, Req, UseGuards, UnauthorizedException } from '@nestjs/common';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { MfaService } from './mfa.service';
 import { JwtAuthGuard } from './jwt-auth.guard';
+import type { RequestWithUser } from '../shared/types';
 import type { MfaSessionDto, MfaVerifyDto, MfaUnenrollDto } from './dto/mfa.dto';
 
 /**
@@ -15,6 +16,24 @@ import type { MfaSessionDto, MfaVerifyDto, MfaUnenrollDto } from './dto/mfa.dto'
 @UseGuards(JwtAuthGuard)
 export class MfaController {
   constructor(private readonly mfaService: MfaService) {}
+
+  /**
+   * Bootstraps a short-lived Supabase session for the calling app-JWT user,
+   * so the mobile app never has to persist Supabase tokens just to reach
+   * Settings > Security. Call this first, then pass the returned tokens to
+   * enroll/verify/factors/unenroll below.
+   */
+  @Post('session')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60 } })
+  async session(@Req() req: RequestWithUser) {
+    const email = req.user?.email;
+    if (!email) {
+      throw new UnauthorizedException('No email associated with this account');
+    }
+    const result = await this.mfaService.mintSessionForUser(email);
+    return { success: true, ...result };
+  }
 
   @Post('enroll')
   @UseGuards(ThrottlerGuard)

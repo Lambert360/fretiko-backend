@@ -1,6 +1,6 @@
 import { Injectable, Logger, UnauthorizedException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createSupabaseClient } from '../shared/supabase.client';
+import { createSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
 
 /**
  * MfaService
@@ -110,6 +110,42 @@ export class MfaService {
     return {
       verifiedFactors,
       currentLevel: aalData?.currentLevel || 'aal1',
+    };
+  }
+
+  /**
+   * Mints a fresh, short-lived Supabase GoTrue session for an already
+   * app-JWT-authenticated user, so Settings > Security can call the
+   * enroll/verify/factors/unenroll endpoints above without the mobile app
+   * ever having to persist long-lived Supabase tokens. Uses the service-role
+   * admin API to generate a magic-link token and immediately redeems it
+   * server-side - no email is sent, and no password is required.
+   */
+  async mintSessionForUser(email: string) {
+    const serviceClient = createServiceSupabaseClient(this.configService);
+    const { data: linkData, error: linkError } = await serviceClient.auth.admin.generateLink({
+      type: 'magiclink',
+      email,
+    });
+    if (linkError || !linkData?.properties?.hashed_token) {
+      this.logger.error(`Could not mint MFA session for ${email}: ${linkError?.message}`);
+      throw new BadRequestException('Could not start MFA session');
+    }
+
+    const client = createSupabaseClient(this.configService);
+    const { data, error } = await client.auth.verifyOtp({
+      email,
+      token: linkData.properties.hashed_token,
+      type: 'magiclink',
+    });
+    if (error || !data.session) {
+      this.logger.error(`Could not verify MFA session for ${email}: ${error?.message}`);
+      throw new BadRequestException('Could not start MFA session');
+    }
+
+    return {
+      supabaseAccessToken: data.session.access_token,
+      supabaseRefreshToken: data.session.refresh_token,
     };
   }
 
