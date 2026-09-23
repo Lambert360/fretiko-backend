@@ -9,6 +9,7 @@ import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 // import { SocketIoAdapter } from './realtime/socket-io.adapter';
 import { WinstonLoggerService } from './logger/winston.logger.service';
 import * as express from 'express';
+import helmet from 'helmet';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { 
@@ -18,6 +19,11 @@ async function bootstrap() {
 
   const configService = app.get(ConfigService);
   const logger = app.get(WinstonLoggerService);
+
+  // Security headers (HSTS, X-Frame-Options, X-Content-Type-Options, etc.)
+  app.use(helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' }, // allow images/video served to mobile/admin
+  }));
 
   // Enable CORS for frontend and mobile app
   app.enableCors({

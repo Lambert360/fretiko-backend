@@ -9,7 +9,8 @@ import {
   ValidationPipe,
   HttpCode,
   Header,
-  UseGuards
+  UseGuards,
+  BadRequestException
 } from '@nestjs/common';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { MessagePattern } from '@nestjs/microservices';
@@ -110,6 +111,17 @@ export class AuthController {
     try {
       const result = await this.authService.signIn(signInDto as any);
 
+      if (result.mfaRequired) {
+        return {
+          success: true,
+          mfaRequired: true,
+          mfaFactorId: result.mfaFactorId,
+          supabaseAccessToken: result.supabaseAccessToken,
+          supabaseRefreshToken: result.supabaseRefreshToken,
+          message: 'MFA code required to complete sign-in',
+        };
+      }
+
       return {
         success: true,
         message: 'Signed in successfully',
@@ -120,6 +132,35 @@ export class AuthController {
     } catch (error: any) {
       throw error; // Let the error filter handle the response format
     }
+  }
+
+  @Post('mfa/login-verify')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60 } }) // 10 attempts per minute
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  async mfaLoginVerify(@Req() req: Request) {
+    const { supabaseAccessToken, supabaseRefreshToken, factorId, code } = req.body || {};
+    if (!supabaseAccessToken || !supabaseRefreshToken || !factorId || !code) {
+      throw new BadRequestException('supabaseAccessToken, supabaseRefreshToken, factorId and code are required');
+    }
+
+    const result = await this.authService.completeMfaLogin(
+      supabaseAccessToken,
+      supabaseRefreshToken,
+      factorId,
+      code,
+      req.ip,
+      req.get('User-Agent'),
+    );
+
+    return {
+      success: true,
+      message: 'Signed in successfully',
+      user: result.user,
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
+    };
   }
 
   @Post('send-verification-email')

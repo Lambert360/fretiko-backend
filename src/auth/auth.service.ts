@@ -5,6 +5,7 @@ import { SupabaseClientManager } from './supabase-client-manager.service';
 import { SignUpDto, SignInDto, AuthResponse } from '../shared/dto/auth.dto';
 import { EmailService } from './email.service';
 import { TokenService } from './token.service';
+import { MfaService } from './mfa.service';
 
 @Injectable()
 export class AuthService {
@@ -17,6 +18,7 @@ export class AuthService {
     private jwtService: JwtService,
     private emailService: EmailService,
     private tokenService: TokenService,
+    private mfaService: MfaService,
   ) {
     this.supabase = this.clientManager.getUserClient();
     this.serviceSupabase = this.clientManager.getServiceClient();
@@ -364,6 +366,39 @@ export class AuthService {
       throw new UnauthorizedException('Authentication failed - no session created');
     }
 
+    // MFA step-up check: if this user has enrolled and verified a TOTP factor,
+    // password success alone is not enough - require the second factor before
+    // issuing our app's tokens. Users with no verified factor (the default for
+    // every existing account) are completely unaffected by this check.
+    try {
+      const { verifiedFactors, currentLevel } = await this.mfaService.getVerifiedFactorsAndLevel(
+        data.session.access_token,
+        data.session.refresh_token,
+      );
+      if (verifiedFactors.length > 0 && currentLevel !== 'aal2') {
+        return {
+          mfaRequired: true,
+          mfaFactorId: verifiedFactors[0].id,
+          supabaseAccessToken: data.session.access_token,
+          supabaseRefreshToken: data.session.refresh_token,
+        };
+      }
+    } catch (mfaCheckError) {
+      // Fail open on the MFA *check* itself (e.g. transient Supabase error) so a
+      // Supabase hiccup never locks out users who don't even have MFA enabled.
+      console.error('🔍 MFA status check failed, proceeding without step-up:', mfaCheckError);
+    }
+
+    return this.finalizeSignIn(data, ipAddress, userAgent);
+  }
+
+  /**
+   * Shared tail of signIn(): fetches the profile, runs account status checks,
+   * and issues our app's custom token pair. Used both by the direct sign-in
+   * path (no MFA enrolled) and by completeMfaLogin() after a successful
+   * TOTP challenge, so both paths behave identically post-authentication.
+   */
+  private async finalizeSignIn(data: any, ipAddress?: string, userAgent?: string): Promise<AuthResponse> {
     // Set the session on the client so RLS policies allow the user to read their own profile
     if (data.session) {
       await this.supabase.auth.setSession({
@@ -442,6 +477,36 @@ export class AuthService {
       refreshToken: tokenPair.refreshToken,
       isSuspended: isSuspended, // Suspended users can authenticate but have limited access
     };
+  }
+
+  /**
+   * Completes sign-in after AuthService.signIn() returned mfaRequired: true.
+   * Re-validates the TOTP code against Supabase, then finishes exactly like
+   * a normal password sign-in would have.
+   */
+  async completeMfaLogin(
+    supabaseAccessToken: string,
+    supabaseRefreshToken: string,
+    factorId: string,
+    code: string,
+    ipAddress?: string,
+    userAgent?: string,
+  ): Promise<AuthResponse> {
+    await this.mfaService.completeLoginChallenge(supabaseAccessToken, supabaseRefreshToken, factorId, code);
+
+    const { data, error } = await this.supabase.auth.getUser(supabaseAccessToken);
+    if (error || !data.user) {
+      throw new UnauthorizedException('Session expired, please sign in again');
+    }
+
+    return this.finalizeSignIn(
+      {
+        user: data.user,
+        session: { access_token: supabaseAccessToken, refresh_token: supabaseRefreshToken },
+      },
+      ipAddress,
+      userAgent,
+    );
   }
 
   async verifyEmailToken(
