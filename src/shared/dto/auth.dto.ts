@@ -110,6 +110,10 @@ export class SignInDto {
   @IsString()
   @IsOptional()
   userAgent?: string;
+
+  @IsString()
+  @IsOptional()
+  deviceToken?: string;
 }
 
 export class MigrateAccountDto {
@@ -149,4 +153,5 @@ export class AuthResponse {
   mfaFactorId?: string; // Factor to challenge, only set when mfaRequired is true
   supabaseAccessToken?: string; // Short-lived, only used to complete /auth/mfa/login-verify
   supabaseRefreshToken?: string; // Short-lived, only used to complete /auth/mfa/login-verify
+  deviceToken?: string; // Returned after MFA login-verify with rememberDevice: true; store and resend on future signIns to skip MFA
 }

@@ -140,7 +140,7 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   @Header('Cache-Control', 'no-store')
   async mfaLoginVerify(@Req() req: Request) {
-    const { supabaseAccessToken, supabaseRefreshToken, factorId, code } = req.body || {};
+    const { supabaseAccessToken, supabaseRefreshToken, factorId, code, isBackupCode, rememberDevice } = req.body || {};
     if (!supabaseAccessToken || !supabaseRefreshToken || !factorId || !code) {
       throw new BadRequestException('supabaseAccessToken, supabaseRefreshToken, factorId and code are required');
     }
@@ -152,6 +152,8 @@ export class AuthController {
       code,
       req.ip,
       req.get('User-Agent'),
+      isBackupCode,
+      rememberDevice,
     );
 
     return {
@@ -160,6 +162,7 @@ export class AuthController {
       user: result.user,
       accessToken: result.accessToken,
       refreshToken: result.refreshToken,
+      deviceToken: result.deviceToken,
     };
   }
 
