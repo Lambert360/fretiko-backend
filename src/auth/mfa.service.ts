@@ -1,6 +1,11 @@
 import { Injectable, Logger, UnauthorizedException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import * as crypto from 'crypto';
+import * as bcrypt from 'bcrypt';
 import { createSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
+
+const BACKUP_CODE_COUNT = 10;
+const TRUSTED_DEVICE_DAYS = 30;
 
 /**
  * MfaService
@@ -167,5 +172,124 @@ export class MfaService {
     }
 
     return true;
+  }
+
+  /**
+   * Generates a fresh set of one-time backup codes for a user, replacing any
+   * previously issued (unused or used) codes. Only the bcrypt hash is
+   * persisted; the plaintext codes are returned once and must be shown to
+   * the user immediately - they cannot be retrieved again.
+   */
+  async generateBackupCodes(userId: string): Promise<string[]> {
+    const service = createServiceSupabaseClient(this.configService);
+
+    const { error: deleteError } = await service
+      .from('mfa_backup_codes')
+      .delete()
+      .eq('user_id', userId);
+    if (deleteError) {
+      this.logger.error(`Could not clear old backup codes for ${userId}: ${deleteError.message}`);
+      throw new BadRequestException('Could not generate backup codes');
+    }
+
+    const codes: string[] = [];
+    const rows: { user_id: string; code_hash: string }[] = [];
+    for (let i = 0; i < BACKUP_CODE_COUNT; i++) {
+      const code = this.generateReadableCode();
+      codes.push(code);
+      rows.push({ user_id: userId, code_hash: await bcrypt.hash(code, 10) });
+    }
+
+    const { error: insertError } = await service.from('mfa_backup_codes').insert(rows);
+    if (insertError) {
+      this.logger.error(`Could not store backup codes for ${userId}: ${insertError.message}`);
+      throw new BadRequestException('Could not generate backup codes');
+    }
+
+    return codes;
+  }
+
+  /**
+   * Verifies and consumes a single backup code for a user. Returns true on
+   * success (and marks the code used so it cannot be reused).
+   */
+  async verifyBackupCode(userId: string, code: string): Promise<boolean> {
+    const service = createServiceSupabaseClient(this.configService);
+    const { data, error } = await service
+      .from('mfa_backup_codes')
+      .select('id, code_hash')
+      .eq('user_id', userId)
+      .is('used_at', null);
+
+    if (error || !data) {
+      return false;
+    }
+
+    for (const row of data) {
+      if (await bcrypt.compare(code, row.code_hash)) {
+        await service
+          .from('mfa_backup_codes')
+          .update({ used_at: new Date().toISOString() })
+          .eq('id', row.id);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Issues a trusted-device token after a successful MFA verification when
+   * the user opts to "remember this device". Only the hash is stored; the
+   * plaintext token is returned once for the client to persist locally and
+   * resend on future sign-ins via SignInDto.deviceToken.
+   */
+  async issueTrustedDeviceToken(userId: string, deviceName?: string): Promise<string> {
+    const service = createServiceSupabaseClient(this.configService);
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + TRUSTED_DEVICE_DAYS * 24 * 60 * 60 * 1000);
+
+    const { error } = await service.from('mfa_trusted_devices').insert({
+      user_id: userId,
+      device_token_hash: await bcrypt.hash(token, 10),
+      device_name: deviceName || null,
+      expires_at: expiresAt.toISOString(),
+    });
+    if (error) {
+      this.logger.error(`Could not store trusted device for ${userId}: ${error.message}`);
+      throw new BadRequestException('Could not remember this device');
+    }
+
+    return token;
+  }
+
+  /**
+   * Checks whether a device token is a valid, unexpired trusted device for
+   * this user. Used by AuthService.signIn() to decide whether MFA can be
+   * skipped. Fails closed (returns false) on any lookup error.
+   */
+  async isTrustedDevice(userId: string, deviceToken: string): Promise<boolean> {
+    if (!deviceToken) return false;
+    const service = createServiceSupabaseClient(this.configService);
+    const { data, error } = await service
+      .from('mfa_trusted_devices')
+      .select('device_token_hash')
+      .eq('user_id', userId)
+      .gt('expires_at', new Date().toISOString());
+
+    if (error || !data) {
+      return false;
+    }
+
+    for (const row of data) {
+      if (await bcrypt.compare(deviceToken, row.device_token_hash)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private generateReadableCode(): string {
+    const bytes = crypto.randomBytes(5).toString('hex').toUpperCase();
+    return `${bytes.slice(0, 5)}-${bytes.slice(5, 10)}`;
   }
 }

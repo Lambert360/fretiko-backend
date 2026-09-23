@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsString, IsNotEmpty } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsBoolean } from 'class-validator';
 
 export class MfaSessionDto {
   @ApiProperty({ description: 'Supabase access token issued at sign-in, used only for MFA setup calls' })
@@ -48,8 +48,18 @@ export class MfaLoginVerifyDto {
   @IsNotEmpty()
   factorId: string;
 
-  @ApiProperty({ description: '6-digit code from the authenticator app' })
+  @ApiProperty({ description: '6-digit code from the authenticator app, or a backup code if isBackupCode is true' })
   @IsString()
   @IsNotEmpty()
   code: string;
+
+  @ApiProperty({ description: 'Set to true if `code` is a backup/recovery code instead of a TOTP code', required: false })
+  @IsBoolean()
+  @IsOptional()
+  isBackupCode?: boolean;
+
+  @ApiProperty({ description: 'If true, issue a trusted-device token so this device skips MFA next time', required: false })
+  @IsBoolean()
+  @IsOptional()
+  rememberDevice?: boolean;
 }

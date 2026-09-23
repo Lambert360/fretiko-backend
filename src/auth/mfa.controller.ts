@@ -35,6 +35,18 @@ export class MfaController {
     return { success: true, ...result };
   }
 
+  @Post('backup-codes')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60 } })
+  async backupCodes(@Req() req: RequestWithUser) {
+    const userId = req.user?.sub;
+    if (!userId) {
+      throw new UnauthorizedException('Not authenticated');
+    }
+    const codes = await this.mfaService.generateBackupCodes(userId);
+    return { success: true, codes };
+  }
+
   @Post('enroll')
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 5, ttl: 60 } })

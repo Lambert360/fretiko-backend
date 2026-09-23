@@ -392,12 +392,18 @@ export class AuthService {
         data.session.refresh_token,
       );
       if (verifiedFactors.length > 0 && currentLevel !== 'aal2') {
-        return {
-          mfaRequired: true,
-          mfaFactorId: verifiedFactors[0].id,
-          supabaseAccessToken: data.session.access_token,
-          supabaseRefreshToken: data.session.refresh_token,
-        };
+        const isTrusted = signInDto.deviceToken
+          ? await this.mfaService.isTrustedDevice(data.user.id, signInDto.deviceToken)
+          : false;
+
+        if (!isTrusted) {
+          return {
+            mfaRequired: true,
+            mfaFactorId: verifiedFactors[0].id,
+            supabaseAccessToken: data.session.access_token,
+            supabaseRefreshToken: data.session.refresh_token,
+          };
+        }
       }
     } catch (mfaCheckError) {
       // Fail open on the MFA *check* itself (e.g. transient Supabase error) so a
@@ -494,15 +500,24 @@ export class AuthService {
     code: string,
     ipAddress?: string,
     userAgent?: string,
+    isBackupCode?: boolean,
+    rememberDevice?: boolean,
   ): Promise<AuthResponse> {
-    await this.mfaService.completeLoginChallenge(supabaseAccessToken, supabaseRefreshToken, factorId, code);
-
     const { data, error } = await this.supabase.auth.getUser(supabaseAccessToken);
     if (error || !data.user) {
       throw new UnauthorizedException('Session expired, please sign in again');
     }
 
-    return this.finalizeSignIn(
+    if (isBackupCode) {
+      const valid = await this.mfaService.verifyBackupCode(data.user.id, code);
+      if (!valid) {
+        throw new UnauthorizedException('Invalid or already-used backup code');
+      }
+    } else {
+      await this.mfaService.completeLoginChallenge(supabaseAccessToken, supabaseRefreshToken, factorId, code);
+    }
+
+    const result = await this.finalizeSignIn(
       {
         user: data.user,
         session: { access_token: supabaseAccessToken, refresh_token: supabaseRefreshToken },
@@ -510,6 +525,13 @@ export class AuthService {
       ipAddress,
       userAgent,
     );
+
+    if (rememberDevice) {
+      const deviceToken = await this.mfaService.issueTrustedDeviceToken(data.user.id, userAgent);
+      result.deviceToken = deviceToken;
+    }
+
+    return result;
   }
 
   async verifyEmailToken(
