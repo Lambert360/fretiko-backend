@@ -1,18 +1,18 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
-import { ImageFeedsService, BotPersona } from './image-feeds.service';
+import { VideoFeedsService, BotPersona } from './video-feeds.service';
 import { EngagementBotsService } from '../engagement-bots/engagement-bots.service';
 
 @Injectable()
-export class ImageFeedsScheduler implements OnModuleInit {
-  private readonly logger = new Logger(ImageFeedsScheduler.name);
+export class VideoFeedsScheduler implements OnModuleInit {
+  private readonly logger = new Logger(VideoFeedsScheduler.name);
   private personaUserIds: Map<string, string> = new Map();
   private rotationIndex = 0;
   private isProcessing = false;
   private lastPostTime: Date = new Date(0);
 
   constructor(
-    private readonly imageFeedsService: ImageFeedsService,
+    private readonly videoFeedsService: VideoFeedsService,
     private readonly engagementBotsService: EngagementBotsService,
   ) {}
 
@@ -36,14 +36,14 @@ export class ImageFeedsScheduler implements OnModuleInit {
 
   onModuleInit() {
     void this.initializeBotUsers()
-      .then(() => this.logger.log('Image Feeds Scheduler initialized'))
-      .catch((error: any) => this.logger.error('Failed to initialize image feed bot users', error?.stack));
+      .then(() => this.logger.log('Video Feeds Scheduler initialized'))
+      .catch((error: any) => this.logger.error('Failed to initialize video feed bot users', error?.stack));
   }
 
   private async initializeBotUsers(): Promise<void> {
-    const personas = this.imageFeedsService.getPersonas();
+    const personas = this.videoFeedsService.getPersonas();
     for (const persona of personas) {
-      const id = await this.imageFeedsService.ensureBotUser(persona);
+      const id = await this.videoFeedsService.ensureBotUser(persona);
       if (id) {
         this.personaUserIds.set(persona.username, id);
       }
@@ -53,7 +53,7 @@ export class ImageFeedsScheduler implements OnModuleInit {
 
   @Cron('*/5 * * * *')
   async postCycle() {
-    const config = this.imageFeedsService.getConfig();
+    const config = this.videoFeedsService.getConfig();
     if (!config.settings.enable_auto_posting) return;
     if (this.isProcessing) return;
 
@@ -61,7 +61,7 @@ export class ImageFeedsScheduler implements OnModuleInit {
     const minutesSinceLastPost = (now.getTime() - this.lastPostTime.getTime()) / (1000 * 60);
     if (minutesSinceLastPost < config.settings.post_interval_minutes) return;
 
-    const personas = this.imageFeedsService.getPersonas();
+    const personas = this.videoFeedsService.getPersonas();
     if (personas.length === 0 || this.personaUserIds.size === 0) return;
 
     this.isProcessing = true;
@@ -70,11 +70,11 @@ export class ImageFeedsScheduler implements OnModuleInit {
       const botUserId = this.personaUserIds.get(persona.username);
       if (!botUserId) return;
 
-      const post = await this.imageFeedsService.createImagePost(persona, botUserId);
+      const post = await this.videoFeedsService.createVideoPost(persona, botUserId);
       this.lastPostTime = now;
       await this.seedEngagement(post, botUserId);
     } catch (error) {
-      this.logger.error('Error in image post cycle', error.stack);
+      this.logger.error('Error in video post cycle', error.stack);
     } finally {
       this.isProcessing = false;
     }
@@ -87,7 +87,7 @@ export class ImageFeedsScheduler implements OnModuleInit {
   }
 
   async manualPostOnce(): Promise<{ success: boolean; message: string; persona?: string }> {
-    const personas = this.imageFeedsService.getPersonas();
+    const personas = this.videoFeedsService.getPersonas();
     if (personas.length === 0 || this.personaUserIds.size === 0) {
       return { success: false, message: 'No bot personas initialized' };
     }
@@ -99,7 +99,7 @@ export class ImageFeedsScheduler implements OnModuleInit {
     }
 
     try {
-      const post = await this.imageFeedsService.createImagePost(persona, botUserId);
+      const post = await this.videoFeedsService.createVideoPost(persona, botUserId);
       this.lastPostTime = new Date();
       await this.seedEngagement(post, botUserId);
       return { success: true, message: `Posted as ${persona.username}`, persona: persona.username };
@@ -112,7 +112,7 @@ export class ImageFeedsScheduler implements OnModuleInit {
     return {
       botsInitialized: this.personaUserIds.size,
       lastPostTime: this.lastPostTime,
-      nextPersonaIndex: this.rotationIndex % Math.max(this.imageFeedsService.getPersonas().length, 1),
+      nextPersonaIndex: this.rotationIndex % Math.max(this.videoFeedsService.getPersonas().length, 1),
     };
   }
 }

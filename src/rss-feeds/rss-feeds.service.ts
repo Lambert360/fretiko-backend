@@ -4,6 +4,7 @@ import Parser from 'rss-parser';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
+import { insertBotPost } from '../shared/bot-persona.util';
 
 export interface RssFeed {
   name: string;
@@ -259,17 +260,13 @@ export class RssFeedsService {
       const content = this.buildCaptionFromItem(item);
       const hasImage = !!item.imageUrl;
 
-      const { data: post, error } = await this.supabaseClient
-        .from('posts')
-        .insert({
-          user_id: botUserId,
-          content,
-          media_urls: hasImage ? [item.imageUrl] : [],
-          media_type: hasImage ? 'image' : 'text',
-          privacy_level: 'public',
-        })
-        .select()
-        .single();
+      const { data: post, error } = await insertBotPost(this.supabaseClient, {
+        user_id: botUserId,
+        content,
+        media_urls: hasImage ? [item.imageUrl] : [],
+        media_type: hasImage ? 'image' : 'text',
+        privacy_level: 'public',
+      });
 
       if (error) throw error;
 

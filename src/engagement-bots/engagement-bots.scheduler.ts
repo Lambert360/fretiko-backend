@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { EngagementBotsService } from './engagement-bots.service';
 
-const BOTS_PER_CYCLE = 6;
+const BOTS_PER_CYCLE = 20;
 const ENABLE_AUTO_ENGAGEMENT = true;
 
 @Injectable()
@@ -15,9 +15,11 @@ export class EngagementBotsScheduler implements OnModuleInit {
 
   constructor(private readonly engagementBotsService: EngagementBotsService) {}
 
-  async onModuleInit() {
-    await this.engagementBotsService.initializeBotUsers();
-    this.logger.log('Engagement Bots Scheduler initialized');
+  onModuleInit() {
+    void this.engagementBotsService
+      .initializeBotUsers()
+      .then(() => this.logger.log('Engagement Bots Scheduler initialized'))
+      .catch((error: any) => this.logger.error('Failed to initialize engagement bots', error?.stack));
   }
 
   @Cron('*/3 * * * *')

@@ -88,17 +88,36 @@ function pick<T>(items: T[], seed: number): T {
   return items[Math.abs(seed) % items.length];
 }
 
-export function fallbackComment(content: string, seed = 0): string {
+export function fallbackComment(content: string, seed = 0, race: 'caucasian' | 'nigerian' = 'nigerian'): string {
   const snippet = snippetFromPost(content);
   const details = extractDetails(content);
   const detail = details[0] || snippet;
   const second = details[1];
 
+  if (race === 'caucasian') {
+    const options = [
+      `The part about ${detail} really stood out to me.`,
+      `I had to stop and think about "${snippet}".`,
+      `So ${detail} is the real takeaway here? Interesting.`,
+      `Didn't expect ${detail} to be part of this conversation.`,
+      `The way they framed ${detail} here is actually important.`,
+      `People will still be debating ${detail} tomorrow.`,
+    ];
+    if (second) {
+      options.push(`${detail} and ${second} in one post? That's a lot to unpack.`);
+      options.push(`I get the ${detail} part, but ${second} surprised me.`);
+    }
+    if (snippet && snippet !== detail) {
+      options.push(`"${snippet}" — this actually matters.`);
+    }
+    return pick(options, seed);
+  }
+
   const options = [
     `This gist about ${detail} no be small thing.`,
     `I had to pause at "${snippet}".`,
     `So ${detail} is really the story here? Okay.`,
-    `${detail} sef… I no expect this one at all.`,
+    `${detail} sef... I no expect this one at all.`,
     `The way them talk ${detail} here is actually important.`,
     `People go still dey argue ${detail} by tomorrow.`,
   ];
@@ -115,26 +134,47 @@ export function fallbackComment(content: string, seed = 0): string {
   return pick(options, seed);
 }
 
-export function fallbackReply(content: string, parentComment: string, seed = 0): string {
+export function fallbackReply(content: string, parentComment: string, seed = 0, race: 'caucasian' | 'nigerian' = 'nigerian'): string {
   const detail = extractDetails(content)[0] || snippetFromPost(content);
   const parentBit = cleanPostText(parentComment).split(/\s+/).slice(0, 6).join(' ');
+
+  if (race === 'caucasian') {
+    const options = [
+      `True, especially when it comes to ${detail}.`,
+      `That's exactly why ${detail} isn't going away anytime soon.`,
+      `You mentioned "${parentBit}" — that's the key point about ${detail}.`,
+      `I agree with you on that, ${detail} is pretty clear here.`,
+    ];
+    return pick(options, seed);
+  }
+
   const options = [
     `True, especially with ${detail}.`,
-    `That’s why ${detail} no go just die down.`,
-    `You mentioned "${parentBit}" — that’s the exact point on ${detail}.`,
+    `That's why ${detail} no go just die down.`,
+    `You mentioned "${parentBit}" — that's the exact point on ${detail}.`,
     `I dey with you on that, ${detail} too obvious here.`,
   ];
   return pick(options, seed);
 }
 
-export function buildCommentPrompt(content: string, parentComment?: string): { system: string; user: string } {
-  const system = [
+export function buildCommentPrompt(content: string, parentComment?: string, race: 'caucasian' | 'nigerian' = 'nigerian'): { system: string; user: string } {
+  const systemNigerian = [
     'You write one short social comment as a young Nigerian on Fretiko.',
     'React to a concrete detail in the post (person, place, event, claim, score, food, team, or vibe).',
     'One sentence, max 140 characters. Light Nigerian English or Pidgin is fine.',
     'No hashtags, no URLs, no quotation marks wrapping the whole comment, at most one emoji.',
     'Do not write generic praise like "great post", "nice one", "this is fire", or "love this".',
   ].join(' ');
+
+  const systemCaucasian = [
+    'You write one short social comment as a casual English-speaking user on Fretiko.',
+    'React to a concrete detail in the post (person, place, event, claim, stat, or topic).',
+    'One sentence, max 140 characters. Standard conversational English. No slang, no pidgin.',
+    'No hashtags, no URLs, no quotation marks wrapping the whole comment, at most one emoji.',
+    'Do not write generic praise like "great post", "nice one", "this is fire", or "love this".',
+  ].join(' ');
+
+  const system = race === 'caucasian' ? systemCaucasian : systemNigerian;
 
   if (parentComment) {
     return {

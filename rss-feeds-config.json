@@ -24,6 +24,24 @@
         "url": "https://itnewsafrica.com/feed/",
         "category": "African Technology",
         "active": true
+      },
+      {
+        "name": "TechCrunch",
+        "url": "https://techcrunch.com/feed/",
+        "category": "Global Technology",
+        "active": true
+      },
+      {
+        "name": "The Verge",
+        "url": "https://www.theverge.com/rss/index.xml",
+        "category": "Global Technology",
+        "active": true
+      },
+      {
+        "name": "Ars Technica",
+        "url": "http://feeds.arstechnica.com/arstechnica/index",
+        "category": "Global Technology",
+        "active": true
       }
     ],
     "ai": [
@@ -43,6 +61,18 @@
         "name": "Disrupt Africa",
         "url": "https://disrupt-africa.com/feed/",
         "category": "African Technology",
+        "active": true
+      },
+      {
+        "name": "MIT Technology Review AI",
+        "url": "https://www.technologyreview.com/topic/artificial-intelligence/feed",
+        "category": "Global AI",
+        "active": true
+      },
+      {
+        "name": "VentureBeat AI",
+        "url": "https://venturebeat.com/category/ai/feed/",
+        "category": "Global AI",
         "active": true
       }
     ],
@@ -102,6 +132,18 @@
         "name": "TechCabal",
         "url": "https://techcabal.com/feed",
         "category": "African Technology",
+        "active": true
+      },
+      {
+        "name": "Engadget",
+        "url": "https://www.engadget.com/rss.xml",
+        "category": "Global Gadgets",
+        "active": true
+      },
+      {
+        "name": "The Verge Gadgets",
+        "url": "https://www.theverge.com/rss/index.xml",
+        "category": "Global Gadgets",
         "active": true
       }
     ],
@@ -287,32 +329,6 @@
         "active": true
       }
     ],
-    "sports": [
-      {
-        "name": "BBC Sport Football",
-        "url": "http://feeds.bbci.co.uk/sport/football/rss.xml",
-        "category": "Football",
-        "active": true
-      },
-      {
-        "name": "Complete Sports",
-        "url": "https://www.completesports.com/feed/",
-        "category": "Sports",
-        "active": true
-      },
-      {
-        "name": "ESPN Soccer",
-        "url": "https://www.espn.com/espn/rss/soccer/news",
-        "category": "Football",
-        "active": true
-      },
-      {
-        "name": "Sky Sports Football",
-        "url": "https://www.skysports.com/rss/12040",
-        "category": "Football",
-        "active": true
-      }
-    ],
     "business_entrepreneurship": [
       {
         "name": "TechCabal",
@@ -337,19 +353,17 @@
         "url": "https://www.entrepreneur.com/latest.rss",
         "category": "Entrepreneurship",
         "active": true
-      }
-    ],
-    "culture_entertainment": [
+      },
       {
-        "name": "Legit.ng Entertainment",
-        "url": "https://www.legit.ng/rss/entertainment.rss",
-        "category": "Culture",
+        "name": "Harvard Business Review",
+        "url": "https://hbr.org/feed",
+        "category": "Global Business",
         "active": true
       },
       {
-        "name": "BellaNaija",
-        "url": "https://www.bellanaija.com/feed/",
-        "category": "Culture",
+        "name": "Fast Company",
+        "url": "https://www.fastcompany.com/latest/rss",
+        "category": "Global Business",
         "active": true
       }
     ],
@@ -384,38 +398,6 @@
         "name": "Nollyrated",
         "url": "https://nollyrated.com/feed/",
         "category": "Nollywood",
-        "active": true
-      }
-    ],
-    "food_travel": [
-      {
-        "name": "9jafoodie",
-        "url": "https://www.9jafoodie.com/feed",
-        "category": "Nigerian Food",
-        "active": true
-      },
-      {
-        "name": "All Nigerian Foods",
-        "url": "https://www.allnigerianfoods.com/feed",
-        "category": "Nigerian Food",
-        "active": true
-      },
-      {
-        "name": "Dobby's Signature",
-        "url": "https://www.dobbyssignature.com/feed",
-        "category": "Nigerian Food",
-        "active": true
-      },
-      {
-        "name": "Kitchen Butterfly",
-        "url": "https://www.kitchenbutterfly.com/feed",
-        "category": "Nigerian Food",
-        "active": true
-      },
-      {
-        "name": "Chef Lola's Kitchen",
-        "url": "https://cheflolaskitchen.com/feed",
-        "category": "Nigerian Food",
         "active": true
       }
     ],
@@ -470,6 +452,160 @@
         "category": "Education",
         "active": true
       }
+    ],
+    "nigerian_food_culture": [
+      {
+        "name": "9jafoodie",
+        "url": "https://www.9jafoodie.com/feed",
+        "category": "Nigerian Food",
+        "active": true
+      },
+      {
+        "name": "All Nigerian Foods",
+        "url": "https://www.allnigerianfoods.com/feed",
+        "category": "Nigerian Food",
+        "active": true
+      },
+      {
+        "name": "Dobby's Signature",
+        "url": "https://www.dobbyssignature.com/feed",
+        "category": "Nigerian Food",
+        "active": true
+      },
+      {
+        "name": "Kitchen Butterfly",
+        "url": "https://www.kitchenbutterfly.com/feed",
+        "category": "Nigerian Food",
+        "active": true
+      },
+      {
+        "name": "Chef Lola's Kitchen",
+        "url": "https://cheflolaskitchen.com/feed",
+        "category": "Nigerian Food",
+        "active": true
+      },
+      {
+        "name": "Naijaloaded",
+        "url": "https://www.naijaloaded.com.ng/feed",
+        "category": "Nigerian Culture",
+        "active": true
+      }
+    ],
+    "football": [
+      {
+        "name": "BBC Sport Football",
+        "url": "http://feeds.bbci.co.uk/sport/football/rss.xml",
+        "category": "Football",
+        "active": true
+      },
+      {
+        "name": "Complete Sports",
+        "url": "https://www.completesports.com/feed/",
+        "category": "Sports",
+        "active": true
+      },
+      {
+        "name": "ESPN Soccer",
+        "url": "https://www.espn.com/espn/rss/soccer/news",
+        "category": "Football",
+        "active": true
+      },
+      {
+        "name": "Sky Sports Football",
+        "url": "https://www.skysports.com/rss/12040",
+        "category": "Football",
+        "active": true
+      }
+    ],
+    "sports": [
+      {
+        "name": "ESPN Top Headlines",
+        "url": "https://www.espn.com/espn/rss/news",
+        "category": "International Sports",
+        "active": true
+      },
+      {
+        "name": "BBC Sport",
+        "url": "http://feeds.bbci.co.uk/sport/rss.xml",
+        "category": "International Sports",
+        "active": true
+      },
+      {
+        "name": "Sky Sports News",
+        "url": "https://www.skysports.com/rss/12040",
+        "category": "International Sports",
+        "active": true
+      },
+      {
+        "name": "CBS Sports",
+        "url": "https://www.cbssports.com/rss/headlines/",
+        "category": "International Sports",
+        "active": true
+      }
+    ],
+    "african_tech": [
+      {
+        "name": "TechCabal",
+        "url": "https://techcabal.com/feed",
+        "category": "African Technology",
+        "active": true
+      },
+      {
+        "name": "Technext24",
+        "url": "https://technext24.com/feed/",
+        "category": "African Technology",
+        "active": true
+      },
+      {
+        "name": "Disrupt Africa",
+        "url": "https://disrupt-africa.com/feed/",
+        "category": "African Technology",
+        "active": true
+      },
+      {
+        "name": "IT News Africa",
+        "url": "https://itnewsafrica.com/feed/",
+        "category": "African Technology",
+        "active": true
+      }
+    ],
+    "controversial_trending": [
+      {
+        "name": "Legit.ng Entertainment",
+        "url": "https://www.legit.ng/rss/entertainment.rss",
+        "category": "Culture",
+        "active": true
+      },
+      {
+        "name": "BellaNaija",
+        "url": "https://www.bellanaija.com/feed/",
+        "category": "Culture",
+        "active": true
+      },
+      {
+        "name": "Naijaloaded",
+        "url": "https://www.naijaloaded.com.ng/feed",
+        "category": "Trending",
+        "active": true
+      },
+      {
+        "name": "Linda Ikeji Blog",
+        "url": "https://www.lindaikejisblog.com/feed",
+        "category": "Gossip",
+        "active": true
+      },
+      {
+        "name": "Nairaland",
+        "url": "https://www.nairaland.com/feed",
+        "category": "Forum Trending",
+        "active": false
+      },
+      {
+        "name": "The Cable",
+        "url": "https://www.thecable.ng/feed",
+        "category": "Nigeria News",
+        "active": true
+      }
     ]
   },
   "settings": {
@@ -488,14 +624,16 @@
       "nature",
       "animals",
       "nigeria_news",
-      "sports",
       "business_entrepreneurship",
-      "culture_entertainment",
       "afrobeats_music",
       "nollywood",
-      "food_travel",
       "health_fitness",
-      "education_career"
+      "education_career",
+      "nigerian_food_culture",
+      "football",
+      "sports",
+      "african_tech",
+      "controversial_trending"
     ]
   }
 }

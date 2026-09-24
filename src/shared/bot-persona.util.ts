@@ -10,6 +10,7 @@ export interface BotPersona {
   last_name: string;
   gender: string;
   ethnic_group: string;
+  race: 'caucasian' | 'nigerian';
   bio: string;
   avatar_url: string;
   niche?: string;
@@ -46,7 +47,7 @@ async function mirrorIntoLegacyUsersTable(supabaseClient: any, persona: BotPerso
     last_name: persona.last_name,
     bio: persona.bio,
     avatar_url: persona.avatar_url,
-    is_bot: false,
+    is_bot: true,
   });
 
   if (error && error.code !== 'PGRST205') {
@@ -60,6 +61,7 @@ function buildProfilePayload(persona: BotPersona, id?: string): Record<string, a
     bio: persona.bio,
     avatar_url: persona.avatar_url,
     display_name: persona.full_name,
+    is_bot: true,
   };
   if (id) payload.id = id;
   if (persona.location) payload.location = persona.location;
@@ -72,6 +74,7 @@ function withoutCountColumns(payload: Record<string, any>): Record<string, any> 
   const copy = { ...payload };
   delete copy.followers_count;
   delete copy.following_count;
+  delete copy.is_bot;
   return copy;
 }
 
@@ -90,7 +93,7 @@ async function writeProfile(
   const { data, error } = await query;
   if (!error) return { id: data?.id };
 
-  const missingCounts = /followers_count|following_count|display_name|location/i.test(error.message || '');
+  const missingCounts = /followers_count|following_count|display_name|location|is_bot/i.test(error.message || '');
   if (!missingCounts) return { error };
 
   const fallback = withoutCountColumns(payload);
@@ -196,4 +199,25 @@ export async function ensureBotUser(supabaseClient: any, persona: BotPersona): P
     logger.error(`Error ensuring bot user ${persona.username}`, error.stack);
     return null;
   }
+}
+
+// Inserts a bot-authored post, flagging it with is_bot_post. Falls back to a
+// plain insert if the column hasn't been migrated yet (see
+// migrations/121_add_is_bot_flags.sql) so bot posting doesn't break in the
+// meantime.
+export async function insertBotPost(
+  supabaseClient: any,
+  payload: Record<string, any>,
+): Promise<{ data?: any; error?: any }> {
+  const { data, error } = await supabaseClient
+    .from('posts')
+    .insert({ ...payload, is_bot_post: true })
+    .select()
+    .single();
+
+  if (!error) return { data };
+  if (!/is_bot_post/i.test(error.message || '')) return { error };
+
+  const retry = await supabaseClient.from('posts').insert(payload).select().single();
+  return retry.error ? { error: retry.error } : { data: retry.data };
 }
