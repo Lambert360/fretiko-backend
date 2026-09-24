@@ -328,7 +328,7 @@ export class AuthService {
     };
   }
 
-  async signIn(signInDto: SignInDto): Promise<AuthResponse> {
+  async signIn(signInDto: SignInDto, ipAddress?: string, userAgent?: string): Promise<AuthResponse> {
     const { email, password } = signInDto;
 
     console.log('🔍 SignIn Debug:', {

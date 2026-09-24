@@ -1,5 +1,5 @@
 import { Injectable, ConflictException, NotFoundException, ForbiddenException } from '@nestjs/common';
-import { createSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
+import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { ConfigService } from '@nestjs/config';
 import {
   CreateConnectionDto,
@@ -10,21 +10,24 @@ import {
 } from './dto/connection.dto';
 import { ConnectionStatus, UserConnection, ClientRelationship } from './entities/user-connection.entity';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
+import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 
 @Injectable()
 export class ConnectionsService {
   private supabase;
+  private serviceSupabase;
 
   constructor(
     private configService: ConfigService,
+    private clientManager: SupabaseClientManager,
     private notificationHelper: NotificationHelperService,
   ) {
-    // Use base client - methods will use user-authenticated client when userToken is provided
-    this.supabase = createSupabaseClient(this.configService);
+    this.supabase = createServiceSupabaseClient(this.configService);
+    this.serviceSupabase = this.clientManager.getServiceClient();
   }
 
   async getUserStats(userId: string): Promise<UserStatsDto> {
-    const { data, error } = await this.supabase
+    const { data, error } = await this.serviceSupabase
       .from('user_stats')
       .select('plugs_count, clients_count, connection_requests_count')
       .eq('id', userId)
@@ -61,15 +64,13 @@ export class ConnectionsService {
   async createConnection(requesterId: string, dto: CreateConnectionDto, userToken?: string): Promise<ConnectionResponseDto> {
     console.log(`🔌 Creating connection request from ${requesterId} to ${dto.addresseeId}`);
 
-    // Create user-authenticated client for RLS compliance
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
     // Prevent self-connection
     if (requesterId === dto.addresseeId) {
       throw new ConflictException('Cannot connect to yourself');
     }
 
     // Check if connection already exists
-    const { data: existing } = await client
+    const { data: existing } = await this.serviceSupabase
       .from('user_connections')
       .select('*')
       .or(`and(requester_id.eq.${requesterId},addressee_id.eq.${dto.addresseeId}),and(requester_id.eq.${dto.addresseeId},addressee_id.eq.${requesterId})`)
@@ -81,7 +82,7 @@ export class ConnectionsService {
     }
 
     // Check if target user exists
-    const { data: targetUser, error: userError } = await client
+    const { data: targetUser, error: userError } = await this.serviceSupabase
       .from('user_profiles')
       .select('id, username, avatar_url')
       .eq('id', dto.addresseeId)
@@ -94,7 +95,7 @@ export class ConnectionsService {
 
     // Create connection
     console.log(`📝 Inserting connection with status: ${ConnectionStatus.PENDING}`);
-    const { data, error } = await client
+    const { data, error } = await this.serviceSupabase
       .from('user_connections')
       .insert({
         requester_id: requesterId,
@@ -112,7 +113,7 @@ export class ConnectionsService {
     console.log(`✅ Connection created successfully:`, data);
 
     // Get requester info for response
-    const { data: requesterUser } = await client
+    const { data: requesterUser } = await this.serviceSupabase
       .from('user_profiles')
       .select('id, username, avatar_url')
       .eq('id', requesterId)
@@ -154,9 +155,8 @@ export class ConnectionsService {
   }
 
   async updateConnection(userId: string, connectionId: string, dto: UpdateConnectionDto, userToken?: string): Promise<ConnectionResponseDto> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
     // Get the connection first
-    const { data: connection, error: fetchError } = await client
+    const { data: connection, error: fetchError } = await this.serviceSupabase
       .from('user_connections')
       .select('*')
       .eq('id', connectionId)
@@ -172,7 +172,7 @@ export class ConnectionsService {
     }
 
     // Update connection
-    const { data, error } = await client
+    const { data, error } = await this.serviceSupabase
       .from('user_connections')
       .update({ status: dto.status })
       .eq('id', connectionId)
@@ -187,7 +187,7 @@ export class ConnectionsService {
     if (dto.status === ConnectionStatus.ACCEPTED) {
       try {
         // Get accepter's username and avatar for notification
-        const { data: accepterProfile } = await client
+        const { data: accepterProfile } = await this.serviceSupabase
           .from('user_profiles')
           .select('username, avatar_url')
           .eq('id', connection.addressee_id)
@@ -221,9 +221,7 @@ export class ConnectionsService {
   }
 
   async getMyConnections(userId: string, userToken?: string): Promise<ConnectionResponseDto[]> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
-    const { data, error } = await client
+    const { data, error } = await this.serviceSupabase
       .from('user_connections')
       .select(`
         *,
@@ -267,12 +265,7 @@ export class ConnectionsService {
   async getPendingRequests(userId: string, userToken?: string): Promise<ConnectionResponseDto[]> {
     console.log(`📥 Getting pending requests for user: ${userId}`);
 
-    // Use user-authenticated client to respect RLS (industry standard)
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-    console.log(`🔑 Using ${userToken ? 'user-authenticated' : 'base'} Supabase client`);
-
-    // First, let's see ALL connections for debugging
-    const { data: allConnections } = await client
+    const { data: allConnections } = await this.serviceSupabase
       .from('user_connections')
       .select('*')
       .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`);
@@ -287,7 +280,7 @@ export class ConnectionsService {
       })));
     }
 
-    const { data, error } = await client
+    const { data, error } = await this.serviceSupabase
       .from('user_connections')
       .select(`
         *,
@@ -295,7 +288,7 @@ export class ConnectionsService {
       `)
       .eq('addressee_id', userId)
       .eq('status', ConnectionStatus.PENDING)
-      .order('created_at', { ascending: false});
+      .order('created_at', { ascending: false });
 
     if (error) {
       console.error(`❌ Error fetching pending requests: ${error.message}`);
@@ -328,7 +321,7 @@ export class ConnectionsService {
 
   async createClientRelationship(providerId: string, dto: CreateClientRelationshipDto): Promise<void> {
     // Check if relationship already exists
-    const { data: existing } = await this.supabase
+    const { data: existing } = await this.serviceSupabase
       .from('client_relationships')
       .select('*')
       .eq('provider_id', providerId)
@@ -337,7 +330,7 @@ export class ConnectionsService {
 
     if (existing) {
       // Update existing relationship
-      await this.supabase
+      await this.serviceSupabase
         .from('client_relationships')
         .update({
           relationship_type: dto.relationshipType || existing.relationship_type,
@@ -348,7 +341,7 @@ export class ConnectionsService {
         .eq('id', existing.id);
     } else {
       // Create new relationship
-      const { error } = await this.supabase
+      const { error } = await this.serviceSupabase
         .from('client_relationships')
         .insert({
           provider_id: providerId,
@@ -365,11 +358,9 @@ export class ConnectionsService {
   }
 
   async getClientRelationships(userId: string, userToken?: string): Promise<any[]> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
     // Get all users who plugged to current user (social followers)
     // These are users where current user is the addressee
-    const { data: connections, error: connError } = await client
+    const { data: connections, error: connError } = await this.serviceSupabase
       .from('user_connections')
       .select(`
         *,
@@ -384,7 +375,7 @@ export class ConnectionsService {
     }
 
     // Get all business relationships (people who bought from current user)
-    const { data: businessRelations, error: bizError } = await this.supabase
+    const { data: businessRelations, error: bizError } = await this.serviceSupabase
       .from('client_relationships')
       .select('*')
       .eq('provider_id', userId);
@@ -436,37 +427,57 @@ export class ConnectionsService {
     const connectedClientIds = new Set(connections.map(c => c.requester_id));
     const unconnectedBusinessClients: any[] = [];
 
-    if (businessRelations) {
-      for (const rel of businessRelations) {
-        if (!connectedClientIds.has(rel.client_id)) {
-          // This person bought from us but is not connected
-          // Fetch their profile
-          const { data: clientProfile } = await client
-            .from('user_profiles')
-            .select('id, username, bio, avatar_url, is_seller, is_rider')
-            .eq('id', rel.client_id)
-            .single();
+    if (businessRelations && businessRelations.length > 0) {
+      // Filter to relations where the client is not already socially connected
+      const unconnectedRelations = businessRelations.filter(rel => !connectedClientIds.has(rel.client_id));
 
-          if (clientProfile) {
-            unconnectedBusinessClients.push({
-              id: rel.id,
-              providerId: rel.provider_id,
-              clientId: rel.client_id,
-              relationshipType: rel.relationship_type,
-              totalOrders: rel.total_orders,
-              totalSpent: rel.total_spent,
-              lastInteraction: rel.last_interaction,
-              createdAt: rel.created_at,
-              client: {
-                id: clientProfile.id,
-                username: clientProfile.username,
-                bio: clientProfile.bio,
-                avatarUrl: clientProfile.avatar_url,
-                isSeller: clientProfile.is_seller,
-                isRider: clientProfile.is_rider,
-              },
-            });
+      if (unconnectedRelations.length > 0) {
+        // Batch-load all needed user profiles in a single query to avoid N+1
+        const clientIds = unconnectedRelations.map(rel => rel.client_id);
+
+        const { data: clientProfiles, error: profilesError } = await this.serviceSupabase
+          .from('user_profiles')
+          .select('id, username, bio, avatar_url, is_seller, is_rider')
+          .in('id', clientIds);
+
+        if (profilesError) {
+          // Preserve previous behavior: don't fail the whole call if profiles can't be loaded
+          console.error('Error fetching client profiles for business relationships:', profilesError);
+        }
+
+        const profileMap = new Map<string, any>();
+        if (clientProfiles) {
+          clientProfiles.forEach(profile => {
+            profileMap.set(profile.id, profile);
+          });
+        }
+
+        // Build unconnected business clients list using the loaded profiles
+        for (const rel of unconnectedRelations) {
+          const clientProfile = profileMap.get(rel.client_id);
+          if (!clientProfile) {
+            // If a specific profile is missing, just skip it as before
+            continue;
           }
+
+          unconnectedBusinessClients.push({
+            id: rel.id,
+            providerId: rel.provider_id,
+            clientId: rel.client_id,
+            relationshipType: rel.relationship_type,
+            totalOrders: rel.total_orders,
+            totalSpent: rel.total_spent,
+            lastInteraction: rel.last_interaction,
+            createdAt: rel.created_at,
+            client: {
+              id: clientProfile.id,
+              username: clientProfile.username,
+              bio: clientProfile.bio,
+              avatarUrl: clientProfile.avatar_url,
+              isSeller: clientProfile.is_seller,
+              isRider: clientProfile.is_rider,
+            },
+          });
         }
       }
     }
@@ -483,9 +494,8 @@ export class ConnectionsService {
   }
 
   async deleteConnection(userId: string, connectionId: string, userToken?: string): Promise<void> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
     // Get the connection first to verify ownership
-    const { data: connection, error: fetchError } = await client
+    const { data: connection, error: fetchError } = await this.serviceSupabase
       .from('user_connections')
       .select('*')
       .eq('id', connectionId)
@@ -500,7 +510,7 @@ export class ConnectionsService {
       throw new ForbiddenException('You can only delete your own connections');
     }
 
-    const { error } = await client
+    const { error } = await this.serviceSupabase
       .from('user_connections')
       .delete()
       .eq('id', connectionId);
@@ -511,9 +521,8 @@ export class ConnectionsService {
   }
 
   async getConnectionStatus(currentUserId: string, targetUserId: string, userToken?: string): Promise<{ status: string; connectionId?: string }> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
     // Check if there's a connection between the two users
-    const { data, error } = await client
+    const { data, error } = await this.serviceSupabase
       .from('user_connections')
       .select('*')
       .or(`and(requester_id.eq.${currentUserId},addressee_id.eq.${targetUserId}),and(requester_id.eq.${targetUserId},addressee_id.eq.${currentUserId})`)
@@ -537,10 +546,8 @@ export class ConnectionsService {
    * Accept all pending connection requests for a user
    */
   async acceptAllConnectionRequests(userId: string, userToken?: string): Promise<{ accepted: number; failed: number }> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
     // Get all pending requests for this user
-    const { data: pendingConnections, error: fetchError } = await client
+    const { data: pendingConnections, error: fetchError } = await this.serviceSupabase
       .from('user_connections')
       .select('*')
       .eq('addressee_id', userId)
@@ -583,13 +590,11 @@ export class ConnectionsService {
    * Includes connection info, business metrics, and recent orders
    */
   async getRelationshipDetails(currentUserId: string, targetUserId: string, userToken?: string): Promise<any> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
     // Get connection status
     const connectionStatus = await this.getConnectionStatus(currentUserId, targetUserId, userToken);
 
     // Get user profile info
-    const { data: targetProfile } = await client
+    const { data: targetProfile } = await this.serviceSupabase
       .from('user_profiles')
       .select('id, username, bio, avatar_url, is_seller, is_rider')
       .eq('id', targetUserId)
@@ -601,7 +606,7 @@ export class ConnectionsService {
     let recentOrders: any[] = [];
 
     // Check if target is current user's client (they bought from me)
-    const { data: clientRelation } = await this.supabase
+    const { data: clientRelation } = await this.serviceSupabase
       .from('client_relationships')
       .select('*')
       .eq('provider_id', currentUserId)
@@ -618,7 +623,7 @@ export class ConnectionsService {
       };
 
       // Get recent orders
-      const { data: orders } = await this.supabase
+      const { data: orders } = await this.serviceSupabase
         .from('orders')
         .select('id, order_number, total, status, order_date, order_items(id, name, image, price, quantity)')
         .eq('buyer_id', targetUserId)
@@ -629,7 +634,7 @@ export class ConnectionsService {
       recentOrders = orders || [];
     } else {
       // Check if current user is target's client (I bought from them)
-      const { data: reverseRelation } = await this.supabase
+      const { data: reverseRelation } = await this.serviceSupabase
         .from('client_relationships')
         .select('*')
         .eq('provider_id', targetUserId)
@@ -646,7 +651,7 @@ export class ConnectionsService {
         };
 
         // Get recent orders I made with them
-        const { data: orders } = await this.supabase
+        const { data: orders } = await this.serviceSupabase
           .from('orders')
           .select('id, order_number, total, status, order_date, order_items(id, name, image, price, quantity)')
           .eq('buyer_id', currentUserId)
@@ -661,7 +666,7 @@ export class ConnectionsService {
     // Get connection date if connected
     let connectedSince = null;
     if (connectionStatus.connectionId) {
-      const { data: connection } = await client
+      const { data: connection } = await this.serviceSupabase
         .from('user_connections')
         .select('created_at, updated_at')
         .eq('id', connectionStatus.connectionId)
@@ -695,13 +700,11 @@ export class ConnectionsService {
    * Returns connections separated into categories
    */
   async getCategorizedConnections(userId: string, type: 'plugs' | 'clients', userToken?: string): Promise<any> {
-    const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
-
     if (type === 'plugs') {
       // For Plugs tab: Following + Patronage
 
       // Category 1: Following (social connections where I'm the requester)
-      const { data: following } = await client
+      const { data: following } = await this.serviceSupabase
         .from('user_connections')
         .select(`
           *,
@@ -712,7 +715,7 @@ export class ConnectionsService {
         .order('updated_at', { ascending: false });
 
       // Category 2: Patronage (people I bought from)
-      const { data: patronage } = await this.supabase
+      const { data: patronage } = await this.serviceSupabase
         .from('client_relationships')
         .select('*')
         .eq('client_id', userId); // I am the customer
@@ -721,7 +724,7 @@ export class ConnectionsService {
       const patronageUserIds = patronage?.map(p => p.provider_id) || [];
       let patronageUsers: any[] = [];
       if (patronageUserIds.length > 0) {
-        const { data: users } = await client
+        const { data: users } = await this.serviceSupabase
           .from('user_profiles')
           .select('id, username, bio, avatar_url, is_seller, is_rider')
           .in('id', patronageUserIds);
@@ -746,7 +749,7 @@ export class ConnectionsService {
       // For Clients tab: Followers + Patronage
 
       // Category 1: Followers (social connections where I'm the addressee)
-      const { data: followers } = await client
+      const { data: followers } = await this.serviceSupabase
         .from('user_connections')
         .select(`
           *,
@@ -757,7 +760,7 @@ export class ConnectionsService {
         .order('updated_at', { ascending: false });
 
       // Category 2: Patronage (people who bought from me)
-      const { data: patronage } = await this.supabase
+      const { data: patronage } = await this.serviceSupabase
         .from('client_relationships')
         .select('*')
         .eq('provider_id', userId); // I am the provider
@@ -766,7 +769,7 @@ export class ConnectionsService {
       const patronageUserIds = patronage?.map(p => p.client_id) || [];
       let patronageUsers: any[] = [];
       if (patronageUserIds.length > 0) {
-        const { data: users } = await client
+        const { data: users } = await this.serviceSupabase
           .from('user_profiles')
           .select('id, username, bio, avatar_url, is_seller, is_rider')
           .in('id', patronageUserIds);

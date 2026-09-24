@@ -145,8 +145,8 @@ export class AuthResponse {
     is_rider?: boolean;
     is_verified?: boolean;
   };
-  accessToken: string;
-  refreshToken: string;
+  accessToken?: string;
+  refreshToken?: string;
   isSuspended?: boolean; // Industry standard: allow suspended users to authenticate
   requiresEmailVerification?: boolean; // New flag for email verification requirement
   mfaRequired?: boolean; // True when password was correct but a verified TOTP factor still needs a code

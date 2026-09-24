@@ -1,24 +1,42 @@
 import express from 'express';
 import { backgroundVideoProcessor } from '../services/backgroundVideoProcessor';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { JwtService } from '@nestjs/jwt';
 
-// Define custom user interface for our JWT payload
-interface AuthenticatedUser {
-  sub: string;
-  email: string;
-  isAdmin?: boolean;
-}
-
-// Extend Express Request type
-declare global {
-  namespace Express {
-    interface Request {
-      user?: AuthenticatedUser;
+const authenticateToken = async (req: any, res: any, next: any) => {
+  try {
+    const authHeader = req.headers?.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
-  }
-}
 
-const authenticateToken = new JwtAuthGuard(require('@nestjs/config').ConfigService).canActivate.bind(new JwtAuthGuard(require('@nestjs/config').ConfigService));
+    const token = authHeader.replace('Bearer ', '');
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      return res.status(500).json({ error: 'Server misconfigured' });
+    }
+
+    const jwtService = new JwtService({ secret: jwtSecret });
+    const decoded: any = jwtService.verify(token);
+
+    if (!decoded?.sub) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    req.user = {
+      sub: decoded.sub,
+      id: decoded.sub,
+      email: decoded.email,
+      type: decoded.type,
+      iat: decoded.iat,
+      exp: decoded.exp,
+    };
+
+    next();
+  } catch (error) {
+    console.error('Authentication error:', error);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+};
 
 const router = express.Router();
 

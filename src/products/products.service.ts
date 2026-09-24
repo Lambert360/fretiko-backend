@@ -275,6 +275,36 @@ export class ProductsService {
     }
   }
 
+  async getTrendingProducts(limit: number = 10): Promise<ProductResponseDto[]> {
+    // Best-effort: use the trending_products view if available, otherwise
+    // fall back to the newest products. Used by the AI trending tool.
+    const { data: trendingData, error: trendingError } = await this.supabase
+      .from('trending_products')
+      .select('product_id, trending_score')
+      .order('trending_score', { ascending: false })
+      .limit(limit);
+
+    if (trendingError || !trendingData || trendingData.length === 0) {
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    const productIds: string[] = trendingData.map((row: any) => row.product_id).filter(Boolean);
+    if (productIds.length === 0) {
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    const { data, error } = await this.supabase
+      .from('products')
+      .select('*')
+      .in('id', productIds);
+
+    if (error || !data) {
+      return this.getProducts({ limit, offset: 0 } as any);
+    }
+
+    return data as ProductResponseDto[];
+  }
+
   async getProductReviews(productId: string) {
     try {
       console.log(`Fetching reviews for product: ${productId}`);

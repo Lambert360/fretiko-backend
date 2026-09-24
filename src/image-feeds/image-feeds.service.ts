@@ -6,7 +6,7 @@ import * as path from 'path';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { BotPersona, ensureBotUser as ensureBotUserShared, insertBotPost } from '../shared/bot-persona.util';
 
-export { BotPersona };
+export type { BotPersona };
 
 export interface NicheContent {
   search_terms: string[];
