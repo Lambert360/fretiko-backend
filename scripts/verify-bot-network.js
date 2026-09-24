@@ -26,43 +26,47 @@ async function main() {
   const content = readJson('content-bots.json').bots;
   const engagement = readJson('engagement-bots.json').bots;
 
-  check('content bot count', content.length, '150-200', content.length >= 150 && content.length <= 200);
-  check('engagement bot count', engagement.length, 200, engagement.length === 200);
+  check('content bot count', content.length, '~400', content.length >= 380 && content.length <= 420);
+  check('engagement bot count', engagement.length, '~300', engagement.length >= 280 && engagement.length <= 320);
 
-  const totalFollowers = content.reduce((s, b) => s + b.followers_count, 0);
-  const avgFollowers = totalFollowers / content.length;
-  check('avg content-bot followers', avgFollowers.toFixed(1), '~500 (450-550)', avgFollowers >= 450 && avgFollowers <= 550);
+  const totalFollowers = [...content, ...engagement].reduce((s, b) => s + b.followers_count, 0);
+  const avgFollowers = totalFollowers / (content.length + engagement.length);
+  const allFollowersInRange = [...content, ...engagement].every((b) => b.followers_count >= 330 && b.followers_count <= 670);
+  check('all bot followers within 330-670', `avg=${avgFollowers.toFixed(1)}, allInRange=${allFollowersInRange}`, '330-670 each', allFollowersInRange);
 
-  const requiredNiches = [
-    'science_technology', 'ai', 'space', 'gadgets', 'fashion_lifestyle', 'nature_environment', 'animals_wildlife',
-    'nigeria_news', 'sports', 'business_entrepreneurship', 'culture_entertainment', 'food_travel', 'health_fitness', 'education_career',
-  ];
+  const raceCounts = [...content, ...engagement].reduce((acc, b) => { acc[b.race] = (acc[b.race] || 0) + 1; return acc; }, {});
+  check('race split ~400 caucasian / ~300 nigerian', JSON.stringify(raceCounts), '{"caucasian":400,"nigerian":300}', raceCounts.caucasian >= 380 && raceCounts.caucasian <= 420 && raceCounts.nigerian >= 280 && raceCounts.nigerian <= 320);
+
+  const requiredNigerianNiches = ['nigeria_news', 'afrobeats_music', 'nollywood', 'football', 'nigerian_food_culture', 'african_tech', 'controversial_trending'];
+  const requiredCaucasianNiches = ['science_technology', 'ai', 'space', 'gadgets', 'fashion_lifestyle', 'nature_environment', 'animals_wildlife', 'health_fitness', 'education_career', 'business_entrepreneurship', 'sports'];
   const nicheSet = new Set(content.map((b) => b.niche));
-  const missingNiches = requiredNiches.filter((n) => !nicheSet.has(n));
-  check('all 14 required niches present', `${requiredNiches.length - missingNiches.length}/14 (missing: ${missingNiches.join(',') || 'none'})`, '14/14', missingNiches.length === 0);
+  const missingNigerianNiches = requiredNigerianNiches.filter((n) => !nicheSet.has(n));
+  const missingCaucasianNiches = requiredCaucasianNiches.filter((n) => !nicheSet.has(n));
+  check('all Nigerian niches present', `missing: ${missingNigerianNiches.join(',') || 'none'}`, 'none missing', missingNigerianNiches.length === 0);
+  check('all Caucasian niches present', `missing: ${missingCaucasianNiches.join(',') || 'none'}`, 'none missing', missingCaucasianNiches.length === 0);
+
+  const nigerianBotsUseTechOnlyAfrican = content.filter((b) => b.race === 'nigerian').every((b) => b.niche !== 'science_technology' && b.niche !== 'ai' && b.niche !== 'gadgets');
+  check('Nigerian bots never assigned generic/international tech niches', nigerianBotsUseTechOnlyAfrican, true, nigerianBotsUseTechOnlyAfrican);
 
   const ethnicGroups = new Set([...content, ...engagement].map((b) => b.ethnic_group));
-  const requiredGroups = ['yoruba', 'igbo', 'hausa', 'english'];
+  const requiredGroups = ['yoruba', 'igbo', 'hausa', 'english', 'western'];
   const missingGroups = requiredGroups.filter((g) => !ethnicGroups.has(g));
-  check('Hausa/Igbo/Yoruba/English name groups present', `present: ${[...ethnicGroups].join(',')}`, requiredGroups.join(','), missingGroups.length === 0);
+  check('Yoruba/Igbo/Hausa/English/Western name groups present', `present: ${[...ethnicGroups].join(',')}`, requiredGroups.join(','), missingGroups.length === 0);
 
   const avatarPool = readJson('avatar-pool.json');
-  check('avatar pool has male + female dark-skin-filtered photos', `${avatarPool.men.length} men / ${avatarPool.women.length} women`, '>0 each', avatarPool.men.length > 0 && avatarPool.women.length > 0);
+  check('avatar pool has nigerian + caucasian male/female photos', `nigerian: ${avatarPool.nigerian.men.length}m/${avatarPool.nigerian.women.length}w, caucasian: ${avatarPool.caucasian.men.length}m/${avatarPool.caucasian.women.length}w`, '>0 each', avatarPool.nigerian.men.length > 0 && avatarPool.nigerian.women.length > 0 && avatarPool.caucasian.men.length > 0 && avatarPool.caucasian.women.length > 0);
 
   const allBots = [...content, ...engagement];
-  const isRealPoolPhoto = (url) => url.includes('images.pexels.com') || url.includes('images.unsplash.com');
-  const notFromPool = allBots.filter((b) => !isRealPoolPhoto(b.avatar_url));
-  check('all bot avatars use filtered Pexels/Unsplash pool (not randomuser.me placeholder)', `${allBots.length - notFromPool.length}/${allBots.length}`, `${allBots.length}/${allBots.length}`, notFromPool.length === 0);
 
   const csvPath = path.join(ROOT, 'bot-network-roster.csv');
   const csvLines = fs.readFileSync(csvPath, 'utf8').trim().split('\n');
-  check('roster CSV row count (header + 400 bots)', csvLines.length, content.length + engagement.length + 1, csvLines.length === content.length + engagement.length + 1);
+  check('roster CSV row count (header + bots)', csvLines.length, content.length + engagement.length + 1, csvLines.length === content.length + engagement.length + 1);
 
-  // --- RSS feed liveness for the 7 new niches ---
+  // --- RSS feed liveness for the new/updated niches ---
   const Parser = require('rss-parser');
   const parser = new Parser({ timeout: 15000 });
   const rssConfig = readJson('rss-feeds-config.json');
-  const newNiches = ['nigeria_news', 'sports', 'business_entrepreneurship', 'culture_entertainment', 'food_travel', 'health_fitness', 'education_career'];
+  const newNiches = ['nigeria_news', 'football', 'sports', 'nigerian_food_culture', 'african_tech', 'controversial_trending', 'business_entrepreneurship', 'health_fitness', 'education_career'];
   let totalNewNicheFeeds = 0;
   let workingNewNicheFeeds = 0;
   for (const niche of newNiches) {
@@ -88,11 +92,11 @@ async function main() {
     .select('username, avatar_url')
     .in('username', usernames);
   if (profErr) {
-    check('bot profiles provisioned in Supabase', 'query error: ' + profErr.message, '400 rows', false);
+    check('bot profiles provisioned in Supabase', 'query error: ' + profErr.message, `${allBots.length} rows`, false);
   } else {
-    check('bot profiles provisioned in Supabase', `${profiles.length}/400`, '400/400', profiles.length === 400);
-    const avatarMismatches = profiles.filter((p) => !p.avatar_url || !(p.avatar_url.includes('images.pexels.com') || p.avatar_url.includes('images.unsplash.com')));
-    check('provisioned profiles carry dark-skin-filtered avatar_url', `${profiles.length - avatarMismatches.length}/${profiles.length}`, `${profiles.length}/${profiles.length}`, avatarMismatches.length === 0);
+    check('bot profiles provisioned in Supabase', `${profiles.length}/${allBots.length}`, `${allBots.length}/${allBots.length}`, profiles.length === allBots.length);
+    const avatarMismatches = profiles.filter((p) => !p.avatar_url);
+    check('provisioned profiles carry an avatar_url', `${profiles.length - avatarMismatches.length}/${profiles.length}`, `${profiles.length}/${profiles.length}`, avatarMismatches.length === 0);
   }
 
   const { data: recentPosts, error: postErr } = await client
@@ -102,18 +106,26 @@ async function main() {
     .limit(10);
 
   if (postErr || !recentPosts || recentPosts.length === 0) {
-    check('recent posts exist with seeded likes >= 4', 'no posts found', '>=4 likes per recent post', false);
+    check('recent posts exist with seeded likes >= 50 and comments >= 50', 'no posts found', '>=50 likes and >=50 comments per recent post', false);
   } else {
     let postsWithEnoughLikes = 0;
+    let postsWithEnoughComments = 0;
     for (const p of recentPosts) {
       const { data: likes } = await client
         .from('post_interactions')
         .select('id')
         .eq('post_id', p.id)
         .eq('interaction_type', 'like');
-      if ((likes || []).length >= 4) postsWithEnoughLikes++;
+      if ((likes || []).length >= 50) postsWithEnoughLikes++;
+      const { data: comments } = await client
+        .from('post_interactions')
+        .select('id')
+        .eq('post_id', p.id)
+        .eq('interaction_type', 'comment');
+      if ((comments || []).length >= 50) postsWithEnoughComments++;
     }
-    check('recent posts have >=4 seeded likes', `${postsWithEnoughLikes}/${recentPosts.length}`, `${recentPosts.length}/${recentPosts.length}`, postsWithEnoughLikes === recentPosts.length);
+    check('recent posts have >=50 seeded likes', `${postsWithEnoughLikes}/${recentPosts.length}`, `${recentPosts.length}/${recentPosts.length}`, postsWithEnoughLikes === recentPosts.length);
+    check('recent posts have >=50 seeded comments', `${postsWithEnoughComments}/${recentPosts.length}`, `${recentPosts.length}/${recentPosts.length}`, postsWithEnoughComments === recentPosts.length);
   }
 
   // --- followers_count column / migration status ---

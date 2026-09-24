@@ -1,0 +1,84 @@
+{
+  "niches": {
+    "science_technology": {
+      "search_terms": ["tech office", "coding screen", "developer workspace", "tech conference", "innovation lab"],
+      "captions": ["this is giving future \u2728", "the tech scene is not playing", "okay but this is actually so cool", "we're so back", "not me watching this on repeat"]
+    },
+    "ai": {
+      "search_terms": ["robotics demo", "futuristic technology", "digital art abstract", "neural network visual", "automation process"],
+      "captions": ["the future is loading... \ud83e\udd16", "this is what tomorrow looks like", "no thoughts just vibes and algorithms", "this hit different at 2am"]
+    },
+    "space": {
+      "search_terms": ["galaxy timelapse", "night sky stars", "nebula animation", "astronaut footage", "planets space"],
+      "captions": ["we're so small and it's kind of comforting \ud83c\udf0c", "space core aesthetic \ud83d\ude80", "this made me feel something", "certified cosmic moment"]
+    },
+    "gadgets": {
+      "search_terms": ["smartphone unboxing", "headphones aesthetic", "gadget flatlay", "wireless earbuds", "smartwatch demo"],
+      "captions": ["adding this to cart rn \ud83d\uded2", "the aesthetic is unmatched", "why is this so satisfying to watch", "need this in my life immediately"]
+    },
+    "fashion_lifestyle": {
+      "search_terms": ["street style fashion", "outfit walkthrough", "minimalist fashion", "lifestyle vlog", "coffee shop aesthetic"],
+      "captions": ["the fit is doing numbers \ud83d\udd25", "main character energy fr", "mood board material", "obsessed with this whole vibe"]
+    },
+    "nature_environment": {
+      "search_terms": ["waterfall drone shot", "forest walk", "mountains sunrise", "ocean waves", "green landscape"],
+      "captions": ["nature really said 'i got you' \ud83c\udf3f", "this is healing my nervous system", "take me here right now", "certified peace of mind"]
+    },
+    "animals_wildlife": {
+      "search_terms": ["wildlife animal", "cute animal", "wild animal close up", "birds nature", "ocean animal"],
+      "captions": ["he/she is just like me fr \ud83e\udd79", "this made my whole day better", "the audacity of this cutie", "rate this little guy /10"]
+    },
+    "health_fitness": {
+      "search_terms": ["gym workout", "healthy lifestyle fitness", "morning run outdoors", "yoga session", "fitness training"],
+      "captions": ["no excuses today \ud83d\udcaa", "consistency is the secret", "morning workout done \u2705", "discipline over motivation"]
+    },
+    "education_career": {
+      "search_terms": ["students studying", "graduation ceremony", "career professional office", "young professional working", "university campus"],
+      "captions": ["invest in yourself, always \ud83d\udcda", "another skill unlocked", "career growth mode", "learning never stops"]
+    },
+    "business_entrepreneurship": {
+      "search_terms": ["business meeting", "entrepreneur working laptop", "startup office", "young entrepreneur", "team brainstorm"],
+      "captions": ["building something from nothing \ud83d\udcbc", "hustle never stops", "small business energy", "another day building the dream"]
+    },
+    "sports": {
+      "search_terms": ["football skills", "basketball highlights", "soccer training", "athlete training", "sports highlights"],
+      "captions": ["the skill is unreal \u26bd", "matchday energy", "this is why we love the game", "champions mentality"]
+    },
+    "football": {
+      "search_terms": ["football match action", "soccer training", "football stadium", "football skills", "goal celebration"],
+      "captions": ["matchday energy \ud83d\udd25\u26bd", "the passion is unreal", "who else watched this?!", "football no dey rest"]
+    },
+    "nigeria_news": {
+      "search_terms": ["city street life", "urban skyline", "market street scene", "city traffic", "downtown city"],
+      "captions": ["things happening around us right now", "this is why I stay informed", "had to share this update", "keeping up with wetin dey happen"]
+    },
+    "afrobeats_music": {
+      "search_terms": ["dj set performance", "concert crowd", "live music stage", "dance performance", "music festival"],
+      "captions": ["afrobeats to the world \ud83c\udf0d", "this beat is a whole mood", "vibes on repeat \ud83c\udfa7", "the culture sound different"]
+    },
+    "nollywood": {
+      "search_terms": ["film set behind the scenes", "movie premiere", "cinema footage", "actor performance", "movie theatre"],
+      "captions": ["the industry is growing fast \ud83c\udfac", "this storyline got me", "cinema night was worth it", "our movies keep getting better"]
+    },
+    "nigerian_food_culture": {
+      "search_terms": ["cooking process", "street food preparation", "food plating", "local market food", "traditional cooking"],
+      "captions": ["this looks so good \ud83d\ude0b", "food no go ever fall my hand", "street food hits different", "jollof rice supremacy"]
+    },
+    "african_tech": {
+      "search_terms": ["tech office", "developer workspace", "startup office", "tech conference", "coding screen"],
+      "captions": ["the tech scene is not playing", "building the future rn", "this energy is everything", "innovation looks like this"]
+    },
+    "controversial_trending": {
+      "search_terms": ["trending news clip", "viral moment reaction", "street interview", "public reaction", "crowd reaction"],
+      "captions": ["everyone is talking about this", "had to share this take", "the internet is not okay", "this is the discourse today"]
+    }
+  },
+  "settings": {
+    "fetch_interval_minutes": 20,
+    "post_interval_minutes": 30,
+    "enable_auto_posting": true,
+    "video_sources": ["pexels", "pixabay"],
+    "show_attribution": false,
+    "max_recent_videos_remembered": 200
+  }
+}

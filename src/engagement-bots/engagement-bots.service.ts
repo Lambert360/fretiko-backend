@@ -9,10 +9,11 @@ import {
   fallbackReply,
   sanitizeComment,
 } from './bot-comment.util';
+// fallbackComment is now also used directly in seedEngagementForPost
 
-const LIKE_ONLY_WEIGHT = 0.55;
-const LIKE_AND_COMMENT_WEIGHT = 0.3;
-const LIKE_COMMENT_AND_SHARE_WEIGHT = 0.15;
+const LIKE_ONLY_WEIGHT = 0.30;
+const LIKE_AND_COMMENT_WEIGHT = 0.50;
+const LIKE_COMMENT_AND_SHARE_WEIGHT = 0.20;
 
 @Injectable()
 export class EngagementBotsService {
@@ -22,6 +23,7 @@ export class EngagementBotsService {
   private contentPersonas: BotPersona[] = [];
   private engagementUserIds: Map<string, string> = new Map();
   private contentUserIds: Set<string> = new Set();
+  private botRaceMap: Map<string, 'caucasian' | 'nigerian'> = new Map();
 
   constructor(
     private readonly configService: ConfigService,
@@ -69,6 +71,7 @@ export class EngagementBotsService {
       const id = await ensureBotUser(this.supabaseClient, persona);
       if (id) {
         this.engagementUserIds.set(persona.username, id);
+        this.botRaceMap.set(id, persona.race || 'nigerian');
       }
     }
 
@@ -76,6 +79,7 @@ export class EngagementBotsService {
       const id = await ensureBotUser(this.supabaseClient, persona);
       if (id) {
         this.contentUserIds.add(id);
+        this.botRaceMap.set(id, persona.race || 'nigerian');
       }
     }
 
@@ -150,10 +154,11 @@ export class EngagementBotsService {
     const content = (postContent || '').trim();
     if (!content) return null;
 
+    const race = this.botRaceMap.get(botUserId) || 'nigerian';
     const seed = this.hashSeed(`${botUserId}:${content.slice(0, 80)}:${parentComment || ''}`);
 
     try {
-      const prompt = buildCommentPrompt(content, parentComment);
+      const prompt = buildCommentPrompt(content, parentComment, race);
       const result = await this.llmService.chat(
         [
           { role: 'system', content: prompt.system },
@@ -168,7 +173,7 @@ export class EngagementBotsService {
       this.logger.warn(`Contextual comment LLM failed, using post-specific fallback: ${error.message}`);
     }
 
-    return parentComment ? fallbackReply(content, parentComment, seed) : fallbackComment(content, seed);
+    return parentComment ? fallbackReply(content, parentComment, seed, race) : fallbackComment(content, seed, race);
   }
 
   // Called right after a content bot creates a post so it doesn't sit with
@@ -176,22 +181,24 @@ export class EngagementBotsService {
   async seedEngagementForPost(
     postId: string,
     authorId: string,
-    minLikes = 4,
-    maxLikes = 9,
+    minLikes = 50,
+    maxLikes = 80,
+    minComments = 50,
+    maxComments = 65,
     postContent?: string,
-  ): Promise<number> {
+  ): Promise<{ liked: number; commented: number }> {
     if (this.engagementUserIds.size === 0) {
       await this.initializeBotUsers();
     }
 
     const candidates = Array.from(this.engagementUserIds.values()).filter((id) => id !== authorId);
-    if (candidates.length === 0) return 0;
+    if (candidates.length === 0) return { liked: 0, commented: 0 };
 
     const likeCount = minLikes + Math.floor(Math.random() * (maxLikes - minLikes + 1));
-    const shuffled = [...candidates].sort(() => Math.random() - 0.5).slice(0, likeCount);
+    const shuffledForLikes = [...candidates].sort(() => Math.random() - 0.5).slice(0, likeCount);
 
     let liked = 0;
-    for (const botUserId of shuffled) {
+    for (const botUserId of shuffledForLikes) {
       const { error } = await this.supabaseClient.from('post_interactions').insert({
         post_id: postId,
         user_id: botUserId,
@@ -201,22 +208,43 @@ export class EngagementBotsService {
       else if (error.code !== '23505') this.logger.warn(`Seed like failed: ${error.message}`);
     }
 
-    if (Math.random() < 0.6 && shuffled.length > 0) {
-      const commenter = shuffled[0];
-      const sourceContent = postContent || (await this.getPostContent(postId));
-      const commentText = await this.composeComment(sourceContent, commenter);
-      if (commentText) {
-        const { error } = await this.supabaseClient.from('post_interactions').insert({
-          post_id: postId,
-          user_id: commenter,
-          interaction_type: 'comment',
-          content: commentText,
-        });
-        if (error && error.code !== '23505') this.logger.warn(`Seed comment failed: ${error.message}`);
-      }
+    const commentCount = minComments + Math.floor(Math.random() * (maxComments - minComments + 1));
+    const shuffledForComments = [...candidates].sort(() => Math.random() - 0.5).slice(0, commentCount);
+    const sourceContent = postContent || (await this.getPostContent(postId));
+
+    let commented = 0;
+    const LLM_COMMENT_RATIO = 0.4;
+    const llmLimit = Math.ceil(commentCount * LLM_COMMENT_RATIO);
+    const CONCURRENCY = 5;
+
+    for (let i = 0; i < shuffledForComments.length; i += CONCURRENCY) {
+      const batch = shuffledForComments.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map(async (botUserId, batchIdx) => {
+          const globalIdx = i + batchIdx;
+          let commentText: string | null = null;
+          if (globalIdx < llmLimit) {
+            commentText = await this.composeComment(sourceContent, botUserId);
+          }
+          if (!commentText) {
+            const race = this.botRaceMap.get(botUserId) || 'nigerian';
+            const seed = this.hashSeed(`${botUserId}:${sourceContent.slice(0, 80)}:seed${globalIdx}`);
+            commentText = fallbackComment(sourceContent, seed, race);
+          }
+          const { error } = await this.supabaseClient.from('post_interactions').insert({
+            post_id: postId,
+            user_id: botUserId,
+            interaction_type: 'comment',
+            content: commentText,
+          });
+          if (error && error.code !== '23505') this.logger.warn(`Seed comment failed: ${error.message}`);
+          return !error || error.code === '23505';
+        }),
+      );
+      commented += results.filter((r) => r.status === 'fulfilled' && r.value).length;
     }
 
-    return liked;
+    return { liked, commented };
   }
 
   async engageWithPost(botUserId: string, postId: string, postContent?: string): Promise<string[]> {

@@ -11,6 +11,17 @@ const RSS_NICHE_TO_BOT_NICHE: Record<string, string> = {
   animals: 'animals_wildlife',
 };
 
+const NIGERIAN_ONLY_NICHES = new Set([
+  'nigeria_news', 'afrobeats_music', 'nollywood', 'football',
+  'nigerian_food_culture', 'african_tech', 'controversial_trending',
+]);
+
+const CAUCASIAN_ONLY_NICHES = new Set([
+  'science_technology', 'ai', 'space', 'gadgets', 'fashion_lifestyle',
+  'nature_environment', 'animals_wildlife', 'health_fitness',
+  'education_career', 'business_entrepreneurship', 'sports',
+]);
+
 @Injectable()
 export class RssFeedsScheduler implements OnModuleInit {
   private readonly logger = new Logger(RssFeedsScheduler.name);
@@ -34,22 +45,25 @@ export class RssFeedsScheduler implements OnModuleInit {
   private async seedEngagement(post: any, botUserId: string): Promise<void> {
     if (!post?.id) return;
     try {
-      const liked = await this.engagementBotsService.seedEngagementForPost(
+      const result = await this.engagementBotsService.seedEngagementForPost(
         post.id,
         botUserId,
-        4,
-        9,
+        50,
+        80,
+        50,
+        65,
         post.content,
       );
-      if (liked > 0) this.logger.log(`Seeded ${liked} likes on post ${post.id}`);
+      this.logger.log(`Seeded ${result.liked} likes and ${result.commented} comments on post ${post.id}`);
     } catch (error: any) {
       this.logger.warn(`Failed to seed engagement for post ${post.id}: ${error.message}`);
     }
   }
 
-  async onModuleInit() {
-    await this.initializeBotUsers();
-    this.logger.log('RSS Feeds Scheduler initialized');
+  onModuleInit() {
+    void this.initializeBotUsers()
+      .then(() => this.logger.log('RSS Feeds Scheduler initialized'))
+      .catch((error: any) => this.logger.error('Failed to initialize RSS bot users', error?.stack));
   }
 
   private async initializeBotUsers(): Promise<void> {
@@ -85,9 +99,12 @@ export class RssFeedsScheduler implements OnModuleInit {
     if (!rssNiche) return this.nextBotUserId();
 
     const botNiche = RSS_NICHE_TO_BOT_NICHE[rssNiche] || rssNiche;
-    const matching = this.personas.filter(
-      (persona) => persona.niche === botNiche && this.personaUserIds.has(persona.username),
-    );
+    const matching = this.personas.filter((persona) => {
+      if (persona.niche !== botNiche || !this.personaUserIds.has(persona.username)) return false;
+      if (NIGERIAN_ONLY_NICHES.has(botNiche) && persona.race !== 'nigerian') return false;
+      if (CAUCASIAN_ONLY_NICHES.has(botNiche) && persona.race !== 'caucasian') return false;
+      return true;
+    });
 
     if (matching.length === 0) return this.nextBotUserId();
 
