@@ -14,6 +14,9 @@ import { PartnershipsController } from '../partnerships/partnerships.controller'
 import { OrdersController } from './orders.controller';
 import { DisputesController } from './disputes.controller';
 import { AdminNotificationsController } from './admin-notifications.controller';
+import { BroadcastsController } from './broadcasts.controller';
+import { BroadcastsService } from './broadcasts.service';
+import { BroadcastSchedulerService } from './broadcast-scheduler.service';
 import { GiftCardAdminController } from './gift-card-admin.controller';
 import { LiveSalesGamificationAdminController } from './live-sales-gamification-admin.controller';
 import { AdminService } from './admin.service';
@@ -76,6 +79,7 @@ import { LiveSalesModule } from '../live-sales/live-sales.module';
     OrdersController, 
     DisputesController,
     AdminNotificationsController, // REST endpoints for admin notifications
+    BroadcastsController, // Vendor/user promotional broadcasts
     GiftCardAdminController, // NEW: Gift card management endpoints
     LiveSalesGamificationAdminController, // NEW: Live sales gamification admin
   ],
@@ -83,6 +87,8 @@ import { LiveSalesModule } from '../live-sales/live-sales.module';
     AdminService,
     AdminNotificationsGateway,
     AdminNotificationsService,
+    BroadcastsService,
+    BroadcastSchedulerService,
     AuthEmailService,
     SharedEmailService,
   ],

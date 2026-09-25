@@ -237,7 +237,7 @@ export class WorkspaceController {
   @Get('orders/source/:source')
   async getOrdersBySource(
     @Request() req,
-    @Param('source') source: 'regular' | 'live_stream' | 'auction' | 'service_booking',
+    @Param('source') source: 'regular' | 'live_stream' | 'auction' | 'service_booking' | 'invoice' | 'wishlist',
   ) {
     return await this.workspaceService.getOrdersBySource(
       req.user.sub,
@@ -250,6 +250,18 @@ export class WorkspaceController {
   async getRealTimeMetrics(@Request() req) {
     return await this.workspaceService.getRealTimeMetrics(
       req.user.sub,
+      req.supabaseToken,
+    );
+  }
+
+  @Get('analytics/orders-by-source')
+  async getOrdersAnalyticsBySource(
+    @Request() req,
+    @Query('period') period?: 'today' | 'week' | 'month',
+  ) {
+    return await this.workspaceService.getOrdersAnalyticsBySource(
+      req.user.sub,
+      period || 'today',
       req.supabaseToken,
     );
   }

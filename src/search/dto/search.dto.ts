@@ -7,6 +7,7 @@ export enum SearchType {
   SERVICES = 'services',
   PEOPLE = 'people',
   PROVIDERS = 'providers',
+  VENDORS = 'vendors',
 }
 
 export class SearchQueryDto {
@@ -56,6 +57,10 @@ export class SearchQueryDto {
   sortBy?: 'relevance' | 'price_asc' | 'price_desc' | 'rating' | 'newest' | 'popular';
 
   @IsOptional()
+  @Transform(({ value }) => value === true || value === 'true')
+  verifiedOnly?: boolean;
+
+  @IsOptional()
   @IsNumber()
   @Min(1)
   @Transform(({ value }) => value ? parseInt(value) : 1)
@@ -102,7 +107,7 @@ export class FeaturedContentDto {
 export class SearchSuggestionsDto {
   @IsString()
   @Transform(({ value }) => value?.toLowerCase().trim())
-  query: string;
+  query!: string;
 
   @IsOptional()
   @IsNumber()

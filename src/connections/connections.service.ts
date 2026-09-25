@@ -611,18 +611,20 @@ export class ConnectionsService {
         totalSpent: clientRelation.total_spent,
         relationshipStatus: clientRelation.relationship_type,
         lastOrderDate: clientRelation.last_interaction,
+        // When this customer relationship began — the real "Customer Since"
+        customerSince: clientRelation.created_at,
       };
 
       // Get recent orders
       const { data: orders } = await this.serviceSupabase
         .from('orders')
-        .select('id, order_number, total, status, order_date, order_items(id, name, image, price, quantity)')
+        .select('id, order_number, total_amount, status, created_at, order_items(id, product_id, service_id, product_name, price, quantity)')
         .eq('buyer_id', targetUserId)
-        .eq('seller_id', currentUserId)
-        .order('order_date', { ascending: false })
+        .eq('vendor_id', currentUserId)
+        .order('created_at', { ascending: false })
         .limit(10);
 
-      recentOrders = orders || [];
+      recentOrders = await this.mapConnectionOrders(orders || []);
     } else {
       // Check if current user is target's client (I bought from them)
       const { data: reverseRelation } = await this.serviceSupabase
@@ -639,18 +641,20 @@ export class ConnectionsService {
           totalSpent: reverseRelation.total_spent,
           relationshipStatus: reverseRelation.relationship_type,
           lastOrderDate: reverseRelation.last_interaction,
+          // When I first became their customer
+          customerSince: reverseRelation.created_at,
         };
 
         // Get recent orders I made with them
         const { data: orders } = await this.serviceSupabase
           .from('orders')
-          .select('id, order_number, total, status, order_date, order_items(id, name, image, price, quantity)')
+          .select('id, order_number, total_amount, status, created_at, order_items(id, product_id, service_id, product_name, price, quantity)')
           .eq('buyer_id', currentUserId)
-          .eq('seller_id', targetUserId)
-          .order('order_date', { ascending: false })
+          .eq('vendor_id', targetUserId)
+          .order('created_at', { ascending: false })
           .limit(10);
 
-        recentOrders = orders || [];
+        recentOrders = await this.mapConnectionOrders(orders || []);
       }
     }
 
@@ -675,15 +679,57 @@ export class ConnectionsService {
       },
       relationshipType,
       businessMetrics,
-      recentOrders: recentOrders.map(order => ({
-        id: order.id,
-        orderNumber: order.order_number,
-        total: order.total,
-        status: order.status,
-        date: order.order_date,
-        items: order.order_items || [],
-      })),
+      recentOrders,
     };
+  }
+
+  /**
+   * Map raw order rows into the shape ConnectionDetailsScreen expects,
+   * resolving item names/images from products/services.
+   */
+  private async mapConnectionOrders(orders: any[]): Promise<any[]> {
+    if (!orders.length) return [];
+
+    // Collect product/service ids to resolve item names + images
+    const productIds = new Set<string>();
+    const serviceIds = new Set<string>();
+    for (const order of orders) {
+      for (const item of order.order_items || []) {
+        if (item.product_id) productIds.add(item.product_id);
+        if (item.service_id) serviceIds.add(item.service_id);
+      }
+    }
+
+    const [productsRes, servicesRes] = await Promise.all([
+      productIds.size
+        ? this.serviceSupabase.from('products').select('id, name, primary_image_url').in('id', [...productIds])
+        : Promise.resolve({ data: [] as any[] }),
+      serviceIds.size
+        ? this.serviceSupabase.from('services').select('id, name, primary_media_url').in('id', [...serviceIds])
+        : Promise.resolve({ data: [] as any[] }),
+    ]);
+
+    const productMap = new Map<string, any>((productsRes.data || []).map((p: any) => [p.id, p]));
+    const serviceMap = new Map<string, any>((servicesRes.data || []).map((s: any) => [s.id, s]));
+
+    return orders.map(order => ({
+      id: order.id,
+      orderNumber: order.order_number,
+      total: order.total_amount,
+      status: order.status,
+      date: order.created_at,
+      items: (order.order_items || []).map((item: any) => {
+        const product = item.product_id ? productMap.get(item.product_id) : null;
+        const service = item.service_id ? serviceMap.get(item.service_id) : null;
+        return {
+          id: item.id,
+          name: item.product_name || product?.name || service?.name || 'Item',
+          image: product?.primary_image_url || service?.primary_media_url || null,
+          price: item.price,
+          quantity: item.quantity,
+        };
+      }),
+    }));
   }
 
   /**

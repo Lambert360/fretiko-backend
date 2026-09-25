@@ -1,4 +1,4 @@
-import { IsString, IsEnum, IsOptional, IsNumber, IsInt, IsUUID, IsArray, ArrayMinSize, ValidateNested, IsPositive, Min, Max, IsBoolean, IsObject } from 'class-validator';
+import { IsString, IsEnum, IsOptional, IsNumber, IsInt, IsUUID, IsArray, ArrayMinSize, ValidateNested, IsPositive, Min, Max, IsBoolean, IsObject, IsIn } from 'class-validator';
 import { Type } from 'class-transformer';
 
 /**
@@ -219,6 +219,11 @@ export class CreateSoundDto {
   @IsOptional()
   @IsBoolean()
   is_active?: boolean;
+
+  /** Which surface this sound belongs to. Defaults to 'gift'. */
+  @IsOptional()
+  @IsIn(['gift', 'live_stream'])
+  context?: 'gift' | 'live_stream';
 }
 
 /**
@@ -240,4 +245,8 @@ export class UpdateSoundDto {
   @IsOptional()
   @IsBoolean()
   is_active?: boolean;
+
+  @IsOptional()
+  @IsIn(['gift', 'live_stream'])
+  context?: 'gift' | 'live_stream';
 }

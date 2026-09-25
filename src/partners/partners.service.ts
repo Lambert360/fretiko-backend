@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { PartnerProfileUpdateDto } from './dto/partner-auth.dto';
 import { EmailService } from '../auth/email.service';
+import { DeliveryRate } from '../shared/delivery-pricing';
 
 @Injectable()
 export class PartnersService {
@@ -416,7 +417,7 @@ export class PartnersService {
    */
   async updatePricingConfig(
     partnerId: string,
-    pricingConfig: Record<string, { base_price: number; per_km_rate: number }>
+    pricingConfig: Record<string, DeliveryRate>
   ): Promise<{ success: boolean; message: string }> {
     try {
       const { error } = await this.supabase
@@ -491,8 +492,12 @@ export class PartnersService {
       enabled: data.interstate_config?.enabled ?? false,
       basePrice: data.interstate_config?.base_price ?? 0,
       perKmRate: data.interstate_config?.per_km_rate ?? 0,
+      perKgRate: data.interstate_config?.per_kg_rate ?? 0,
       internationalBasePrice: data.interstate_config?.international_base_price ?? 0,
       internationalPerKmRate: data.interstate_config?.international_per_km_rate ?? 0,
+      internationalPerKgRate: data.interstate_config?.international_per_kg_rate ?? 0,
+      includedWeightKg: data.interstate_config?.included_weight_kg ?? 0,
+      maxWeightKg: data.interstate_config?.max_weight_kg ?? null,
       estimatedDeliveryDaysMin: data.interstate_config?.estimated_delivery_days_min ?? 2,
       estimatedDeliveryDaysMax: data.interstate_config?.estimated_delivery_days_max ?? 5,
       internationalEnabled: data.interstate_config?.international_enabled ?? false,
@@ -509,8 +514,12 @@ export class PartnersService {
       enabled?: boolean;
       basePrice?: number;
       perKmRate?: number;
+      perKgRate?: number;
       internationalBasePrice?: number;
       internationalPerKmRate?: number;
+      internationalPerKgRate?: number;
+      includedWeightKg?: number;
+      maxWeightKg?: number | null;
       estimatedDeliveryDaysMin?: number;
       estimatedDeliveryDaysMax?: number;
       internationalEnabled?: boolean;
@@ -528,8 +537,12 @@ export class PartnersService {
         ...(config.enabled !== undefined ? { enabled: config.enabled } : {}),
         ...(config.basePrice !== undefined ? { base_price: config.basePrice } : {}),
         ...(config.perKmRate !== undefined ? { per_km_rate: config.perKmRate } : {}),
+        ...(config.perKgRate !== undefined ? { per_kg_rate: config.perKgRate } : {}),
         ...(config.internationalBasePrice !== undefined ? { international_base_price: config.internationalBasePrice } : {}),
         ...(config.internationalPerKmRate !== undefined ? { international_per_km_rate: config.internationalPerKmRate } : {}),
+        ...(config.internationalPerKgRate !== undefined ? { international_per_kg_rate: config.internationalPerKgRate } : {}),
+        ...(config.includedWeightKg !== undefined ? { included_weight_kg: config.includedWeightKg } : {}),
+        ...(config.maxWeightKg !== undefined ? { max_weight_kg: config.maxWeightKg } : {}),
         ...(config.estimatedDeliveryDaysMin !== undefined ? { estimated_delivery_days_min: config.estimatedDeliveryDaysMin } : {}),
         ...(config.estimatedDeliveryDaysMax !== undefined ? { estimated_delivery_days_max: config.estimatedDeliveryDaysMax } : {}),
         ...(config.internationalEnabled !== undefined ? { international_enabled: config.internationalEnabled } : {}),
@@ -614,6 +627,7 @@ export class PartnersService {
       isInternational: order.metadata?.interstate_delivery?.isInternational || false,
       totalAmount: order.total_amount,
       deliveryFee: order.delivery_fee,
+      totalWeightKg: order.total_weight_kg ?? null,
       deliveryAddress: order.delivery_address,
       deliveryInstructions: order.delivery_instructions,
       estimatedDeliveryDays: order.metadata?.interstate_delivery?.estimatedDeliveryDays,
@@ -773,11 +787,11 @@ export class PartnersService {
    * Enables all standard service categories with the same rates.
    */
   private buildServicePricingFromRates(
-    rates: { base_price: number; per_km_rate: number }
-  ): Record<string, { enabled: boolean; base_price: number; per_km_rate: number }> {
+    rates: DeliveryRate
+  ): Record<string, DeliveryRate & { enabled: boolean }> {
     const categories = ['intracity', 'intercity', 'interstate', 'express', 'cargo'];
     return Object.fromEntries(
-      categories.map((cat) => [cat, { enabled: true, base_price: rates.base_price, per_km_rate: rates.per_km_rate }])
+      categories.map((cat) => [cat, { enabled: true, ...rates }])
     );
   }
 

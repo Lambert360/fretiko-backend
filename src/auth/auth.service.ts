@@ -1,10 +1,13 @@
-import { Injectable, UnauthorizedException, ConflictException, BadRequestException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ConflictException, BadRequestException, Inject, Optional, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { SupabaseClientManager } from './supabase-client-manager.service';
 import { SignUpDto, SignInDto, AuthResponse } from '../shared/dto/auth.dto';
 import { EmailService } from './email.service';
 import { TokenService } from './token.service';
+import { EmailNotificationService } from '../notifications/email-notification.service';
+import { welcomeEmail } from '../notifications/email-templates';
+import { resolveReferrer } from '../shared/referral';
 
 @Injectable()
 export class AuthService {
@@ -17,6 +20,8 @@ export class AuthService {
     private jwtService: JwtService,
     private emailService: EmailService,
     private tokenService: TokenService,
+    @Optional() @Inject(forwardRef(() => EmailNotificationService))
+    private emailNotificationService?: EmailNotificationService,
   ) {
     this.supabase = this.clientManager.getUserClient();
     this.serviceSupabase = this.clientManager.getServiceClient();
@@ -109,6 +114,13 @@ export class AuthService {
       email: email,
     });
 
+    // Referral input may be a code OR the referrer's username — normalize
+    // to the canonical referral_code before storing (referred_by_code is
+    // VARCHAR(10); a long username would fail the upsert).
+    const resolvedReferralCode = referralCode
+      ? (await resolveReferrer(this.serviceSupabase, referralCode))?.referral_code ?? null
+      : null;
+
     // Create or update user profile record with user ID, role, and verification data
     const profileData = {
       id: data.user.id, // Required for upsert
@@ -125,7 +137,7 @@ export class AuthService {
       terms_accepted_at: originalTermsAcceptedAt, // Use original timestamp from signup
       terms_accepted_ip: ipAddress || null,
       terms_accepted_user_agent: userAgent || null,
-      ...(referralCode && { referred_by_code: referralCode }),
+      ...(resolvedReferralCode && { referred_by_code: resolvedReferralCode }),
     };
 
     console.log('🔍 Updating user profile with data:', {
@@ -144,6 +156,19 @@ export class AuthService {
     if (updateError) {
       console.error('❌ Failed to update user profile:', updateError);
       throw new BadRequestException('Failed to create user profile');
+    }
+
+    // Record the completed referral (best-effort — never block signup on it).
+    // The RPC resolves code-or-username itself and stores the canonical code.
+    if (referralCode) {
+      try {
+        await this.serviceSupabase.rpc('complete_referral', {
+          p_referred_user_id: data.user.id,
+          p_referral_code: referralCode,
+        });
+      } catch (referralError) {
+        console.error('⚠️ complete_referral failed (non-fatal):', referralError);
+      }
     }
 
     // Update verification log with user_id
@@ -180,7 +205,8 @@ export class AuthService {
         is_seller,
         is_rider,
         is_verified,
-        display_name
+        display_name,
+        citizen_number
       `)
       .eq('id', data.user.id)
       .single();
@@ -196,7 +222,21 @@ export class AuthService {
       is_seller: completeProfileData?.is_seller || false,
       is_rider: completeProfileData?.is_rider || false,
       is_verified: completeProfileData?.is_verified || false,
+      citizen_number: completeProfileData?.citizen_number,
     };
+
+    // Best-effort welcome email — deduped once per user, gated by email prefs
+    const emailService = this.emailNotificationService;
+    if (emailService) {
+      void emailService
+        .sendUserEmail(data.user.id, {
+          subject: 'Welcome to Fretiko',
+          category: 'system',
+          reminder: { type: 'welcome', entityType: 'user', entityId: data.user.id },
+          buildHtml: (ctx) => welcomeEmail({ name: ctx.name, appUrl: emailService.appUrl() }),
+        })
+        .catch(() => {});
+    }
 
     // Return user data only - tokens will be created by signin in WelcomeScreen
     return {
@@ -388,6 +428,7 @@ export class AuthService {
         is_rider,
         is_verified,
         display_name,
+        citizen_number,
         preferences
       `)
       .eq('id', data.user.id)
@@ -422,6 +463,7 @@ export class AuthService {
       is_seller: profileData?.is_seller,
       is_rider: profileData?.is_rider,
       is_verified: profileData?.is_verified,
+      citizen_number: profileData?.citizen_number,
     };
 
     // Generate our custom token pair (7-day access + 30-day refresh)
@@ -746,7 +788,7 @@ export class AuthService {
       }
 
       throw new UnauthorizedException('Email not found in user profiles');
-    } catch (error) {
+    } catch (error: any) {
       throw new UnauthorizedException('Migration failed: ' + error.message);
     }
   }

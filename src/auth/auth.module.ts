@@ -1,6 +1,7 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
@@ -20,6 +21,8 @@ import { SupabaseClientManager } from './supabase-client-manager.service';
       }),
       inject: [ConfigService],
     }),
+    // NotificationsModule imports AuthModule — forwardRef resolves the cycle
+    forwardRef(() => NotificationsModule),
   ],
   providers: [
     AuthService, 

@@ -25,6 +25,7 @@ export interface Auction {
   end_time: Date;
   soft_close_enabled: boolean;
   soft_close_extension: number;
+  last_extended_at?: Date;
 
   // Status & Statistics
   status: 'scheduled' | 'active' | 'ended' | 'cancelled' | 'sold';
@@ -47,6 +48,7 @@ export interface Auction {
   stream_url?: string;
   auctioneer_enabled: boolean;
   crowd_sounds_enabled: boolean;
+  current_item_id?: string;
 
   // Fees & Commission
   listing_fee: number;

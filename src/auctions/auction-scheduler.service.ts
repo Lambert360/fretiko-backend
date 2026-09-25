@@ -3,7 +3,14 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient } from '../shared/supabase.client';
 import { AuctionGateway } from './auction.gateway';
-import { AuctionPaymentService } from './auction-payment.service';
+import { PushNotificationService } from '../notifications/push-notification.service';
+import { EmailNotificationService } from '../notifications/email-notification.service';
+import {
+  auctionWonEmail,
+  auctionWinExpiredEmail,
+  auctionWinForfeitedEmail,
+  auctionSaleFailedEmail,
+} from '../notifications/email-templates';
 
 /**
  * Auction Scheduler Service
@@ -22,7 +29,8 @@ export class AuctionSchedulerService {
   constructor(
     private configService: ConfigService,
     private auctionGateway: AuctionGateway,
-    private auctionPaymentService: AuctionPaymentService,
+    private pushNotificationService: PushNotificationService,
+    private emailNotificationService: EmailNotificationService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
   }
@@ -111,11 +119,13 @@ export class AuctionSchedulerService {
       const now = new Date();
       const warningTime = new Date(now.getTime() + 30 * 60 * 1000); // 30 minutes from now
 
-      // Find auctions ending within 30 minutes
+      // Find auctions ending within 30 minutes (timed only — live auctions
+      // carry a nominal end_time but only end via the host flow)
       const { data: endingSoonAuctions, error } = await this.supabase
         .from('auctions')
         .select('id, title, end_time')
         .eq('status', 'active')
+        .eq('auction_type', 'timed')
         .gte('end_time', now.toISOString())
         .lte('end_time', warningTime.toISOString());
 
@@ -156,14 +166,15 @@ export class AuctionSchedulerService {
       const { data: activeAuctions, error: auctionsError } = await this.supabase
         .from('auctions')
         .select(`
-          id, 
-          end_time, 
-          soft_close_enabled, 
+          id,
+          end_time,
+          soft_close_enabled,
           soft_close_extension,
-          updated_at
+          last_extended_at
         `)
         .eq('status', 'active')
         .eq('soft_close_enabled', true)
+        .eq('auction_type', 'timed')
         .gte('end_time', now.toISOString()) // Not ended yet
         .lte('end_time', extensionThreshold.toISOString()); // Within extension window
 
@@ -182,13 +193,17 @@ export class AuctionSchedulerService {
         const extensionWindowStart = new Date(endTime.getTime() - extensionWindowSeconds * 1000);
         
         // Check if auction was extended recently (within last 60 seconds)
-        // This prevents duplicate extensions from multiple cron runs
-        const lastUpdated = new Date(auction.updated_at);
-        const secondsSinceLastUpdate = (now.getTime() - lastUpdated.getTime()) / 1000;
-        
-        if (secondsSinceLastUpdate < minTimeSinceLastExtension) {
-          // Auction was recently extended, skip to avoid duplicate extensions
-          continue;
+        // This prevents duplicate extensions from multiple cron runs.
+        // NOTE: uses last_extended_at — NOT updated_at, which the bid trigger
+        // bumps on every bid (a sniping bid would otherwise suppress the
+        // extension it should trigger).
+        if (auction.last_extended_at) {
+          const lastExtended = new Date(auction.last_extended_at);
+          const secondsSinceLastExtension = (now.getTime() - lastExtended.getTime()) / 1000;
+
+          if (secondsSinceLastExtension < minTimeSinceLastExtension) {
+            continue;
+          }
         }
         
         // Check for bids within the extension window (5 minutes before end time)
@@ -336,6 +351,19 @@ export class AuctionSchedulerService {
         auction_type: updatedAuction.auction_type,
       });
 
+      // Notify watchers — the auction they bookmarked just went live
+      await this.notifyWatchers(
+        auctionId,
+        'auction_started',
+        '🔔 Watched Auction Started',
+        `"${updatedAuction.title}" is now live — bidding is open.`,
+        {
+          auction_id: auctionId,
+          auction_title: updatedAuction.title,
+          auction_type: updatedAuction.auction_type,
+        },
+      );
+
     } catch (error) {
       console.error(`Error starting auction ${auctionId}:`, error);
     }
@@ -369,23 +397,62 @@ export class AuctionSchedulerService {
       const winnerId = result.winner_id;
       const sellerId = result.seller_id;
 
+      // Public broadcast carries the winner's alias, not the real user id —
+      // the winner learns of their win via the targeted auction_won
+      // notification sent by sendWinnerNotification below.
+      let winnerDisplayId: string | null = null;
+      if (newStatus === 'sold' && winnerId) {
+        const { data: winningBidRow } = await this.supabase
+          .from('auction_bids')
+          .select('bidder_display_id')
+          .eq('auction_id', auction.id)
+          .eq('is_valid', true)
+          .eq('is_winning', true)
+          .limit(1)
+          .maybeSingle();
+        winnerDisplayId = winningBidRow?.bidder_display_id || null;
+      }
+
       // Broadcast auction end
       await this.auctionGateway.broadcastAuctionStatusChange(auction.id, newStatus, {
         message: eventMessage,
         final_bid: finalBid,
-        winner_id: winnerId,
+        bidder_display_id: winnerDisplayId,
         seller_id: sellerId,
       });
 
       // Send notifications if auction was sold
       if (newStatus === 'sold' && winnerId) {
         try {
-          await this.sendWinnerNotification(auction.id, winnerId, auction.title, finalBid);
-          await this.sendSellerNotification(auction.id, sellerId, auction.title, finalBid);
+          await this.sendWinnerNotification(auction.id, winnerId, auction.title, finalBid, auction.auction_type);
+          await this.sendSellerNotification(auction.id, sellerId, auction.title, finalBid, auction.auction_type);
         } catch (error) {
           console.error(`Failed to send auction end notifications for ${auction.id}:`, error);
         }
       }
+
+      // Bidders whose winner-time hold failed during settlement
+      for (const entry of result.forfeited || []) {
+        await this.sendForfeitNotification(auction.id, entry.bidder_id, auction.title, entry.amount);
+      }
+
+      // Notify watchers the auction ended — skip winner/seller (they get their own)
+      await this.notifyWatchers(
+        auction.id,
+        'auction_ended',
+        '🏁 Watched Auction Ended',
+        newStatus === 'sold' && finalBid
+          ? `"${auction.title}" ended — sold for ₣${finalBid.toFixed(2)}.`
+          : `"${auction.title}" has ended.`,
+        {
+          auction_id: auction.id,
+          auction_title: auction.title,
+          auction_type: auction.auction_type,
+          final_bid: finalBid,
+          status: newStatus,
+        },
+        [winnerId, sellerId].filter(Boolean) as string[],
+      );
 
       console.log(`Ended auction: ${auction.id} with status: ${newStatus}`);
     } catch (error) {
@@ -449,11 +516,13 @@ export class AuctionSchedulerService {
 
       const newEndTime = new Date(new Date(auction.end_time).getTime() + extensionSeconds * 1000);
 
+      const now = new Date().toISOString();
       const { error } = await this.supabase
         .from('auctions')
         .update({
           end_time: newEndTime.toISOString(),
-          updated_at: new Date().toISOString(),
+          last_extended_at: now,
+          updated_at: now,
         })
         .eq('id', auctionId);
 
@@ -490,9 +559,65 @@ export class AuctionSchedulerService {
   }
 
   /**
+   * Send a notification to every user watching an auction who has
+   * notification_enabled on their watchlist row.
+   */
+  private async notifyWatchers(
+    auctionId: string,
+    type: string,
+    title: string,
+    message: string,
+    data: Record<string, any>,
+    excludeUserIds: string[] = [],
+  ) {
+    try {
+      const { data: watchers, error } = await this.supabase
+        .from('auction_watchlist')
+        .select('user_id')
+        .eq('auction_id', auctionId)
+        .eq('notification_enabled', true);
+
+      if (error) {
+        console.error(`Failed to load watchers for auction ${auctionId}:`, error);
+        return;
+      }
+
+      const recipients = [...new Set<string>((watchers || []).map(w => w.user_id))]
+        .filter(id => !excludeUserIds.includes(id));
+
+      if (recipients.length === 0) return;
+
+      await this.supabase.from('notifications').insert(
+        recipients.map(userId => ({
+          user_id: userId,
+          type,
+          title,
+          message,
+          data,
+          created_at: new Date().toISOString(),
+        }))
+      );
+
+      await Promise.all(
+        recipients.map(userId =>
+          this.pushNotificationService.sendPushNotification(userId, {
+            title,
+            body: message,
+            data: { type, ...data },
+          }),
+        ),
+      );
+
+      console.log(`Notified ${recipients.length} watcher(s) for auction ${auctionId} (${type})`);
+    } catch (error) {
+      console.error(`Failed to notify watchers for auction ${auctionId}:`, error);
+    }
+  }
+
+  /**
    * Send notification to auction winner
    */
-  private async sendWinnerNotification(auctionId: string, winnerId: string, auctionTitle: string, winningBid: number) {
+  private async sendWinnerNotification(auctionId: string, winnerId: string, auctionTitle: string, winningBid: number, auctionType?: string) {
     try {
       await this.supabase
         .from('notifications')
@@ -504,6 +629,7 @@ export class AuctionSchedulerService {
           data: {
             auction_id: auctionId,
             auction_title: auctionTitle,
+            auction_type: auctionType,
             winning_bid: winningBid,
             action: 'checkout',
           },
@@ -512,6 +638,26 @@ export class AuctionSchedulerService {
 
       // Broadcast to winner's socket if connected
       await this.auctionGateway.notifyAuctionWinner(winnerId, auctionId, auctionTitle, winningBid);
+
+      await this.pushNotificationService.sendPushNotification(winnerId, {
+        title: 'Congratulations! You Won the Auction!',
+        body: `You've won "${auctionTitle}" with a bid of ₣${winningBid.toFixed(2)}. Proceed to checkout to complete your purchase.`,
+        data: { type: 'auction_won', auction_id: auctionId, auction_type: auctionType, action: 'checkout' },
+      });
+
+      await this.emailNotificationService.sendUserEmail(winnerId, {
+        subject: `You won "${auctionTitle}"!`,
+        category: 'auction',
+        reminder: { type: 'auction_won', entityType: 'auction', entityId: auctionId },
+        buildHtml: ({ name }) => auctionWonEmail({
+          name,
+          title: auctionTitle,
+          amount: winningBid,
+          // Timed-auction wins carry a 7-day checkout window (migration 228)
+          expiresAt: new Date(Date.now() + 7 * 24 * 3600_000),
+          appUrl: this.configService.get('FRONTEND_URL') || 'https://fretiko.com',
+        }),
+      });
 
       console.log(`Sent winner notification to user ${winnerId} for auction ${auctionId}`);
     } catch (error) {
@@ -522,7 +668,7 @@ export class AuctionSchedulerService {
   /**
    * Send notification to auction seller
    */
-  private async sendSellerNotification(auctionId: string, sellerId: string, auctionTitle: string, finalBid: number) {
+  private async sendSellerNotification(auctionId: string, sellerId: string, auctionTitle: string, finalBid: number, auctionType?: string) {
     try {
       await this.supabase
         .from('notifications')
@@ -534,14 +680,325 @@ export class AuctionSchedulerService {
           data: {
             auction_id: auctionId,
             auction_title: auctionTitle,
+            auction_type: auctionType,
             final_bid: finalBid,
           },
           created_at: new Date().toISOString(),
         });
 
+      await this.pushNotificationService.sendPushNotification(sellerId, {
+        title: 'Your Auction Has Sold!',
+        body: `"${auctionTitle}" sold for ₣${finalBid.toFixed(2)}. Await payment and prepare for delivery.`,
+        data: { type: 'auction_sold', auction_id: auctionId, auction_type: auctionType },
+      });
+
       console.log(`Sent seller notification to user ${sellerId} for auction ${auctionId}`);
     } catch (error) {
       console.error(`Error sending seller notification:`, error);
+    }
+  }
+
+  /**
+   * Notify a bidder whose winning bid could not be funded at settlement
+   * or during runner-up promotion.
+   */
+  private async sendForfeitNotification(auctionId: string, bidderId: string, title: string | undefined, amount: number) {
+    try {
+      await this.supabase.from('notifications').insert({
+        user_id: bidderId,
+        type: 'auction_win_forfeited',
+        title: 'Auction Win Forfeited',
+        message: `Your winning bid of ₣${Number(amount).toFixed(2)} on "${title || 'an auction'}" could not be completed — insufficient wallet balance. The item went to the next bidder.`,
+        data: { auction_id: auctionId, amount },
+        created_at: new Date().toISOString(),
+      });
+
+      await this.pushNotificationService.sendPushNotification(bidderId, {
+        title: 'Auction Win Forfeited',
+        body: `Your winning bid of ₣${Number(amount).toFixed(2)} on "${title || 'an auction'}" could not be completed — insufficient wallet balance.`,
+        data: { type: 'auction_win_forfeited', auction_id: auctionId },
+      });
+
+      await this.emailNotificationService.sendUserEmail(bidderId, {
+        subject: `Auction win forfeited — "${title || 'an auction'}"`,
+        category: 'auction',
+        buildHtml: ({ name }) => auctionWinForfeitedEmail({
+          name,
+          title: title || 'an auction',
+          amount,
+          appUrl: this.configService.get('FRONTEND_URL') || 'https://fretiko.com',
+        }),
+      });
+    } catch (error) {
+      console.error(`Error sending forfeit notification to ${bidderId}:`, error);
+    }
+  }
+
+  /**
+   * Notify a winner whose checkout window expired (their hold was released
+   * and the win passed to a runner-up or the sale failed).
+   */
+  private async sendExpiredWinNotification(userId: string, auctionTitle: string | undefined) {
+    try {
+      await this.supabase.from('notifications').insert({
+        user_id: userId,
+        type: 'auction_win_expired',
+        title: 'Auction Win Expired',
+        message: `Your checkout window for "${auctionTitle || 'an auction item'}" has expired. The held funds were released back to your wallet.`,
+        data: {},
+        created_at: new Date().toISOString(),
+      });
+
+      await this.pushNotificationService.sendPushNotification(userId, {
+        title: 'Auction Win Expired',
+        body: `Your checkout window for "${auctionTitle || 'an auction item'}" has expired. The held funds were released back to your wallet.`,
+        data: { type: 'auction_win_expired' },
+      });
+
+      await this.emailNotificationService.sendUserEmail(userId, {
+        subject: `Your win on "${auctionTitle || 'an auction item'}" expired`,
+        category: 'auction',
+        buildHtml: ({ name }) => auctionWinExpiredEmail({
+          name,
+          title: auctionTitle || 'an auction item',
+          appUrl: this.configService.get('FRONTEND_URL') || 'https://fretiko.com',
+        }),
+      });
+    } catch (error) {
+      console.error(`Error sending expired-win notification to ${userId}:`, error);
+    }
+  }
+
+  /**
+   * Notify a runner-up promoted to winner after the previous winner's win
+   * expired — same shape as the normal winner notification so the app
+   * routes them to checkout.
+   */
+  private async sendPromotedWinnerNotification(
+    userId: string, auctionId: string, itemId: string | null, title: string | undefined, amount: number,
+  ) {
+    try {
+      const isItem = !!itemId;
+      await this.supabase.from('notifications').insert({
+        user_id: userId,
+        type: 'auction_won',
+        title: '🎉 You Won!',
+        message: `You won "${title || 'an auction item'}" for ₣${Number(amount).toFixed(2)} — the previous buyer did not complete checkout. Proceed to checkout to complete your purchase.`,
+        data: { auction_id: auctionId, item_id: itemId, winning_bid: amount, action: 'checkout', promoted: true },
+        created_at: new Date().toISOString(),
+      });
+
+      await this.auctionGateway.sendUserNotification(userId, {
+        type: isItem ? 'auction_item_won' : 'auction_won',
+        title: '🎉 You Won!',
+        message: `You won "${title || 'an item'}" for ₣${Number(amount).toFixed(2)}`,
+        auction_id: auctionId,
+        item_id: itemId,
+        amount,
+      });
+
+      await this.pushNotificationService.sendPushNotification(userId, {
+        title: 'Congratulations! You Won!',
+        body: `You won "${title || 'an auction item'}" for ₣${Number(amount).toFixed(2)}. Proceed to checkout to complete your purchase.`,
+        data: { type: isItem ? 'auction_item_won' : 'auction_won', auction_id: auctionId, item_id: itemId, action: 'checkout' },
+      });
+
+      await this.emailNotificationService.sendUserEmail(userId, {
+        subject: `You won "${title || 'an auction item'}"!`,
+        category: 'auction',
+        buildHtml: ({ name }) => auctionWonEmail({
+          name,
+          title: title || 'an auction item',
+          amount,
+          promoted: true,
+          appUrl: this.configService.get('FRONTEND_URL') || 'https://fretiko.com',
+        }),
+      });
+    } catch (error) {
+      console.error(`Error sending promoted-winner notification to ${userId}:`, error);
+    }
+  }
+
+  /**
+   * Notify a seller that a sale failed — the winner and every runner-up
+   * could not complete payment.
+   */
+  private async sendSaleFailedNotification(sellerId: string | null, auctionTitle: string | undefined) {
+    if (!sellerId) return;
+    try {
+      await this.supabase.from('notifications').insert({
+        user_id: sellerId,
+        type: 'auction_sale_failed',
+        title: 'Auction Sale Failed',
+        message: `The sale of "${auctionTitle || 'an auction item'}" could not be completed — the winning bidders did not pay. The item was marked as passed.`,
+        data: {},
+        created_at: new Date().toISOString(),
+      });
+
+      await this.pushNotificationService.sendPushNotification(sellerId, {
+        title: 'Auction Sale Failed',
+        body: `The sale of "${auctionTitle || 'an auction item'}" could not be completed — the winning bidders did not pay.`,
+        data: { type: 'auction_sale_failed' },
+      });
+
+      await this.emailNotificationService.sendUserEmail(sellerId, {
+        subject: `Sale failed for "${auctionTitle || 'an auction item'}"`,
+        category: 'auction',
+        buildHtml: ({ name }) => auctionSaleFailedEmail({
+          name,
+          title: auctionTitle || 'an auction item',
+          appUrl: this.configService.get('FRONTEND_URL') || 'https://fretiko.com',
+        }),
+      });
+    } catch (error) {
+      console.error(`Error sending sale-failed notification to ${sellerId}:`, error);
+    }
+  }
+
+  /**
+   * Expire pending auction wins that passed their checkout window (hourly).
+   * expire_and_promote_auction_wins expires stale wins, releases the
+   * winner-time wallet hold, promotes the next bidder who can fund a hold,
+   * or fails the sale when nobody qualifies. Notifications are sent here
+   * since the RPC cannot emit socket events or pushes.
+   */
+  @Cron(CronExpression.EVERY_HOUR)
+  async expireOldAuctionWins() {
+    try {
+      // Revert abandoned checkout claims ('checked_out' with no order_id)
+      // so they re-enter the normal expiry flow below. Tolerate the RPC
+      // missing on pre-229 deploys.
+      const { data: reverted, error: revertError } = await this.supabase
+        .rpc('revert_stale_auction_win_claims');
+      if (revertError && revertError.code !== 'PGRST202') {
+        console.warn('revert_stale_auction_win_claims error:', revertError.message);
+      } else if (reverted > 0) {
+        console.log(`Reverted ${reverted} stale auction win claim(s)`);
+      }
+
+      const { data, error } = await this.supabase.rpc('expire_and_promote_auction_wins');
+
+      if (error) {
+        console.error('Error expiring old auction wins:', error);
+        return;
+      }
+
+      const result = data as any;
+      const expired = result?.expired || [];
+      const promoted = result?.promoted || [];
+      const forfeited = result?.forfeited || [];
+      const failed = result?.failed || [];
+
+      if (expired.length === 0 && promoted.length === 0) return;
+
+      console.log(
+        `Auction wins: ${expired.length} expired, ${promoted.length} promoted, ` +
+        `${forfeited.length} forfeited, ${failed.length} failed`,
+      );
+
+      // Fetch titles for notification copy
+      const auctionIds = [...new Set<string>([
+        ...expired.map((e: any) => e.auction_id),
+        ...promoted.map((e: any) => e.auction_id),
+        ...forfeited.map((e: any) => e.auction_id),
+        ...failed.map((e: any) => e.auction_id),
+      ].filter(Boolean))];
+      const itemIds = [...new Set<string>([
+        ...promoted.map((e: any) => e.item_id),
+        ...forfeited.map((e: any) => e.item_id),
+      ].filter(Boolean))];
+
+      const auctionTitles = new Map<string, string>();
+      const itemTitles = new Map<string, string>();
+
+      if (auctionIds.length) {
+        const { data: auctions } = await this.supabase
+          .from('auctions').select('id, title, auction_type').in('id', auctionIds);
+        (auctions || []).forEach((a: any) => auctionTitles.set(a.id, a.title));
+      }
+      if (itemIds.length) {
+        const { data: items } = await this.supabase
+          .from('auction_items').select('id, title').in('id', itemIds);
+        (items || []).forEach((i: any) => itemTitles.set(i.id, i.title));
+      }
+
+      for (const e of expired) {
+        await this.sendExpiredWinNotification(e.user_id, auctionTitles.get(e.auction_id));
+      }
+      for (const e of forfeited) {
+        await this.sendForfeitNotification(
+          e.auction_id, e.bidder_id,
+          e.item_id ? (itemTitles.get(e.item_id) || auctionTitles.get(e.auction_id)) : auctionTitles.get(e.auction_id),
+          e.amount,
+        );
+      }
+      for (const e of promoted) {
+        await this.sendPromotedWinnerNotification(
+          e.user_id, e.auction_id, e.item_id,
+          e.item_id ? itemTitles.get(e.item_id) : auctionTitles.get(e.auction_id),
+          e.amount,
+        );
+      }
+      for (const e of failed) {
+        await this.sendSaleFailedNotification(e.seller_id, auctionTitles.get(e.auction_id));
+      }
+    } catch (error) {
+      console.error('Error in expireOldAuctionWins cron:', error);
+    }
+  }
+
+  /**
+   * Promote items stuck in 'countdown' to 'active' (every 30 seconds).
+   * The normal countdown → open transition runs on an in-process setTimeout
+   * in startItemCountdown; if the process restarts mid-countdown the item
+   * would stay 'countdown' forever. Any countdown item older than 10s is
+   * swept here instead.
+   */
+  @Cron('*/30 * * * * *')
+  async promoteStuckCountdownItems() {
+    try {
+      const threshold = new Date(Date.now() - 10 * 1000).toISOString();
+
+      const { data: stuckItems, error } = await this.supabase
+        .from('auction_items')
+        .select('id, auction_id, title, starting_price, bid_increment, bidding_duration, auctions!auction_items_auction_id_fkey!inner(status)')
+        .eq('bidding_status', 'countdown')
+        .eq('auctions.status', 'active')
+        .lt('countdown_started_at', threshold);
+
+      if (error) {
+        console.error('Error fetching stuck countdown items:', error);
+        return;
+      }
+
+      for (const item of stuckItems || []) {
+        const { data: openedItem } = await this.supabase
+          .from('auction_items')
+          .update({
+            bidding_status: 'active',
+            bidding_started_at: new Date().toISOString(),
+          })
+          .eq('id', item.id)
+          .eq('bidding_status', 'countdown')
+          .select('id')
+          .maybeSingle();
+
+        if (!openedItem) continue; // already resolved by the normal path
+
+        await this.auctionGateway.broadcastItemEvent(item.auction_id, item.id, 'bidding_open', {
+          item_id: item.id,
+          item_title: item.title,
+          starting_price: item.starting_price,
+          minimum_bid: item.starting_price + item.bid_increment,
+          bid_increment: item.bid_increment,
+          duration: item.bidding_duration,
+          timestamp: new Date().toISOString(),
+        });
+
+        console.log(`Promoted stuck countdown item ${item.id} in auction ${item.auction_id}`);
+      }
+    } catch (error) {
+      console.error('Error in promoteStuckCountdownItems:', error);
     }
   }
 }

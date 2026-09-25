@@ -10,6 +10,9 @@ import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { isAdultViewer } from '../shared/viewer-age';
+import { chargeableWeightKg, recomputeRiderDeliveryFee } from '../shared/delivery-pricing';
+import { hasCoords, roadDistanceKm } from '../shared/geo';
 
 @Injectable()
 export class WishlistService {
@@ -51,7 +54,8 @@ export class WishlistService {
           user_id,
           user_profiles (
             username,
-            display_name
+            display_name,
+            is_adult_content
           ),
           product_categories (
             name
@@ -72,6 +76,8 @@ export class WishlistService {
       userId
     });
 
+    const viewerIsAdult = await isAdultViewer(this.serviceSupabase, userId);
+
     // Transform data to match frontend expectations
     // Filter out items with deleted products (null products field)
     return data
@@ -86,7 +92,9 @@ export class WishlistService {
         sellerName: item.products?.user_profiles?.username || item.products?.user_profiles?.display_name || 'Unknown Seller',
         category: item.products?.product_categories?.name || 'Uncategorized',
         createdAt: item.created_at,
-        isAvailable: item.products?.status === 'active' && (item.products?.quantity || 0) > 0,
+        isAvailable: item.products?.status === 'active'
+          && (item.products?.quantity || 0) > 0
+          && (viewerIsAdult || !item.products?.user_profiles?.is_adult_content),
         productDeleted: item.products === null
       })) || [];
   }
@@ -1124,6 +1132,8 @@ export class WishlistService {
       state: string;
       country?: string;
       postalCode: string;
+      latitude?: number;
+      longitude?: number;
     },
     giftMessage?: string,
     isSurprise: boolean = false,
@@ -1133,6 +1143,7 @@ export class WishlistService {
       vehicleType?: string;
       deliveryPrice?: number;
       estimatedArrival?: number;
+      distance?: number; // km from the rider quote — feeds per-km fee recompute
     },
     userToken?: string
   ) {
@@ -1188,7 +1199,16 @@ export class WishlistService {
         quantity,
         primary_image_url,
         images,
-        user_id
+        user_id,
+        weight_kg,
+        length_cm,
+        width_cm,
+        height_cm,
+        location_latitude,
+        location_longitude,
+        product_categories!category_id (
+          default_weight_kg
+        )
       `)
       .eq('id', wishlistItem.product_id)
       .maybeSingle();
@@ -1293,7 +1313,23 @@ export class WishlistService {
     const itemPrice = (wishlistItem as any).products.price;
     const platformFee = itemPrice * 0.02; // 2% platform commission (deducted from vendor during escrow release)
 
-    // Calculate delivery fee and rider info based on selected rider
+    // Server-computed chargeable weight for the single wishlist product.
+    // Supabase returns the category embed as an array — handle both shapes.
+    const categoryEmbed = (product as any).product_categories;
+    const categoryDefaultKg = Array.isArray(categoryEmbed)
+      ? categoryEmbed[0]?.default_weight_kg
+      : categoryEmbed?.default_weight_kg;
+    const totalWeightKg = chargeableWeightKg({
+      weight_kg: product.weight_kg ?? categoryDefaultKg,
+      length_cm: product.length_cm,
+      width_cm: product.width_cm,
+      height_cm: product.height_cm,
+    });
+
+    // Calculate delivery fee and rider info based on selected rider.
+    // Fee is recomputed server-side from the rider's company pricing_config;
+    // the client-supplied deliveryPrice is only a fallback when the rider's
+    // company has no pricing configured.
     let deliveryFee = 0;
     let riderId: string | null = null;
     let deliveryType: 'delivery' | 'pickup' = 'delivery';
@@ -1303,8 +1339,24 @@ export class WishlistService {
         deliveryFee = 0;
         riderId = null;
         deliveryType = 'pickup';
-      } else if (selectedRider.deliveryPrice) {
-        deliveryFee = selectedRider.deliveryPrice;
+      } else {
+        // Authoritative route distance: product location coords ↔ delivery
+        // address coords; client-sent distance is only a fallback.
+        const pickupCoords = {
+          latitude: product.location_latitude,
+          longitude: product.location_longitude,
+        };
+        const serverRouteKm = hasCoords(pickupCoords) && hasCoords(deliveryAddress)
+          ? roadDistanceKm(pickupCoords, deliveryAddress)
+          : undefined;
+        const recomputed = await recomputeRiderDeliveryFee(
+          serviceClient,
+          selectedRider.riderId,
+          selectedRider.vehicleType,
+          serverRouteKm ?? selectedRider.distance,
+          totalWeightKg,
+        );
+        deliveryFee = recomputed ?? selectedRider.deliveryPrice ?? 0;
         riderId = selectedRider.riderId;
         deliveryType = 'delivery';
       }
@@ -1327,6 +1379,7 @@ export class WishlistService {
       escrow_enabled: true,
       total_amount: total,
       delivery_fee: deliveryFee,
+      total_weight_kg: totalWeightKg,
       platform_fee: platformFee,
       rider_id: riderId,
       delivery_type: deliveryType,
@@ -1338,6 +1391,10 @@ export class WishlistService {
         state: deliveryAddress.state,
         country: deliveryAddress.country,
         postalCode: deliveryAddress.postalCode,
+        // Geocoded coords when the client resolved them — powers live
+        // tracking + server-side route-distance recompute.
+        ...(deliveryAddress.latitude != null && { latitude: deliveryAddress.latitude }),
+        ...(deliveryAddress.longitude != null && { longitude: deliveryAddress.longitude }),
       },
       delivery_instructions: giftMessage ? `Gift from ${giverUser.username}: ${giftMessage}` : `Gift from ${giverUser.username}`,
       estimated_delivery: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(),
@@ -1458,6 +1515,8 @@ export class WishlistService {
               order_id: order.id,
               gift_message: giftMessage,
               is_surprise: isSurprise,
+              recipient_role: 'buyer',
+              target_screen: 'OrderTracking',
             },
             badge: 'gift'
           });
@@ -2101,6 +2160,8 @@ export class WishlistService {
               order_id: createdOrder.id,
               gift_message: giftMessage,
               is_surprise: isSurprise,
+              recipient_role: 'buyer',
+              target_screen: 'OrderTracking',
             },
             badge: 'gift'
           });

@@ -123,20 +123,31 @@ export class SearchController {
         userId ? this.searchService.getPersonalizedRecommendations(userId, SearchType.ALL, 8) : null,
       ]);
 
+      const featuredValue = featured.status === 'fulfilled' ? featured.value : {
+        products: [],
+        services: [],
+        people: [],
+        providers: [],
+        vendors: [],
+      };
+      const recommendationsValue = recommendations.status === 'fulfilled' && recommendations.value ? recommendations.value : {
+        products: [],
+        services: [],
+        people: [],
+        providers: [],
+        vendors: [],
+      };
+
+      // Remove items already shown in Featured so Recommended never repeats them
+      for (const key of ['products', 'services', 'people', 'providers', 'vendors'] as const) {
+        const featuredIds = new Set(((featuredValue as any)[key] || []).map((i: any) => i.id));
+        (recommendationsValue as any)[key] = ((recommendationsValue as any)[key] || []).filter((i: any) => !featuredIds.has(i.id));
+      }
+
       return {
         trending: trending.status === 'fulfilled' ? trending.value : [],
-        featured: featured.status === 'fulfilled' ? featured.value : {
-          products: [],
-          services: [],
-          people: [],
-          providers: [],
-        },
-        recommendations: recommendations.status === 'fulfilled' && recommendations.value ? recommendations.value : {
-          products: [],
-          services: [],
-          people: [],
-          providers: [],
-        },
+        featured: featuredValue,
+        recommendations: recommendationsValue,
         timestamp: new Date().toISOString(),
       };
     } catch (error) {

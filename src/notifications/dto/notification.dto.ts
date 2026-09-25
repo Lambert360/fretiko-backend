@@ -24,7 +24,21 @@ export enum NotificationType {
   AI_REMINDER = 'ai_reminder',
   AI_ENGAGEMENT = 'ai_engagement',
   USER_WARNING = 'user_warning',
-  SCHEDULE = 'schedule'
+  SCHEDULE = 'schedule',
+  DISPUTE = 'dispute',
+  NEW_BID = 'new_bid',
+  OUTBID = 'outbid',
+  AUCTION_STARTED = 'auction_started',
+  AUCTION_ENDED = 'auction_ended',
+  AUCTION_EXTENDED = 'auction_extended',
+  AUCTION_WON = 'auction_won',
+  AUCTION_ITEM_WON = 'auction_item_won',
+  AUCTION_SOLD = 'auction_sold',
+  AUCTION_WIN_FORFEITED = 'auction_win_forfeited',
+  AUCTION_WIN_EXPIRED = 'auction_win_expired',
+  AUCTION_SALE_FAILED = 'auction_sale_failed',
+  FRAUD_ALERT = 'fraud_alert',
+  BID_INVALIDATED = 'bid_invalidated'
 }
 
 export enum NotificationPriority {
@@ -180,6 +194,39 @@ export class UpdateNotificationSettingsDto {
   @IsBoolean()
   in_app_enabled?: boolean;
 
+  // Per-category email preferences (migration 230)
+  @IsOptional()
+  @IsBoolean()
+  email_auction_notifications?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  email_order_notifications?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  email_payment_notifications?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  email_delivery_notifications?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  email_promotion_notifications?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  email_live_notifications?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  email_social_notifications?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  email_system_notifications?: boolean;
+
   // Type-specific preferences
   @IsOptional()
   @IsBoolean()
@@ -286,6 +333,14 @@ export class NotificationSettingsResponseDto {
   push_enabled!: boolean;
   email_enabled!: boolean;
   in_app_enabled!: boolean;
+  email_auction_notifications?: boolean;
+  email_order_notifications?: boolean;
+  email_payment_notifications?: boolean;
+  email_delivery_notifications?: boolean;
+  email_promotion_notifications?: boolean;
+  email_live_notifications?: boolean;
+  email_social_notifications?: boolean;
+  email_system_notifications?: boolean;
   order_notifications!: boolean;
   social_notifications!: boolean;
   promotion_notifications!: boolean;

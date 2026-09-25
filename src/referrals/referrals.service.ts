@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { resolveReferrer } from '../shared/referral';
 
 export interface ReferralStats {
   total_referrals: number;
@@ -11,6 +12,7 @@ export interface ReferralStats {
 
 export interface ReferralData {
   code: string;
+  username?: string;
   url: string;
   stats: ReferralStats;
 }
@@ -28,7 +30,7 @@ export class ReferralsService {
     // Get user's referral code
     const { data: profile, error: profileError } = await supabase
       .from('user_profiles')
-      .select('referral_code')
+      .select('referral_code, username')
       .eq('id', userId)
       .single();
 
@@ -52,11 +54,14 @@ export class ReferralsService {
     // Get referral stats
     const stats = await this.getReferralStats(userId);
 
-    // Build referral URL
-    const referralUrl = `https://fretiko.com/r/${referralCode}`;
+    // Build referral URL — prefer the username slug when one exists
+    // (human-readable), fall back to the random code otherwise.
+    const slug = profile.username || referralCode;
+    const referralUrl = `https://www.fretiko.com/r/${slug}`;
 
     return {
       code: referralCode,
+      username: profile.username || undefined,
       url: referralUrl,
       stats,
     };
@@ -67,18 +72,8 @@ export class ReferralsService {
    */
   async validateReferralCode(code: string): Promise<{ valid: boolean; referrerId?: string }> {
     const supabase = this.supabaseClientManager.getServiceClient();
-
-    const { data, error } = await supabase
-      .from('user_profiles')
-      .select('id')
-      .eq('referral_code', code)
-      .single();
-
-    if (error || !data) {
-      return { valid: false };
-    }
-
-    return { valid: true, referrerId: data.id };
+    const referrer = await resolveReferrer(supabase, code);
+    return referrer ? { valid: true, referrerId: referrer.id } : { valid: false };
   }
 
   /**

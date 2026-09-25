@@ -10,8 +10,11 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { UseGuards, Inject, forwardRef, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AuctionsService } from './auctions.service';
+import { createServiceSupabaseClient } from '../shared/supabase.client';
 
 /**
  * Auction WebSocket Gateway
@@ -42,12 +45,24 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   private readonly logger = new Logger(AuctionGateway.name);
 
   private activeConnections = new Map<string, { userId?: string; auctionRooms: Set<string>; role?: string }>();
-  private auctionViewerCounts = new Map<string, Set<string>>(); // Fallback viewer tracking: auctionId -> Set of userIds
+  // Presence tracking, split by where the user is in the app:
+  //  - stream watchers: AuctionLiveViewerScreen (context='stream')
+  //  - details viewers: details/lobby screens (context='details')
+  // Keys are verified userId, or socket.id for anonymous users. The host and
+  // update-only joins (no context) are tracked in neither.
+  private auctionStreamWatchers = new Map<string, Set<string>>();
+  private auctionDetailsViewers = new Map<string, Set<string>>();
+  private soundCooldowns = new Map<string, number>(); // client.id -> last play_sound timestamp
+  private supabase;
 
   constructor(
     @Inject(forwardRef(() => AuctionsService))
     private auctionsService: AuctionsService,
-  ) {}
+    private configService: ConfigService,
+    private jwtService: JwtService,
+  ) {
+    this.supabase = createServiceSupabaseClient(this.configService);
+  }
 
   afterInit(server: Server) {
     console.log('Auction WebSocket Gateway initialized');
@@ -55,22 +70,34 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
 
   async handleConnection(client: Socket) {
     console.log(`Client connected: ${client.id}`);
-    
-    // Verify JWT token from handshake
-    const token = client.handshake.auth?.token;
+
+    // Verify JWT token from handshake — anonymous connections stay connected
+    // but carry no trusted identity (join_auction uses this, never a
+    // client-supplied user_id).
+    const token = client.handshake.auth?.token || (client.handshake.query?.token as string | undefined);
     if (token) {
       try {
-        // Token validation would happen here via JWT service
-        // For now, just log that we received a token
-        console.log(`Client ${client.id} authenticated with token`);
+        const decoded = this.jwtService.verify(token);
+        if (decoded?.sub) {
+          (client as any).user = {
+            sub: decoded.sub,
+            id: decoded.sub,
+            email: decoded.email,
+            type: decoded.type,
+          };
+          this.activeConnections.set(client.id, {
+            auctionRooms: new Set(),
+            userId: decoded.sub,
+          });
+        }
       } catch (error) {
-        console.error(`Authentication failed for client ${client.id}`);
-        client.disconnect();
-        return;
+        this.logger.warn(`Invalid handshake token for client ${client.id} — continuing as anonymous`);
       }
     }
-    
-    this.activeConnections.set(client.id, { auctionRooms: new Set() });
+
+    if (!this.activeConnections.has(client.id)) {
+      this.activeConnections.set(client.id, { auctionRooms: new Set() });
+    }
 
     // Send welcome message
     client.emit('connection_established', {
@@ -88,10 +115,10 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       connection.auctionRooms.forEach(auctionId => {
         const roomName = `auction_${auctionId}`;
 
-        // Remove from fallback tracking if we have a userId
-        if (connection.userId && this.auctionViewerCounts.has(auctionId)) {
-          this.auctionViewerCounts.get(auctionId)!.delete(connection.userId);
-        }
+        // Remove from presence tracking (same key join_auction used)
+        const presenceKey = connection.userId ?? client.id;
+        this.auctionStreamWatchers.get(auctionId)?.delete(presenceKey);
+        this.auctionDetailsViewers.get(auctionId)?.delete(presenceKey);
 
         // Ensure the socket leaves the room before recounting
         try {
@@ -100,14 +127,8 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
           this.logger.warn(`Failed to leave room ${roomName} on disconnect`, leaveErr as any);
         }
         
-        // Broadcast updated viewer count
-        const viewerCount = this.getAuctionViewerCount(auctionId);
-        const viewerData = {
-          auction_id: auctionId,
-          view_count: viewerCount,
-          current_viewers: viewerCount,
-          timestamp: new Date().toISOString(),
-        };
+        // Broadcast updated counts
+        const viewerData = this.buildViewerCountPayload(auctionId);
 
         // Broadcast to all remaining viewers in the auction room
         this.server.to(roomName).emit('view_count_updated', viewerData);
@@ -121,6 +142,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
     }
 
     this.activeConnections.delete(client.id);
+    this.soundCooldowns.delete(client.id);
   }
 
   /**
@@ -129,7 +151,12 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   @SubscribeMessage('join_auction')
   async handleJoinAuction(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { auction_id: string; user_id?: string },
+    @MessageBody() data: {
+      auction_id: string;
+      user_id?: string;
+      /** 'stream' = watching the live video; 'details' = on a details screen */
+      context?: 'stream' | 'details';
+    },
   ) {
     try {
       // Verify auction exists
@@ -144,40 +171,54 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       const roomName = `auction_${data.auction_id}`;
       client.join(roomName);
       
+      // Identity comes ONLY from the verified handshake token (set in
+      // handleConnection). The client-supplied data.user_id is ignored —
+      // it was previously trusted for host-role and notification targeting.
+      const connection = this.activeConnections.get(client.id);
+      const verifiedUserId = connection?.userId;
+
       // Debug: Log room membership after join
       setTimeout(() => {
         try {
           const room = this.server?.sockets?.adapter?.rooms?.get(roomName);
-          this.logger.log(`📊 Room ${roomName} now has ${room?.size || 0} members after ${data.user_id?.slice(-8) || 'unknown'} joined`);
+          this.logger.log(`📊 Room ${roomName} now has ${room?.size || 0} members after ${verifiedUserId?.slice(-8) || 'anonymous'} joined`);
         } catch (error) {
           this.logger.log(`📊 Could not check room size for ${roomName}`);
         }
       }, 100);
 
       // Update connection info
-      const connection = this.activeConnections.get(client.id);
       if (connection) {
         connection.auctionRooms.add(data.auction_id);
-        if (data.user_id) {
-          connection.userId = data.user_id;
-          
-          // Add to fallback viewer tracking (like live stream)
-          if (!this.auctionViewerCounts.has(data.auction_id)) {
-            this.auctionViewerCounts.set(data.auction_id, new Set());
+
+        const isHost = !!verifiedUserId && verifiedUserId === auction.seller_id;
+        if (verifiedUserId) {
+          connection.role = isHost ? 'host' : 'viewer';
+        }
+
+        // Count presence by declared context — key by userId (dedupes a
+        // user's devices), falling back to socket.id for anonymous users.
+        const presenceKey = verifiedUserId ?? client.id;
+        if (data.context === 'stream' && !isHost) {
+          if (!this.auctionStreamWatchers.has(data.auction_id)) {
+            this.auctionStreamWatchers.set(data.auction_id, new Set());
           }
-          this.auctionViewerCounts.get(data.auction_id)!.add(data.user_id);
-          
-          // Debug: Log user comparison
-          this.logger.log(`🔍 Checking host status: user_id=${data.user_id}, seller_id=${auction.seller_id}`);
-          
-          // Check if user is the auction host (owner)
-          if (data.user_id === auction.seller_id) {
-            connection.role = 'host';
-            this.logger.log(`✅ User ${data.user_id} is the auction owner - joined as host and included in viewer count`);
-          } else {
-            connection.role = 'viewer';
-            this.logger.log(`👤 User ${data.user_id} joined as viewer (seller is ${auction.seller_id})`);
+          this.auctionStreamWatchers.get(data.auction_id)!.add(presenceKey);
+          this.logger.log(`👁️ Stream watcher ${presenceKey} joined auction ${data.auction_id}`);
+        } else if (data.context === 'details') {
+          if (!this.auctionDetailsViewers.has(data.auction_id)) {
+            this.auctionDetailsViewers.set(data.auction_id, new Set());
           }
+          this.auctionDetailsViewers.get(data.auction_id)!.add(presenceKey);
+          this.logger.log(`[details] Details viewer ${presenceKey} joined auction ${data.auction_id}`);
+        }
+
+        if (verifiedUserId) {
+          this.logger.log(
+            isHost
+              ? `✅ User ${verifiedUserId} is the auction owner - joined as host`
+              : `👤 User ${verifiedUserId} joined as viewer`,
+          );
         }
       }
 
@@ -196,14 +237,8 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
         timestamp: new Date().toISOString(),
       });
 
-      // Broadcast updated viewer count immediately after join
-      const viewerCount = this.getAuctionViewerCount(data.auction_id);
-      const viewerData = {
-        auction_id: data.auction_id,
-        view_count: viewerCount,
-        current_viewers: viewerCount,
-        timestamp: new Date().toISOString(),
-      };
+      // Broadcast updated counts immediately after join
+      const viewerData = this.buildViewerCountPayload(data.auction_id);
 
       // Send to the joining client first (so they get current count immediately)
       client.emit('view_count_updated', viewerData);
@@ -211,7 +246,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       // Then broadcast to all clients (so everyone gets updated count)
       this.server.to(roomName).emit('view_count_updated', viewerData);
 
-      this.logger.log(`📊 Sent viewer count ${viewerCount} to new joiner and broadcasted to room`);
+      this.logger.log(`📊 Sent viewer counts (watchers=${viewerData.stream_watchers}, details=${viewerData.details_viewers}) to new joiner and broadcasted to room`);
 
     } catch (error) {
       this.logger.error(`Failed to join auction ${data.auction_id}`, {
@@ -238,9 +273,9 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
     const connection = this.activeConnections.get(client.id);
     if (connection) {
       connection.auctionRooms.delete(data.auction_id);
-      if (connection.userId && this.auctionViewerCounts.has(data.auction_id)) {
-        this.auctionViewerCounts.get(data.auction_id)!.delete(connection.userId);
-      }
+      const presenceKey = connection.userId ?? client.id;
+      this.auctionStreamWatchers.get(data.auction_id)?.delete(presenceKey);
+      this.auctionDetailsViewers.get(data.auction_id)?.delete(presenceKey);
     }
 
     // Notify room of viewer leaving
@@ -249,14 +284,8 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       timestamp: new Date().toISOString(),
     });
 
-    // Broadcast updated viewer count
-    const viewerCount = this.getAuctionViewerCount(data.auction_id);
-    const viewerData = {
-      auction_id: data.auction_id,
-      view_count: viewerCount,
-      current_viewers: viewerCount,
-      timestamp: new Date().toISOString(),
-    };
+    // Broadcast updated counts
+    const viewerData = this.buildViewerCountPayload(data.auction_id);
 
     // Broadcast to all viewers in the auction room
     this.server.to(roomName).emit('view_count_updated', viewerData);
@@ -273,17 +302,11 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
     @MessageBody() data: { auction_id: string },
   ) {
     try {
-      const viewerCount = this.getAuctionViewerCount(data.auction_id);
-      const viewerData = {
-        auction_id: data.auction_id,
-        view_count: viewerCount,
-        current_viewers: viewerCount,
-        timestamp: new Date().toISOString(),
-      };
+      const viewerData = this.buildViewerCountPayload(data.auction_id);
 
-      // Send current viewer count to requesting client
+      // Send current counts to requesting client
       client.emit('view_count_updated', viewerData);
-      this.logger.log(`📊 Sent current viewer count ${viewerCount} for auction ${data.auction_id}`);
+      this.logger.log(`📊 Sent viewer counts (watchers=${viewerData.stream_watchers}, details=${viewerData.details_viewers}) for auction ${data.auction_id}`);
     } catch (error) {
       this.logger.error(`Failed to get viewer count for auction ${data.auction_id}:`, error);
       client.emit('error', { message: 'Failed to get viewer count' });
@@ -297,7 +320,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   @UseGuards(JwtAuthGuard)
   async handlePlaceBid(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { auction_id: string; amount: number; bid_type?: 'manual' | 'proxy'; max_bid_amount?: number },
+    @MessageBody() data: { auction_id: string; item_id?: string; amount: number; bid_type?: 'manual' | 'proxy'; max_bid_amount?: number },
   ) {
     const user = (client as any).user;
     if (!user?.sub) {
@@ -309,12 +332,21 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
     }
 
     try {
-      const bid = await this.auctionsService.placeBid(user.sub, {
-        auction_id: data.auction_id,
-        amount: data.amount,
-        bid_type: data.bid_type || 'manual',
-        max_bid_amount: data.max_bid_amount,
-      });
+      const bid = await this.auctionsService.placeBid(
+        user.sub,
+        {
+          auction_id: data.auction_id,
+          item_id: data.item_id,
+          amount: data.amount,
+          bid_type: data.bid_type || 'manual',
+          max_bid_amount: data.max_bid_amount,
+        },
+        undefined,
+        {
+          ipAddress: client.handshake.address,
+          userAgent: client.handshake.headers?.['user-agent'],
+        },
+      );
 
       client.emit('bid_confirmed', {
         auction_id: data.auction_id,
@@ -340,6 +372,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
    * Handle live auction events (AI auctioneer)
    */
   @SubscribeMessage('auctioneer_event')
+  @UseGuards(JwtAuthGuard)
   async handleAuctioneerEvent(
     @ConnectedSocket() client: Socket,
     @MessageBody() data: {
@@ -348,15 +381,197 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       message?: string;
     },
   ) {
-    const roomName = `auction_${data.auction_id}`;
+    const user = (client as any).user;
+    if (!user?.sub || !data?.auction_id) {
+      return;
+    }
 
-    // Broadcast auctioneer event to all room members
-    this.server.to(roomName).emit('auctioneer_speaks', {
-      auction_id: data.auction_id,
-      event_type: data.event_type,
-      message: data.message,
-      timestamp: new Date().toISOString(),
-    });
+    try {
+      // Only the auction's seller may speak as the auctioneer
+      const auction = await this.auctionsService.findById(data.auction_id);
+      if (!auction || auction.seller_id !== user.sub) {
+        return;
+      }
+
+      const roomName = `auction_${data.auction_id}`;
+
+      // Broadcast auctioneer event to all room members
+      this.server.to(roomName).emit('auctioneer_speaks', {
+        auction_id: data.auction_id,
+        event_type: data.event_type,
+        message: data.message,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      this.logger.error(`Error in auctioneer_event for auction ${data?.auction_id}:`, error);
+    }
+  }
+
+  /**
+   * Host plays a soundboard sound — broadcast to all viewers so every
+   * device plays the actual audio file natively.
+   *
+   * Emits 'sound_played' with a server-verified payload:
+   *   { auction_id, soundId, name, soundUrl? }
+   * soundId is either a 'builtin:*' key (bundled asset on all devices) or a
+   * sounds-table UUID that must be an active live_stream sound owned by the
+   * platform or by this host — the URL is always taken from the DB.
+   *
+   * NOTE: unlike join_auction (which trusts a client-supplied user_id),
+   * this uses the authenticated JWT identity and verifies seller ownership.
+   */
+  @SubscribeMessage('play_sound')
+  @UseGuards(JwtAuthGuard)
+  async handlePlaySound(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { auction_id: string; soundId: string; name?: string },
+  ) {
+    const user = (client as any).user;
+    if (!user?.sub) {
+      client.emit('error', { message: 'User not authenticated' });
+      return;
+    }
+
+    try {
+      if (!data?.auction_id || !data?.soundId) {
+        client.emit('error', { message: 'auction_id and soundId are required' });
+        return;
+      }
+
+      // Simple per-socket cooldown to prevent sound spam
+      const now = Date.now();
+      const last = this.soundCooldowns.get(client.id) || 0;
+      if (now - last < 800) {
+        return; // silently drop — soundboard spam is not an error worth surfacing
+      }
+      this.soundCooldowns.set(client.id, now);
+
+      // Verify the caller owns this auction and it is live
+      const auction = await this.auctionsService.findById(data.auction_id);
+      if (!auction) {
+        client.emit('error', { message: 'Auction not found' });
+        return;
+      }
+
+      if (auction.seller_id !== user.sub) {
+        client.emit('error', { message: 'Only the auction host can play sounds' });
+        return;
+      }
+
+      if (auction.status !== 'active') {
+        client.emit('error', { message: 'Can only play sounds while the auction is live' });
+        return;
+      }
+
+      let payload: { auction_id: string; soundId: string; name: string; soundUrl?: string };
+
+      if (data.soundId.startsWith('builtin:')) {
+        payload = {
+          auction_id: data.auction_id,
+          soundId: data.soundId,
+          name: data.name || data.soundId.replace('builtin:', ''),
+        };
+      } else {
+        const { data: sound, error: soundError } = await this.supabase
+          .from('sounds')
+          .select('id, name, sound_url, owner_id')
+          .eq('id', data.soundId)
+          .eq('context', 'live_stream')
+          .eq('is_active', true)
+          .single();
+
+        if (soundError || !sound) {
+          client.emit('error', { message: 'Sound not found' });
+          return;
+        }
+
+        if (sound.owner_id && sound.owner_id !== user.sub) {
+          client.emit('error', { message: 'You cannot play this sound' });
+          return;
+        }
+
+        payload = {
+          auction_id: data.auction_id,
+          soundId: sound.id,
+          name: sound.name,
+          soundUrl: sound.sound_url,
+        };
+      }
+
+      // Broadcast to all OTHER clients in the auction room — the host
+      // already plays the sound locally on their own device.
+      client.broadcast.to(`auction_${data.auction_id}`).emit('sound_played', {
+        ...payload,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      this.logger.error(`Error playing sound in auction ${data?.auction_id}:`, error);
+      client.emit('error', { message: error.message });
+    }
+  }
+
+  /**
+   * Host taps the gavel — broadcast 'gavel_played' so every viewer shows
+   * the gavel lottie animation in sync with the host's gavel sound.
+   * JWT + seller + active-status checks, same as play_sound.
+   */
+  @SubscribeMessage('play_gavel')
+  @UseGuards(JwtAuthGuard)
+  async handlePlayGavel(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { auction_id: string; item_id?: string },
+  ) {
+    const user = (client as any).user;
+    if (!user?.sub || !data?.auction_id) {
+      return;
+    }
+
+    try {
+      const auction = await this.auctionsService.findById(data.auction_id);
+      if (!auction || auction.seller_id !== user.sub || auction.status !== 'active') {
+        return;
+      }
+
+      client.broadcast.to(`auction_${data.auction_id}`).emit('gavel_played', {
+        auction_id: data.auction_id,
+        item_id: data.item_id,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      this.logger.error(`Error broadcasting gavel for auction ${data?.auction_id}:`, error);
+    }
+  }
+
+  /**
+   * Host stops a playing soundboard sound — broadcast so viewers stop
+   * playback mid-play too. Emits 'sound_stopped' { auction_id, soundId }.
+   * No sound lookup needed: stopping is harmless regardless of the id.
+   */
+  @SubscribeMessage('stop_sound')
+  @UseGuards(JwtAuthGuard)
+  async handleStopSound(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { auction_id: string; soundId: string },
+  ) {
+    const user = (client as any).user;
+    if (!user?.sub || !data?.auction_id || !data?.soundId) {
+      return;
+    }
+
+    try {
+      const auction = await this.auctionsService.findById(data.auction_id);
+      if (!auction || auction.seller_id !== user.sub || auction.status !== 'active') {
+        return;
+      }
+
+      client.broadcast.to(`auction_${data.auction_id}`).emit('sound_stopped', {
+        auction_id: data.auction_id,
+        soundId: data.soundId,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      this.logger.error(`Error stopping sound in auction ${data?.auction_id}:`, error);
+    }
   }
 
   /**
@@ -372,9 +587,7 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
       timestamp: new Date().toISOString(),
     };
 
-    // Emit under both names for mobile/client compatibility
     this.server.to(roomName).emit('new_bid', payload);
-    this.server.to(roomName).emit('bid_placed', payload);
   }
 
   /**
@@ -387,6 +600,8 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
     this.server.to(roomName).emit('view_count_updated', {
       auction_id: auctionId,
       view_count: viewCount,
+      stream_watchers: this.getAuctionViewerCount(auctionId),
+      details_viewers: this.getAuctionDetailsViewerCount(auctionId),
       timestamp: new Date().toISOString(),
     });
   }
@@ -436,6 +651,21 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   }
 
   /**
+   * Broadcast broadcast pause/resume state (when host pauses/resumes the live stream)
+   */
+  async broadcastBroadcastStatus(auctionId: string, status: 'paused' | 'live') {
+    const roomName = `auction_${auctionId}`;
+    const eventData = {
+      auction_id: auctionId,
+      broadcast_status: status,
+      timestamp: new Date().toISOString(),
+    };
+
+    this.server.to(roomName).emit('broadcast_status', eventData);
+    this.server.emit('broadcast_status', eventData);
+  }
+
+  /**
    * Broadcast auction status change
    * Called from scheduler service
    * Broadcasts to both the specific auction room AND all connected clients (for discovery screen)
@@ -473,52 +703,45 @@ export class AuctionGateway implements OnGatewayInit, OnGatewayConnection, OnGat
   }
 
   /**
-   * Get active connections count for an auction
+   * Stream watchers for an auction (users on the live stream screen).
    */
   getAuctionViewerCount(auctionId: string): number {
-    const roomName = `auction_${auctionId}`;
-    
-    // Validate input
     if (!auctionId || typeof auctionId !== 'string') {
       this.logger.error(`Invalid auction ID provided to getAuctionViewerCount: ${auctionId}`);
       return 0;
     }
-    
-    try {
-      // For Socket.IO v4, use the proper adapter method
-      if (this.server && this.server.sockets && this.server.sockets.adapter) {
-        const adapter = this.server.sockets.adapter;
-        
-        // Method 1: Try adapter.sockets (works with Redis adapter)
-        if (adapter.sockets) {
-          const roomSockets = adapter.sockets(new Set([roomName]));
-          if (roomSockets instanceof Set) {
-            const count = roomSockets.size;
-            this.logger.log(`📊 Room ${roomName} has ${count} viewers (Redis adapter method)`);
-            return Math.max(0, count); // Ensure non-negative
-          }
-        }
-        
-        // Method 2: Try adapter.rooms (fallback for single server)
-        if (adapter.rooms) {
-          const room = adapter.rooms.get(roomName);
-          if (room) {
-            const count = room.size;
-            this.logger.log(`📊 Room ${roomName} has ${count} viewers (adapter.rooms method)`);
-            return Math.max(0, count); // Ensure non-negative
-          }
-        }
-      } else {
-        this.logger.warn(`📊 Socket.IO adapter not available for viewer count calculation`);
-      }
-    } catch (error) {
-      this.logger.error(`📊 Error calculating viewer count for auction ${auctionId}:`, error);
+
+    return Math.max(0, this.auctionStreamWatchers.get(auctionId)?.size || 0);
+  }
+
+  /**
+   * Details-screen viewers for an auction (users on details/lobby screens).
+   */
+  getAuctionDetailsViewerCount(auctionId: string): number {
+    if (!auctionId || typeof auctionId !== 'string') {
+      return 0;
     }
-    
-    // Fallback to manual tracking
-    const fallbackCount = this.auctionViewerCounts.get(auctionId)?.size || 0;
-    this.logger.log(`📊 Using fallback viewer count for auction ${auctionId}: ${fallbackCount}`);
-    return Math.max(0, fallbackCount); // Ensure non-negative
+
+    return Math.max(0, this.auctionDetailsViewers.get(auctionId)?.size || 0);
+  }
+
+  /**
+   * Standard view_count_updated payload — every emit carries both presence
+   * counts explicitly so each screen can read the one it displays.
+   * view_count/current_viewers stay equal to stream watchers so older
+   * clients keep showing the watcher count.
+   */
+  private buildViewerCountPayload(auctionId: string) {
+    const streamWatchers = this.getAuctionViewerCount(auctionId);
+    const detailsViewers = this.getAuctionDetailsViewerCount(auctionId);
+    return {
+      auction_id: auctionId,
+      view_count: streamWatchers,
+      current_viewers: streamWatchers,
+      stream_watchers: streamWatchers,
+      details_viewers: detailsViewers,
+      timestamp: new Date().toISOString(),
+    };
   }
 
   /**

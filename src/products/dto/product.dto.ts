@@ -3,44 +3,78 @@ import { Transform, Type } from 'class-transformer';
 
 export class ProductVariantDto {
   @IsString()
-  name: string;
+  name!: string;
 
   @IsNumber()
   @Min(0)
-  price: number;
+  price!: number;
 
   // Index into the uploaded variant_media files array for this variant's media
   @IsNumber()
-  mediaIndex: number;
+  mediaIndex!: number;
 
   @IsEnum(['image', 'video'])
-  mediaType: string;
+  mediaType!: string;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(10000)
+  weight_kg?: number;
+
+  // camelCase alias accepted from the mobile multipart upload payload
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(10000)
+  weightKg?: number;
 }
 
 export class CreateProductDto {
   @IsString()
-  name: string;
+  name!: string;
 
   @IsString()
-  description: string;
+  description!: string;
 
   @IsNumber()
   @Min(0)
-  price: number;
+  price!: number;
 
   @IsNumber()
   @Min(0)
-  quantity: number;
+  quantity!: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(10000)
+  weight_kg?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  length_cm?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  width_cm?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  height_cm?: number;
 
   @IsEnum(['new', 'like-new', 'good', 'fair'])
-  condition: string;
+  condition!: string;
 
   @IsUUID()
-  category_id: string;
+  category_id!: string;
 
   @IsArray()
   @IsString({ each: true })
-  images: string[];
+  images!: string[];
 
   @IsOptional()
   @IsString()
@@ -62,6 +96,16 @@ export class CreateProductDto {
   @IsOptional()
   @IsString()
   location?: string;
+
+  // GPS/state-centroid coords of the ITEM location (set at upload).
+  // Distinct from the vendor's user_profiles.location.
+  @IsOptional()
+  @IsNumber()
+  location_latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  location_longitude?: number;
 
   @IsOptional()
   shipping_options?: {
@@ -106,6 +150,27 @@ export class UpdateProductDto {
   quantity?: number;
 
   @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(10000)
+  weight_kg?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  length_cm?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  width_cm?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  height_cm?: number;
+
+  @IsOptional()
   @IsEnum(['new', 'like-new', 'good', 'fair'])
   condition?: string;
 
@@ -121,6 +186,14 @@ export class UpdateProductDto {
   @IsOptional()
   @IsString()
   location?: string;
+
+  @IsOptional()
+  @IsNumber()
+  location_latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  location_longitude?: number;
 
   @IsOptional()
   shipping_options?: {
@@ -147,6 +220,29 @@ export class ProductQueryDto {
   @IsOptional()
   @IsString()
   search?: string;
+
+  @IsOptional()
+  @Transform(({ value }) => parseFloat(value))
+  @IsNumber()
+  @Min(0)
+  price_min?: number;
+
+  @IsOptional()
+  @Transform(({ value }) => parseFloat(value))
+  @IsNumber()
+  @Min(0)
+  price_max?: number;
+
+  @IsOptional()
+  @Transform(({ value }) => parseFloat(value))
+  @IsNumber()
+  @Min(0)
+  @Max(5)
+  min_rating?: number;
+
+  @IsOptional()
+  @IsEnum(['newest', 'popular', 'rating', 'price_asc', 'price_desc'])
+  sort?: 'newest' | 'popular' | 'rating' | 'price_asc' | 'price_desc';
 
   @IsOptional()
   @Transform(({ value }) => parseInt(value))
@@ -203,10 +299,10 @@ export class RankedProductsQueryDto {
 
 export class RecordProductEventDto {
   @IsUUID()
-  productId: string;
+  productId!: string;
 
   @IsEnum(['impression', 'click', 'view', 'cart_add', 'wishlist_add'])
-  eventType: string;
+  eventType!: string;
 
   @IsOptional()
   @IsString()
@@ -214,25 +310,31 @@ export class RecordProductEventDto {
 }
 
 export class ProductResponseDto {
-  id: string;
-  user_id: string;
-  category_id: string;
-  name: string;
-  description: string;
-  price: number;
-  quantity: number;
-  condition: string;
-  images: string[];
+  id!: string;
+  user_id!: string;
+  category_id!: string;
+  name!: string;
+  description!: string;
+  price!: number;
+  quantity!: number;
+  condition!: string;
+  weight_kg?: number;
+  length_cm?: number;
+  width_cm?: number;
+  height_cm?: number;
+  images!: string[];
   primary_image_url?: string;
-  videos: string[];
+  videos!: string[];
   processed_videos?: string[];
   video_processing_status?: any;
   primary_video_url?: string;
-  media_type: string;
+  media_type!: string;
   location?: string;
-  shipping_options: any;
-  tags: string[];
-  status: string;
+  location_latitude?: number;
+  location_longitude?: number;
+  shipping_options!: any;
+  tags!: string[];
+  status!: string;
   is_multi_item?: boolean;
   variants?: {
     id: string;
@@ -241,26 +343,27 @@ export class ProductResponseDto {
     media_url: string;
     media_type: string;
     sort_order: number;
+    weight_kg?: number;
   }[];
-  is_featured: boolean;
-  view_count: number;
-  like_count: number;
-  save_count: number;
+  is_featured!: boolean;
+  view_count!: number;
+  like_count!: number;
+  save_count!: number;
   average_rating?: number;
   review_count?: number;
-  created_at: string;
-  updated_at: string;
+  created_at!: string;
+  updated_at!: string;
   vendor_username?: string;
   vendor_avatar?: string;
   vendor_verified?: boolean;
 }
 
 export class ProductCategoryDto {
-  id: string;
-  name: string;
+  id!: string;
+  name!: string;
   description?: string;
   icon_name?: string;
   color_hex?: string;
-  sort_order: number;
-  is_active: boolean;
+  sort_order!: number;
+  is_active!: boolean;
 }

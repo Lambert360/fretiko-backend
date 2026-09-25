@@ -7,13 +7,15 @@ import { ScheduleRemindersService } from './schedule-reminders.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { EscrowModule } from '../escrow/escrow.module';
 import { AuthModule } from '../auth/auth.module';
+import { AnalyticsModule } from '../analytics/analytics.module';
 
 @Module({
   imports: [
     AuthModule, 
     ConfigModule, 
     ScheduleModule.forRoot(),
-    NotificationsModule, 
+    NotificationsModule,
+    AnalyticsModule,
     forwardRef(() => EscrowModule)
   ],
   controllers: [WorkspaceController],

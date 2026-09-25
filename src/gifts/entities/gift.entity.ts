@@ -25,6 +25,13 @@ export interface Sound {
   sound_url: string;
   is_active: boolean;
   sort_order: number;
+  /**
+   * Which surface this sound is for:
+   * 'gift' -> virtual gifts, 'live_stream' -> host soundboard.
+   */
+  context?: 'gift' | 'live_stream';
+  /** NULL = platform/admin sound; set = vendor-owned upload. */
+  owner_id?: string | null;
   created_at: string;
   updated_at: string;
 }

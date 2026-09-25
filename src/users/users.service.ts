@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException, ConflictException, BadRequestException, ForbiddenException, UnauthorizedException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createUserSupabaseClient, createServiceSupabaseClient } from '../shared/supabase.client';
+import { escapePostgrestTerm } from '../shared/postgrest';
 import { UpdateProfileDto, UserProfileResponse, PublicProfileResponse } from '../shared/dto/user-profile.dto';
 import * as crypto from 'crypto';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
@@ -46,7 +47,7 @@ export class UsersService {
     // SECURITY: Use service role for public profile access (no sensitive data)
     const { data, error } = await this.serviceSupabase
       .from('user_profiles')
-      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name')
+      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name, citizen_number, catalog_hidden, is_adult_content')
       .eq('id', userId)
       .single();
 
@@ -69,6 +70,9 @@ export class UsersService {
       location: data.location,
       isSeller: data.is_seller,
       isRider: data.is_rider,
+      catalogHidden: data.catalog_hidden,
+      isAdultContent: data.is_adult_content,
+      citizenNumber: data.citizen_number,
       createdAt: data.created_at,
     };
   }
@@ -77,7 +81,7 @@ export class UsersService {
     // SECURITY: Use service role for public profile access (no sensitive data)
     const { data, error } = await this.serviceSupabase
       .from('user_profiles')
-      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name')
+      .select('id, username, bio, avatar_url, bg_pic_url, location, is_seller, is_rider, created_at, display_name, citizen_number, catalog_hidden, is_adult_content')
       .ilike('username', username)
       .single();
 
@@ -100,6 +104,9 @@ export class UsersService {
       location: data.location,
       isSeller: data.is_seller,
       isRider: data.is_rider,
+      catalogHidden: data.catalog_hidden,
+      isAdultContent: data.is_adult_content,
+      citizenNumber: data.citizen_number,
       createdAt: data.created_at,
     };
   }
@@ -125,7 +132,8 @@ export class UsersService {
     // SECURITY: Only allow profile creation for authenticated users with valid tokens
     // Check if this is a new profile creation
     const isNewProfile = !profileCheck || profileCheck.length === 0;
-    
+    let authCreatedAt: string | undefined;
+
     if (isNewProfile) {
       // SECURITY: Verify user has valid authentication context
       if (!userToken) {
@@ -146,7 +154,8 @@ export class UsersService {
         });
         throw new UnauthorizedException('Invalid authentication token');
       }
-      
+
+      authCreatedAt = tokenUser.created_at;
       console.log('SECURITY: Creating new profile for authenticated user', userId);
     }
     
@@ -187,9 +196,16 @@ export class UsersService {
       is_rider: false, // Default rider status
       is_verified: false, // SECURITY: Don't auto-verify users
       email_confirmed: false, // SECURITY: Don't auto-confirm emails
-      created_at: new Date().toISOString(), // For new profiles
       updated_at: new Date().toISOString(), // Always update this
     };
+
+    // created_at must NEVER be overwritten on update — upserts would reset the
+    // "member since" date on every profile edit. For genuinely new profiles,
+    // use the auth signup timestamp so late-created profiles still show the
+    // user's true join date.
+    if (isNewProfile) {
+      dbUpsertData.created_at = authCreatedAt || new Date().toISOString();
+    }
     
     // Add optional fields if provided
     if (updateData.username !== undefined) dbUpsertData.username = updateData.username;
@@ -200,6 +216,8 @@ export class UsersService {
     if (updateData.gender !== undefined) dbUpsertData.gender = updateData.gender;
     if (updateData.isSeller !== undefined) dbUpsertData.is_seller = updateData.isSeller;
     if (updateData.isRider !== undefined) dbUpsertData.is_rider = updateData.isRider;
+    if (updateData.catalogHidden !== undefined) dbUpsertData.catalog_hidden = updateData.catalogHidden;
+    if (updateData.isAdultContent !== undefined) dbUpsertData.is_adult_content = updateData.isAdultContent;
     if (updateData.avatarUrl !== undefined) dbUpsertData.avatar_url = updateData.avatarUrl;
     if (updateData.bgPicUrl !== undefined) dbUpsertData.bg_pic_url = updateData.bgPicUrl;
     if (updateData.preferences !== undefined) dbUpsertData.preferences = updateData.preferences;
@@ -330,21 +348,64 @@ export class UsersService {
     }
   }
 
-  async searchUsers(query: string, limit: number = 20): Promise<PublicProfileResponse[]> {
-    const { data, error } = await this.serviceSupabase
+  async searchUsers(query: string, limit: number = 20, options?: { verifiedOnly?: boolean; offset?: number }): Promise<PublicProfileResponse[]> {
+    const q = escapePostgrestTerm(query);
+    const offset = options?.offset || 0;
+    let builder = this.serviceSupabase
       .from('user_profiles')
       .select('id, username, bio, avatar_url, location, is_seller, created_at, display_name')
-      .or(`username.ilike.%${query}%,bio.ilike.%${query}%`)
       // Exclude system accounts: Iko AI assistant, platform wallet, marketing/gift wallet
       .not('id', 'in', '("00000000-0000-4000-8000-000000000001","00000000-0000-4000-8000-000000000002","00000000-0000-4000-8000-000000000003")')
-      .limit(limit)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (options?.verifiedOnly) {
+      builder = builder.eq('is_verified', true);
+    }
+
+    if (q) {
+      builder = builder.or(`username.ilike.%${q}%,bio.ilike.%${q}%`);
+    }
+
+    const { data, error } = await builder;
 
     if (error) {
       throw new Error(`Search failed: ${error.message}`);
     }
 
     return data.map(user => ({
+      id: user.id,
+      username: user.username || user.display_name || 'Unknown',
+      bio: user.bio,
+      avatarUrl: user.avatar_url,
+      location: user.location,
+      isSeller: user.is_seller,
+      createdAt: user.created_at,
+    }));
+  }
+
+  async searchVendors(query: string, limit: number = 20, offset: number = 0): Promise<PublicProfileResponse[]> {
+    const q = escapePostgrestTerm(query);
+    let builder = this.serviceSupabase
+      .from('user_profiles')
+      .select('id, username, bio, avatar_url, location, is_seller, created_at, display_name')
+      .eq('is_seller', true)
+      .eq('is_verified', true)
+      .not('id', 'in', '("00000000-0000-4000-8000-000000000001","00000000-0000-4000-8000-000000000002","00000000-0000-4000-8000-000000000003")')
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (q) {
+      builder = builder.or(`username.ilike.%${q}%,display_name.ilike.%${q}%,bio.ilike.%${q}%`);
+    }
+
+    const { data, error } = await builder;
+
+    if (error) {
+      throw new Error(`Vendor search failed: ${error.message}`);
+    }
+
+    return (data || []).map(user => ({
       id: user.id,
       username: user.username || user.display_name || 'Unknown',
       bio: user.bio,
@@ -692,6 +753,10 @@ export class UsersService {
       preferences: data.preferences || {},
       isSeller: data.is_seller,
       isRider: data.is_rider,
+      catalogHidden: data.catalog_hidden,
+      isAdultContent: data.is_adult_content,
+      citizenNumber: data.citizen_number,
+      citizenNumberSeenAt: data.citizen_number_seen_at,
       createdAt: data.created_at,
       updatedAt: data.updated_at,
     };
@@ -879,5 +944,29 @@ export class UsersService {
     }
 
     return { timezone };
+  }
+
+  /**
+   * Stamp the first time a user has been shown their citizen number.
+   * Idempotent — only writes when citizen_number_seen_at is still NULL so the
+   * original reveal moment is preserved. Used by the mobile app to show a
+   * one-time "You are Citizen FRT-XXXXXX" reveal for backfilled accounts and
+   * social signups (which skip the WelcomeScreen).
+   */
+  async markCitizenNumberSeen(userId: string): Promise<{ citizenNumberSeenAt: string | null }> {
+    const { data, error } = await this.serviceSupabase
+      .from('user_profiles')
+      .update({ citizen_number_seen_at: new Date().toISOString() })
+      .eq('id', userId)
+      .is('citizen_number_seen_at', null)
+      .select('citizen_number_seen_at')
+      .single();
+
+    // PGRST116 = already stamped; return the existing value
+    if (error && error.code !== 'PGRST116') {
+      throw new Error(`Failed to mark citizen number as seen: ${error.message}`);
+    }
+
+    return { citizenNumberSeenAt: data?.citizen_number_seen_at || null };
   }
 }

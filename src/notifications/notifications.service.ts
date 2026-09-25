@@ -465,6 +465,10 @@ export class NotificationsService {
         return settings.payment_notifications;
       case NotificationType.CHAT:
         return settings.chat_notifications;
+      // Schedule reminders and dispute updates only exist in order context
+      case NotificationType.SCHEDULE:
+      case NotificationType.DISPUTE:
+        return settings.order_notifications;
       default:
         return true;
     }
@@ -551,7 +555,7 @@ export class NotificationsService {
       this.logger.error('Service role client test error:', error);
       return {
         success: false,
-        message: `Service role test error: ${error.message}`,
+        message: `Service role test error: ${error instanceof Error ? error.message : String(error)}`,
         data: error
       };
     }

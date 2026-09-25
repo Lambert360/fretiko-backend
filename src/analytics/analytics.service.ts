@@ -42,6 +42,7 @@ export class AnalyticsService implements OnModuleDestroy {
   // ✅ PHASE 5 FIX: Configurable values (can be overridden via environment variables)
   private readonly PLATFORM_COMMISSION_RATE: number;
   private readonly EXPORT_EXPIRY_HOURS = 24; // Export files expire after 24 hours
+  private readonly LOW_STOCK_THRESHOLD = 5; // products with quantity <= this are "low stock"
   
   // ✅ PERFORMANCE FIX: Caching layer
   private analyticsCache = new Map<string, CacheEntry>();
@@ -156,11 +157,13 @@ export class AnalyticsService implements OnModuleDestroy {
           .lte('created_at', effectiveDateRange.end)
           .limit(this.MAX_QUERY_RESULTS),
         
-        // 2. Get live stream transactions
+        // 2. Get live stream transactions (unlinked only — transactions with
+        // order_id are already represented by their orders rows)
         supabaseClient
           .from('live_stream_transactions')
           .select('*')
           .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+          .is('order_id', null)
           .gte('created_at', effectiveDateRange.start)
           .lte('created_at', effectiveDateRange.end)
           .limit(this.MAX_QUERY_RESULTS),
@@ -191,9 +194,10 @@ export class AnalyticsService implements OnModuleDestroy {
           .from('service_bookings')
           .select(`
             *,
-            service:services!inner(vendor_id)
+            service:services!inner(user_id)
           `)
-          .eq('service.vendor_id', userId)
+          .eq('service.user_id', userId)
+          .is('order_id', null)
           .gte('created_at', effectiveDateRange.start)
           .lte('created_at', effectiveDateRange.end)
           .limit(this.MAX_QUERY_RESULTS)
@@ -207,9 +211,9 @@ export class AnalyticsService implements OnModuleDestroy {
 
       if (!ordersError && orders) {
         totalOrdersProcessed += orders.length;
-        totalTransactionValue += orders.reduce((sum, order) => sum + (order.total || 0), 0);
+        totalTransactionValue += orders.reduce((sum, order) => sum + (order.total_amount || 0), 0);
         totalCompletedTransactions += orders.filter(order => order.status === 'delivered').length;
-        orders.forEach(order => order.customer_id && allCustomers.add(order.customer_id));
+        orders.forEach(order => order.buyer_id && allCustomers.add(order.buyer_id));
       }
 
       if (!liveError && liveTransactions) {
@@ -228,18 +232,29 @@ export class AnalyticsService implements OnModuleDestroy {
         liveGifts.forEach(gift => gift.sender_id && allCustomers.add(gift.sender_id));
       }
 
+      // Auction checkouts create orders rows AND auction_sales rows — skip
+      // sales that already have a matching order (metadata.auction_id + buyer)
+      const auctionOrderKeys = new Set(
+        (orders || [])
+          .filter(o => o.source === 'auction' && o.metadata?.auction_id)
+          .map(o => `${o.metadata.auction_id}:${o.buyer_id}`)
+      );
+      const unmatchedAuctionSales = (!auctionError && auctionSales)
+        ? auctionSales.filter(sale => !auctionOrderKeys.has(`${sale.auction_id}:${sale.buyer_id}`))
+        : [];
+
       if (!auctionError && auctionSales) {
-        totalOrdersProcessed += auctionSales.length;
-        totalTransactionValue += auctionSales.reduce((sum, sale) => sum + (sale.total_amount || 0), 0);
-        totalCompletedTransactions += auctionSales.filter(sale => sale.payment_status === 'completed').length;
-        auctionSales.forEach(sale => sale.buyer_id && allCustomers.add(sale.buyer_id));
+        totalOrdersProcessed += unmatchedAuctionSales.length;
+        totalTransactionValue += unmatchedAuctionSales.reduce((sum, sale) => sum + (sale.total_amount || 0), 0);
+        totalCompletedTransactions += unmatchedAuctionSales.filter(sale => sale.payment_status === 'completed').length;
+        unmatchedAuctionSales.forEach(sale => sale.buyer_id && allCustomers.add(sale.buyer_id));
       }
 
       if (!bookingError && serviceBookings) {
         totalOrdersProcessed += serviceBookings.length;
-        totalTransactionValue += serviceBookings.reduce((sum, booking) => sum + (booking.total_price || 0), 0);
+        totalTransactionValue += serviceBookings.reduce((sum, booking) => sum + (booking.final_price ?? booking.quoted_price ?? 0), 0);
         totalCompletedTransactions += serviceBookings.filter(booking => booking.status === 'completed').length;
-        serviceBookings.forEach(booking => booking.customer_id && allCustomers.add(booking.customer_id));
+        serviceBookings.forEach(booking => booking.user_id && allCustomers.add(booking.user_id));
       }
 
       // ✅ ERROR HANDLING FIX: Check for critical errors
@@ -275,27 +290,11 @@ export class AnalyticsService implements OnModuleDestroy {
       const averageOrderValue = ordersProcessed > 0 ? transactionValue / ordersProcessed : 0;
 
       // Generate chart data (simplified example - using combined data)
-      const chartData = this.generateChartData({ orders, liveTransactions, auctionSales, serviceBookings }, period);
+      const chartData = this.generateChartData({ orders, liveTransactions, auctionSales: unmatchedAuctionSales, serviceBookings }, period);
 
-      // Generate sample reports
-      const reports = [
-        {
-          id: '1',
-          title: `${period.charAt(0).toUpperCase() + period.slice(1)} Sales Report`,
-          subtitle: `Generated on ${new Date().toLocaleDateString()}`,
-          status: 'completed',
-          createdAt: new Date().toISOString(),
-          type: period,
-        },
-        {
-          id: '2',
-          title: 'Customer Analytics Report',
-          subtitle: `${activeCustomers} customers analyzed`,
-          status: 'completed',
-          createdAt: new Date().toISOString(),
-          type: 'custom',
-        },
-      ];
+      // Real generated reports are served by GET /analytics/reports — this
+      // field is kept for response-shape compatibility only
+      const reports: any[] = [];
 
       // Calculate real trends by comparing with previous period
       const trends = await this.calculateTrends(
@@ -305,6 +304,19 @@ export class AnalyticsService implements OnModuleDestroy {
         { ordersProcessed, revenue, activeCustomers },
         supabaseClient
       );
+
+      // Channel breakdown from orders table (covers regular, live_stream,
+      // auction, service_booking, invoice, wishlist). Live transactions,
+      // auction sales and bookings are also tracked in their own tables.
+      const sourceBreakdown: Record<string, { orders: number; revenue: number }> = {};
+      (orders || []).forEach(order => {
+        const source = order.source || 'regular';
+        if (!sourceBreakdown[source]) {
+          sourceBreakdown[source] = { orders: 0, revenue: 0 };
+        }
+        sourceBreakdown[source].orders += 1;
+        sourceBreakdown[source].revenue += order.total_amount || 0;
+      });
 
       const result = {
         period,
@@ -320,10 +332,14 @@ export class AnalyticsService implements OnModuleDestroy {
         chartData,
         reports,
         trends,
+        sourceBreakdown,
       };
 
-      // ✅ PERFORMANCE FIX: Cache the result
-      this.setCachedData(cacheKey, result, this.CACHE_TTL.HISTORICAL);
+      // ✅ PERFORMANCE FIX: Cache the result. Periods that include "now" still
+      // change as orders come in — cache them briefly (REALTIME); fully-past
+      // periods are immutable and can use the longer HISTORICAL TTL.
+      const isLivePeriod = new Date(effectiveDateRange.end).getTime() >= Date.now();
+      this.setCachedData(cacheKey, result, isLivePeriod ? this.CACHE_TTL.REALTIME : this.CACHE_TTL.HISTORICAL);
       
       return result;
     } catch (error) {
@@ -356,16 +372,18 @@ export class AnalyticsService implements OnModuleDestroy {
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`);
 
       if (!ordersError && allOrders) {
-        totalRevenue += allOrders.reduce((sum, order) => sum + (order.total || 0), 0);
+        totalRevenue += allOrders.reduce((sum, order) => sum + (order.total_amount || 0), 0);
         totalOrders += allOrders.length;
-        allOrders.forEach(order => order.customer_id && allCustomers.add(order.customer_id));
+        allOrders.forEach(order => order.buyer_id && allCustomers.add(order.buyer_id));
       }
 
-      // 2. Get all-time live stream transactions
+      // 2. Get all-time live stream transactions (unlinked only — linked
+      // transactions are already represented by their orders rows)
       const { data: allLiveTransactions, error: liveError } = await supabaseClient
         .from('live_stream_transactions')
         .select('*')
-        .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`);
+        .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+        .is('order_id', null);
 
       if (!liveError && allLiveTransactions) {
         totalRevenue += allLiveTransactions.reduce((sum, tx) => sum + (tx.total_amount || 0), 0);
@@ -380,9 +398,18 @@ export class AnalyticsService implements OnModuleDestroy {
         .eq('seller_id', userId);
 
       if (!auctionError && allAuctionSales) {
-        totalRevenue += allAuctionSales.reduce((sum, sale) => sum + (sale.total_amount || 0), 0);
-        totalOrders += allAuctionSales.length;
-        allAuctionSales.forEach(sale => sale.buyer_id && allCustomers.add(sale.buyer_id));
+        // Skip auction sales that already have a matching order row
+        const auctionOrderKeys = new Set(
+          (allOrders || [])
+            .filter(o => o.source === 'auction' && o.metadata?.auction_id)
+            .map(o => `${o.metadata.auction_id}:${o.buyer_id}`)
+        );
+        const unmatchedAuctionSales = allAuctionSales.filter(
+          sale => !auctionOrderKeys.has(`${sale.auction_id}:${sale.buyer_id}`)
+        );
+        totalRevenue += unmatchedAuctionSales.reduce((sum, sale) => sum + (sale.total_amount || 0), 0);
+        totalOrders += unmatchedAuctionSales.length;
+        unmatchedAuctionSales.forEach(sale => sale.buyer_id && allCustomers.add(sale.buyer_id));
       }
 
       // 4. Get all-time service bookings
@@ -390,14 +417,15 @@ export class AnalyticsService implements OnModuleDestroy {
         .from('service_bookings')
         .select(`
           *,
-          service:services!inner(vendor_id)
+          service:services!inner(user_id)
         `)
-        .eq('service.vendor_id', userId);
+        .eq('service.user_id', userId)
+        .is('order_id', null);
 
       if (!bookingError && allServiceBookings) {
-        totalRevenue += allServiceBookings.reduce((sum, booking) => sum + (booking.total_price || 0), 0);
+        totalRevenue += allServiceBookings.reduce((sum, booking) => sum + (booking.final_price ?? booking.quoted_price ?? 0), 0);
         totalOrders += allServiceBookings.length;
-        allServiceBookings.forEach(booking => booking.customer_id && allCustomers.add(booking.customer_id));
+        allServiceBookings.forEach(booking => booking.user_id && allCustomers.add(booking.user_id));
       }
 
       const totalCustomers = allCustomers.size;
@@ -408,7 +436,7 @@ export class AnalyticsService implements OnModuleDestroy {
       // ✅ PHASE 5 FIX: Get recent activity from actual orders
       const { data: recentOrders } = await supabaseClient
         .from('orders')
-        .select('id, order_number, total, status, created_at')
+        .select('id, order_number, total_amount, status, created_at')
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
         .order('created_at', { ascending: false })
         .limit(10);
@@ -425,7 +453,7 @@ export class AnalyticsService implements OnModuleDestroy {
         totalRevenue,
         totalOrders,
         totalCustomers,
-        averageRating: 4.7,
+        averageRating: await this.calculateCustomerSatisfaction(userId, supabaseClient),
         topSellingProducts,
         recentActivity,
       };
@@ -460,7 +488,7 @@ export class AnalyticsService implements OnModuleDestroy {
         throw new Error(`Failed to fetch revenue analytics: ${error.message}`);
       }
 
-      const totalRevenue = orders?.reduce((sum, order) => sum + (order.total || 0), 0) || 0;
+      const totalRevenue = orders?.reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
 
       // Revenue by day (simplified)
       const revenueByDay = this.groupRevenueByDay(orders);
@@ -469,7 +497,10 @@ export class AnalyticsService implements OnModuleDestroy {
       const { data: orderItems } = await supabaseClient
         .from('order_items')
         .select(`
+          product_id,
+          product_name,
           category,
+          quantity,
           total_price,
           orders!inner(vendor_id, created_at, status)
         `)
@@ -498,13 +529,29 @@ export class AnalyticsService implements OnModuleDestroy {
         revenueByCategory.push({ category: 'Uncategorized', revenue: totalRevenue, percentage: 100 });
       }
 
-      // Revenue by product (simplified)
-      const revenueByProduct = orders?.slice(0, 5).map(order => ({
-        productId: order.id,
-        productName: `Order ${order.order_number}`,
-        revenue: order.total,
-        orders: 1,
-      })) || [];
+      // Revenue by product — aggregated from actual order items
+      const productRevenue = new Map<string, { productName: string; revenue: number; orders: number }>();
+      orderItems?.forEach(item => {
+        const key = item.product_id || `custom:${item.product_name || 'Unknown'}`;
+        const existing = productRevenue.get(key) || {
+          productName: item.product_name || 'Unknown Product',
+          revenue: 0,
+          orders: 0,
+        };
+        existing.revenue += item.total_price || 0;
+        existing.orders += 1;
+        productRevenue.set(key, existing);
+      });
+
+      const revenueByProduct = Array.from(productRevenue.entries())
+        .map(([productId, data]) => ({
+          productId,
+          productName: data.productName,
+          revenue: data.revenue,
+          orders: data.orders,
+        }))
+        .sort((a, b) => b.revenue - a.revenue)
+        .slice(0, 5);
 
       return {
         totalRevenue,
@@ -529,7 +576,7 @@ export class AnalyticsService implements OnModuleDestroy {
       // ✅ BUG FIX: Fetch actual orders with customer and total data
       const { data: orders, error } = await supabaseClient
         .from('orders')
-        .select('customer_id, created_at, total, buyer_id')
+        .select('buyer_id, created_at, total_amount')
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
         .gte('created_at', dateRange.start)
         .lte('created_at', dateRange.end);
@@ -563,7 +610,7 @@ export class AnalyticsService implements OnModuleDestroy {
       const periodStart = new Date(dateRange.start);
 
       orders.forEach(order => {
-        const customerId = order.customer_id || order.buyer_id;
+        const customerId = order.buyer_id;
         if (!customerId) return;
 
         const firstOrderDate = customerFirstOrders.get(customerId);
@@ -594,13 +641,13 @@ export class AnalyticsService implements OnModuleDestroy {
       const customerSpending = new Map<string, { orders: number; total: number }>();
       
       orders.forEach(order => {
-        const customerId = order.customer_id || order.buyer_id;
+        const customerId = order.buyer_id;
         if (!customerId) return;
 
         const current = customerSpending.get(customerId) || { orders: 0, total: 0 };
         customerSpending.set(customerId, {
           orders: current.orders + 1,
-          total: current.total + (order.total || 0)
+          total: current.total + (order.total_amount || 0)
         });
       });
 
@@ -621,11 +668,11 @@ export class AnalyticsService implements OnModuleDestroy {
       if (customerIds.length > 0) {
         const { data: profiles } = await supabaseClient
           .from('user_profiles')
-          .select('id, username, name')
+          .select('id, username, display_name')
           .in('id', customerIds);
 
         profiles?.forEach(profile => {
-          profileMap.set(profile.id, profile.username || profile.name || 'Unknown Customer');
+          profileMap.set(profile.id, profile.username || profile.display_name || 'Unknown Customer');
         });
       }
 
@@ -636,9 +683,6 @@ export class AnalyticsService implements OnModuleDestroy {
         totalSpent: c.totalSpent,
       }));
 
-      // Get conversion metrics (time to first purchase)
-      const conversionMetrics = await this.getTimeToFirstPurchaseMetrics(userId, supabaseClient);
-
       return {
         totalCustomers,
         newCustomers: newCustomers.size,
@@ -646,7 +690,6 @@ export class AnalyticsService implements OnModuleDestroy {
         customerRetentionRate: Math.round(customerRetentionRate * 10) / 10,
         averageOrdersPerCustomer: Math.round(averageOrdersPerCustomer * 10) / 10,
         topCustomers,
-        conversionMetrics,
       };
     } catch (error) {
       if (error instanceof AnalyticsError || error instanceof HttpException) {
@@ -672,14 +715,14 @@ export class AnalyticsService implements OnModuleDestroy {
     try {
       const { data: allOrders } = await supabaseClient
         .from('orders')
-        .select('customer_id, created_at, buyer_id')
+        .select('buyer_id, created_at')
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
         .order('created_at', { ascending: true });
 
       const firstOrderMap = new Map<string, Date>();
       
       allOrders?.forEach(order => {
-        const customerId = order.customer_id || order.buyer_id;
+        const customerId = order.buyer_id;
         if (!customerId) return;
 
         if (!firstOrderMap.has(customerId)) {
@@ -691,163 +734,6 @@ export class AnalyticsService implements OnModuleDestroy {
     } catch (error) {
       console.error('Error fetching customer first order dates:', error);
       return new Map();
-    }
-  }
-
-  /**
-   * Helper method to calculate time-to-first-purchase metrics
-   * Returns conversion metrics including average time to first purchase
-   */
-  private async getTimeToFirstPurchaseMetrics(
-    userId: string,
-    supabaseClient: any
-  ): Promise<{
-    averageTimeToFirstPurchaseHours: number;
-    medianTimeToFirstPurchaseHours: number;
-    conversionRate: number;
-    totalUsers: number;
-    purchasers: number;
-    nonPurchasers: number;
-    timeBuckets: {
-      within24Hours: number;
-      within7Days: number;
-      within30Days: number;
-      over30Days: number;
-    };
-  }> {
-    try {
-      // Get all user profiles (registration dates)
-      const { data: users, error: usersError } = await supabaseClient
-        .from('user_profiles')
-        .select('id, created_at')
-        .limit(this.MAX_QUERY_RESULTS);
-
-      if (usersError) {
-        console.error('Error fetching user profiles:', usersError);
-        throw new AnalyticsError(
-          'Failed to fetch user profiles for conversion metrics',
-          'USER_PROFILES_FETCH_ERROR',
-          HttpStatus.INTERNAL_SERVER_ERROR
-        );
-      }
-
-      if (!users || users.length === 0) {
-        return {
-          averageTimeToFirstPurchaseHours: 0,
-          medianTimeToFirstPurchaseHours: 0,
-          conversionRate: 0,
-          totalUsers: 0,
-          purchasers: 0,
-          nonPurchasers: 0,
-          timeBuckets: {
-            within24Hours: 0,
-            within7Days: 0,
-            within30Days: 0,
-            over30Days: 0,
-          },
-        };
-      }
-
-      // Get first order dates for all users
-      const { data: allOrders, error: ordersError } = await supabaseClient
-        .from('orders')
-        .select('buyer_id, created_at')
-        .order('created_at', { ascending: true })
-        .limit(this.MAX_QUERY_RESULTS);
-
-      if (ordersError) {
-        console.error('Error fetching orders for conversion metrics:', ordersError);
-        throw new AnalyticsError(
-          'Failed to fetch orders for conversion metrics',
-          'ORDERS_FETCH_ERROR',
-          HttpStatus.INTERNAL_SERVER_ERROR
-        );
-      }
-
-      // Build first order map
-      const firstOrderMap = new Map<string, Date>();
-      allOrders?.forEach(order => {
-        const buyerId = order.buyer_id;
-        if (!buyerId) return;
-
-        if (!firstOrderMap.has(buyerId)) {
-          firstOrderMap.set(buyerId, new Date(order.created_at));
-        }
-      });
-
-      // Calculate time to first purchase for each user
-      const timeToPurchaseArray: number[] = [];
-      const timeBuckets = {
-        within24Hours: 0,
-        within7Days: 0,
-        within30Days: 0,
-        over30Days: 0,
-      };
-
-      users.forEach(user => {
-        const registrationDate = new Date(user.created_at);
-        const firstOrderDate = firstOrderMap.get(user.id);
-
-        if (firstOrderDate) {
-          const timeDiffHours = (firstOrderDate.getTime() - registrationDate.getTime()) / (1000 * 60 * 60);
-          
-          // Only include positive time differences (order after registration)
-          if (timeDiffHours > 0) {
-            timeToPurchaseArray.push(timeDiffHours);
-
-            // Categorize into time buckets
-            if (timeDiffHours <= 24) {
-              timeBuckets.within24Hours++;
-            } else if (timeDiffHours <= 168) { // 7 days = 168 hours
-              timeBuckets.within7Days++;
-            } else if (timeDiffHours <= 720) { // 30 days = 720 hours
-              timeBuckets.within30Days++;
-            } else {
-              timeBuckets.over30Days++;
-            }
-          }
-        }
-      });
-
-      const totalUsers = users.length;
-      const purchasers = timeToPurchaseArray.length;
-      const nonPurchasers = totalUsers - purchasers;
-      const conversionRate = totalUsers > 0 ? (purchasers / totalUsers) * 100 : 0;
-
-      // Calculate average
-      const averageTimeToFirstPurchaseHours = purchasers > 0
-        ? timeToPurchaseArray.reduce((sum, time) => sum + time, 0) / purchasers
-        : 0;
-
-      // Calculate median
-      let medianTimeToFirstPurchaseHours = 0;
-      if (purchasers > 0) {
-        const sorted = [...timeToPurchaseArray].sort((a, b) => a - b);
-        const mid = Math.floor(sorted.length / 2);
-        medianTimeToFirstPurchaseHours = sorted.length % 2 !== 0
-          ? sorted[mid]
-          : (sorted[mid - 1] + sorted[mid]) / 2;
-      }
-
-      return {
-        averageTimeToFirstPurchaseHours: Math.round(averageTimeToFirstPurchaseHours * 100) / 100,
-        medianTimeToFirstPurchaseHours: Math.round(medianTimeToFirstPurchaseHours * 100) / 100,
-        conversionRate: Math.round(conversionRate * 100) / 100,
-        totalUsers,
-        purchasers,
-        nonPurchasers,
-        timeBuckets,
-      };
-    } catch (error) {
-      if (error instanceof AnalyticsError) {
-        throw error;
-      }
-      console.error('Error calculating time-to-first-purchase metrics:', error);
-      throw new AnalyticsError(
-        'An unexpected error occurred while calculating conversion metrics',
-        'CONVERSION_METRICS_ERROR',
-        HttpStatus.INTERNAL_SERVER_ERROR
-      );
     }
   }
 
@@ -868,7 +754,7 @@ export class AnalyticsService implements OnModuleDestroy {
           product_name,
           category,
           quantity,
-          price,
+          unit_price,
           total_price,
           orders!inner(
             id,
@@ -894,8 +780,9 @@ export class AnalyticsService implements OnModuleDestroy {
       // ✅ BUG FIX: Get total products count
       const { data: products, error: productsError } = await supabaseClient
         .from('products')
-        .select('id, name, stock_quantity, min_stock_level')
-        .eq('vendor_id', userId);
+        .select('id, name, quantity')
+        .eq('user_id', userId)
+        .is('deleted_at', null);
 
       if (productsError) {
         console.error('Error fetching products:', productsError);
@@ -910,12 +797,12 @@ export class AnalyticsService implements OnModuleDestroy {
           topSellingProducts: [],
           categoryPerformance: [],
           lowStockProducts: products?.filter(p => 
-            p.stock_quantity <= (p.min_stock_level || 0)
+            (p.quantity ?? 0) <= this.LOW_STOCK_THRESHOLD
           ).map(p => ({
             productId: p.id,
             productName: p.name,
-            currentStock: p.stock_quantity,
-            minStock: p.min_stock_level || 0
+            currentStock: p.quantity ?? 0,
+            minStock: this.LOW_STOCK_THRESHOLD
           })) || [],
         };
       }
@@ -1018,12 +905,12 @@ export class AnalyticsService implements OnModuleDestroy {
 
       // ✅ BUG FIX: Get low stock products
       const lowStockProducts = products?.filter(p => 
-        p.stock_quantity <= (p.min_stock_level || 0)
+        (p.quantity ?? 0) <= this.LOW_STOCK_THRESHOLD
       ).map(p => ({
         productId: p.id,
         productName: p.name,
-        currentStock: p.stock_quantity,
-        minStock: p.min_stock_level || 0
+        currentStock: p.quantity ?? 0,
+        minStock: this.LOW_STOCK_THRESHOLD
       })) || [];
 
       const totalSales = orderItems.reduce((sum, item) => sum + (item.quantity || 0), 0);
@@ -1056,7 +943,7 @@ export class AnalyticsService implements OnModuleDestroy {
     try {
       const reportId = `report_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const reportType = reportData.type || 'daily';
-      const reportSource = reportData.source || 'all'; // 'all', 'auctions', 'live_stream', 'regular'
+      const reportSource = reportData.source || 'all'; // 'all', 'auctions', 'live_stream', 'regular', 'invoice', 'wishlist'
       const format = reportData.format || 'pdf';
 
       // Generate report data based on type and source
@@ -1095,6 +982,18 @@ export class AnalyticsService implements OnModuleDestroy {
         reportContent.regularData = regularAnalytics;
       }
 
+      if (reportSource === 'invoice' || reportSource === 'all') {
+        reportContent.invoiceData = await this.getSourceOrdersReport(
+          userId, 'invoice', reportType, reportData.startDate, supabaseClient
+        );
+      }
+
+      if (reportSource === 'wishlist' || reportSource === 'all') {
+        reportContent.wishlistData = await this.getSourceOrdersReport(
+          userId, 'wishlist', reportType, reportData.startDate, supabaseClient
+        );
+      }
+
       // Save report metadata to database
       await supabaseClient.from('analytics_reports').insert({
         id: reportId,
@@ -1109,7 +1008,19 @@ export class AnalyticsService implements OnModuleDestroy {
 
       // ✅ PHASE 4 FIX: Generate actual file and upload to storage
       try {
-        const filePath = await this.generateReportFile(reportContent, format, reportId);
+        // Vendor display name for the report letterhead
+        const { data: vendorProfile } = await supabaseClient
+          .from('user_profiles')
+          .select('username, display_name')
+          .eq('id', userId)
+          .single();
+
+        const filePath = await this.generateReportFile(reportContent, format, reportId, {
+          reportType,
+          reportSource,
+          startDate: reportData.startDate,
+          vendorName: vendorProfile?.username || vendorProfile?.display_name || undefined,
+        });
         const downloadUrl = await this.uploadReportToStorage(filePath, reportId, userId, format);
 
         // Update report status to completed
@@ -1166,10 +1077,67 @@ export class AnalyticsService implements OnModuleDestroy {
   }
 
   /**
+   * Build a report section for a single order source (invoice, wishlist, etc.)
+   * Orders are the canonical record — every checkout creates an orders row.
+   */
+  private async getSourceOrdersReport(
+    userId: string,
+    source: string,
+    period: string,
+    startDate: string | undefined,
+    supabaseClient: any
+  ) {
+    const dateRange = this.getDateRange(period, startDate);
+    const { data: orders, error } = await supabaseClient
+      .from('orders')
+      .select('id, buyer_id, total_amount, status, created_at, order_items(product_name, quantity, unit_price, total_price)')
+      .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+      .eq('source', source)
+      .gte('created_at', dateRange.start)
+      .lte('created_at', dateRange.end)
+      .limit(this.MAX_QUERY_RESULTS);
+
+    if (error) {
+      throw new AnalyticsError(
+        `Failed to fetch ${source} orders for report: ${error.message}`,
+        'REPORT_DATA_ERROR',
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+
+    const statusBreakdown: Record<string, number> = {};
+    (orders || []).forEach(o => {
+      statusBreakdown[o.status] = (statusBreakdown[o.status] || 0) + 1;
+    });
+
+    return {
+      source,
+      period,
+      dateRange,
+      totalOrders: (orders || []).length,
+      totalRevenue: (orders || []).reduce((sum, o) => sum + (o.total_amount || 0), 0),
+      completedOrders: (orders || []).filter(o => o.status === 'delivered').length,
+      statusBreakdown,
+      orders: (orders || []).map(o => ({
+        id: o.id,
+        total: o.total_amount || 0,
+        status: o.status,
+        createdAt: o.created_at,
+        items: (o.order_items || []).map((i: any) => ({
+          name: i.product_name,
+          quantity: i.quantity,
+          unitPrice: i.unit_price,
+          total: i.total_price,
+        })),
+      })),
+    };
+  }
+
+  /**
    * Generate report file based on format
    * ✅ PHASE 4 FIX: Actual file generation
    */
-  private async generateReportFile(data: any, format: string, reportId: string): Promise<string> {
+  private async generateReportFile(data: any, format: string, reportId: string, meta?: { reportType?: string; reportSource?: string; startDate?: string; vendorName?: string }): Promise<string> {
     const tempDir = os.tmpdir();
     const fileName = `${reportId}.${format === 'excel' ? 'xlsx' : format === 'pdf' ? 'pdf' : format === 'csv' ? 'csv' : 'json'}`;
     const filePath = path.join(tempDir, fileName);
@@ -1189,10 +1157,10 @@ export class AnalyticsService implements OnModuleDestroy {
         const workbook = new ExcelJS.Workbook();
         workbook.creator = 'Fretiko Analytics';
         workbook.created = new Date();
-        
+
         // Create main report worksheet
         const worksheet = workbook.addWorksheet('Analytics Report');
-        this.populateExcelWorksheet(worksheet, data);
+        this.populateExcelWorksheet(worksheet, data, meta);
         
         // Save the workbook
         await workbook.xlsx.writeFile(filePath);
@@ -1201,13 +1169,13 @@ export class AnalyticsService implements OnModuleDestroy {
       case 'pdf':
         // ✅ IMPLEMENTATION: Generate actual PDF file using PDFKit
         await new Promise<void>((resolve, reject) => {
-          const doc = new PDFDocument({ margin: 50 });
+          const doc = new PDFDocument({ margin: 50, bufferPages: true });
           const stream = fs.createWriteStream(filePath);
-          
+
           doc.pipe(stream);
-          
+
           // Populate PDF with data
-          this.populatePDFDocument(doc, data);
+          this.populatePDFDocument(doc, data, meta);
           
           doc.end();
           
@@ -1296,12 +1264,37 @@ export class AnalyticsService implements OnModuleDestroy {
    * Populate Excel worksheet with analytics data
    * ✅ IMPLEMENTATION: Excel generation helper
    */
-  private populateExcelWorksheet(worksheet: any, data: any): void {
-    // Add title
-    worksheet.addRow(['Fretiko Analytics Report']);
+  private populateExcelWorksheet(worksheet: any, data: any, meta?: { reportType?: string; reportSource?: string; startDate?: string; vendorName?: string }): void {
+    const sourceLabels: Record<string, string> = {
+      all: 'All Sales Channels',
+      regular: 'Store Sales',
+      auctions: 'Auctions',
+      live_stream: 'Live Stream Sales',
+      services: 'Service Bookings',
+      invoice: 'Chat Invoice Sales',
+      wishlist: 'Wishlist Gift Sales',
+    };
+
+    // ── Fretiko letterhead ──
+    worksheet.addRow(['FRETIKO — Vendor Analytics Report']);
     worksheet.mergeCells(1, 1, 1, 5);
-    worksheet.getCell(1, 1).font = { size: 16, bold: true };
-    worksheet.getCell(1, 1).alignment = { vertical: 'middle', horizontal: 'center' };
+    const titleCell = worksheet.getCell(1, 1);
+    titleCell.font = { size: 18, bold: true, color: { argb: 'FFFFFFFF' } };
+    titleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF007AFF' } };
+    titleCell.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+    worksheet.getRow(1).height = 28;
+
+    // Meta row: report type / channel / vendor / generated
+    const metaParts = [
+      meta?.reportType ? `Type: ${String(meta.reportType).replace(/_/g, ' ')}` : null,
+      meta?.reportSource ? `Channel: ${sourceLabels[meta.reportSource] || meta.reportSource}` : null,
+      meta?.startDate ? `From: ${meta.startDate}` : null,
+      meta?.vendorName ? `Vendor: ${meta.vendorName}` : null,
+      `Generated: ${new Date().toLocaleString()}`,
+    ].filter(Boolean).join('   |   ');
+    worksheet.addRow([metaParts]);
+    worksheet.mergeCells(2, 1, 2, 5);
+    worksheet.getCell(2, 1).font = { italic: true, size: 9, color: { argb: 'FF666666' } };
     worksheet.addRow([]); // Empty row
 
     // Helper function to add a section
@@ -1370,18 +1363,30 @@ export class AnalyticsService implements OnModuleDestroy {
     };
 
     // Add data sections
+    let sectionAdded = false;
     if (data.regularData) {
-      addSection('Regular Sales Data', data.regularData);
+      addSection('Store Sales Data', data.regularData);
+      sectionAdded = true;
     }
     if (data.auctionData) {
       addSection('Auction Data', data.auctionData);
+      sectionAdded = true;
     }
     if (data.liveStreamData) {
       addSection('Live Stream Data', data.liveStreamData);
+      sectionAdded = true;
+    }
+    if (data.invoiceData) {
+      addSection('Chat Invoice Sales Data', data.invoiceData);
+      sectionAdded = true;
+    }
+    if (data.wishlistData) {
+      addSection('Wishlist Gift Sales Data', data.wishlistData);
+      sectionAdded = true;
     }
 
     // If no sections, add all data
-    if (!data.regularData && !data.auctionData && !data.liveStreamData) {
+    if (!sectionAdded) {
       Object.entries(data).forEach(([key, value]) => {
         addSection(key, value);
       });
@@ -1404,23 +1409,86 @@ export class AnalyticsService implements OnModuleDestroy {
    * Populate PDF document with analytics data
    * ✅ IMPLEMENTATION: PDF generation helper
    */
-  private populatePDFDocument(doc: any, data: any): void {
+  private populatePDFDocument(doc: any, data: any, meta?: { reportType?: string; reportSource?: string; startDate?: string; vendorName?: string }): void {
     // Set up fonts
     const titleFont = 'Helvetica-Bold';
     const headingFont = 'Helvetica-Bold';
     const bodyFont = 'Helvetica';
+    const brandColor = '#007AFF';
+    const pageWidth = doc.page.width;
 
-    // Add title
-    doc.font(titleFont)
-      .fontSize(20)
-      .text('Fretiko Analytics Report', { align: 'center' });
+    const sourceLabels: Record<string, string> = {
+      all: 'All Sales Channels',
+      regular: 'Store Sales',
+      auctions: 'Auctions',
+      live_stream: 'Live Stream Sales',
+      services: 'Service Bookings',
+      invoice: 'Chat Invoice Sales',
+      wishlist: 'Wishlist Gift Sales',
+    };
 
-    doc.moveDown();
-    doc.fontSize(10)
-      .font(bodyFont)
-      .text(`Generated: ${new Date().toLocaleString()}`, { align: 'center' });
+    // ── Fretiko letterhead ──────────────────────────────────────────
+    // Brand bar across the top
+    doc.save();
+    doc.rect(0, 0, pageWidth, 10).fill(brandColor);
+    doc.restore();
 
-    doc.moveDown(2);
+    // Wordmark + tagline
+    doc.font(titleFont).fontSize(24).fillColor(brandColor)
+      .text('FRETIKO', 50, 28, { lineBreak: false });
+    const wordmarkWidth = doc.widthOfString('FRETIKO');
+    doc.font(bodyFont).fontSize(10).fillColor('#666666')
+      .text('Vendor Analytics', 50 + wordmarkWidth + 10, 40, { lineBreak: false });
+
+    // Right-aligned report meta block
+    const metaLines = [
+      'Analytics Report',
+      meta?.reportType ? `Type: ${String(meta.reportType).replace(/_/g, ' ')}` : null,
+      meta?.reportSource ? `Channel: ${sourceLabels[meta.reportSource] || meta.reportSource}` : null,
+      meta?.startDate ? `From: ${meta.startDate}` : null,
+      meta?.vendorName ? `Vendor: ${meta.vendorName}` : null,
+      `Generated: ${new Date().toLocaleString()}`,
+    ].filter(Boolean) as string[];
+    doc.font(bodyFont).fontSize(9).fillColor('#444444');
+    metaLines.forEach((line, i) => {
+      doc.text(line, 50, 30 + i * 12, {
+        align: 'right',
+        width: pageWidth - 100,
+        lineBreak: false,
+      });
+    });
+
+    // Divider under the letterhead
+    const letterheadBottom = Math.max(60, 30 + metaLines.length * 12 + 10);
+    doc.save();
+    doc.moveTo(50, letterheadBottom)
+      .lineTo(pageWidth - 50, letterheadBottom)
+      .lineWidth(1.5)
+      .strokeColor(brandColor)
+      .stroke();
+    doc.restore();
+
+    // Slim header on continuation pages
+    doc.on('pageAdded', () => {
+      doc.save();
+      doc.font(titleFont).fontSize(12).fillColor(brandColor)
+        .text('FRETIKO', 50, 24, { lineBreak: false });
+      doc.font(bodyFont).fontSize(8).fillColor('#999999')
+        .text('Vendor Analytics Report', 50, 24, {
+          align: 'right',
+          width: pageWidth - 100,
+          lineBreak: false,
+        });
+      doc.moveTo(50, 42).lineTo(pageWidth - 50, 42)
+        .lineWidth(0.5).strokeColor('#DDDDDD').stroke();
+      doc.restore();
+      doc.y = 55;
+      doc.fillColor('#000000');
+    });
+
+    // Resume body content below the letterhead
+    doc.y = letterheadBottom + 15;
+    doc.fillColor('#000000');
 
     // Helper function to add a section
     const addSection = (title: string, items: any) => {
@@ -1520,26 +1588,68 @@ export class AnalyticsService implements OnModuleDestroy {
     };
 
     // Add data sections
+    let sectionAdded = false;
     if (data.regularData) {
-      addSection('Regular Sales Data', data.regularData);
-      doc.addPage(); // New page for next section
+      addSection('Store Sales Data', data.regularData);
+      sectionAdded = true;
     }
     if (data.auctionData) {
+      if (sectionAdded) doc.addPage();
       addSection('Auction Data', data.auctionData);
-      doc.addPage();
+      sectionAdded = true;
     }
     if (data.liveStreamData) {
+      if (sectionAdded) doc.addPage();
       addSection('Live Stream Data', data.liveStreamData);
+      sectionAdded = true;
+    }
+    if (data.invoiceData) {
+      if (sectionAdded) doc.addPage();
+      addSection('Chat Invoice Sales Data', data.invoiceData);
+      sectionAdded = true;
+    }
+    if (data.wishlistData) {
+      if (sectionAdded) doc.addPage();
+      addSection('Wishlist Gift Sales Data', data.wishlistData);
+      sectionAdded = true;
     }
 
-    // If no sections, add all data
-    if (!data.regularData && !data.auctionData && !data.liveStreamData) {
+    // If no recognized sections, add all data
+    if (!sectionAdded) {
       Object.entries(data).forEach(([key, value], index) => {
         if (index > 0) {
           doc.addPage();
         }
         addSection(key, value);
       });
+    }
+
+    // ── Footer on every page (buffered pages) ──
+    const range = doc.bufferedPageRange();
+    for (let i = range.start; i < range.start + range.count; i++) {
+      doc.switchToPage(i);
+      const savedBottom = doc.page.margins.bottom;
+      doc.page.margins.bottom = 0; // prevent auto-paginate while drawing footer
+      const footerY = doc.page.height - 40;
+      doc.save();
+      doc.moveTo(50, footerY - 8)
+        .lineTo(pageWidth - 50, footerY - 8)
+        .lineWidth(0.5)
+        .strokeColor('#DDDDDD')
+        .stroke();
+      doc.font(bodyFont).fontSize(8).fillColor('#999999')
+        .text('Fretiko — Confidential vendor analytics', 50, footerY, {
+          align: 'center',
+          width: pageWidth - 100,
+          lineBreak: false,
+        });
+      doc.text(`Page ${i - range.start + 1} of ${range.count}`, 50, footerY + 10, {
+        align: 'center',
+        width: pageWidth - 100,
+        lineBreak: false,
+      });
+      doc.restore();
+      doc.page.margins.bottom = savedBottom;
     }
   }
 
@@ -1558,7 +1668,7 @@ export class AnalyticsService implements OnModuleDestroy {
   ): Promise<string> {
     try {
       const fileBuffer = fs.readFileSync(filePath);
-      const fileName = `${userId}/${reportId}.${format === 'excel' ? 'xlsx' : format === 'pdf' ? 'pdf' : format === 'csv' ? 'csv' : 'json'}`;
+      const fileName = `${userId}/fretiko-report-${reportId}.${format === 'excel' ? 'xlsx' : format === 'pdf' ? 'pdf' : format === 'csv' ? 'csv' : 'json'}`;
       
       // ✅ PHASE 4 FIX: Upload to Supabase Storage
       const { data, error } = await this.supabase.storage
@@ -1664,6 +1774,8 @@ export class AnalyticsService implements OnModuleDestroy {
     const sourceLabel = source === 'all' ? 'Sales'
       : source === 'auctions' ? 'Auction Performance'
       : source === 'live_stream' ? 'Live Stream Performance'
+      : source === 'invoice' ? 'Chat Sales'
+      : source === 'wishlist' ? 'Wishlist Sales'
       : 'Sales';
 
     return `${typeLabel} ${sourceLabel} Report`;
@@ -1770,6 +1882,62 @@ export class AnalyticsService implements OnModuleDestroy {
         .gte('created_at', dateRange.start)
         .lte('created_at', dateRange.end);
 
+      // 2b. Derive real revenue per stream. live_streams.total_sales is only
+      // bumped by the update_live_stream_analytics_atomic RPC, which the sales
+      // flows never call with a purchase amount — so it is effectively always
+      // zero. Orders (source='live_stream', metadata.stream_id) are the source
+      // of truth for product, service AND portfolio sales; unlinked
+      // live_stream_transactions cover sales that never produced an order row.
+      const { data: liveOrders, error: liveOrdersError } = await supabaseClient
+        .from('orders')
+        .select('id, total_amount, metadata')
+        .eq('vendor_id', userId)
+        .eq('source', 'live_stream')
+        .gte('created_at', dateRange.start)
+        .lte('created_at', dateRange.end);
+
+      if (liveOrdersError) {
+        console.error(`[Analytics] Warning: Error fetching live-stream orders for user ${userId}:`, liveOrdersError);
+      }
+
+      const { data: liveTxs, error: liveTxsError } = await supabaseClient
+        .from('live_stream_transactions')
+        .select('id, stream_id, total_amount, order_id')
+        .eq('vendor_id', userId)
+        .gte('created_at', dateRange.start)
+        .lte('created_at', dateRange.end);
+
+      if (liveTxsError) {
+        console.error(`[Analytics] Warning: Error fetching live-stream transactions for user ${userId}:`, liveTxsError);
+      }
+
+      const revenueByStreamId = new Map<string, number>();
+      const orderTxIds = new Set(
+        (liveOrders || []).map(o => o.metadata?.transaction_id).filter(Boolean)
+      );
+      (liveOrders || []).forEach(o => {
+        const streamId = o.metadata?.stream_id;
+        if (streamId) {
+          revenueByStreamId.set(streamId, (revenueByStreamId.get(streamId) || 0) + (o.total_amount || 0));
+        }
+      });
+      // Transactions with no order_id AND not referenced by an order's
+      // metadata.transaction_id represent sales with no orders row — count
+      // them so service bookings (which insert unlinked transactions) aren't
+      // double-counted or missed.
+      (liveTxs || []).forEach(tx => {
+        if (tx.order_id || orderTxIds.has(tx.id)) return;
+        if (tx.stream_id) {
+          revenueByStreamId.set(tx.stream_id, (revenueByStreamId.get(tx.stream_id) || 0) + (tx.total_amount || 0));
+        }
+      });
+
+      // Patch the dead total_sales column value with computed revenue so the
+      // aggregate, chart data and active-stream cards are all consistent.
+      (liveStreams || []).forEach(stream => {
+        stream.total_sales = revenueByStreamId.get(stream.id) || 0;
+      });
+
       // 3. Aggregate metrics
       let totalStreams = 0;
       let totalLiveRevenue = 0;
@@ -1803,12 +1971,17 @@ export class AnalyticsService implements OnModuleDestroy {
         averageViewerCount = totalStreams > 0 ? totalViewers / totalStreams : 0;
       }
 
-      // 4. Get current active streams
+      // 4. Get current active streams — attach computed revenue (the stored
+      // total_sales column is never updated by sales flows)
       const { data: activeStreams, error: activeError } = await supabaseClient
         .from('live_streams')
         .select('id, title, viewer_count, total_sales')
         .eq('vendor_id', userId)
         .eq('status', 'live');
+
+      (activeStreams || []).forEach(stream => {
+        stream.total_sales = revenueByStreamId.get(stream.id) || 0;
+      });
 
       // 5. Calculate conversion metrics
       const totalTransactions = await this.getTotalLiveTransactions(userId, dateRange, supabaseClient);
@@ -1955,17 +2128,19 @@ export class AnalyticsService implements OnModuleDestroy {
         activeOrders += todayRegularOrders.filter(order =>
           ['processing', 'ready_for_pickup', 'out_for_delivery'].includes(order.status)
         ).length;
-        todayRevenue += todayRegularOrders.reduce((sum, order) => sum + (order.total || 0), 0);
+        todayRevenue += todayRegularOrders.reduce((sum, order) => sum + (order.total_amount || 0), 0);
         pendingOrders += todayRegularOrders.filter(order => order.status === 'pending').length;
         completedOrders += todayRegularOrders.filter(order => order.status === 'delivered').length;
         totalTodayOrders += todayRegularOrders.length;
       }
 
-      // 2. Get today's live stream transactions
+      // 2. Get today's live stream transactions (unlinked only — linked
+      // transactions are already represented by their orders rows)
       const { data: todayLiveTransactions, error: liveError } = await supabaseClient
         .from('live_stream_transactions')
         .select('*')
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+        .is('order_id', null)
         .gte('created_at', `${today}T00:00:00.000Z`)
         .lt('created_at', `${today}T23:59:59.999Z`);
 
@@ -1988,11 +2163,20 @@ export class AnalyticsService implements OnModuleDestroy {
         .lt('created_at', `${today}T23:59:59.999Z`);
 
       if (!auctionError && todayAuctionSales) {
-        activeOrders += todayAuctionSales.filter(sale => sale.payment_status === 'processing').length;
-        todayRevenue += todayAuctionSales.reduce((sum, sale) => sum + (sale.total_amount || 0), 0);
-        pendingOrders += todayAuctionSales.filter(sale => sale.payment_status === 'pending').length;
-        completedOrders += todayAuctionSales.filter(sale => sale.payment_status === 'completed').length;
-        totalTodayOrders += todayAuctionSales.length;
+        // Skip auction sales that already have a matching order row
+        const todayAuctionOrderKeys = new Set(
+          (todayRegularOrders || [])
+            .filter(o => o.source === 'auction' && o.metadata?.auction_id)
+            .map(o => `${o.metadata.auction_id}:${o.buyer_id}`)
+        );
+        const unmatchedTodayAuctionSales = todayAuctionSales.filter(
+          sale => !todayAuctionOrderKeys.has(`${sale.auction_id}:${sale.buyer_id}`)
+        );
+        activeOrders += unmatchedTodayAuctionSales.filter(sale => sale.payment_status === 'processing').length;
+        todayRevenue += unmatchedTodayAuctionSales.reduce((sum, sale) => sum + (sale.total_amount || 0), 0);
+        pendingOrders += unmatchedTodayAuctionSales.filter(sale => sale.payment_status === 'pending').length;
+        completedOrders += unmatchedTodayAuctionSales.filter(sale => sale.payment_status === 'completed').length;
+        totalTodayOrders += unmatchedTodayAuctionSales.length;
       }
 
       // 4. Get today's service bookings
@@ -2000,9 +2184,10 @@ export class AnalyticsService implements OnModuleDestroy {
         .from('service_bookings')
         .select(`
           *,
-          service:services!inner(vendor_id)
+          service:services!inner(user_id)
         `)
-        .eq('service.vendor_id', userId)
+        .eq('service.user_id', userId)
+        .is('order_id', null)
         .gte('created_at', `${today}T00:00:00.000Z`)
         .lt('created_at', `${today}T23:59:59.999Z`);
 
@@ -2010,7 +2195,7 @@ export class AnalyticsService implements OnModuleDestroy {
         activeOrders += todayServiceBookings.filter(booking =>
           ['confirmed', 'in_progress'].includes(booking.status)
         ).length;
-        todayRevenue += todayServiceBookings.reduce((sum, booking) => sum + (booking.total_price || 0), 0);
+        todayRevenue += todayServiceBookings.reduce((sum, booking) => sum + (booking.final_price ?? booking.quoted_price ?? 0), 0);
         pendingOrders += todayServiceBookings.filter(booking => booking.status === 'pending').length;
         completedOrders += todayServiceBookings.filter(booking => booking.status === 'completed').length;
         totalTodayOrders += todayServiceBookings.length;
@@ -2018,10 +2203,10 @@ export class AnalyticsService implements OnModuleDestroy {
 
       // ✅ PHASE 5 FIX: Calculate online customers from recent active orders
       const recentOrderCustomers = new Set([
-        ...(todayRegularOrders || []).map(o => o.customer_id || o.buyer_id).filter(Boolean),
+        ...(todayRegularOrders || []).map(o => o.buyer_id).filter(Boolean),
         ...(todayLiveTransactions || []).map(t => t.buyer_id).filter(Boolean),
         ...(todayAuctionSales || []).map(a => a.buyer_id).filter(Boolean),
-        ...(todayServiceBookings || []).map(b => b.customer_id).filter(Boolean),
+        ...(todayServiceBookings || []).map(b => b.user_id).filter(Boolean),
       ]);
       const onlineCustomers = recentOrderCustomers.size;
       
@@ -2283,10 +2468,10 @@ export class AnalyticsService implements OnModuleDestroy {
     
     // Combine all data sources into unified format
     const allTransactions: Array<{ date: string; value: number }> = [
-      ...(orders || []).map(o => ({ date: o.created_at, value: o.total || 0 })),
+      ...(orders || []).map(o => ({ date: o.created_at, value: o.total_amount || 0 })),
       ...(liveTransactions || []).map(t => ({ date: t.created_at, value: t.total_amount || 0 })),
       ...(auctionSales || []).map(a => ({ date: a.created_at, value: a.total_amount || 0 })),
-      ...(serviceBookings || []).map(b => ({ date: b.created_at, value: b.total_price || 0 })),
+      ...(serviceBookings || []).map(b => ({ date: b.created_at, value: b.final_price ?? b.quoted_price ?? 0 })),
     ];
     
     // Group by time period
@@ -2403,14 +2588,16 @@ export class AnalyticsService implements OnModuleDestroy {
             .lte('created_at', previousDateRange.end),
           supabaseClient.from('live_stream_transactions').select('*')
             .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+            .is('order_id', null)
             .gte('created_at', previousDateRange.start)
             .lte('created_at', previousDateRange.end),
           supabaseClient.from('auction_sales').select('*')
             .eq('seller_id', userId)
             .gte('created_at', previousDateRange.start)
             .lte('created_at', previousDateRange.end),
-          supabaseClient.from('service_bookings').select(`*, service:services!inner(vendor_id)`)
-            .eq('service.vendor_id', userId)
+          supabaseClient.from('service_bookings').select(`*, service:services!inner(user_id)`)
+            .eq('service.user_id', userId)
+            .is('order_id', null)
             .gte('created_at', previousDateRange.start)
             .lte('created_at', previousDateRange.end),
           supabaseClient.from('live_stream_gifts').select(`*, stream:live_streams!inner(vendor_id)`)
@@ -2419,23 +2606,33 @@ export class AnalyticsService implements OnModuleDestroy {
             .lte('created_at', previousDateRange.end),
         ]);
 
-      // Calculate previous period metrics
+      // Calculate previous period metrics — skip auction sales that already
+      // have a matching order row (metadata.auction_id + buyer)
+      const prevAuctionOrderKeys = new Set(
+        (prevOrders.data || [])
+          .filter(o => o.source === 'auction' && o.metadata?.auction_id)
+          .map(o => `${o.metadata.auction_id}:${o.buyer_id}`)
+      );
+      const unmatchedPrevAuctionSales = (prevAuctionSales.data || []).filter(
+        sale => !prevAuctionOrderKeys.has(`${sale.auction_id}:${sale.buyer_id}`)
+      );
+
       const prevOrdersCount = (prevOrders.data || []).length + 
                               (prevLiveTransactions.data || []).length + 
-                              (prevAuctionSales.data || []).length + 
+                              unmatchedPrevAuctionSales.length + 
                               (prevServiceBookings.data || []).length;
 
-      const prevRevenue = (prevOrders.data || []).reduce((sum, o) => sum + (o.total || 0), 0) +
+      const prevRevenue = (prevOrders.data || []).reduce((sum, o) => sum + (o.total_amount || 0), 0) +
                           (prevLiveTransactions.data || []).reduce((sum, t) => sum + (t.total_amount || 0), 0) +
-                          (prevAuctionSales.data || []).reduce((sum, a) => sum + (a.total_amount || 0), 0) +
-                          (prevServiceBookings.data || []).reduce((sum, b) => sum + (b.total_price || 0), 0) +
+                          unmatchedPrevAuctionSales.reduce((sum, a) => sum + (a.total_amount || 0), 0) +
+                          (prevServiceBookings.data || []).reduce((sum, b) => sum + (b.final_price ?? b.quoted_price ?? 0), 0) +
                           (prevGifts.data || []).reduce((sum, g) => sum + (g.total_amount || 0), 0);
 
       const prevCustomers = new Set([
-        ...(prevOrders.data || []).map(o => o.customer_id),
+        ...(prevOrders.data || []).map(o => o.buyer_id),
         ...(prevLiveTransactions.data || []).map(t => t.buyer_id),
         ...(prevAuctionSales.data || []).map(a => a.buyer_id),
-        ...(prevServiceBookings.data || []).map(b => b.customer_id),
+        ...(prevServiceBookings.data || []).map(b => b.user_id),
         ...(prevGifts.data || []).map(g => g.sender_id),
       ].filter(Boolean)).size;
 
@@ -2458,21 +2655,29 @@ export class AnalyticsService implements OnModuleDestroy {
 
   private async calculateCustomerSatisfaction(userId: string, supabaseClient: any): Promise<number> {
     try {
-      // Get post-purchase ratings from order_item_ratings for vendor's orders
-      const { data: orderRatings } = await supabaseClient
-        .from('order_item_ratings')
-        .select(`
-          rating,
-          orders!inner(vendor_id)
-        `)
-        .eq('orders.vendor_id', userId);
+      // Ratings live on products/services (there is no order-level ratings table)
+      const [productRatings, serviceRatings] = await Promise.all([
+        supabaseClient
+          .from('product_ratings')
+          .select('rating, products!inner(user_id)')
+          .eq('products.user_id', userId),
+        supabaseClient
+          .from('service_ratings')
+          .select('rating, services!inner(user_id)')
+          .eq('services.user_id', userId),
+      ]);
 
-      if (!orderRatings || orderRatings.length === 0) {
+      const ratings = [
+        ...(productRatings.data || []),
+        ...(serviceRatings.data || []),
+      ];
+
+      if (ratings.length === 0) {
         return 0; // No ratings yet
       }
 
-      const totalRating = orderRatings.reduce((sum, rating) => sum + (rating.rating || 0), 0);
-      const avgRating = totalRating / orderRatings.length;
+      const totalRating = ratings.reduce((sum, r) => sum + (r.rating || 0), 0);
+      const avgRating = totalRating / ratings.length;
 
       return parseFloat(avgRating.toFixed(1));
     } catch (error) {
@@ -2503,9 +2708,9 @@ export class AnalyticsService implements OnModuleDestroy {
         const productId = item.product_id;
         if (!productId) return; // Skip service items
         
-        const productName = item.products?.name || item.name || 'Unknown Product';
+        const productName = item.products?.name || item.product_name || 'Unknown Product';
         const quantity = item.quantity || 0;
-        const revenue = item.price * quantity;
+        const revenue = item.total_price ?? (item.unit_price || 0) * quantity;
 
         if (productSales.has(productId)) {
           const existing = productSales.get(productId)!;
@@ -2540,7 +2745,7 @@ export class AnalyticsService implements OnModuleDestroy {
     const grouped = {};
     orders?.forEach(order => {
       const date = order.created_at.split('T')[0];
-      grouped[date] = (grouped[date] || 0) + order.total;
+      grouped[date] = (grouped[date] || 0) + (order.total_amount || 0);
     });
 
     return Object.entries(grouped).map(([date, revenue]) => ({ date, revenue }));
@@ -3713,16 +3918,24 @@ export class AnalyticsService implements OnModuleDestroy {
    */
   private async calculateVendorRating(vendorId: string, supabaseClient: any): Promise<number> {
     try {
-      // Get ratings from orders
-      const { data: ratings } = await supabaseClient
-        .from('order_item_ratings')
-        .select(`
-          rating,
-          orders!inner(vendor_id)
-        `)
-        .eq('orders.vendor_id', vendorId);
+      // Ratings live on products/services (there is no order-level ratings table)
+      const [productRatings, serviceRatings] = await Promise.all([
+        supabaseClient
+          .from('product_ratings')
+          .select('rating, products!inner(user_id)')
+          .eq('products.user_id', vendorId),
+        supabaseClient
+          .from('service_ratings')
+          .select('rating, services!inner(user_id)')
+          .eq('services.user_id', vendorId),
+      ]);
 
-      if (!ratings || ratings.length === 0) {
+      const ratings = [
+        ...(productRatings.data || []),
+        ...(serviceRatings.data || []),
+      ];
+
+      if (ratings.length === 0) {
         return 0;
       }
 
@@ -3750,42 +3963,50 @@ export class AnalyticsService implements OnModuleDestroy {
 
       // Get total users by type
       const { data: users } = await supabaseClient
-        .from('users')
-        .select('account_type, created_at');
+        .from('user_profiles')
+        .select('user_role, is_seller, is_rider, created_at');
 
       const userStats = {
         totalUsers: users?.length || 0,
-        vendors: users?.filter(u => u.account_type === 'vendor').length || 0,
-        customers: users?.filter(u => u.account_type === 'customer').length || 0,
-        riders: users?.filter(u => u.account_type === 'rider').length || 0,
+        vendors: users?.filter(u => u.user_role === 'vendor' || u.is_seller).length || 0,
+        customers: users?.filter(u => u.user_role !== 'vendor' && u.user_role !== 'rider' && !u.is_seller && !u.is_rider).length || 0,
+        riders: users?.filter(u => u.user_role === 'rider' || u.is_rider).length || 0,
       };
 
-      // Get platform revenue from all sources
+      // Get platform revenue from all sources — dedupe parallel-table records
+      // already represented by an orders row
       const [ordersData, liveTransactionsData, auctionSalesData] = await Promise.all([
         supabaseClient
           .from('orders')
-          .select('total, created_at, status')
+          .select('total_amount, created_at, status, source, metadata, buyer_id')
           .gte('created_at', dateRange.start)
           .lte('created_at', dateRange.end),
         supabaseClient
           .from('live_stream_transactions')
           .select('total_amount, created_at, status')
+          .is('order_id', null)
           .gte('created_at', dateRange.start)
           .lte('created_at', dateRange.end),
         supabaseClient
           .from('auction_sales')
-          .select('total_amount, created_at, payment_status')
+          .select('total_amount, created_at, payment_status, auction_id, buyer_id')
           .gte('created_at', dateRange.start)
           .lte('created_at', dateRange.end),
       ]);
 
       const orders = ordersData.data || [];
       const liveTransactions = liveTransactionsData.data || [];
-      const auctionSales = auctionSalesData.data || [];
+      const auctionOrderKeys = new Set(
+        orders.filter(o => o.source === 'auction' && o.metadata?.auction_id)
+          .map(o => `${o.metadata.auction_id}:${o.buyer_id}`)
+      );
+      const auctionSales = (auctionSalesData.data || []).filter(
+        sale => !auctionOrderKeys.has(`${sale.auction_id}:${sale.buyer_id}`)
+      );
 
       const platformMetrics = {
         totalRevenue:
-          orders.reduce((sum, o) => sum + (o.total || 0), 0) +
+          orders.reduce((sum, o) => sum + (o.total_amount || 0), 0) +
           liveTransactions.reduce((sum, t) => sum + (t.total_amount || 0), 0) +
           auctionSales.reduce((sum, s) => sum + (s.total_amount || 0), 0),
         totalOrders: orders.length + liveTransactions.length + auctionSales.length,
@@ -3801,31 +4022,39 @@ export class AnalyticsService implements OnModuleDestroy {
       const [prevOrdersData, prevLiveTransactionsData, prevAuctionSalesData, prevUsersData] = await Promise.all([
         supabaseClient
           .from('orders')
-          .select('total, created_at, status')
+          .select('total_amount, created_at, status, source, metadata, buyer_id')
           .gte('created_at', previousDateRange.start)
           .lte('created_at', previousDateRange.end),
         supabaseClient
           .from('live_stream_transactions')
           .select('total_amount, created_at, status')
+          .is('order_id', null)
           .gte('created_at', previousDateRange.start)
           .lte('created_at', previousDateRange.end),
         supabaseClient
           .from('auction_sales')
-          .select('total_amount, created_at, payment_status')
+          .select('total_amount, created_at, payment_status, auction_id, buyer_id')
           .gte('created_at', previousDateRange.start)
           .lte('created_at', previousDateRange.end),
         supabaseClient
-          .from('users')
+          .from('user_profiles')
           .select('created_at')
+          .lte('created_at', previousDateRange.end)
       ]);
 
       const prevOrders = prevOrdersData.data || [];
       const prevLiveTransactions = prevLiveTransactionsData.data || [];
-      const prevAuctionSales = prevAuctionSalesData.data || [];
+      const prevAuctionOrderKeys = new Set(
+        prevOrders.filter(o => o.source === 'auction' && o.metadata?.auction_id)
+          .map(o => `${o.metadata.auction_id}:${o.buyer_id}`)
+      );
+      const prevAuctionSales = (prevAuctionSalesData.data || []).filter(
+        sale => !prevAuctionOrderKeys.has(`${sale.auction_id}:${sale.buyer_id}`)
+      );
       const prevUsers = prevUsersData.data || [];
 
       const prevRevenue = 
-        prevOrders.reduce((sum, o) => sum + (o.total || 0), 0) +
+        prevOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0) +
         prevLiveTransactions.reduce((sum, t) => sum + (t.total_amount || 0), 0) +
         prevAuctionSales.reduce((sum, s) => sum + (s.total_amount || 0), 0);
 
@@ -3876,7 +4105,7 @@ export class AnalyticsService implements OnModuleDestroy {
       // ✅ BUG FIX: Get orders with delivery addresses
       const { data: orders, error: ordersError } = await supabaseClient
         .from('orders')
-        .select('id, total, delivery_address, created_at, status')
+        .select('id, total_amount, delivery_address, created_at, status')
         .gte('created_at', dateRange.start)
         .lte('created_at', dateRange.end)
         .eq('status', 'delivered');
@@ -3891,7 +4120,7 @@ export class AnalyticsService implements OnModuleDestroy {
       const { data: vendors } = await supabaseClient
         .from('user_profiles')
         .select('id, location')
-        .eq('is_vendor', true)
+        .eq('is_seller', true)
         .not('location', 'is', null);
 
       // ✅ BUG FIX: Aggregate by region from delivery addresses and vendor locations
@@ -3922,7 +4151,7 @@ export class AnalyticsService implements OnModuleDestroy {
         }
 
         const existing = regionData.get(region) || { revenue: 0, orders: 0, viewers: 0, streams: 0 };
-        existing.revenue += order.total || 0;
+        existing.revenue += order.total_amount || 0;
         existing.orders += 1;
         regionData.set(region, existing);
       });
@@ -4090,7 +4319,7 @@ export class AnalyticsService implements OnModuleDestroy {
       const [todayOrdersData, todayRevenueData] = await Promise.all([
         supabaseClient
           .from('orders')
-          .select('total')
+          .select('total_amount')
           .gte('created_at', todayStart.toISOString()),
         supabaseClient
           .from('live_stream_transactions')
@@ -4100,7 +4329,7 @@ export class AnalyticsService implements OnModuleDestroy {
 
       const todayOrders = (todayOrdersData.data?.length || 0) + (todayRevenueData.data?.length || 0);
       const todayRevenue =
-        (todayOrdersData.data?.reduce((sum, o) => sum + (o.total || 0), 0) || 0) +
+        (todayOrdersData.data?.reduce((sum, o) => sum + (o.total_amount || 0), 0) || 0) +
         (todayRevenueData.data?.reduce((sum, t) => sum + (t.total_amount || 0), 0) || 0);
 
       return {

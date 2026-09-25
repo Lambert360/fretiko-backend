@@ -10,6 +10,15 @@ import { WalletService } from '../wallet/wallet.service';
 import { WalletTransactionType } from '../wallet/constants/transaction-types';
 import { AuctionsService } from '../auctions/auctions.service';
 import { GiftCardService } from '../gift-cards/gift-cards.service';
+import { isAdultViewer } from '../shared/viewer-age';
+import {
+  chargeableWeightKg,
+  computeDeliveryFee,
+  DeliveryRate,
+  recomputeInterstateDeliveryFee,
+  recomputeRiderDeliveryFee,
+} from '../shared/delivery-pricing';
+import { hasCoords, roadDistanceKm } from '../shared/geo';
 
 @Injectable()
 export class CheckoutService {
@@ -109,14 +118,33 @@ export class CheckoutService {
           user_id,
           category_id,
           quantity,
-          location
+          status,
+          location,
+          location_latitude,
+          location_longitude,
+          weight_kg,
+          length_cm,
+          width_cm,
+          height_cm,
+          product_categories!category_id (
+            default_weight_kg
+          ),
+          user_profiles!products_user_id_fkey (
+            is_adult_content
+          )
         ),
         services!cart_items_service_id_fkey (
           id,
           name,
           base_price,
           user_id,
+          status,
           location,
+          location_latitude,
+          location_longitude,
+          user_profiles!services_user_id_fkey (
+            is_adult_content
+          ),
           service_categories (
             name
           )
@@ -135,6 +163,21 @@ export class CheckoutService {
 
     console.log(`📋 Backend found ${cartItems.length} cart items`);
 
+    const viewerIsAdult = await isAdultViewer(this.supabase, userId);
+
+    // Variant weight overrides (multi-item products): cart_items.variant_id → product_variants.weight_kg
+    const variantIds = cartItems.map((c: any) => c.variant_id).filter(Boolean);
+    const variantWeightMap = new Map<string, number>();
+    if (variantIds.length > 0) {
+      const { data: variantRows } = await client
+        .from('product_variants')
+        .select('id, weight_kg')
+        .in('id', variantIds);
+      variantRows?.forEach((v: any) => {
+        if (v.weight_kg != null) variantWeightMap.set(v.id, parseFloat(v.weight_kg));
+      });
+    }
+
     // Calculate summary - handle BOTH products AND services
     let items = cartItems.map(item => {
       const isService = !!item.service_id;
@@ -142,11 +185,11 @@ export class CheckoutService {
       if (isService) {
         // Service item
         return {
-          id: item.services.id,
-          name: item.services.name,
+          id: item.services?.id || item.service_id,
+          name: item.services?.name || 'Unavailable service',
           price: item.price_at_add,
           quantity: item.quantity,
-          sellerId: item.services.user_id,
+          sellerId: item.services?.user_id,
           requiresEscrow: false,
           itemType: 'service',
           serviceDate: item.scheduled_date,
@@ -154,18 +197,41 @@ export class CheckoutService {
           serviceNotes: item.service_notes,
           category: item.services?.service_categories?.name || 'Services',
           itemLocation: item.services?.location || undefined,
+          locationCoords: {
+            latitude: item.services?.location_latitude ?? undefined,
+            longitude: item.services?.location_longitude ?? undefined,
+          },
+          isAvailable: !!item.services
+            && (item.services.status === 'active' || item.services.status === 'busy')
+            && (viewerIsAdult || !item.services.user_profiles?.is_adult_content),
         };
       } else {
-        // Product item
+        // Product item — chargeable weight: variant override → product weight → category default
+        const variantWeight = item.variant_id ? variantWeightMap.get(item.variant_id) : undefined;
+        const productWeight = item.products?.weight_kg ?? item.products?.product_categories?.default_weight_kg;
+        const weightKg = chargeableWeightKg({
+          weight_kg: variantWeight ?? productWeight,
+          length_cm: item.products?.length_cm,
+          width_cm: item.products?.width_cm,
+          height_cm: item.products?.height_cm,
+        });
         return {
-          id: item.products.id,
-          name: item.products.name,
-          price: item.products.price,
+          id: item.products?.id || item.product_id,
+          name: item.products?.name || 'Unavailable product',
+          price: item.products?.price ?? item.price_at_add,
           quantity: item.quantity,
-          sellerId: item.products.user_id,
+          sellerId: item.products?.user_id,
           requiresEscrow: false,
           itemType: 'product',
           itemLocation: item.products?.location || undefined,
+          locationCoords: {
+            latitude: item.products?.location_latitude ?? undefined,
+            longitude: item.products?.location_longitude ?? undefined,
+          },
+          weightKg,
+          isAvailable: item.products?.status === 'active'
+            && (item.products?.quantity || 0) > 0
+            && (viewerIsAdult || !item.products.user_profiles?.is_adult_content),
         };
       }
     });
@@ -179,6 +245,22 @@ export class CheckoutService {
       
       if (items.length === 0) {
         throw new HttpException('No selected items found in cart', HttpStatus.BAD_REQUEST);
+      }
+    }
+
+    // Block items whose product/service became unavailable after being added
+    // to cart (hidden, removed by moderation, sold, or out of stock)
+    const unavailableItems = items.filter((item: any) => item.isAvailable === false);
+    if (unavailableItems.length > 0) {
+      if (selectedItemIds && selectedItemIds.length > 0) {
+        throw new HttpException(
+          `Some items are no longer available: ${unavailableItems.map((i: any) => i.name).join(', ')}`,
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+      items = items.filter((item: any) => item.isAvailable !== false);
+      if (items.length === 0) {
+        throw new HttpException('No available items in cart', HttpStatus.BAD_REQUEST);
       }
     }
 
@@ -234,6 +316,9 @@ export class CheckoutService {
     const tax = this.calculateTax(subtotal);
     const escrowFee = this.calculateEscrowFee(subtotal + shipping + tax);
     const total = subtotal + shipping + tax + escrowFee;
+    const totalWeightKg = Math.round(
+      itemsWithInterstate.reduce((sum: number, item: any) => sum + ((item.weightKg || 0) * item.quantity), 0) * 1000
+    ) / 1000;
 
     return {
       items: itemsWithInterstate,
@@ -242,6 +327,7 @@ export class CheckoutService {
       tax,
       escrowFee,
       total,
+      totalWeightKg,
       hasOutOfStateItems,
       hasOutOfCountryItems,
     };
@@ -275,7 +361,7 @@ export class CheckoutService {
     const productIds = [...new Set(wishlistItems.map((w: any) => w.product_id).filter(Boolean))];
     const { data: products, error: productsError } = await client
       .from('products')
-      .select('id, name, price, user_id, status, quantity, location')
+      .select('id, name, price, user_id, status, quantity, location, location_latitude, location_longitude, weight_kg, length_cm, width_cm, height_cm, product_categories!category_id(default_weight_kg)')
       .in('id', productIds)
       .eq('status', 'active')
       .gt('quantity', 0);
@@ -303,6 +389,16 @@ export class CheckoutService {
       sellerId: item.product.user_id,
       requiresEscrow: true, // Wishlist purchases always use escrow
       itemLocation: item.product?.location || undefined,
+      locationCoords: {
+        latitude: item.product?.location_latitude ?? undefined,
+        longitude: item.product?.location_longitude ?? undefined,
+      },
+      weightKg: chargeableWeightKg({
+        weight_kg: item.product.weight_kg ?? item.product.product_categories?.default_weight_kg,
+        length_cm: item.product.length_cm,
+        width_cm: item.product.width_cm,
+        height_cm: item.product.height_cm,
+      }),
     }));
 
     // Attach seller location so mobile can pass vendor state/country to rider filter
@@ -348,6 +444,9 @@ export class CheckoutService {
     const tax = this.calculateTax(subtotal);
     const escrowFee = this.calculateEscrowFee(subtotal + shipping + tax);
     const total = subtotal + shipping + tax + escrowFee;
+    const totalWeightKg = Math.round(
+      wishlistItemsWithInterstate.reduce((sum: number, item: any) => sum + ((item.weightKg || 0) * item.quantity), 0) * 1000
+    ) / 1000;
 
     return {
       items: wishlistItemsWithInterstate,
@@ -356,6 +455,7 @@ export class CheckoutService {
       tax,
       escrowFee,
       total,
+      totalWeightKg,
       hasOutOfStateItems,
       hasOutOfCountryItems,
     };
@@ -368,12 +468,13 @@ export class CheckoutService {
     // Get product details
     const { data: product, error: productError } = await client
       .from('products')
-      .select('id, name, price, user_id, category_id, quantity, location')
+      .select('id, name, price, user_id, category_id, quantity, location, location_latitude, location_longitude, weight_kg, length_cm, width_cm, height_cm, product_categories!category_id(default_weight_kg)')
       .eq('id', productId)
+      .eq('status', 'active')
       .single();
 
     if (productError || !product) {
-      throw new HttpException('Product not found', HttpStatus.NOT_FOUND);
+      throw new HttpException('Product not found or no longer available', HttpStatus.NOT_FOUND);
     }
 
     // Check stock availability
@@ -388,6 +489,16 @@ export class CheckoutService {
       quantity,
       sellerId: product.user_id,
       requiresEscrow: false,
+      locationCoords: {
+        latitude: product.location_latitude ?? undefined,
+        longitude: product.location_longitude ?? undefined,
+      },
+      weightKg: chargeableWeightKg({
+        weight_kg: product.weight_kg ?? product.product_categories?.default_weight_kg,
+        length_cm: product.length_cm,
+        width_cm: product.width_cm,
+        height_cm: product.height_cm,
+      }),
     }];
 
     // Attach seller location: prefer the product's own location, fall back to seller profile
@@ -427,6 +538,9 @@ export class CheckoutService {
     const tax = this.calculateTax(subtotal);
     const escrowFee = this.calculateEscrowFee(subtotal + shipping + tax);
     const total = subtotal + shipping + tax + escrowFee;
+    const totalWeightKg = Math.round(
+      itemsWithInterstate.reduce((sum: number, item: any) => sum + ((item.weightKg || 0) * item.quantity), 0) * 1000
+    ) / 1000;
 
     return {
       items: itemsWithInterstate,
@@ -435,13 +549,15 @@ export class CheckoutService {
       tax,
       escrowFee,
       total,
+      totalWeightKg,
       hasOutOfStateItems,
       hasOutOfCountryItems,
     };
   }
 
   // Get auction winner checkout summary
-  async getAuctionCheckoutSummary(userId: string, auctionId: string, userToken?: string) {
+  // itemId is optional; when provided, the checkout is scoped to that specific live item.
+  async getAuctionCheckoutSummary(userId: string, auctionId: string, itemId?: string, userToken?: string) {
     // Use service role client to read auction (bypasses RLS)
     // Authorization is validated below by checking winner_id matches userId
     const { data: auction, error: auctionError } = await this.supabase
@@ -457,7 +573,10 @@ export class CheckoutService {
         start_time,
         end_time,
         commission_rate,
-        thumbnail_url
+        thumbnail_url,
+        seller:user_profiles!seller_id (
+          is_adult_content
+        )
       `)
       .eq('id', auctionId)
       .single();
@@ -467,11 +586,35 @@ export class CheckoutService {
       throw new HttpException('Auction not found', HttpStatus.NOT_FOUND);
     }
 
+    // Adult-content sellers: completing checkout requires verified 18+
+    // (bidding is gated too — this catches wins that predate the flag)
+    if (
+      (auction as any).seller?.is_adult_content &&
+      !(await isAdultViewer(this.supabase, userId))
+    ) {
+      throw new HttpException(
+        { code: 'ADULT_CONTENT_RESTRICTED', message: 'This content is restricted to viewers 18 and older' },
+        HttpStatus.FORBIDDEN,
+      );
+    }
+
     // ✅ CRITICAL: Verify user is the winner (authorization check)
-    // For multi-item auctions, check auction_items; for single-item, check auction.winner_id
+    // Validate the user is the winner of the requested auction item.
+    // For live multi-item auctions, itemId scopes the win to a specific lot.
     let isWinner = false;
-    
-    if (auction.winner_id === userId) {
+
+    if (itemId) {
+      const { data: scopedWin } = await this.supabase
+        .from('user_auction_wins')
+        .select('id')
+        .eq('auction_id', auctionId)
+        .eq('user_id', userId)
+        .eq('item_id', itemId)
+        .eq('status', 'pending_checkout')
+        .maybeSingle();
+
+      isWinner = !!scopedWin;
+    } else if (auction.winner_id === userId) {
       isWinner = true;
     } else {
       // Check if user won any items in this auction (for multi-item auctions)
@@ -482,7 +625,7 @@ export class CheckoutService {
         .eq('winner_id', userId)
         .in('bidding_status', ['ended', 'sold'])
         .limit(1);
-      
+
       if (wonItems && wonItems.length > 0) {
         isWinner = true;
       } else {
@@ -494,7 +637,7 @@ export class CheckoutService {
           .eq('user_id', userId)
           .eq('status', 'pending_checkout')
           .limit(1);
-        
+
         if (win && win.length > 0) {
           isWinner = true;
         }
@@ -517,10 +660,21 @@ export class CheckoutService {
     }
 
     // Check if sale record exists and its status (use service role client)
-    const { data: existingSale } = await this.supabase
+    const saleQuery = this.supabase
       .from('auction_sales')
       .select('payment_status, payment_transaction_id')
       .eq('auction_id', auctionId)
+      .eq('buyer_id', userId);
+
+    if (itemId) {
+      saleQuery.eq('item_id', itemId);
+    } else {
+      saleQuery.is('item_id', null);
+    }
+
+    const { data: existingSale } = await saleQuery
+      .order('created_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     // If payment is already completed, don't allow checkout
@@ -547,11 +701,45 @@ export class CheckoutService {
     // Get winning bid - check multiple sources
     // For multi-item auctions, winning_bid is stored in auction_items
     // For single-item auctions, it's in auctions table
-    let winningBid = auction.winning_bid;
+    let winningBid: number | null = auction.winning_bid ?? null;
     let itemTitle = auction.title;
     let itemThumbnail = auction.thumbnail_url;
-    
-    console.log(`🔍 Getting winning bid for auction ${auctionId}, user ${userId}`);
+
+    // If an explicit item is requested, scope the win to that item first
+    if (itemId) {
+      const { data: scopedWin } = await this.supabase
+        .from('user_auction_wins')
+        .select('winning_bid, item_id')
+        .eq('auction_id', auctionId)
+        .eq('user_id', userId)
+        .eq('item_id', itemId)
+        .eq('status', 'pending_checkout')
+        .maybeSingle();
+
+      if (scopedWin) {
+        winningBid = scopedWin.winning_bid ?? null;
+      }
+
+      const { data: item } = await this.supabase
+        .from('auction_items')
+        .select('title, images')
+        .eq('id', itemId)
+        .maybeSingle();
+
+      if (item) {
+        itemTitle = item.title || auction.title;
+        itemThumbnail = item.images?.[0] || auction.thumbnail_url;
+      }
+
+      if (!winningBid) {
+        throw new HttpException(
+          `You do not have a pending checkout for this auction item.`,
+          HttpStatus.FORBIDDEN,
+        );
+      }
+    }
+
+    console.log(`🔍 Getting winning bid for auction ${auctionId}, user ${userId}, item ${itemId || 'n/a'}`);
     console.log(`  - Auction winning_bid: ${auction.winning_bid}`);
     console.log(`  - Auction winner_id: ${auction.winner_id}`);
     
@@ -654,7 +842,7 @@ export class CheckoutService {
       : null;
 
     const items = [{
-      id: auction.id,
+      id: itemId || auction.id,
       name: itemTitle,
       price: winningBid,
       quantity: 1,
@@ -663,6 +851,10 @@ export class CheckoutService {
       imageUrl: itemThumbnail,
       itemType: 'auction',
       sellerLocation: auctionSellerLoc,
+      product_metadata: {
+        auction_id: auction.id,
+        auction_item_id: itemId || null,
+      },
     }];
 
     const subtotal = winningBid;
@@ -989,6 +1181,7 @@ export class CheckoutService {
       summary = await this.getAuctionCheckoutSummary(
         userId,
         orderData.auctionCheckout.auctionId,
+        orderData.auctionCheckout.itemId,
         userToken,
       );
       isAuctionOrder = true;
@@ -1072,6 +1265,8 @@ export class CheckoutService {
     let interstateCompanyName: string | null = null;
     let estimatedDeliveryDays: number | null = null;
     
+    const totalWeightKg: number = summary.totalWeightKg ?? 0;
+
     if (orderData.interstateCompany) {
       // Interstate/international delivery via logistics company
       isInterstateDelivery = true;
@@ -1079,7 +1274,34 @@ export class CheckoutService {
       interstateCompanyId = orderData.interstateCompany.companyId;
       interstateCompanyName = orderData.interstateCompany.companyName;
       estimatedDeliveryDays = orderData.interstateCompany.estimatedDeliveryDays || null;
-      actualDeliveryFee = orderData.interstateCompany.deliveryPrice;
+
+      // Authoritative recompute: fee comes from the partner's own
+      // interstate_config rates + server-computed order weight.
+      // The client-supplied deliveryPrice is never trusted for charging.
+      const recomputed = await recomputeInterstateDeliveryFee(
+        this.supabase,
+        orderData.interstateCompany.companyId,
+        isInternationalDelivery,
+        totalWeightKg,
+      );
+
+      if (recomputed == null) {
+        // Partner not found/inactive, or has no pricing configured —
+        // null means the helper couldn't produce an authoritative fee.
+        const { data: partnerExists } = await this.supabase
+          .from('verified_logistics_partners')
+          .select('id')
+          .eq('id', interstateCompanyId)
+          .eq('partner_status', 'active')
+          .single();
+        if (!partnerExists) {
+          throw new HttpException('Selected delivery partner is not available', HttpStatus.BAD_REQUEST);
+        }
+        // Partner has not configured pricing yet — keep legacy client quote
+        actualDeliveryFee = orderData.interstateCompany.deliveryPrice;
+      } else {
+        actualDeliveryFee = recomputed;
+      }
       riderId = null;
     } else if (orderData.selectedRider) {
       if (orderData.selectedRider.riderId === 'pickup') {
@@ -1087,9 +1309,39 @@ export class CheckoutService {
         actualDeliveryFee = 0;
         riderId = null;
       } else {
-        // Rider delivery - use rider's price and assign rider
-        actualDeliveryFee = orderData.selectedRider.deliveryPrice;
+        // Rider delivery — recompute the fee server-side from the rider's
+        // company pricing_config + server-computed order weight.
+        // The client-supplied deliveryPrice is never trusted for charging.
         riderId = orderData.selectedRider.riderId;
+
+        // Authoritative route distance: pickup = item location coords
+        // (products/services.location_lat/lng — the client never touches
+        // those), delivery = delivery_address coords. Client-sent distance
+        // is only a fallback when coords are unavailable.
+        const deliveryCoords = orderData.deliveryAddress;
+        let serverRouteKm: number | undefined;
+        if (hasCoords(deliveryCoords)) {
+          const legs = (summary.items || [])
+            .map((i: any) => i.locationCoords)
+            .filter((c: any) => hasCoords(c))
+            .map((c: any) => roadDistanceKm(c, deliveryCoords));
+          if (legs.length > 0) serverRouteKm = Math.max(...legs); // farthest pickup leg
+        }
+
+        const distanceKm =
+          serverRouteKm ??
+          orderData.selectedRider.distance ??
+          orderData.orderDetails?.distance;
+
+        const recomputed = await recomputeRiderDeliveryFee(
+          this.supabase,
+          orderData.selectedRider.riderId,
+          orderData.selectedRider.vehicleType,
+          distanceKm,
+          totalWeightKg,
+        );
+
+        actualDeliveryFee = recomputed ?? orderData.selectedRider.deliveryPrice;
       }
     }
 
@@ -1157,6 +1409,7 @@ export class CheckoutService {
       escrow_enabled: orderData.useEscrow || false,
       total_amount: actualTotal,
       delivery_fee: actualDeliveryFee,
+      total_weight_kg: totalWeightKg,
       platform_fee: isAuctionOrder && summary.commissionFee
         ? summary.commissionFee
         : summary.total * 0.02,
@@ -1172,6 +1425,10 @@ export class CheckoutService {
         state: orderData.deliveryAddress.state,
         country: orderData.deliveryAddress.country,
         postalCode: orderData.deliveryAddress.postalCode,
+        // Geocoded coords when the client resolved them — powers live
+        // tracking + server-side route-distance recompute.
+        ...(orderData.deliveryAddress.latitude != null && { latitude: orderData.deliveryAddress.latitude }),
+        ...(orderData.deliveryAddress.longitude != null && { longitude: orderData.deliveryAddress.longitude }),
       },
       delivery_instructions: orderData.deliveryInstructions,
       estimated_delivery: isInterstateDelivery
@@ -1199,6 +1456,7 @@ export class CheckoutService {
             companyName: interstateCompanyName,
             estimatedDeliveryDays,
             deliveryPrice: actualDeliveryFee,
+            weightKg: totalWeightKg,
             isInternational: isInternationalDelivery,
           },
         } : {}),
@@ -1215,11 +1473,31 @@ export class CheckoutService {
       },
     };
 
+    // For invoice orders, resolve catalog product/service references from the
+    // stored invoice items — the client payload collapses them into item.id
+    // (productId || serviceId || invoiceItemRowId)
+    const invoiceItemRefs = new Map<string, { product_id: string | null; service_id: string | null }>();
+    if (orderSource === 'invoice' && orderData.invoiceCheckout?.invoiceId) {
+      const { data: invoiceItems } = await this.supabase
+        .from('chat_invoice_items')
+        .select('id, product_id, service_id')
+        .eq('invoice_id', orderData.invoiceCheckout.invoiceId);
+      (invoiceItems || []).forEach(inv => {
+        const ref = { product_id: inv.product_id ?? null, service_id: inv.service_id ?? null };
+        invoiceItemRefs.set(inv.id, ref);
+        if (inv.product_id) invoiceItemRefs.set(inv.product_id, ref);
+        if (inv.service_id) invoiceItemRefs.set(inv.service_id, ref);
+      });
+    }
+
     // Build order items for the atomic RPC
     const p_items = summary.items.map(item => {
-      const isService = item.itemType === 'service';
       const isAuction = item.itemType === 'auction';
       const isInvoiceOrder = orderSource === 'invoice';
+      const resolvedServiceId = isInvoiceOrder
+        ? (invoiceItemRefs.get(item.id)?.service_id ?? null)
+        : (item.itemType === 'service' ? item.id : null);
+      const isService = !!resolvedServiceId || item.itemType === 'service';
 
       const unitPrice = item.price || 0;
       if (!item.price || item.price <= 0) {
@@ -1227,8 +1505,10 @@ export class CheckoutService {
       }
 
       return {
-        product_id: isService || isAuction || isInvoiceOrder ? null : item.id,
-        service_id: (isService && !isInvoiceOrder) ? item.id : null,
+        product_id: isInvoiceOrder
+          ? (invoiceItemRefs.get(item.id)?.product_id ?? null)
+          : (isService || isAuction ? null : item.id),
+        service_id: resolvedServiceId,
         product_name: item.name,
         category: item.category || 'General',
         quantity: item.quantity,
@@ -1242,9 +1522,117 @@ export class CheckoutService {
           auction_item_id: orderData.auctionCheckout?.itemId || item.product_metadata?.auction_item_id || null,
           auction_lot: item.product_metadata?.auction_lot,
           description: item.product_metadata?.description,
+        } : isService ? {
+          is_service: true,
         } : null,
       };
     });
+
+    // Atomically claim the auction win and release its winner-time hold.
+    // The claim flips status to 'checked_out' inside the win row's lock, so a
+    // concurrent createOrder cannot pass the read-time checks and create a
+    // second paid order (the double-charge this prevents). If order creation
+    // later fails, the claim is reverted to 'pending_checkout'.
+    let claimedWinId: string | null = null;
+    const revertWinClaim = async () => {
+      if (!claimedWinId) return;
+      try {
+        await this.supabase
+          .from('user_auction_wins')
+          .update({ status: 'pending_checkout', updated_at: new Date().toISOString() })
+          .eq('id', claimedWinId)
+          .is('order_id', null);
+      } catch (e) {
+        console.warn(`Failed to revert win claim ${claimedWinId}:`, e);
+      }
+    };
+
+    if (isAuctionOrder && orderData.auctionCheckout) {
+      const winItemId = orderData.auctionCheckout.itemId || null;
+      let winQuery = client
+        .from('user_auction_wins')
+        .select('id, status, order_id')
+        .eq('user_id', userId)
+        .eq('auction_id', orderData.auctionCheckout.auctionId)
+        .in('status', ['pending_checkout', 'checked_out']);
+      winQuery = winItemId ? winQuery.eq('item_id', winItemId) : winQuery.is('item_id', null);
+      const { data: winRow } = await winQuery
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      // Win already fully checked out → return the existing order instead of
+      // creating a duplicate (covers retries after the first order succeeded)
+      if (winRow?.status === 'checked_out' && winRow.order_id) {
+        const { data: existingOrder } = await client
+          .from('orders')
+          .select('id, order_number, status, total_amount, created_at, estimated_delivery')
+          .eq('id', winRow.order_id)
+          .maybeSingle();
+        if (existingOrder) {
+          return {
+            id: existingOrder.id,
+            orderNumber: existingOrder.order_number,
+            status: existingOrder.status,
+            total: existingOrder.total_amount,
+            createdAt: existingOrder.created_at,
+            estimatedDelivery: existingOrder.estimated_delivery,
+            isAuctionOrder: true,
+            auctionId: orderData.auctionCheckout.auctionId,
+          };
+        }
+        throw new HttpException('An order already exists for this auction win', HttpStatus.CONFLICT);
+      }
+
+      if (winRow?.id) {
+        const { data: releaseResult, error: releaseError } = await this.supabase.rpc(
+          'release_auction_win_hold',
+          { p_win_id: winRow.id, p_user_id: userId },
+        );
+        if (releaseError) {
+          // PGRST202 = function missing (pre-migration deploy): no win-holds
+          // exist yet anywhere, so proceeding is semantically correct.
+          if (releaseError.code === 'PGRST202') {
+            console.warn('release_auction_win_hold not deployed — skipping win hold release');
+          } else {
+            console.error('release_auction_win_hold RPC error:', releaseError.message);
+            throw new HttpException('Failed to release auction hold', HttpStatus.INTERNAL_SERVER_ERROR);
+          }
+        } else if (!releaseResult?.success) {
+          console.error('release_auction_win_hold failed:', releaseResult?.error);
+          throw new HttpException(
+            releaseResult?.error || 'Failed to release auction hold',
+            HttpStatus.INTERNAL_SERVER_ERROR,
+          );
+        } else if (releaseResult.checkout_in_progress) {
+          throw new HttpException('Checkout already in progress for this win', HttpStatus.CONFLICT);
+        } else if (releaseResult.already_checked_out) {
+          // Claimed between our read and the lock — return that order
+          if (releaseResult.order_id) {
+            const { data: existingOrder } = await client
+              .from('orders')
+              .select('id, order_number, status, total_amount, created_at, estimated_delivery')
+              .eq('id', releaseResult.order_id)
+              .maybeSingle();
+            if (existingOrder) {
+              return {
+                id: existingOrder.id,
+                orderNumber: existingOrder.order_number,
+                status: existingOrder.status,
+                total: existingOrder.total_amount,
+                createdAt: existingOrder.created_at,
+                estimatedDelivery: existingOrder.estimated_delivery,
+                isAuctionOrder: true,
+                auctionId: orderData.auctionCheckout.auctionId,
+              };
+            }
+          }
+          throw new HttpException('Checkout already in progress for this win', HttpStatus.CONFLICT);
+        } else if (releaseResult.claimed) {
+          claimedWinId = winRow.id;
+        }
+      }
+    }
 
     // ✅ HANDLE REWARDS REDEMPTION (before the atomic RPC)
     let rewardsUsed = 0;
@@ -1253,26 +1641,34 @@ export class CheckoutService {
     if (orderData.useRewards && orderData.rewardsAmount > 0) {
       console.log(`🎁 User wants to use ${orderData.rewardsAmount} rewards`);
 
-      const redemptionResult = await this.rewardsService.redeemRewards(
-        userId,
-        orderData.rewardsAmount,
-      );
+      try {
+        const redemptionResult = await this.rewardsService.redeemRewards(
+          userId,
+          orderData.rewardsAmount,
+        );
 
-      if (!redemptionResult.success) {
-        throw new HttpException('Failed to redeem rewards', HttpStatus.INTERNAL_SERVER_ERROR);
+        if (!redemptionResult.success) {
+          throw new HttpException('Failed to redeem rewards', HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+
+        rewardsUsed = orderData.rewardsAmount;
+        rewardsTransactionId = redemptionResult.transaction_id ?? null;
+
+        console.log(`✅ Redeemed ${rewardsUsed} rewards`);
+      } catch (rewardsError) {
+        await revertWinClaim();
+        throw rewardsError;
       }
-
-      rewardsUsed = orderData.rewardsAmount;
-      rewardsTransactionId = redemptionResult.transaction_id ?? null;
-
-      console.log(`✅ Redeemed ${rewardsUsed} rewards`);
     }
 
-    // Build escrow breakdown
-    const orderCommissionRate = orderToInsert.platform_fee && actualTotal > 0
-      ? orderToInsert.platform_fee / actualTotal
-      : undefined;
-    const escrowBreakdown = this.calculateEscrowBreakdown(actualTotal, riderId, orderCommissionRate);
+    // Build escrow breakdown from the exact delivery fee and platform fee that
+    // were already computed for this order. This ensures riders/partners are paid
+    // the actual delivery fee and the platform receives the exact commission.
+    const escrowBreakdown = this.calculateEscrowBreakdownFromFees(
+      actualTotal,
+      actualDeliveryFee,
+      orderToInsert.platform_fee || 0,
+    );
     const p_escrow = {
       total_amount: escrowBreakdown.totalAmount,
       vendor_amount: escrowBreakdown.vendorAmount,
@@ -1297,6 +1693,7 @@ export class CheckoutService {
 
     if (rpcError) {
       console.error('create_product_order_atomic RPC error:', rpcError);
+      await revertWinClaim();
       if (rewardsUsed > 0) {
         await this.rewardsService.reverseRewardsRedemption(userId, rewardsUsed);
       }
@@ -1309,6 +1706,7 @@ export class CheckoutService {
     const rpcResult = rpcData as any;
     if (!rpcResult || !rpcResult.success) {
       console.error('create_product_order_atomic failed:', rpcResult?.error);
+      await revertWinClaim();
       if (rewardsUsed > 0) {
         await this.rewardsService.reverseRewardsRedemption(userId, rewardsUsed);
       }
@@ -1324,6 +1722,45 @@ export class CheckoutService {
     console.log(`✅ Order created: ${order.order_number}, source: ${order.source}, isAuctionOrder: ${isAuctionOrder}`);
     if (isAuctionOrder && order.source !== 'auction') {
       console.error(`❌ WARNING: Order ${order.order_number} was created as auction but source is '${order.source}' instead of 'auction'!`);
+    }
+
+    // Create service_bookings rows for service items so the booking is
+    // queryable per-service (schedule, notes, status tracking on completion)
+    try {
+      const serviceBookings = summary.items
+        .map(item => {
+          const serviceId = orderSource === 'invoice'
+            ? (invoiceItemRefs.get(item.id)?.service_id ?? null)
+            : (item.itemType === 'service' ? item.id : null);
+          if (!serviceId) return null;
+          const requestedDateTime = item.serviceDate
+            ? new Date(`${item.serviceDate}T${item.serviceTime || '00:00'}`)
+            : null;
+          return {
+            order_id: order.id,
+            user_id: userId,
+            service_id: serviceId,
+            requested_date: requestedDateTime && !isNaN(requestedDateTime.getTime())
+              ? requestedDateTime.toISOString() : null,
+            special_requests: item.serviceNotes || null,
+            quoted_price: (item.price || 0) * (item.quantity || 1),
+            final_price: (item.price || 0) * (item.quantity || 1),
+            status: 'confirmed',
+            confirmed_at: new Date().toISOString(),
+          };
+        })
+        .filter(Boolean);
+
+      if (serviceBookings.length > 0) {
+        const { error: bookingError } = await this.supabase
+          .from('service_bookings')
+          .insert(serviceBookings);
+        if (bookingError) {
+          console.warn(`⚠️ service_bookings insert failed for order ${order.id} (non-critical):`, bookingError.message);
+        }
+      }
+    } catch (bookingError) {
+      console.warn(`⚠️ service_bookings creation failed for order ${order.id} (non-critical):`, bookingError);
     }
 
     // Update rewards transaction with the new order id
@@ -1477,12 +1914,17 @@ export class CheckoutService {
         // Find the win that matches this auction (and item if multi-item)
         const auctionId = orderData.auctionCheckout.auctionId;
         const itemId = orderData.auctionCheckout.itemId || null; // For multi-item auctions
-        
-        const matchingWin = wins.find(
-          (win: any) =>
-            win.auction_id === auctionId &&
-            (win.item_id === itemId || (win.item_id === null && itemId === null))
-        );
+
+        // A win claimed by release_auction_win_hold is already 'checked_out'
+        // (the claim) — link the order on it directly rather than searching
+        // only pending wins, which would miss it.
+        const matchingWin = claimedWinId
+          ? { id: claimedWinId }
+          : wins.find(
+              (win: any) =>
+                win.auction_id === auctionId &&
+                (win.item_id === itemId || (win.item_id === null && itemId === null))
+            );
 
         if (matchingWin) {
           await this.auctionsService.markWinCheckedOut(
@@ -1542,20 +1984,18 @@ export class CheckoutService {
     // ✅ NOTIFY VENDOR OF PAYMENT IN ESCROW (if wallet payment)
     if (orderData.paymentMethodId === 'wallet') {
       try {
-        // Calculate commission rate from order's platform_fee (already set correctly for all order types)
-        // Auction orders: 10%, Live sales: 5%, Regular orders: 2%
-        const orderCommissionRate = order.platform_fee && actualTotal > 0
-          ? order.platform_fee / actualTotal
-          : undefined; // undefined = use default 2%
-        
-        const escrowBreakdown = this.calculateEscrowBreakdown(actualTotal, riderId, orderCommissionRate);
+        const escrowBreakdown = this.calculateEscrowBreakdownFromFees(
+          order.total_amount,
+          order.delivery_fee || 0,
+          order.platform_fee || 0,
+        );
         await this.notificationHelper.notifyVendorOrderPaid(vendorId, {
           orderId: order.id,
           orderNumber: order.order_number,
           vendorAmount: escrowBreakdown.vendorAmount,
           escrowId: order.id, // Escrow uses order_id as reference
         });
-        console.log(`✅ Vendor ${vendorId} notified of payment in escrow (commission rate: ${orderCommissionRate ? (orderCommissionRate * 100).toFixed(1) + '%' : 'default 2%'})`);
+        console.log(`✅ Vendor ${vendorId} notified of payment in escrow (vendor amount: ${escrowBreakdown.vendorAmount})`);
       } catch (notifyError) {
         console.error('Failed to notify vendor of payment (non-critical):', notifyError);
       }
@@ -1947,6 +2387,34 @@ export class CheckoutService {
     };
   }
 
+  // Exact-fee escrow breakdown: rider/partner gets the actual delivery fee,
+  // platform gets the pre-computed platform fee, and the vendor gets the rest.
+  // This is the correct split for auctions and any order where delivery is
+  // charged separately from the item price.
+  private calculateEscrowBreakdownFromFees(
+    totalAmount: number,
+    deliveryFee: number,
+    platformFee: number,
+  ): { totalAmount: number; vendorAmount: number; riderAmount: number; platformAmount: number } {
+    const round6 = (value: number): number => Math.round(value * 1000000) / 1000000;
+
+    const rDeliveryFee = round6(Math.max(0, deliveryFee));
+    const rPlatformFee = round6(Math.max(0, platformFee));
+    const vendorAmount = round6(Math.max(0, totalAmount - rDeliveryFee - rPlatformFee));
+
+    const sum = round6(vendorAmount + rDeliveryFee + rPlatformFee);
+    if (Math.abs(sum - totalAmount) > 0.000001) {
+      throw new Error(`Escrow breakdown does not sum to total: ${sum} != ${totalAmount}`);
+    }
+
+    return {
+      totalAmount,
+      vendorAmount,
+      riderAmount: rDeliveryFee,
+      platformAmount: rPlatformFee,
+    };
+  }
+
   // ========== MULTI-VENDOR CHECKOUT METHODS ==========
 
   // Group items by vendor
@@ -2008,7 +2476,8 @@ export class CheckoutService {
         const groupEscrowFee = orderData.useEscrow ? this.calculateEscrowFee(groupSubtotal + deliveryFee + groupTax) : 0;
         const groupTotal = groupSubtotal + deliveryFee + groupTax + groupEscrowFee;
         const orderNumber = 'ORD-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4).toUpperCase() + '-' + (i + 1);
-        const escrowBreakdown = this.calculateEscrowBreakdown(groupTotal, riderId, groupTotal > 0 ? groupTotal * 0.02 / groupTotal : 0.02);
+        const groupPlatformFee = Math.round((groupTotal * 0.02) * 1000000) / 1000000;
+        const escrowBreakdown = this.calculateEscrowBreakdownFromFees(groupTotal, deliveryFee, groupPlatformFee);
 
         const orderToInsert = {
           buyer_id: userId,

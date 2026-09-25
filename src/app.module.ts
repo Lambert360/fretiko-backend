@@ -57,6 +57,7 @@ import { VideoProcessingModule } from './video-processing/video-processing.modul
 import { AiModule } from './ai/ai.module';
 import { ReferralsModule } from './referrals/referrals.module';
 import { GiftCardsModule } from './gift-cards/gift-cards.module';
+import { SoundsModule } from './sounds/sounds.module';
 
 @Module({
   imports: [
@@ -117,6 +118,7 @@ import { GiftCardsModule } from './gift-cards/gift-cards.module';
     AiModule,
     ReferralsModule,
     GiftCardsModule,
+    SoundsModule,
   ],
   controllers: [AppController, ExchangeRateController, HealthController],
   providers: [

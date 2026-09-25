@@ -1,9 +1,10 @@
-import { Injectable, NotFoundException, ForbiddenException, forwardRef, Inject } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, forwardRef, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createSupabaseClient, createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { EscrowService } from '../escrow/escrow.service';
 import { ScheduleRemindersService } from './schedule-reminders.service';
+import { AnalyticsService } from '../analytics/analytics.service';
 
 @Injectable()
 export class WorkspaceService {
@@ -16,9 +17,25 @@ export class WorkspaceService {
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
     private scheduleReminders: ScheduleRemindersService,
+    private analyticsService: AnalyticsService,
   ) {
     this.supabase = createServiceSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService); // Service role client
+  }
+
+  /**
+   * Drop cached analytics for everyone affected by an order mutation so a
+   * fresh sale/delivery shows up on the analytics screens immediately
+   * instead of after the cache TTL.
+   */
+  private invalidateAnalyticsFor(order: { vendor_id?: string | null; buyer_id?: string | null; rider_id?: string | null }) {
+    try {
+      [order.vendor_id, order.buyer_id, order.rider_id].forEach(id => {
+        if (id) this.analyticsService.invalidateCache(id);
+      });
+    } catch (e) {
+      console.warn('Failed to invalidate analytics cache (non-critical):', e);
+    }
   }
 
   async getActiveOrders(userId: string, userToken?: string) {
@@ -112,6 +129,7 @@ export class WorkspaceService {
           updatedAt: order.updated_at,
         estimatedPreparationTime: order.metadata?.estimated_preparation_time || 15,
         notes: order.metadata?.notes,
+        bookingType: order.metadata?.booking_type || null, // 'service' | 'portfolio' → completes via service endpoint, not pickup pipeline
         source: order.source || 'regular', // ✅ Use source from database!
           items: order.order_items?.map(item => ({
             id: item.id,
@@ -179,7 +197,7 @@ export class WorkspaceService {
       : this.supabase;
 
     try {
-      // ✅ SIMPLIFIED: Query ONLY the orders table
+      // Query orders with a lightweight item embed so itemCount is accurate
       const { data: orders, error: ordersError} = await supabaseClient
         .from('orders')
         .select(`
@@ -191,7 +209,8 @@ export class WorkspaceService {
           updated_at,
           buyer_id,
           delivery_address,
-          source
+          source,
+          order_items(id)
         `)
         .in('status', ['delivered', 'completed', 'cancelled'])
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
@@ -227,7 +246,7 @@ export class WorkspaceService {
         orderNumber: order.order_number,
         status: order.status,
         customerName: buyerProfiles[order.buyer_id]?.username || 'Unknown Customer',
-          itemCount: 1,
+        itemCount: order.order_items?.length || 0,
         total: order.total_amount,
         deliveryAddress: order.delivery_address,
         createdAt: order.created_at,
@@ -303,34 +322,50 @@ export class WorkspaceService {
       const auctionRevenue = todayOrders?.filter(o => o.source === 'auction')
         .reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
         
-      // Service bookings are now part of live_stream orders, identified by metadata.booking_type
-      const serviceOrdersCount = todayOrders?.filter(o => 
-        o.source === 'live_stream' && o.metadata?.booking_type === 'service'
-      ).length || 0;
-      const serviceRevenue = todayOrders?.filter(o => 
-        o.source === 'live_stream' && o.metadata?.booking_type === 'service'
-      ).reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
+      // Service bookings are now part of live_stream orders, identified by
+      // metadata.booking_type — but orders may also carry source='service_booking' directly
+      const isServiceOrder = (o: any) =>
+        o.source === 'service_booking' ||
+        (o.source === 'live_stream' && o.metadata?.booking_type === 'service');
+      const serviceOrdersCount = todayOrders?.filter(isServiceOrder).length || 0;
+      const serviceRevenue = todayOrders?.filter(isServiceOrder)
+        .reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
+
+      // Chat invoice and wishlist-gift orders are distinct sales channels
+      const invoiceOrdersCount = todayOrders?.filter(o => o.source === 'invoice').length || 0;
+      const invoiceRevenue = todayOrders?.filter(o => o.source === 'invoice')
+        .reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
+
+      const wishlistOrdersCount = todayOrders?.filter(o => o.source === 'wishlist').length || 0;
+      const wishlistRevenue = todayOrders?.filter(o => o.source === 'wishlist')
+        .reduce((sum, order) => sum + (order.total_amount || 0), 0) || 0;
 
       console.log(`⏱️ [WORKSPACE] Stats calculated from ${todayOrdersCount} orders`);
 
-      // ✅ BUG FIX: Fetch actual customer rating from order_item_ratings
+      // ✅ BUG FIX: Fetch actual customer rating — ratings live on the vendor's
+      // products/services (there is no order-level ratings table)
       let customerRating = 0;
       try {
-        const { data: orderRatings, error: ratingsError } = await supabaseClient
-          .from('order_item_ratings')
-          .select(`
-            rating,
-            orders!inner(vendor_id)
-          `)
-          .eq('orders.vendor_id', userId);
+        const [productRatingsResult, serviceRatingsResult] = await Promise.all([
+          supabaseClient
+            .from('product_ratings')
+            .select('rating, products!inner(user_id)')
+            .eq('products.user_id', userId),
+          supabaseClient
+            .from('service_ratings')
+            .select('rating, services!inner(user_id)')
+            .eq('services.user_id', userId),
+        ]);
 
-        if (!ratingsError && orderRatings && orderRatings.length > 0) {
-          const totalRating = orderRatings.reduce((sum, r) => sum + (r.rating || 0), 0);
-          const avgRating = totalRating / orderRatings.length;
+        const allRatings = [
+          ...(productRatingsResult.data || []),
+          ...(serviceRatingsResult.data || []),
+        ];
+
+        if (allRatings.length > 0) {
+          const totalRating = allRatings.reduce((sum, r) => sum + (r.rating || 0), 0);
+          const avgRating = totalRating / allRatings.length;
           customerRating = parseFloat(avgRating.toFixed(1));
-        } else {
-          // No ratings yet - use default of 0
-          customerRating = 0;
         }
       } catch (error) {
         console.error('Error fetching customer ratings (non-critical):', error);
@@ -516,36 +551,10 @@ export class WorkspaceService {
         ? deliveryTimes.reduce((sum, time) => sum + time, 0) / deliveryTimes.length
         : 0;
 
-      // ✅ BUG FIX: Fetch actual rider rating from order_item_ratings
-      // Note: Rider ratings may be stored in order_item_ratings or a dedicated rider_ratings table
-      // For now, we'll use order_item_ratings where the order has this rider
-      let riderRating = 0;
-      let totalRatings = 0;
-      try {
-        // Try to get ratings from order_item_ratings for orders where this user is the rider
-        const { data: riderOrderRatings, error: riderRatingsError } = await supabaseClient
-          .from('order_item_ratings')
-          .select(`
-            rating,
-            orders!inner(rider_id)
-          `)
-          .eq('orders.rider_id', userId);
-
-        if (!riderRatingsError && riderOrderRatings && riderOrderRatings.length > 0) {
-          const totalRating = riderOrderRatings.reduce((sum, r) => sum + (r.rating || 0), 0);
-          const avgRating = totalRating / riderOrderRatings.length;
-          riderRating = parseFloat(avgRating.toFixed(1));
-          totalRatings = riderOrderRatings.length;
-        } else {
-          // No ratings yet - use delivery count as total ratings
-          riderRating = 0;
-          totalRatings = totalRiderDeliveries;
-        }
-      } catch (error) {
-        console.error('Error fetching rider ratings (non-critical):', error);
-        riderRating = 0;
-        totalRatings = totalRiderDeliveries;
-      }
+      // Note: There is no rider ratings table in the schema — rider rating
+      // defaults to 0 and totalRatings falls back to delivery count
+      const riderRating = 0;
+      const totalRatings = totalRiderDeliveries;
 
       console.log(`⏱️ [WORKSPACE] ✅ getWorkspaceStats completed in ${Date.now() - startTime}ms`);
 
@@ -589,12 +598,16 @@ export class WorkspaceService {
           live_stream: liveStreamOrdersCount,
           auction: auctionOrdersCount,
           service_booking: serviceOrdersCount,
+          invoice: invoiceOrdersCount,
+          wishlist: wishlistOrdersCount,
         },
         revenueBySource: {
           regular: regularRevenue,
           live_stream: liveStreamRevenue,
           auction: auctionRevenue,
           service_booking: serviceRevenue,
+          invoice: invoiceRevenue,
+          wishlist: wishlistRevenue,
         },
         escrowMetrics: {
           totalInEscrow, // Total funds held in escrow (vendor)
@@ -635,11 +648,22 @@ export class WorkspaceService {
           order_items(
             id,
             product_id,
+            service_id,
             product_name,
             unit_price,
             quantity,
             total_price,
+            scheduled_date,
+            scheduled_time,
+            service_notes,
             product_metadata
+          ),
+          service_bookings(
+            id,
+            service_id,
+            requested_date,
+            special_requests,
+            status
           )
         `)
         .eq('id', orderId)
@@ -803,20 +827,78 @@ export class WorkspaceService {
         }
       }
 
-      // Get order timeline (mock data for now)
-      const timeline = [
-        {
-          status: 'pending',
-          timestamp: order.created_at,
-          note: 'Order received',
-        },
-      ];
+      // Build the order timeline from real timestamp columns (only non-null entries)
+      const timeline: { status: string; timestamp: string; note: string }[] = [];
 
-      if (order.status !== 'pending') {
+      if (order.created_at) {
+        timeline.push({ status: 'pending', timestamp: order.created_at, note: 'Order received' });
+      }
+      if (order.status === 'paid' || order.metadata?.paid_at) {
+        timeline.push({
+          status: 'paid',
+          timestamp: order.metadata?.paid_at || order.updated_at,
+          note: 'Payment confirmed',
+        });
+      }
+      if (['accepted', 'processing', 'ready_for_pickup', 'out_for_delivery', 'delivered'].includes(order.status)) {
         timeline.push({
           status: 'processing',
           timestamp: order.updated_at,
           note: 'Order accepted and being prepared',
+        });
+      }
+      if (order.status === 'ready_for_pickup' || order.pickup_pin_verified_at || order.status === 'out_for_delivery' || order.delivered_at) {
+        timeline.push({
+          status: 'ready_for_pickup',
+          timestamp: order.pickup_pin_verified_at || order.updated_at,
+          note: 'Ready for pickup',
+        });
+      }
+      if (order.pickup_pin_verified_at) {
+        timeline.push({
+          status: 'out_for_delivery',
+          timestamp: order.pickup_pin_verified_at,
+          note: order.delivery_type === 'pickup' || order.delivery_type === 'self_pickup'
+            ? 'Customer pickup verified'
+            : 'Picked up by rider',
+        });
+      }
+      if (order.delivered_at) {
+        timeline.push({ status: 'delivered', timestamp: order.delivered_at, note: 'Order delivered' });
+      }
+      if (order.delivery_pin_verified_at) {
+        timeline.push({
+          status: 'delivered',
+          timestamp: order.delivery_pin_verified_at,
+          note: 'Delivery PIN verified',
+        });
+      }
+      if (order.metadata?.completed_at) {
+        timeline.push({
+          status: 'completed',
+          timestamp: order.metadata.completed_at,
+          note: 'Service completed',
+        });
+      }
+      if (order.order_confirmed_at) {
+        timeline.push({
+          status: 'confirmed',
+          timestamp: order.order_confirmed_at,
+          note: 'Receipt confirmed by buyer',
+        });
+      }
+      if (order.escrow_released_at) {
+        timeline.push({
+          status: 'completed',
+          timestamp: order.escrow_released_at,
+          note: 'Payment released to vendor',
+        });
+      }
+      if (order.status === 'cancelled') {
+        timeline.push({
+          status: 'cancelled',
+          timestamp: order.updated_at,
+          note: order.metadata?.decline_reason || 'Order cancelled',
         });
       }
 
@@ -827,7 +909,15 @@ export class WorkspaceService {
       return {
         ...safeOrder,
         orderNumber: order.order_number,
+        // camelCase aliases the mobile screen expects (spread only carries snake_case)
+        total: order.total_amount,
+        deliveryFee: order.delivery_fee || 0,
+        createdAt: order.created_at,
+        updatedAt: order.updated_at,
         customerName: order.customer?.username || order.customer?.display_name || 'Unknown Customer',
+        // Vendor notes + prep estimate live in metadata (no columns exist)
+        notes: order.metadata?.notes || null,
+        estimatedPreparationTime: order.metadata?.estimated_preparation_time || null,
         // ✅ Include delivery type to distinguish pickup vs delivery
         deliveryType: order.delivery_type || 'delivery',
         // ✅ Include PINs for handoff verification - STRICTLY scoped by role:
@@ -843,6 +933,7 @@ export class WorkspaceService {
         items: order.order_items?.map(item => ({
           id: item.id,
           productId: item.product_id,
+          serviceId: item.service_id,
           name: item.product_name,
           image: item.product_metadata?.image || item.product_metadata?.images?.[0] || null,
           price: item.unit_price,
@@ -854,6 +945,22 @@ export class WorkspaceService {
           scheduledTime: item.scheduled_time || null,
           notes: item.service_notes || item.product_metadata?.notes || null,
         })) || [],
+        // Service booking records (if any) — carry schedule + buyer notes.
+        // Multiple rows possible for multi-service orders.
+        serviceBookings: (order.service_bookings || []).map((b: any) => ({
+          id: b.id,
+          serviceId: b.service_id,
+          scheduledDate: b.requested_date,
+          notes: b.special_requests,
+          status: b.status,
+        })),
+        serviceBooking: order.service_bookings?.[0] ? {
+          id: order.service_bookings[0].id,
+          serviceId: order.service_bookings[0].service_id,
+          scheduledDate: order.service_bookings[0].requested_date,
+          notes: order.service_bookings[0].special_requests,
+          status: order.service_bookings[0].status,
+        } : null,
         customer: {
           id: order.customer?.id,
           name: order.customer?.username,
@@ -896,7 +1003,9 @@ export class WorkspaceService {
         throw new Error('Order not found or unauthorized');
       }
 
-      if (order.status !== 'pending') {
+      // 'paid' orders (payment confirmed, escrow held — e.g. live stream and
+      // invoice orders) are awaiting vendor action just like 'pending' ones
+      if (!['pending', 'paid'].includes(order.status)) {
         throw new Error(`Order cannot be accepted. Current status: ${order.status}`);
       }
 
@@ -909,11 +1018,13 @@ export class WorkspaceService {
         })
         .eq('id', orderId)
         .eq('vendor_id', userId)
-        .eq('status', 'pending');
+        .in('status', ['pending', 'paid']);
 
       if (error) {
         throw new Error(`Failed to accept order: ${error.message}`);
       }
+
+      this.invalidateAnalyticsFor({ vendor_id: userId, buyer_id: order.buyer_id });
 
       // ✅ NOTIFY BUYER OF ORDER ACCEPTANCE
       try {
@@ -966,9 +1077,9 @@ export class WorkspaceService {
         throw new Error('Order not found or unauthorized');
       }
 
-      if (order.status !== 'pending') {
-        console.error(`❌ [DECLINE] Invalid order status: ${order.status} (expected: pending)`);
-        throw new Error('Only pending orders can be declined');
+      if (!['pending', 'paid'].includes(order.status)) {
+        console.error(`❌ [DECLINE] Invalid order status: ${order.status} (expected: pending or paid)`);
+        throw new Error('Only pending or paid orders can be declined');
       }
 
       const declineReason = reason ? `Declined: ${reason}` : 'Order declined by vendor';
@@ -983,12 +1094,14 @@ export class WorkspaceService {
         })
         .eq('id', orderId)
         .eq('vendor_id', userId)
-        .eq('status', 'pending');
+        .in('status', ['pending', 'paid']);
 
       if (error) {
         console.error(`❌ [DECLINE] Failed to update order:`, error.message);
         throw new Error(`Failed to decline order: ${error.message}`);
       }
+
+      this.invalidateAnalyticsFor({ vendor_id: userId, buyer_id: order.buyer_id });
 
       console.log(` [DECLINE] Order updated successfully, now checking escrow...`);
 
@@ -1004,38 +1117,11 @@ export class WorkspaceService {
           .limit(1)
           .maybeSingle();
 
-        console.log(` [DECLINE] Escrow found:`, { 
-          found: !!escrow?.id, 
-          status: escrow?.status, 
-          amount: escrow?.total_amount 
+        console.log(` [DECLINE] Escrow found:`, {
+          found: !!escrow?.id,
+          status: escrow?.status,
+          amount: escrow?.total_amount
         });
-
-        // 🔍 SURGICAL DEBUG: Check escrow system health
-        const { data: systemEscrows, count: escrowCount } = await this.serviceSupabase
-          .from('escrows')
-          .select('id, order_id, status', { count: 'exact' })
-          .limit(3);
-        
-        console.log(`🔍 [DEBUG] System escrow count: ${escrowCount}`);
-        if (escrowCount > 0) {
-          console.log(`🔍 [DEBUG] Recent escrows:`, systemEscrows?.map(e => ({ id: e.id, orderId: e.order_id, status: e.status })));
-        }
-
-        // 🔍 SURGICAL DEBUG: Check wallet transactions for this order
-        const { data: orderTxns } = await this.serviceSupabase
-          .from('wallet_transactions')
-          .select('id, transaction_type, amount, created_at')
-          .eq('reference_id', orderId)
-          .eq('reference_type', 'order')
-          .order('created_at', { ascending: false })
-          .limit(5);
-        
-        console.log(`🔍 [DEBUG] Wallet transactions for order ${orderId}:`, orderTxns?.map(t => ({ 
-          id: t.id, 
-          type: t.transaction_type, 
-          amount: t.amount,
-          created: t.created_at 
-        })));
 
         if (escrow?.id && escrow.status === 'held') {
           console.log(` [DECLINE] Escrow is held, attempting refund to buyer ${order.buyer_id}...`);
@@ -1106,6 +1192,8 @@ export class WorkspaceService {
       if (error) {
         throw new Error(`Failed to mark order ready: ${error.message}`);
       }
+
+      this.invalidateAnalyticsFor(order);
 
       // ✅ Notify rider and buyer that order is ready
       // Skip rider notification for self-pickup orders (rider_id is null)
@@ -1199,6 +1287,8 @@ export class WorkspaceService {
         throw new Error(`Failed to mark order ready for pickup: ${error.message}`);
       }
 
+      this.invalidateAnalyticsFor(order);
+
       // ✅ Notify buyer that order is ready for collection
       try {
         // Get vendor name for notification
@@ -1283,17 +1373,17 @@ export class WorkspaceService {
         .single();
 
       if (fetchError || !order) {
-        throw new Error('Order not found or unauthorized');
+        throw new NotFoundException('Order not found or unauthorized');
       }
 
       // ✅ Verify this is a self-pickup order
       if (order.delivery_type !== 'pickup') {
-        throw new Error('This action is only for self-pickup orders');
+        throw new BadRequestException('This action is only for self-pickup orders');
       }
 
       // ✅ Validate buyer's delivery PIN
       if (order.delivery_pin !== deliveryPin) {
-        throw new Error('Invalid PIN. Please check the buyer\'s PIN and try again.');
+        throw new BadRequestException('Incorrect PIN');
       }
 
       // ✅ FETCH ORDER ITEMS WITH CATEGORIES
@@ -1323,6 +1413,8 @@ export class WorkspaceService {
       if (error) {
         throw new Error(`Failed to confirm self-pickup: ${error.message}`);
       }
+
+      this.invalidateAnalyticsFor(order);
 
       // ✅ SET ESCROW AUTO-RELEASE TIMER (category-based)
       // ✅ ESCROW TIMER LOGIC:
@@ -1432,12 +1524,12 @@ export class WorkspaceService {
         .single();
 
       if (fetchError || !order) {
-        throw new Error('Order not found or unauthorized');
+        throw new NotFoundException('Order not found or unauthorized');
       }
 
       // ✅ Verify pickup PIN
       if (order.pickup_pin !== pickupPin) {
-        throw new Error('Invalid pickup PIN');
+        throw new BadRequestException('Incorrect PIN');
       }
 
       // ✅ PIN verified - update status to out_for_delivery
@@ -1455,6 +1547,8 @@ export class WorkspaceService {
       if (error) {
         throw new Error(`Failed to confirm pickup: ${error.message}`);
       }
+
+      this.invalidateAnalyticsFor(order);
 
       // ✅ Notify buyer and vendor that order was picked up
       try {
@@ -1494,12 +1588,32 @@ export class WorkspaceService {
       : this.supabase;
 
     try {
+      // Ownership check: only the order's vendor or assigned rider may
+      // confirm pickup (previously any authenticated user could transition
+      // ANY ready_for_pickup order and self-assign as rider)
+      const { data: order, error: fetchError } = await supabaseClient
+        .from('orders')
+        .select('id, vendor_id, rider_id, buyer_id, status')
+        .eq('id', orderId)
+        .eq('status', 'ready_for_pickup')
+        .single();
+
+      if (fetchError || !order) {
+        throw new NotFoundException('Order not found or not ready for pickup');
+      }
+
+      if (order.vendor_id !== userId && order.rider_id !== userId) {
+        throw new ForbiddenException('Order not found or unauthorized');
+      }
+
       const { data, error } = await supabaseClient
         .from('orders')
         .update({
           status: 'out_for_delivery',
           updated_at: new Date().toISOString(),
-          rider_id: userId,
+          // Only assign rider_id if the order doesn't already have one —
+          // a vendor confirming handoff must not become the rider
+          ...(order.rider_id ? {} : { rider_id: userId }),
         })
         .eq('id', orderId)
         .eq('status', 'ready_for_pickup');
@@ -1507,6 +1621,8 @@ export class WorkspaceService {
       if (error) {
         throw new Error(`Failed to confirm pickup: ${error.message}`);
       }
+
+      this.invalidateAnalyticsFor(order);
 
       return { success: true, message: 'Pickup confirmed' };
     } catch (error) {
@@ -1532,20 +1648,11 @@ export class WorkspaceService {
 
       if (fetchError || !order) {
         console.error(`❌ Order not found or unauthorized:`, fetchError);
-        throw new Error('Order not found or unauthorized');
+        throw new NotFoundException('Order not found or unauthorized');
       }
 
-      console.log(`🔍 PIN Verification Debug:`, {
-        orderId,
-        storedPIN: order.delivery_pin,
-        receivedPIN: deliveryPin,
-        match: order.delivery_pin === deliveryPin,
-        storedType: typeof order.delivery_pin,
-        receivedType: typeof deliveryPin,
-      });
-
       if (order.delivery_pin !== deliveryPin) {
-        throw new Error('Invalid delivery PIN');
+        throw new BadRequestException('Incorrect PIN');
       }
 
       // ✅ PIN verified - update order status to delivered AND mark as received
@@ -1565,6 +1672,8 @@ export class WorkspaceService {
       if (error) {
         throw new Error(`Failed to mark delivered: ${error.message}`);
       }
+
+      this.invalidateAnalyticsFor({ ...order, rider_id: userId });
 
       // ✅ FETCH ORDER ITEMS WITH CATEGORIES FOR COUNTDOWN
       const { data: orderItems } = await supabaseClient
@@ -1682,12 +1791,29 @@ export class WorkspaceService {
         .select('id, order_number, status, vendor_id, buyer_id, source, metadata')
         .eq('id', orderId)
         .eq('vendor_id', userId)
-        .eq('source', 'live_stream')
-        .eq('metadata->>booking_type', 'service')
         .single();
 
       if (orderError || !order) {
         throw new Error('Service booking not found or unauthorized');
+      }
+
+      // Eligible if it's a live-stream service/portfolio booking OR the order
+      // has a service_bookings row (regular/invoice service checkouts create one)
+      const isLiveServiceOrder =
+        order.source === 'live_stream' &&
+        ['service', 'portfolio'].includes(order.metadata?.booking_type);
+
+      if (!isLiveServiceOrder) {
+        const { data: bookingRow } = await supabaseClient
+          .from('service_bookings')
+          .select('id')
+          .eq('order_id', orderId)
+          .limit(1)
+          .maybeSingle();
+
+        if (!bookingRow) {
+          throw new Error('Service booking not found or unauthorized');
+        }
       }
 
       // 2. Check order is ready for completion
@@ -1712,6 +1838,8 @@ export class WorkspaceService {
       if (updateError) {
         throw new Error('Failed to update service booking status');
       }
+
+      this.invalidateAnalyticsFor(order);
 
       // 4. Update service_bookings table status to 'pending_confirmation'
       try {
@@ -1757,10 +1885,26 @@ export class WorkspaceService {
       : this.supabase;
 
     try {
+      // orders has no estimated_preparation_time column — the canonical store
+      // is metadata JSONB (getActiveOrders reads metadata.estimated_preparation_time)
+      const { data: order, error: fetchError } = await supabaseClient
+        .from('orders')
+        .select('id, metadata')
+        .eq('id', orderId)
+        .eq('vendor_id', userId)
+        .single();
+
+      if (fetchError || !order) {
+        throw new Error('Order not found or unauthorized');
+      }
+
       const { data, error } = await supabaseClient
         .from('orders')
         .update({
-          estimated_preparation_time: estimatedMinutes,
+          metadata: {
+            ...(order.metadata || {}),
+            estimated_preparation_time: estimatedMinutes,
+          },
           updated_at: new Date().toISOString(),
         })
         .eq('id', orderId)
@@ -1847,10 +1991,26 @@ export class WorkspaceService {
       : this.supabase;
 
     try {
+      // orders has no notes column — vendor notes live in metadata JSONB
+      // (getActiveOrders reads metadata.notes)
+      const { data: order, error: fetchError } = await supabaseClient
+        .from('orders')
+        .select('id, metadata')
+        .eq('id', orderId)
+        .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+        .single();
+
+      if (fetchError || !order) {
+        throw new Error('Order not found or unauthorized');
+      }
+
       const { data, error } = await supabaseClient
         .from('orders')
         .update({
-          notes: notes,
+          metadata: {
+            ...(order.metadata || {}),
+            notes,
+          },
           updated_at: new Date().toISOString(),
         })
         .eq('id', orderId)
@@ -1879,11 +2039,12 @@ export class WorkspaceService {
           id,
           order_number,
           status,
-          total,
-          item_count,
+          total_amount,
+          buyer_id,
           created_at,
           delivery_address,
-          customer_name:user_profiles!customer_id(username, display_name)
+          order_items(id),
+          customer_name:user_profiles!buyer_id(username, display_name)
         `)
         .eq('status', status)
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
@@ -1898,8 +2059,8 @@ export class WorkspaceService {
         orderNumber: order.order_number,
         status: order.status,
         customerName: order.customer_name?.username || order.customer_name?.display_name || 'Unknown Customer',
-        itemCount: order.item_count,
-        total: order.total,
+        itemCount: order.order_items?.length || 0,
+        total: order.total_amount,
         deliveryAddress: order.delivery_address,
         createdAt: order.created_at,
       })) || [];
@@ -1916,7 +2077,7 @@ export class WorkspaceService {
    * ✅ NOTE: service_booking and portfolio bookings are now part of live_stream orders
    * ✅ BUG FIX: Missing endpoint implementation
    */
-  async getOrdersBySource(userId: string, source: 'regular' | 'live_stream' | 'auction' | 'service_booking', userToken?: string) {
+  async getOrdersBySource(userId: string, source: 'regular' | 'live_stream' | 'auction' | 'service_booking' | 'invoice' | 'wishlist', userToken?: string) {
     const supabaseClient = userToken
       ? createUserSupabaseClient(this.configService, userToken)
       : this.supabase;
@@ -1945,11 +2106,12 @@ export class WorkspaceService {
         `)
         .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`);
 
-      // Handle service_booking as a special case (it's now live_stream with metadata.booking_type='service')
+      // Handle service_booking as a special case: it covers both orders with
+      // source='service_booking' and live_stream orders with metadata.booking_type='service'
       if (source === 'service_booking') {
-        query = query
-          .eq('source', 'live_stream')
-          .eq('metadata->>booking_type', 'service');
+        query = query.or(
+          'source.eq.service_booking,and(source.eq.live_stream,metadata->>booking_type.eq.service)'
+        );
       } else {
         query = query.eq('source', source);
       }
@@ -2003,6 +2165,71 @@ export class WorkspaceService {
       }));
     } catch (error) {
       console.error('Error fetching orders by source:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get orders/revenue breakdown by source for a period
+   * Covers all order sources: regular, live_stream, auction, service_booking, invoice, wishlist
+   */
+  async getOrdersAnalyticsBySource(userId: string, period: 'today' | 'week' | 'month' = 'today', userToken?: string) {
+    const supabaseClient = userToken
+      ? createUserSupabaseClient(this.configService, userToken)
+      : this.supabase;
+
+    try {
+      const now = new Date();
+      let start: Date;
+      if (period === 'week') {
+        start = new Date(now);
+        start.setDate(now.getDate() - now.getDay());
+        start.setHours(0, 0, 0, 0);
+      } else if (period === 'month') {
+        start = new Date(now.getFullYear(), now.getMonth(), 1);
+      } else {
+        start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      }
+
+      const { data: orders, error } = await supabaseClient
+        .from('orders')
+        .select('id, source, total_amount, metadata')
+        .or(`vendor_id.eq.${userId},rider_id.eq.${userId}`)
+        .gte('created_at', start.toISOString());
+
+      if (error) {
+        throw new Error(`Failed to fetch orders analytics by source: ${error.message}`);
+      }
+
+      // service_booking covers both direct source and live_stream service orders
+      const buckets = new Map<string, { orderCount: number; revenue: number }>();
+      (orders || []).forEach(order => {
+        let source = order.source || 'regular';
+        if (source === 'live_stream' && order.metadata?.booking_type === 'service') {
+          source = 'service_booking';
+        }
+        const bucket = buckets.get(source) || { orderCount: 0, revenue: 0 };
+        bucket.orderCount += 1;
+        bucket.revenue += order.total_amount || 0;
+        buckets.set(source, bucket);
+      });
+
+      const totalOrders = orders?.length || 0;
+      const totalRevenue = (orders || []).reduce((sum, o) => sum + (o.total_amount || 0), 0);
+
+      const sourceBreakdown = Array.from(buckets.entries())
+        .map(([source, data]) => ({
+          source,
+          orderCount: data.orderCount,
+          revenue: data.revenue,
+          percentage: totalOrders > 0 ? (data.orderCount / totalOrders) * 100 : 0,
+          averageOrderValue: data.orderCount > 0 ? data.revenue / data.orderCount : 0,
+        }))
+        .sort((a, b) => b.revenue - a.revenue);
+
+      return { period, totalOrders, totalRevenue, sourceBreakdown };
+    } catch (error) {
+      console.error('Error fetching orders analytics by source:', error);
       throw error;
     }
   }

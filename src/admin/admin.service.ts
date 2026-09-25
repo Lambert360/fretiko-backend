@@ -4633,7 +4633,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         like_count,
         created_at,
         updated_at,
-        user:user_profiles(id, username, avatar_url, preferences)
+        user:user_profiles(id, username, avatar_url, preferences, catalog_hidden, is_adult_content)
       `)
       .order('created_at', { ascending: false });
 
@@ -4701,7 +4701,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         like_count,
         created_at,
         updated_at,
-        user:user_profiles(id, username, avatar_url, preferences)
+        user:user_profiles(id, username, avatar_url, preferences, catalog_hidden, is_adult_content)
       `)
       .eq('id', productId)
       .single();
@@ -4760,9 +4760,11 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
   async rejectProduct(staffId: string, productId: string, reason: string) {
     await this.verifyContentModerator(staffId);
 
+    // 'removed' (not 'inactive') so vendors cannot undo moderation by
+    // re-activating the item from their store — only staff approve restores it
     const { error } = await this.supabase
       .from('products')
-      .update({ status: 'inactive' })
+      .update({ status: 'removed' })
       .eq('id', productId);
 
     if (error) {
@@ -4810,7 +4812,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         booking_count,
         created_at,
         updated_at,
-        user:user_profiles(id, username, avatar_url, preferences)
+        user:user_profiles(id, username, avatar_url, preferences, catalog_hidden, is_adult_content)
       `)
       .order('created_at', { ascending: false });
 
@@ -4898,7 +4900,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         booking_count,
         created_at,
         updated_at,
-        user:user_profiles(id, username, avatar_url, preferences)
+        user:user_profiles(id, username, avatar_url, preferences, catalog_hidden, is_adult_content)
       `)
       .eq('id', serviceId)
       .single();
@@ -4923,14 +4925,46 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
   }
 
   /**
+   * Set or clear a vendor's adult-content flag.
+   * Staff-only — used when a vendor sells adult products/services without
+   * self-flagging, which hides the catalog from minors platform-wide.
+   */
+  async setUserAdultContentFlag(staffId: string, userId: string, isAdult: boolean, reason?: string) {
+    await this.verifyContentModerator(staffId);
+
+    const { error } = await this.supabase
+      .from('user_profiles')
+      .update({ is_adult_content: isAdult })
+      .eq('id', userId);
+
+    if (error) {
+      this.logger.error(`Failed to update adult-content flag for user ${userId}:`, error);
+      throw new Error(`Failed to update adult-content flag: ${error.message}`);
+    }
+
+    await this.auditService.logContentAction(
+      staffId,
+      AuditAction.EDIT_USER,
+      AuditEntityType.USER,
+      userId,
+      { field: 'is_adult_content', value: isAdult, reason },
+    );
+    this.logger.log(`User ${userId} adult-content flag set to ${isAdult} by staff ${staffId}`);
+
+    return { message: `User ${isAdult ? 'marked' : 'unmarked'} as adult content` };
+  }
+
+  /**
    * Reject/Remove service
    */
   async rejectService(staffId: string, serviceId: string, reason: string) {
     await this.verifyContentModerator(staffId);
 
+    // 'removed' (not 'inactive') so vendors cannot undo moderation by
+    // re-activating the item from their store — only staff approve restores it
     const { error } = await this.supabase
       .from('services')
-      .update({ status: 'inactive' })
+      .update({ status: 'removed' })
       .eq('id', serviceId);
 
     if (error) {
@@ -4965,7 +4999,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         view_count,
         like_count,
         created_at,
-        user:user_profiles(id, username, avatar_url, preferences)
+        user:user_profiles(id, username, avatar_url, preferences, catalog_hidden, is_adult_content)
       `)
       .order('created_at', { ascending: false });
 
@@ -5047,7 +5081,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         started_at,
         ended_at,
         created_at,
-        vendor:user_profiles(id, username, avatar_url, preferences)
+        vendor:user_profiles(id, username, avatar_url, preferences, catalog_hidden, is_adult_content)
       `)
       .order('created_at', { ascending: false });
 
@@ -5430,7 +5464,7 @@ ${disputeDetails.description || dispute.description || 'N/A'}`;
         video_url,
         created_at,
         updated_at,
-        seller:user_profiles!seller_id(id, username, avatar_url, preferences)
+        seller:user_profiles!seller_id(id, username, avatar_url, preferences, catalog_hidden, is_adult_content)
       `)
       .order('created_at', { ascending: false });
 

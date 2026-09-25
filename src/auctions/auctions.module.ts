@@ -5,7 +5,6 @@ import { AuctionsService } from './auctions.service';
 import { AuctionGateway } from './auction.gateway';
 import { AuctionSchedulerService } from './auction-scheduler.service';
 import { AuctioneerAiService } from './auctioneer-ai.service';
-import { AuctionPaymentService } from './auction-payment.service';
 import { AuctionFraudDetectionService } from './fraud-detection.service';
 import { WalletModule } from '../wallet/wallet.module';
 import { EscrowModule } from '../escrow/escrow.module';
@@ -37,7 +36,6 @@ import { AuthModule } from '../auth/auth.module';
     AuctionGateway,
     AuctionSchedulerService,
     AuctioneerAiService,
-    AuctionPaymentService,
     AuctionFraudDetectionService,
   ],
   exports: [AuctionsService, AuctionFraudDetectionService], // Export for use in other modules (especially admin)

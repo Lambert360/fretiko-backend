@@ -193,7 +193,7 @@ export class PartnersController {
   @Patch('pricing')
   async updatePricing(
     @Req() request: Request,
-    @Body() body: { pricing_config: Record<string, { base_price: number; per_km_rate: number }> }
+    @Body() body: { pricing_config: Record<string, import('../shared/delivery-pricing').DeliveryRate> }
   ) {
     try {
       const token = this.extractTokenFromRequest(request);
@@ -402,8 +402,12 @@ export class PartnersController {
       enabled?: boolean;
       basePrice?: number;
       perKmRate?: number;
+      perKgRate?: number;
       internationalBasePrice?: number;
       internationalPerKmRate?: number;
+      internationalPerKgRate?: number;
+      includedWeightKg?: number;
+      maxWeightKg?: number | null;
       estimatedDeliveryDaysMin?: number;
       estimatedDeliveryDaysMax?: number;
       internationalEnabled?: boolean;

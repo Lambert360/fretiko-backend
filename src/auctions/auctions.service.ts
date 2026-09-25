@@ -5,6 +5,14 @@ import { CreateAuctionDto, PlaceBidDto, AuctionFilterDto, UpdateProxyBidDto, Wat
 import { Auction, AuctionWithDetails, AuctionBid, AuctionCategory, AuctionCategoryWithStats, PublicBidHistoryItem, AuctionItem, AuctionItemWithDetails } from './entities';
 import { WalletService } from '../wallet/wallet.service';
 import { AuctionGateway } from './auction.gateway';
+import { PushNotificationService } from '../notifications/push-notification.service';
+import { EmailNotificationService } from '../notifications/email-notification.service';
+import {
+  auctionWonEmail,
+  auctionWinForfeitedEmail,
+  outbidEmail,
+} from '../notifications/email-templates';
+import { isAdultViewer } from '../shared/viewer-age';
 import ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -21,6 +29,8 @@ export class AuctionsService {
     private walletService: WalletService,
     @Inject(forwardRef(() => AuctionGateway))
     private auctionGateway: AuctionGateway,
+    private pushNotificationService: PushNotificationService,
+    private emailNotificationService: EmailNotificationService,
   ) {
     this.supabase = createSupabaseClient(this.configService);
     this.serviceSupabase = createServiceSupabaseClient(this.configService);
@@ -75,7 +85,20 @@ export class AuctionsService {
    * Get auctions with filtering and pagination
    */
   async findAuctions(filters: AuctionFilterDto, userId?: string): Promise<{ auctions: AuctionWithDetails[]; total: number }> {
+    // Vendor catalog visibility: hide auctions from unlisted sellers, and from
+    // adult-content sellers unless the viewer is 18+. A seller viewing their
+    // own auctions (my-auctions) bypasses both filters.
+    const isSelfList = !!filters.seller_id && filters.seller_id === userId;
+    const viewerIsAdult = isSelfList ? true : await isAdultViewer(this.serviceSupabase, userId);
+
     const applyFilters = (q: any) => {
+      if (!isSelfList) {
+        q = q.eq('seller_catalog_hidden', false);
+        if (!viewerIsAdult) {
+          q = q.eq('seller_is_adult_content', false);
+        }
+      }
+
       if (filters.search) {
         q = q.or(`title.ilike.%${filters.search}%,description.ilike.%${filters.search}%`);
       }
@@ -196,9 +219,13 @@ export class AuctionsService {
   }
 
   /**
-   * Get single auction by ID with full details
+   * Get single auction by ID with full details.
+   * `enforceAdultGate` should be true for public/detail endpoints: auctions by
+   * adult-content sellers then 403 for viewers who are not verified 18+.
+   * Unlisted (catalog_hidden) sellers still resolve — direct links work.
+   * Internal callers leave it false so seller/admin flows are unaffected.
    */
-  async findById(id: string, userId?: string): Promise<AuctionWithDetails> {
+  async findById(id: string, userId?: string, enforceAdultGate = false): Promise<AuctionWithDetails> {
     const { data, error } = await this.supabase
       .from('auction_summary')
       .select('*')
@@ -207,6 +234,18 @@ export class AuctionsService {
 
     if (error || !data) {
       throw new NotFoundException('Auction not found');
+    }
+
+    if (
+      enforceAdultGate &&
+      data.seller_is_adult_content &&
+      data.seller_id !== userId &&
+      !(await isAdultViewer(this.serviceSupabase, userId))
+    ) {
+      throw new ForbiddenException({
+        code: 'ADULT_CONTENT_RESTRICTED',
+        message: 'This content is restricted to viewers 18 and older',
+      });
     }
 
     // Add user-specific data if userId provided
@@ -842,12 +881,31 @@ export class AuctionsService {
   /**
    * Place a bid on an auction
    */
-  async placeBid(userId: string, placeBidDto: PlaceBidDto, userToken?: string): Promise<AuctionBid> {
+  async placeBid(
+    userId: string,
+    placeBidDto: PlaceBidDto,
+    userToken?: string,
+    bidContext?: { ipAddress?: string; userAgent?: string },
+  ): Promise<AuctionBid> {
     const client = userToken ? createUserSupabaseClient(this.configService, userToken) : this.supabase;
 
     // Get auction details
     const auction = await this.findById(placeBidDto.auction_id);
-    const itemId = auction.auction_type === 'live' ? (auction as any).current_item_id : null;
+
+    // Adult-content sellers: bids are purchase actions — require verified 18+.
+    if (
+      (auction as any).seller_is_adult_content &&
+      !(await isAdultViewer(this.serviceSupabase, userId))
+    ) {
+      throw new ForbiddenException({
+        code: 'ADULT_CONTENT_RESTRICTED',
+        message: 'This content is restricted to viewers 18 and older',
+      });
+    }
+
+    const itemId = auction.auction_type === 'live'
+      ? (placeBidDto.item_id || (auction as any).current_item_id)
+      : null;
 
     // Validate auction status
     if (auction.status !== 'active') {
@@ -859,8 +917,29 @@ export class AuctionsService {
       throw new BadRequestException('You cannot bid on your own auction');
     }
 
-    // Validate bid amount
-    const minimumBid = auction.current_bid + auction.bid_increment;
+    // For live auctions, validate against the current active item
+    let item: any = null;
+    if (auction.auction_type === 'live') {
+      if (!itemId) {
+        throw new BadRequestException('No active item in this live auction');
+      }
+
+      item = await this.getAuctionItem(itemId);
+      if (!item) {
+        throw new BadRequestException('Current auction item not found');
+      }
+      if (item.auction_id !== placeBidDto.auction_id) {
+        throw new BadRequestException('Item does not belong to this auction');
+      }
+      if (item.bidding_status !== 'active') {
+        throw new BadRequestException(`Bidding for this item is currently ${item.bidding_status}`);
+      }
+    }
+
+    // Validate bid amount against the item (live) or the auction (timed)
+    const currentBase = auction.auction_type === 'live' ? item.current_bid : auction.current_bid;
+    const currentIncrement = auction.auction_type === 'live' ? item.bid_increment : auction.bid_increment;
+    const minimumBid = currentBase + currentIncrement;
     if (placeBidDto.amount < minimumBid) {
       throw new BadRequestException(`Minimum bid is ${minimumBid} Freti`);
     }
@@ -878,8 +957,41 @@ export class AuctionsService {
     }
 
     const availableBalance = parseFloat(wallet.available_balance ?? 0);
-    if (availableBalance < walletCheckAmount) {
-      throw new BadRequestException(`Insufficient wallet balance to place this bid. Available: ₣${availableBalance.toFixed(2)}, required: ₣${walletCheckAmount.toFixed(2)}`);
+
+    // Outstanding commitments: bids the user is currently winning that have
+    // not settled into winner-time holds yet. Without this, the same balance
+    // could be pledged as the leading bid on every item in a live auction.
+    const NULL_UUID = '00000000-0000-0000-0000-000000000000';
+    const { data: liveCommitments } = await this.serviceSupabase
+      .from('auction_bids')
+      .select('amount, max_bid_amount, item_id, auction_items!inner(bidding_status)')
+      .eq('bidder_id', userId)
+      .eq('is_winning', true)
+      .eq('is_valid', true)
+      .not('item_id', 'is', null)
+      .in('auction_items.bidding_status', ['active', 'countdown', 'ended'])
+      .neq('item_id', itemId ?? NULL_UUID);
+
+    const { data: timedCommitments } = await this.serviceSupabase
+      .from('auction_bids')
+      .select('amount, max_bid_amount, auction_id, auctions!inner(status)')
+      .eq('bidder_id', userId)
+      .eq('is_winning', true)
+      .eq('is_valid', true)
+      .is('item_id', null)
+      .eq('auctions.status', 'active')
+      .neq('auction_id', placeBidDto.auction_id);
+
+    const outstanding = [...(liveCommitments || []), ...(timedCommitments || [])]
+      .reduce((sum, b: any) => sum + Math.max(parseFloat(b.amount) || 0, parseFloat(b.max_bid_amount) || 0), 0);
+
+    const effectiveAvailable = availableBalance - outstanding;
+    if (effectiveAvailable < walletCheckAmount) {
+      throw new BadRequestException(
+        `Insufficient wallet balance to place this bid. Available: ₣${availableBalance.toFixed(2)}` +
+        (outstanding > 0 ? ` (₣${outstanding.toFixed(2)} committed to your active winning bids)` : '') +
+        `, required: ₣${walletCheckAmount.toFixed(2)}`
+      );
     }
 
     // For proxy bids, validate max_bid_amount
@@ -919,6 +1031,10 @@ export class AuctionsService {
       bidderDisplayId = `Bidder #${bidderNumber}`;
     }
 
+    // Capture the current winning bidder before this bid replaces them
+    // (the bid trigger flips is_winning per auction/item scope)
+    const previousWinnerId = await this.getCurrentWinnerId(placeBidDto.auction_id, itemId);
+
     // Place the bid
     const bidData = {
       auction_id: placeBidDto.auction_id,
@@ -929,6 +1045,9 @@ export class AuctionsService {
       max_bid_amount: placeBidDto.max_bid_amount,
       is_proxy_bid: placeBidDto.bid_type === 'proxy',
       bidder_display_id: bidderDisplayId,
+      // Server-side request metadata for fraud detection — never client-supplied
+      ip_address: bidContext?.ipAddress ?? null,
+      user_agent: bidContext?.userAgent ?? null,
     };
 
     const { data, error } = await client
@@ -954,6 +1073,7 @@ export class AuctionsService {
       await this.auctionGateway.broadcastBidUpdate(placeBidDto.auction_id, {
         amount: data.amount,
         bidder_display_id: data.bidder_display_id,
+        item_id: data.item_id,
           current_bid: auctionStats.current_bid,
           total_bids: auctionStats.total_bids,
           unique_bidders: auctionStats.unique_bidders,
@@ -966,6 +1086,28 @@ export class AuctionsService {
       console.error(`[Auction ${placeBidDto.auction_id}] Error broadcasting bid update:`, error);
       // Don't throw - WebSocket broadcast failure shouldn't fail the bid
     }
+
+    // Notify the bidder this bid just outbid (persistent + real-time)
+    await this.notifyOutbidUser(
+      placeBidDto.auction_id,
+      previousWinnerId,
+      userId,
+      data.amount,
+      itemId,
+      auction.title,
+      auction.auction_type,
+    );
+
+    // Notify the host a new bid landed on their lot
+    await this.notifySellerOfBid(
+      placeBidDto.auction_id,
+      auction.seller_id,
+      auction.title,
+      data.amount,
+      data.bidder_display_id,
+      itemId,
+      auction.auction_type,
+    );
 
     // Process proxy bids for ANY bid type (both manual and proxy bids should trigger proxy processing)
     // This allows proxy bidders to counter-bid when other proxy bids are placed
@@ -1135,6 +1277,9 @@ export class AuctionsService {
     bidderDisplayId: string,
     proxyBidParentId: string,
   ): Promise<AuctionBid> {
+    // Capture the current winning bidder before this counter-bid replaces them
+    const previousWinnerId = await this.getCurrentWinnerId(auctionId, itemId);
+
     const bidData: any = {
       auction_id: auctionId,
       bidder_id: bidderId,
@@ -1175,13 +1320,172 @@ export class AuctionsService {
           watch_count: auctionStats.watch_count,
           is_winning: true,
           is_proxy_bid: true,
+          item_id: itemId,
         });
       }
     } catch (error) {
       console.error(`[Auction ${auctionId}] Error broadcasting proxy bid update:`, error);
     }
 
+    await this.notifyOutbidUser(auctionId, previousWinnerId, bidderId, amount, itemId);
+    await this.notifySellerOfBid(auctionId, undefined, undefined, amount, bidderDisplayId, itemId);
+
     return data;
+  }
+
+  /**
+   * The bidder currently holding the winning bid for an auction (timed) or
+   * an item (live). is_winning is maintained by the bid trigger in the same
+   * auction/item scope.
+   */
+  private async getCurrentWinnerId(auctionId: string, itemId: string | null): Promise<string | null> {
+    try {
+      let query = this.serviceSupabase
+        .from('auction_bids')
+        .select('bidder_id')
+        .eq('auction_id', auctionId)
+        .eq('is_valid', true)
+        .eq('is_winning', true);
+      query = itemId ? query.eq('item_id', itemId) : query.is('item_id', null);
+      const { data } = await query.limit(1).maybeSingle();
+      return data?.bidder_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Notify the auction host that a new bid landed on their lot — persistent
+   * notification row plus a real-time socket ping if they are connected.
+   * Fetches seller_id/title when not supplied (proxy counter-bid path).
+   */
+  private async notifySellerOfBid(
+    auctionId: string,
+    sellerId: string | undefined,
+    auctionTitle: string | undefined,
+    amount: number,
+    bidderDisplayId: string,
+    itemId: string | null,
+    auctionType?: string,
+  ): Promise<void> {
+    try {
+      let ownerId = sellerId;
+      let title = auctionTitle;
+      let type = auctionType;
+      if (!ownerId || !title || !type) {
+        const { data: a } = await this.serviceSupabase
+          .from('auctions')
+          .select('seller_id, title, auction_type')
+          .eq('id', auctionId)
+          .single();
+        ownerId = ownerId || a?.seller_id;
+        title = title || a?.title;
+        type = type || a?.auction_type;
+      }
+      if (!ownerId) return;
+
+      const label = title || 'your auction';
+      await this.supabase.from('notifications').insert({
+        user_id: ownerId,
+        type: 'new_bid',
+        title: '🔨 New Bid on Your Auction',
+        message: `${bidderDisplayId} bid ₣${amount.toFixed(2)} on "${label}".`,
+        data: { auction_id: auctionId, auction_type: type, item_id: itemId, amount },
+        created_at: new Date().toISOString(),
+      });
+
+      await this.auctionGateway.sendUserNotification(ownerId, {
+        type: 'new_bid',
+        title: 'New bid on your auction',
+        message: `${bidderDisplayId} bid ₣${amount.toFixed(2)} on "${label}"`,
+        auction_id: auctionId,
+        item_id: itemId,
+        amount,
+      });
+
+      await this.pushNotificationService.sendPushNotification(ownerId, {
+        title: 'New Bid on Your Auction',
+        body: `${bidderDisplayId} bid ₣${amount.toFixed(2)} on "${label}".`,
+        data: { type: 'new_bid', auction_id: auctionId, auction_type: type, item_id: itemId },
+      });
+    } catch (error) {
+      console.error(`Failed to send seller bid notification for auction ${auctionId}:`, error);
+    }
+  }
+
+  /**
+   * Notify a bidder that someone just outbid them — persistent notification
+   * row plus a real-time socket ping if they are connected.
+   */
+  private async notifyOutbidUser(
+    auctionId: string,
+    previousWinnerId: string | null,
+    newBidderId: string,
+    amount: number,
+    itemId: string | null,
+    auctionTitle?: string,
+    auctionType?: string,
+  ): Promise<void> {
+    if (!previousWinnerId || previousWinnerId === newBidderId) return;
+
+    try {
+      let title = auctionTitle;
+      let type = auctionType;
+      if (!title || !type) {
+        const { data: a } = await this.serviceSupabase
+          .from('auctions')
+          .select('title, auction_type')
+          .eq('id', auctionId)
+          .single();
+        title = title || a?.title || 'an auction';
+        type = type || a?.auction_type;
+      }
+
+      await this.supabase.from('notifications').insert({
+        user_id: previousWinnerId,
+        type: 'outbid',
+        title: '⚠️ You\'ve Been Outbid',
+        message: `Someone outbid you on "${title}" — the bid is now ₣${amount.toFixed(2)}.`,
+        data: { auction_id: auctionId, auction_type: type, item_id: itemId, amount },
+        created_at: new Date().toISOString(),
+      });
+
+      await this.auctionGateway.sendUserNotification(previousWinnerId, {
+        type: 'outbid',
+        title: "You've been outbid",
+        message: `The bid on "${title}" is now ₣${amount.toFixed(2)}`,
+        auction_id: auctionId,
+        item_id: itemId,
+        amount,
+      });
+
+      await this.pushNotificationService.sendPushNotification(previousWinnerId, {
+        title: "You've Been Outbid",
+        body: `Someone outbid you on "${title}" — the bid is now ₣${amount.toFixed(2)}.`,
+        data: { type: 'outbid', auction_id: auctionId, auction_type: type, item_id: itemId },
+      });
+
+      // Email is throttled to at most one per user per auction per 6h —
+      // hot bidding wars would otherwise flood inboxes.
+      await this.emailNotificationService.sendUserEmail(previousWinnerId, {
+        subject: `You've been outbid on "${title}"`,
+        category: 'auction',
+        reminder: {
+          type: 'outbid',
+          entityType: 'auction',
+          entityId: itemId || auctionId,
+        },
+        resendAfterHours: 6,
+        buildHtml: ({ name }) => outbidEmail({
+          name,
+          title: title || 'an auction',
+          amount,
+          appUrl: this.configService.get('FRONTEND_URL') || 'https://fretiko.com',
+        }),
+      });
+    } catch (error) {
+      console.error(`Failed to send outbid notification for auction ${auctionId}:`, error);
+    }
   }
 
   /**
@@ -1487,14 +1791,41 @@ export class AuctionsService {
    * Update proxy bid maximum amount
    */
   async updateProxyBid(userId: string, auctionId: string, maxBidAmount: number): Promise<any> {
-    // Find user's active proxy bid for this auction (highest max_bid_amount if multiple)
-    const { data: existingBids, error: findError } = await this.supabase
+    // Load auction and current item (for live) first so the query is scoped correctly
+    const auction = await this.findById(auctionId);
+    const itemId = auction.auction_type === 'live' ? (auction as any).current_item_id : null;
+
+    let item: any = null;
+    let currentBase = auction.current_bid;
+    let currentIncrement = auction.bid_increment;
+    if (auction.auction_type === 'live') {
+      if (!itemId) {
+        throw new BadRequestException('No active item in this live auction');
+      }
+      item = await this.getAuctionItem(itemId);
+      if (!item) {
+        throw new BadRequestException('Current auction item not found');
+      }
+      currentBase = item.current_bid;
+      currentIncrement = item.bid_increment;
+    }
+
+    // Find user's active proxy bid for the scoped item/auction
+    let bidsQuery = this.supabase
       .from('auction_bids')
       .select('*')
       .eq('auction_id', auctionId)
-      .eq('bidder_id', userId) // Fixed: was 'user_id', should be 'bidder_id'
+      .eq('bidder_id', userId)
       .eq('is_proxy_bid', true)
-      .eq('is_valid', true)
+      .eq('is_valid', true);
+
+    if (itemId) {
+      bidsQuery = bidsQuery.eq('item_id', itemId);
+    } else {
+      bidsQuery = bidsQuery.is('item_id', null);
+    }
+
+    const { data: existingBids, error: findError } = await bidsQuery
       .order('max_bid_amount', { ascending: false })
       .limit(1);
 
@@ -1504,29 +1835,33 @@ export class AuctionsService {
       throw new BadRequestException('No active proxy bid found for this auction. Place a proxy bid first.');
     }
 
-    const existingBid = existingBids[0];
-
     // Validate the new max_bid_amount is higher than current bid
-    const auction = await this.findById(auctionId);
-    if (maxBidAmount < auction.current_bid + auction.bid_increment) {
-      throw new BadRequestException(`Maximum bid amount must be at least ${auction.current_bid + auction.bid_increment} Freti (current bid + increment)`);
+    if (maxBidAmount < currentBase + currentIncrement) {
+      throw new BadRequestException(`Maximum bid amount must be at least ${currentBase + currentIncrement} Freti (current bid + increment)`);
     }
 
-    // Update the proxy bid's max_bid_amount
-    // Update all proxy bids from this user for this auction to keep them in sync
-    const { data, error } = await this.supabase
+    // Update the proxy bid's max_bid_amount scoped the same way
+    let updateQuery = this.supabase
       .from('auction_bids')
       .update({ max_bid_amount: maxBidAmount })
       .eq('auction_id', auctionId)
-      .eq('bidder_id', userId) // Fixed: was 'user_id', should be 'bidder_id'
+      .eq('bidder_id', userId)
       .eq('is_proxy_bid', true)
-      .eq('is_valid', true)
+      .eq('is_valid', true);
+
+    if (itemId) {
+      updateQuery = updateQuery.eq('item_id', itemId);
+    } else {
+      updateQuery = updateQuery.is('item_id', null);
+    }
+
+    const { data, error } = await updateQuery
       .select()
       .order('created_at', { ascending: false });
 
     if (error) throw error;
 
-    return { message: 'Proxy bid updated successfully', bid: data[0] };
+    return { message: 'Proxy bid updated successfully', bid: data?.[0] };
   }
 
   /**
@@ -1673,7 +2008,7 @@ export class AuctionsService {
       .eq('auction_id', auctionId)
       .eq('is_valid', true);
 
-    const uniqueBidders = [...new Set((bids || []).map(b => b.bidder_id))];
+    const uniqueBidders = [...new Set<string>((bids || []).map((b: { bidder_id: string }) => b.bidder_id))];
 
     // Send notifications to all bidders
     if (uniqueBidders.length > 0) {
@@ -1684,6 +2019,7 @@ export class AuctionsService {
         message: `Auction "${auction.title}" has been extended by ${extensionMinutes} minutes. Reason: ${reason}`,
         data: {
           auction_id: auctionId,
+          auction_type: auction.auction_type,
           extension_minutes: extensionMinutes,
           new_end_time: newEndTime.toISOString(),
           reason,
@@ -1691,6 +2027,16 @@ export class AuctionsService {
       }));
 
       await this.supabase.from('notifications').insert(notifications);
+
+      await Promise.all(
+        uniqueBidders.map(bidderId =>
+          this.pushNotificationService.sendPushNotification(bidderId, {
+            title: 'Auction Extended',
+            body: `"${auction.title}" has been extended by ${extensionMinutes} minutes.`,
+            data: { type: 'auction_extended', auction_id: auctionId, auction_type: auction.auction_type },
+          }),
+        ),
+      );
     }
 
     console.log(
@@ -1765,7 +2111,7 @@ export class AuctionsService {
       // Verify auction exists and is live type
       const { data: auction, error } = await this.serviceSupabase
         .from('auctions')
-        .select('seller_id, auction_type')
+        .select('seller_id, auction_type, status')
         .eq('id', auctionId)
         .single();
 
@@ -1775,6 +2121,10 @@ export class AuctionsService {
 
       if (auction.auction_type !== 'live') {
         throw new BadRequestException('This auction is not a live auction');
+      }
+
+      if (role === 'host' && ['ended', 'sold', 'cancelled'].includes(auction.status)) {
+        throw new BadRequestException('Cannot stream - auction has already ended');
       }
 
       if (auction.seller_id !== sellerId && role === 'host') {
@@ -1836,6 +2186,11 @@ export class AuctionsService {
         throw new ForbiddenException('Only auction owner can start broadcast');
       }
 
+      // Never resurrect an auction that has already ended
+      if (['ended', 'sold', 'cancelled'].includes(auction.status)) {
+        throw new BadRequestException('Cannot start broadcast - auction has already ended');
+      }
+
       // Update auction with stream_url and set status to active (using Agora channel name as identifier)
       const streamUrl = `agora://auction_${auctionId}`;
       console.log(`🎬 Starting broadcast for auction ${auctionId}, setting status to 'active'`);
@@ -1847,11 +2202,15 @@ export class AuctionsService {
           updated_at: new Date().toISOString(),
         })
         .eq('id', auctionId)
-        .select()
-        .single();
+        .in('status', ['scheduled', 'active']) // Guard against a concurrent end
+        .select();
 
       if (error) {
         throw new BadRequestException(`Failed to start broadcast: ${error.message}`);
+      }
+
+      if (!data || data.length === 0) {
+        throw new BadRequestException('Cannot start broadcast - auction has already ended');
       }
 
       // Broadcast stream URL update to all viewers
@@ -1903,6 +2262,171 @@ export class AuctionsService {
         throw error;
       }
       throw new BadRequestException('Failed to stop broadcast');
+    }
+  }
+
+  /**
+   * End a live auction.
+   * Marks the auction as ended, clears the stream, closes any active/countdown item,
+   * and broadcasts the end to all viewers.
+   */
+  async endLiveAuction(auctionId: string, sellerId: string): Promise<any> {
+    try {
+      // Verify auction exists and user is the seller
+      const auction = await this.findById(auctionId);
+
+      if (auction.seller_id !== sellerId) {
+        throw new ForbiddenException('Only auction owner can end the live auction');
+      }
+
+      const client = this.serviceSupabase;
+      const now = new Date().toISOString();
+
+      // Snapshot items still in play so we can settle each one properly.
+      // Includes 'ended' items: an item closed by endItemBidding whose
+      // mark_item_sold_atomic call never landed still has a winner that must
+      // get auction_sales/user_auction_wins rows to check out.
+      const { data: pendingItems } = await client
+        .from('auction_items')
+        .select('id, title, winner_id, winning_bid, starting_price, reserve_price')
+        .eq('auction_id', auctionId)
+        .in('bidding_status', ['active', 'countdown', 'ended']);
+
+      // Close any item currently being bid on
+      const { error: itemError } = await client
+        .from('auction_items')
+        .update({
+          bidding_status: 'ended',
+          updated_at: now,
+        })
+        .eq('auction_id', auctionId)
+        .in('bidding_status', ['active', 'countdown']);
+
+      if (itemError) {
+        console.error(`Error closing active items for auction ${auctionId}:`, itemError);
+        throw new BadRequestException(`Failed to close active auction items: ${itemError.message}`);
+      }
+
+      // Settle each pending item: items with a valid winning bid become real
+      // sales (auction_sales + user_auction_wins via the atomic RPC) so the
+      // winner can still check out; items without a valid bid are 'passed'.
+      for (const item of pendingItems || []) {
+        const hasWinner = item.winner_id && item.winning_bid >= item.starting_price;
+        const reserveMet = !item.reserve_price || (hasWinner && item.winning_bid >= item.reserve_price);
+
+        if (hasWinner && reserveMet) {
+          const { data: rpcResult, error: rpcError } = await client.rpc('mark_item_sold_atomic', {
+            p_auction_id: auctionId,
+            p_item_id: item.id,
+            p_seller_id: sellerId,
+          });
+
+          if (rpcError || !rpcResult?.success) {
+            // Leave the item 'ended' so a retry of endLiveAuction can still
+            // settle it — do not clobber the winner by marking it passed.
+            console.warn(
+              `endLiveAuction: could not settle item ${item.id} — ${rpcError?.message || rpcResult?.error}`,
+            );
+            continue;
+          }
+
+          await this.notifyForfeitedBidders(rpcResult.forfeited, auctionId, item.id, item.title);
+
+          // `outcome` is absent on the pre-228 RPC — anything that isn't an
+          // explicit 'passed' with a winner settles as a normal sale.
+          if (rpcResult.outcome !== 'passed' && rpcResult.winner_id) {
+            await this.auctionGateway.broadcastItemEvent(auctionId, item.id, 'item_sold', {
+              item_id: item.id,
+              item_title: item.title || 'Auction Item',
+              winner: {
+                bidder_display_id: await this.getWinnerDisplayId(auctionId, item.id, rpcResult.winner_id),
+                amount: rpcResult.winning_bid,
+              },
+              timestamp: now,
+            });
+
+            await this.notifyItemWinner(auctionId, item.id, item.title, rpcResult.winner_id, rpcResult.winning_bid);
+          }
+        } else {
+          await client
+            .from('auction_items')
+            .update({
+              bidding_status: 'passed',
+              winner_id: null,
+              winning_bid: null,
+              current_bid: item.starting_price,
+            })
+            .eq('id', item.id)
+            .eq('bidding_status', 'ended');
+        }
+      }
+
+      // Mark the auction as ended and remove the stream URL
+      const { data, error } = await client
+        .from('auctions')
+        .update({
+          status: 'ended',
+          end_time: now,
+          stream_url: null,
+          current_item_id: null,
+          updated_at: now,
+        })
+        .eq('id', auctionId)
+        .select()
+        .single();
+
+      if (error) {
+        throw new BadRequestException(`Failed to end live auction: ${error.message}`);
+      }
+
+      // Notify all clients that the stream and auction have ended
+      await this.auctionGateway.broadcastStreamUrlUpdate(auctionId, null);
+      await this.auctionGateway.broadcastAuctionStatusChange(auctionId, 'ended', {
+        timestamp: now,
+        ended_by: 'host',
+      });
+
+      return { message: 'Live auction ended successfully', auction: data };
+    } catch (error) {
+      if (error instanceof BadRequestException || error instanceof ForbiddenException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to end live auction');
+    }
+  }
+
+  /**
+   * Pause or resume the live broadcast for an auction.
+   * Emits a socket event so viewers can show a paused state.
+   */
+  async setBroadcastStatus(
+    auctionId: string,
+    sellerId: string,
+    status: 'paused' | 'live',
+  ): Promise<any> {
+    try {
+      if (status !== 'paused' && status !== 'live') {
+        throw new BadRequestException('Invalid broadcast status');
+      }
+
+      const auction = await this.findById(auctionId);
+
+      if (auction.seller_id !== sellerId) {
+        throw new ForbiddenException('Only auction owner can pause or resume the broadcast');
+      }
+
+      if (auction.status !== 'active') {
+        throw new BadRequestException('Broadcast status can only be changed while the auction is active');
+      }
+
+      await this.auctionGateway.broadcastBroadcastStatus(auctionId, status);
+
+      return { message: `Broadcast ${status === 'paused' ? 'paused' : 'resumed'} successfully`, broadcast_status: status };
+    } catch (error) {
+      if (error instanceof BadRequestException || error instanceof ForbiddenException) {
+        throw error;
+      }
+      throw new BadRequestException('Failed to update broadcast status');
     }
   }
 
@@ -2155,14 +2679,21 @@ export class AuctionsService {
       throw new BadRequestException('Item is not in waiting status');
     }
 
-    // Update item status to countdown
-    const { error } = await this.serviceSupabase
+    // Update item status to countdown, but only if it is still waiting.
+    const { data: updatedItem, error } = await this.serviceSupabase
       .from('auction_items')
       .update({
         bidding_status: 'countdown',
         countdown_started_at: new Date().toISOString(),
       })
-      .eq('id', itemId);
+      .eq('id', itemId)
+      .eq('bidding_status', 'waiting')
+      .select()
+      .maybeSingle();
+
+    if (!updatedItem) {
+      throw new BadRequestException('Item is not in waiting status or has already been started');
+    }
 
     if (error) {
       throw new BadRequestException('Failed to start countdown');
@@ -2199,21 +2730,27 @@ export class AuctionsService {
       throw new NotFoundException('Auction item not found');
     }
 
-    // Update item status to active
-    const { error } = await this.serviceSupabase
+    // Update item status to active only if it is in countdown or waiting.
+    // This makes the countdown -> open transition idempotent and prevents
+    // overwriting a sold/passed/ended item.
+    const { data: openedItem, error } = await this.serviceSupabase
       .from('auction_items')
       .update({
         bidding_status: 'active',
         bidding_started_at: new Date().toISOString(),
         current_bid: item.starting_price, // Reset to starting price
       })
-      .eq('id', itemId);
+      .eq('id', itemId)
+      .in('bidding_status', ['countdown', 'waiting'])
+      .select()
+      .maybeSingle();
 
-    if (error) {
-      throw new BadRequestException('Failed to open bidding');
+    if (!openedItem) {
+      throw new BadRequestException('Item is not ready to open or has already been processed');
     }
 
-    // Broadcast bidding open
+    // Broadcast bidding open — include media/order fields so clients that
+    // replace their current item with this payload keep the banner image
     await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'bidding_open', {
       item_id: itemId,
       item_title: item.title,
@@ -2221,6 +2758,9 @@ export class AuctionsService {
       minimum_bid: item.starting_price + item.bid_increment,
       bid_increment: item.bid_increment,
       duration: item.bidding_duration,
+      images: item.images,
+      video_url: item.video_url,
+      order_in_auction: item.order_in_auction,
       timestamp: new Date().toISOString(),
     });
 
@@ -2230,9 +2770,17 @@ export class AuctionsService {
   }
 
   /**
-   * End bidding for auction item (manual or automatic)
+   * End bidding for auction item (manual or automatic).
+   * Returns the settled outcome so the host can decide sold-vs-pass on the
+   * database's truth rather than client-side auction-wide counters.
    */
-  async endItemBidding(auctionId: string, itemId: string, sellerId: string): Promise<void> {
+  async endItemBidding(auctionId: string, itemId: string, sellerId: string): Promise<{
+    item_id: string;
+    bidding_status: string;
+    has_valid_bid: boolean;
+    winner_id: string | null;
+    winning_bid: number | null;
+  }> {
     // Verify auction ownership
     const auction = await this.findById(auctionId);
     if (!auction || auction.seller_id !== sellerId) {
@@ -2244,162 +2792,185 @@ export class AuctionsService {
       throw new NotFoundException('Auction item not found');
     }
 
-    if (item.bidding_status !== 'active') {
-      return; // Already ended
-    }
-
-    // Get highest bidder for this item (scoped to item_id)
-    const { data: highestBid, error: bidError } = await this.serviceSupabase
-      .from('auction_bids')
-      .select('bidder_id, amount, bidder_display_id')
-      .eq('auction_id', auctionId)
-      .eq('item_id', itemId)
-      .order('amount', { ascending: false })
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    const reserveMet = !item.reserve_price || (highestBid ? highestBid.amount >= item.reserve_price : false);
-    const hasValidBid = highestBid && highestBid.amount >= item.starting_price && reserveMet;
-    const winner = hasValidBid ? {
-      bidder_id: highestBid.bidder_id,
-      amount: highestBid.amount,
-      bidder_display_id: highestBid.bidder_display_id,
-    } : null;
-
-    // Update item status
-    const updateData: any = {
-      bidding_status: winner ? 'ended' : 'passed',
-      bidding_ended_at: new Date().toISOString(),
+    const outcomeFor = (it: any) => {
+      const hasWinner = !!it.winner_id && it.winning_bid >= it.starting_price;
+      const reserveMet = !it.reserve_price || (hasWinner && it.winning_bid >= it.reserve_price);
+      const hasValidBid = hasWinner && reserveMet;
+      return {
+        item_id: it.id,
+        bidding_status: it.bidding_status,
+        has_valid_bid: hasValidBid,
+        winner_id: hasValidBid ? it.winner_id : null,
+        winning_bid: hasValidBid ? it.winning_bid : null,
+      };
     };
 
-    if (winner) {
-      updateData.winner_id = winner.bidder_id;
-      updateData.winning_bid = winner.amount;
-      updateData.current_bid = winner.amount;
+    if (item.bidding_status !== 'active') {
+      return outcomeFor(item); // Already ended — report current state
     }
 
-    const { error } = await this.serviceSupabase
+    // Atomically close the item to 'ended' while it is still 'active'.
+    // The bid trigger has already maintained item.winner_id / winning_bid on every valid bid.
+    const { data: closedItem, error: closeError } = await this.serviceSupabase
       .from('auction_items')
-      .update(updateData)
-      .eq('id', itemId);
+      .update({
+        bidding_status: 'ended',
+        bidding_ended_at: new Date().toISOString(),
+      })
+      .eq('id', itemId)
+      .eq('bidding_status', 'active')
+      .select()
+      .maybeSingle();
 
-    if (error) {
+    if (closeError) {
       throw new BadRequestException('Failed to end bidding');
     }
 
-    // Broadcast bidding ended
+    if (!closedItem) {
+      // Another host already ended it between the read and the update
+      const fresh = await this.getAuctionItem(itemId);
+      return outcomeFor(fresh || item);
+    }
+
+    // Determine if the winning bid is valid: must have a winner, meet starting price, and meet reserve
+    const hasWinner = closedItem.winner_id && closedItem.winning_bid >= closedItem.starting_price;
+    const reserveMet = !closedItem.reserve_price || (hasWinner && closedItem.winning_bid >= closedItem.reserve_price);
+    const hasValidBid = !!(hasWinner && reserveMet);
+    let winner: any = null;
+    let finalBid = closedItem.starting_price;
+
+    if (hasValidBid) {
+      winner = {
+        bidder_display_id: await this.getWinnerDisplayId(auctionId, itemId, closedItem.winner_id),
+        amount: closedItem.winning_bid,
+      };
+      finalBid = closedItem.winning_bid;
+    } else {
+      // No valid sale — reset item to starting state for 'passed'
+      await this.serviceSupabase
+        .from('auction_items')
+        .update({
+          bidding_status: 'passed',
+          winner_id: null,
+          winning_bid: null,
+          current_bid: closedItem.starting_price,
+        })
+        .eq('id', itemId)
+        .eq('bidding_status', 'ended');
+    }
+
+    // Broadcast bidding ended — public payload carries the alias only
     await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'bidding_ended', {
       item_id: itemId,
       item_title: item.title,
       winner: winner,
-      final_bid: winner?.amount || item.starting_price,
-      item_sold: !!winner,
+      final_bid: finalBid,
+      item_sold: hasValidBid,
       timestamp: new Date().toISOString(),
     });
+
+    // Targeted ping to the winner so their client can show the win modal
+    // without the real user id ever reaching the public room
+    if (hasValidBid) {
+      await this.emitItemWon(auctionId, itemId, item.title, closedItem.winner_id, closedItem.winning_bid);
+    }
+
+    return {
+      item_id: itemId,
+      bidding_status: hasValidBid ? 'ended' : 'passed',
+      has_valid_bid: hasValidBid,
+      winner_id: hasValidBid ? closedItem.winner_id : null,
+      winning_bid: hasValidBid ? closedItem.winning_bid : null,
+    };
   }
 
   /**
    * Mark item as sold (auctioneer strikes gavel)
    */
   async markItemSold(auctionId: string, itemId: string, sellerId: string): Promise<void> {
-    // Verify auction ownership
-    const auction = await this.findById(auctionId);
-    if (!auction || auction.seller_id !== sellerId) {
-      throw new ForbiddenException('Only the auction seller can control items');
+    // Atomically mark the item as sold, create sale/win records, and advance to the next item
+    const { data: result, error } = await this.serviceSupabase
+      .rpc('mark_item_sold_atomic', {
+        p_auction_id: auctionId,
+        p_item_id: itemId,
+        p_seller_id: sellerId,
+      });
+
+    if (error) {
+      console.error('mark_item_sold_atomic RPC error:', error);
+      throw new BadRequestException(`Failed to mark item as sold: ${error.message}`);
+    }
+
+    const rpcResult = result as any;
+    if (!rpcResult || !rpcResult.success) {
+      throw new BadRequestException(`Failed to mark item as sold: ${rpcResult?.error || 'Unknown error'}`);
     }
 
     const item = await this.getAuctionItem(itemId);
-    if (!item || item.auction_id !== auctionId) {
-      throw new NotFoundException('Auction item not found');
-    }
+    const winnerId = rpcResult.winner_id;
+    const winningBid = rpcResult.winning_bid;
 
-    if (item.bidding_status !== 'ended') {
-      throw new BadRequestException('Item bidding must be ended before marking as sold');
-    }
+    // Notify any bidders whose holds failed during the settlement cascade
+    await this.notifyForfeitedBidders(rpcResult.forfeited, auctionId, itemId, item?.title);
 
-    // Update item status to sold
-    const { error } = await this.serviceSupabase
-      .from('auction_items')
-      .update({
-        bidding_status: 'sold',
-      })
-      .eq('id', itemId);
+    if (rpcResult.outcome === 'passed') {
+      // No bidder could cover the winning amount — the RPC passed the item.
+      // Resolve viewers with a no-winner event like a manual pass.
+      await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'bidding_ended', {
+        item_id: itemId,
+        item_title: item?.title || 'Auction Item',
+        winner: null,
+        item_sold: false,
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      // Broadcast item sold — public payload carries the alias only
+      const bidderDisplayId = winnerId
+        ? await this.getWinnerDisplayId(auctionId, itemId, winnerId)
+        : null;
 
-    if (error) {
-      throw new BadRequestException('Failed to mark item as sold');
-    }
+      await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'item_sold', {
+        item_id: itemId,
+        item_title: item?.title || 'Auction Item',
+        winner: winnerId ? {
+          bidder_display_id: bidderDisplayId,
+          amount: winningBid,
+        } : null,
+        timestamp: new Date().toISOString(),
+      });
 
-    // Save win and sale records if there's a winner
-    if (item.winner_id && item.winning_bid) {
-      try {
-        await this.saveAuctionWin(
-          item.winner_id,
-          auctionId,
-          item.winning_bid,
-          itemId,
-        );
-
-        // Create auction_sales record for this live item (idempotent)
-        const existingSale = await this.serviceSupabase
-          .from('auction_sales')
-          .select('id')
-          .eq('auction_id', auctionId)
-          .eq('item_id', itemId)
-          .eq('buyer_id', item.winner_id)
-          .maybeSingle();
-
-        if (!existingSale.data) {
-          const commissionRate = Number((auction as any).commission_rate ?? 0.10);
-          await this.serviceSupabase.from('auction_sales').insert({
-            auction_id: auctionId,
-            seller_id: auction.seller_id,
-            buyer_id: item.winner_id,
-            item_id: itemId,
-            final_bid_amount: item.winning_bid,
-            commission_amount: Number((item.winning_bid * commissionRate).toFixed(6)),
-            buyer_premium_amount: 0,
-            total_amount: item.winning_bid,
-            payment_status: 'pending',
-          });
-        }
-      } catch (error) {
-        console.error('Failed to save auction win/sale:', error);
+      // Persistent + push + targeted socket notification so the winner can
+      // check out even if they missed the live event
+      if (winnerId) {
+        await this.notifyItemWinner(auctionId, itemId, item?.title, winnerId, winningBid);
       }
     }
 
-    // Broadcast item sold
-    let bidderDisplayId = null;
-    if (item.winner_id) {
-      const { data: winnerBid } = await this.serviceSupabase
-        .from('auction_bids')
-        .select('bidder_display_id')
-        .eq('auction_id', auctionId)
-        .eq('item_id', itemId)
-        .eq('bidder_id', item.winner_id)
-        .order('amount', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      bidderDisplayId = winnerBid?.bidder_display_id || 'Winner';
+    // Broadcast the next item if one was queued
+    if (rpcResult.next_item_id) {
+      // The RPC returns only the next item's id/title/pricing/images — fetch
+      // the row for video_url and the authoritative order_in_auction
+      const nextItem = await this.getAuctionItem(rpcResult.next_item_id);
+      await this.auctionGateway.broadcastItemEvent(auctionId, rpcResult.next_item_id, 'item_ready', {
+        item_id: rpcResult.next_item_id,
+        item_title: rpcResult.next_item_title,
+        item_number: nextItem?.order_in_auction ?? (item?.order_in_auction || 0) + 1,
+        order_in_auction: nextItem?.order_in_auction,
+        starting_price: rpcResult.next_item_starting_price,
+        bid_increment: rpcResult.next_item_bid_increment,
+        minimum_bid: (Number(rpcResult.next_item_starting_price) || 0) + (Number(rpcResult.next_item_bid_increment) || 0),
+        images: rpcResult.next_item_images,
+        video_url: nextItem?.video_url,
+        total_items: undefined, // kept undefined to avoid inflating old clients
+        timestamp: new Date().toISOString(),
+      });
     }
-
-    await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'item_sold', {
-      item_id: itemId,
-      item_title: item.title,
-      winner: item.winner_id ? {
-        bidder_id: item.winner_id,
-        bidder_display_id: bidderDisplayId,
-        amount: item.winning_bid,
-      } : null,
-      timestamp: new Date().toISOString(),
-    });
-
-    // Load next item
-    await this.loadNextItem(auctionId, sellerId);
   }
 
   /**
-   * Skip/Pass item (no bids or reserve not met)
+   * Skip/Pass item (no bids or reserve not met).
+   * Passing an item is terminal — the item never comes back into the queue.
+   * Use deferItem to send a waiting item to the back instead.
    */
   async skipItem(auctionId: string, itemId: string, sellerId: string): Promise<void> {
     // Verify auction ownership
@@ -2408,26 +2979,297 @@ export class AuctionsService {
       throw new ForbiddenException('Only the auction seller can control items');
     }
 
+    if (auction.status !== 'active') {
+      throw new BadRequestException('Auction is not live');
+    }
+
     const item = await this.getAuctionItem(itemId);
     if (!item || item.auction_id !== auctionId) {
       throw new NotFoundException('Auction item not found');
     }
 
-    // Update item status to passed
-    const { error } = await this.serviceSupabase
-      .from('auction_items')
-      .update({
-        bidding_status: 'passed',
-        bidding_ended_at: new Date().toISOString(),
-      })
-      .eq('id', itemId);
-
-    if (error) {
-      throw new BadRequestException('Failed to skip item');
+    if (item.bidding_status === 'sold') {
+      throw new BadRequestException('Cannot skip an item that is already sold');
     }
 
-    // Load next item
+    if (item.bidding_status !== 'passed') {
+      // Close the item as passed and clear any stale winner state
+      const { error } = await this.serviceSupabase
+        .from('auction_items')
+        .update({
+          bidding_status: 'passed',
+          winner_id: null,
+          winning_bid: null,
+          current_bid: item.starting_price,
+          bidding_ended_at: new Date().toISOString(),
+        })
+        .eq('id', itemId)
+        .neq('bidding_status', 'sold');
+
+      if (error) {
+        throw new BadRequestException('Failed to skip item');
+      }
+
+      // If viewers could see this item (countdown/active/ended), resolve it
+      // with a no-winner event so they are not left on an open bid UI
+      if (['countdown', 'active', 'ended'].includes(item.bidding_status)) {
+        await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'bidding_ended', {
+          item_id: itemId,
+          item_title: item.title,
+          winner: null,
+          final_bid: item.starting_price,
+          item_sold: false,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+
+    // Load next item (idempotent — safe to call on an already-passed item to
+    // recover a stuck current_item_id pointer)
     await this.loadNextItem(auctionId, sellerId);
+  }
+
+  /**
+   * Defer a waiting item to the back of the queue, then load the next one.
+   * Unlike skipItem the item stays 'waiting' so it can come back later.
+   */
+  async deferItem(auctionId: string, itemId: string, sellerId: string): Promise<void> {
+    // Verify auction ownership
+    const auction = await this.findById(auctionId);
+    if (!auction || auction.seller_id !== sellerId) {
+      throw new ForbiddenException('Only the auction seller can control items');
+    }
+
+    if (auction.status !== 'active') {
+      throw new BadRequestException('Auction is not live');
+    }
+
+    const item = await this.getAuctionItem(itemId);
+    if (!item || item.auction_id !== auctionId) {
+      throw new NotFoundException('Auction item not found');
+    }
+
+    if (item.bidding_status !== 'waiting') {
+      throw new BadRequestException('Only waiting items can be deferred');
+    }
+
+    // Move to the back of the queue so the next waiting item is a different lot
+    const { data: lastItem } = await this.serviceSupabase
+      .from('auction_items')
+      .select('order_in_auction')
+      .eq('auction_id', auctionId)
+      .order('order_in_auction', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const { error } = await this.serviceSupabase
+      .from('auction_items')
+      .update({ order_in_auction: (lastItem?.order_in_auction ?? 0) + 1 })
+      .eq('id', itemId)
+      .eq('bidding_status', 'waiting');
+
+    if (error) {
+      throw new BadRequestException('Failed to defer item');
+    }
+
+    await this.loadNextItem(auctionId, sellerId);
+  }
+
+  /**
+   * Load a specific waiting item as the current item (host picks from queue).
+   */
+  async selectItem(auctionId: string, itemId: string, sellerId: string): Promise<void> {
+    // Verify auction ownership
+    const auction = await this.findById(auctionId);
+    if (!auction || auction.seller_id !== sellerId) {
+      throw new ForbiddenException('Only the auction seller can control items');
+    }
+
+    if (auction.status !== 'active') {
+      throw new BadRequestException('Auction is not live');
+    }
+
+    const item = await this.getAuctionItem(itemId);
+    if (!item || item.auction_id !== auctionId) {
+      throw new NotFoundException('Auction item not found');
+    }
+
+    if (item.bidding_status !== 'waiting') {
+      throw new BadRequestException('Only waiting items can be loaded');
+    }
+
+    const { error } = await this.serviceSupabase
+      .from('auctions')
+      .update({ current_item_id: itemId })
+      .eq('id', auctionId);
+
+    if (error) {
+      throw new BadRequestException('Failed to select item');
+    }
+
+    const { count } = await this.serviceSupabase
+      .from('auction_items')
+      .select('*', { count: 'exact', head: true })
+      .eq('auction_id', auctionId);
+
+    await this.auctionGateway.broadcastItemEvent(auctionId, itemId, 'item_ready', {
+      item_id: item.id,
+      item_title: item.title,
+      item_number: item.order_in_auction,
+      order_in_auction: item.order_in_auction,
+      total_items: count || 0,
+      starting_price: item.starting_price,
+      bid_increment: item.bid_increment,
+      images: item.images,
+      video_url: item.video_url,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Winning bidder's public alias for an item-scoped sale (best-effort).
+   */
+  private async getWinnerDisplayId(auctionId: string, itemId: string, winnerId: string): Promise<string> {
+    const { data: winnerBid } = await this.serviceSupabase
+      .from('auction_bids')
+      .select('bidder_display_id')
+      .eq('auction_id', auctionId)
+      .eq('item_id', itemId)
+      .eq('bidder_id', winnerId)
+      .order('amount', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    return winnerBid?.bidder_display_id || 'Winner';
+  }
+
+  /**
+   * Real-time "you won this item" ping — targeted to the winner's sockets
+   * only so the real user id never reaches the public room.
+   */
+  private async emitItemWon(
+    auctionId: string,
+    itemId: string,
+    itemTitle: string | undefined,
+    winnerId: string,
+    amount: number,
+  ): Promise<void> {
+    try {
+      await this.auctionGateway.sendUserNotification(winnerId, {
+        type: 'auction_item_won',
+        title: '🎉 You Won!',
+        message: `You won "${itemTitle || 'an item'}" for ₣${Number(amount).toFixed(2)}`,
+        auction_id: auctionId,
+        item_id: itemId,
+        item_title: itemTitle,
+        amount,
+      });
+    } catch (error) {
+      console.error(`Failed to emit item-won event for item ${itemId}:`, error);
+    }
+  }
+
+  /**
+   * Persistent + push + targeted socket winner notification for a settled
+   * live-auction item — mirrors the timed-auction winner notification so a
+   * winner who missed the socket event still discovers the win and can
+   * check out.
+   */
+  private async notifyItemWinner(
+    auctionId: string,
+    itemId: string,
+    itemTitle: string | undefined,
+    winnerId: string,
+    amount: number,
+  ): Promise<void> {
+    try {
+      await this.supabase.from('notifications').insert({
+        user_id: winnerId,
+        type: 'auction_won',
+        title: '🎉 Congratulations! You Won!',
+        message: `You won "${itemTitle || 'an auction item'}" for ₣${Number(amount).toFixed(2)}. Proceed to checkout to complete your purchase.`,
+        data: {
+          auction_id: auctionId,
+          item_id: itemId,
+          item_title: itemTitle,
+          winning_bid: amount,
+          action: 'checkout',
+        },
+        created_at: new Date().toISOString(),
+      });
+
+      await this.emitItemWon(auctionId, itemId, itemTitle, winnerId, amount);
+
+      await this.pushNotificationService.sendPushNotification(winnerId, {
+        title: 'Congratulations! You Won!',
+        body: `You won "${itemTitle || 'an auction item'}" for ₣${Number(amount).toFixed(2)}. Proceed to checkout to complete your purchase.`,
+        data: { type: 'auction_item_won', auction_id: auctionId, item_id: itemId, action: 'checkout' },
+      });
+
+      await this.emailNotificationService.sendUserEmail(winnerId, {
+        subject: `You won "${itemTitle || 'an auction item'}"!`,
+        category: 'auction',
+        reminder: { type: 'auction_won', entityType: 'auction_item', entityId: itemId },
+        buildHtml: ({ name }) => auctionWonEmail({
+          name,
+          title: itemTitle || 'an auction item',
+          amount,
+          // Live-item wins carry a 48h checkout window (migration 228)
+          expiresAt: new Date(Date.now() + 48 * 3600_000),
+          appUrl: this.configService.get('FRONTEND_URL') || 'https://fretiko.com',
+        }),
+      });
+    } catch (error) {
+      console.error(`Failed to notify winner for item ${itemId}:`, error);
+    }
+  }
+
+  /**
+   * Notify bidders whose win could not settle because their wallet hold
+   * failed during the settlement/promotion cascade.
+   */
+  private async notifyForfeitedBidders(
+    forfeited: Array<{ bidder_id: string; amount: number }> | undefined,
+    auctionId: string,
+    itemId: string | null,
+    itemTitle: string | undefined,
+  ): Promise<void> {
+    for (const entry of forfeited || []) {
+      if (!entry?.bidder_id) continue;
+      try {
+        await this.supabase.from('notifications').insert({
+          user_id: entry.bidder_id,
+          type: 'auction_win_forfeited',
+          title: 'Auction Win Forfeited',
+          message: `Your winning bid of ₣${Number(entry.amount).toFixed(2)} on "${itemTitle || 'an auction item'}" could not be completed — insufficient wallet balance. The item went to the next bidder.`,
+          data: {
+            auction_id: auctionId,
+            item_id: itemId,
+            item_title: itemTitle,
+            amount: entry.amount,
+          },
+          created_at: new Date().toISOString(),
+        });
+
+        await this.pushNotificationService.sendPushNotification(entry.bidder_id, {
+          title: 'Auction Win Forfeited',
+          body: `Your winning bid of ₣${Number(entry.amount).toFixed(2)} on "${itemTitle || 'an auction item'}" could not be completed — insufficient wallet balance.`,
+          data: { type: 'auction_win_forfeited', auction_id: auctionId, item_id: itemId },
+        });
+
+        await this.emailNotificationService.sendUserEmail(entry.bidder_id, {
+          subject: `Auction win forfeited — "${itemTitle || 'an auction item'}"`,
+          category: 'auction',
+          buildHtml: ({ name }) => auctionWinForfeitedEmail({
+            name,
+            title: itemTitle || 'an auction item',
+            amount: entry.amount,
+            appUrl: this.configService.get('FRONTEND_URL') || 'https://fretiko.com',
+          }),
+        });
+      } catch (error) {
+        console.error(`Failed to notify forfeited bidder ${entry.bidder_id}:`, error);
+      }
+    }
   }
 
   /**
@@ -2436,116 +3278,59 @@ export class AuctionsService {
   async loadNextItem(auctionId: string, sellerId: string): Promise<void> {
     const nextItem = await this.getNextWaitingItem(auctionId);
 
-    if (nextItem) {
-      // Update auction to set current item
-      const { error } = await this.serviceSupabase
-        .from('auctions')
-        .update({
-          current_item_id: nextItem.id,
-        })
-        .eq('id', auctionId);
-
-      if (error) {
-        throw new BadRequestException('Failed to load next item');
-      }
-
-      // Get total items count
-      const { count } = await this.serviceSupabase
-        .from('auction_items')
-        .select('*', { count: 'exact', head: true })
-        .eq('auction_id', auctionId);
-
-      // Broadcast next item ready
-      await this.auctionGateway.broadcastItemEvent(auctionId, null, 'item_ready', {
-        item_id: nextItem.id,
-        item_title: nextItem.title,
-        item_number: nextItem.order_in_auction,
-        total_items: count || 0,
-        starting_price: nextItem.starting_price,
-        bid_increment: nextItem.bid_increment,
-        images: nextItem.images,
-        timestamp: new Date().toISOString(),
-      });
-    } else {
+    if (!nextItem) {
       // No more items - auction remains active for live streaming
       console.log(`Auction ${auctionId}: All items sold, auction remains active for live streaming`);
+      return;
     }
-  }
 
-  /**
-   * End entire auction
-   */
-  private async endAuction(auctionId: string): Promise<void> {
-    const { error } = await this.serviceSupabase
+    // Advance current_item_id only if the auction is still pointing at the item
+    // we expect to replace. This makes concurrent skip/Advance safe.
+    const auction = await this.findById(auctionId);
+    const previousCurrentItemId = auction?.current_item_id || null;
+
+    let updateQuery = this.serviceSupabase
       .from('auctions')
       .update({
-        status: 'ended',
-        end_time: new Date().toISOString(),
+        current_item_id: nextItem.id,
       })
       .eq('id', auctionId);
 
-    if (error) {
-      console.error('Error ending auction:', error);
+    if (previousCurrentItemId) {
+      updateQuery = updateQuery.eq('current_item_id', previousCurrentItemId);
+    } else {
+      updateQuery = updateQuery.is('current_item_id', null);
     }
 
-    // Broadcast auction ended
-    await this.auctionGateway.broadcastAuctionStatusChange(auctionId, 'ended', {
+    const { data: updatedAuction, error } = await updateQuery
+      .select()
+      .maybeSingle();
+
+    if (error || !updatedAuction) {
+      // Another call already advanced the current item; do not broadcast again.
+      console.log(`Auction ${auctionId}: current_item_id already advanced, skipping broadcast`);
+      return;
+    }
+
+    // Get total items count
+    const { count } = await this.serviceSupabase
+      .from('auction_items')
+      .select('*', { count: 'exact', head: true })
+      .eq('auction_id', auctionId);
+
+    // Broadcast next item ready
+    await this.auctionGateway.broadcastItemEvent(auctionId, null, 'item_ready', {
+      item_id: nextItem.id,
+      item_title: nextItem.title,
+      item_number: nextItem.order_in_auction,
+      order_in_auction: nextItem.order_in_auction,
+      total_items: count || 0,
+      starting_price: nextItem.starting_price,
+      bid_increment: nextItem.bid_increment,
+      images: nextItem.images,
+      video_url: nextItem.video_url,
       timestamp: new Date().toISOString(),
     });
-  }
-
-  /**
-   * Save auction win to database (for both live and timed auctions)
-   */
-  async saveAuctionWin(
-    userId: string,
-    auctionId: string,
-    winningBid: number,
-    itemId?: string,
-  ): Promise<any> {
-    try {
-      // Check if win already exists (prevent duplicates)
-      const existingWin = await this.serviceSupabase
-        .from('user_auction_wins')
-        .select('id')
-        .eq('user_id', userId)
-        .eq('auction_id', auctionId)
-        .eq('item_id', itemId || null)
-        .in('status', ['pending_checkout', 'checked_out'])
-        .maybeSingle();
-
-      if (existingWin?.data) {
-        // Win already exists, return it
-        return existingWin.data;
-      }
-
-      // Create new win record
-      const { data, error } = await this.serviceSupabase
-        .from('user_auction_wins')
-        .insert({
-          user_id: userId,
-          auction_id: auctionId,
-          item_id: itemId || null,
-          winning_bid: winningBid,
-          status: 'pending_checkout',
-          expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), // 7 days
-        })
-        .select()
-        .single();
-
-      if (error) {
-        console.error('Error saving auction win:', error);
-        throw new BadRequestException(`Failed to save auction win: ${error.message}`);
-      }
-
-      return data;
-    } catch (error) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-      console.error('Unexpected error saving auction win:', error);
-      throw new BadRequestException('Failed to save auction win');
-    }
   }
 
   /**

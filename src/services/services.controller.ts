@@ -11,12 +11,32 @@ import {
   Request,
   UseInterceptors,
   UploadedFiles,
+  BadRequestException,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../auth/optional-jwt-auth.guard';
 import { ServicesService } from './services.service';
 import { CreateServiceDto, UpdateServiceDto } from './dto/service.dto';
+
+// Postgres NUMERIC accepts NaN — reject non-finite parses at the boundary.
+const parseOptionalFinite = (v: any): number | undefined => {
+  if (v === undefined || v === null || v === '') return undefined;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : undefined;
+};
+
+// FormData fields arrive as JSON strings; malformed input becomes a clean
+// 400 instead of an unhandled SyntaxError 500.
+const parseJsonField = <T = any>(v: any, field: string, fallback?: T): T | undefined => {
+  if (v === undefined || v === null || v === '') return fallback;
+  if (typeof v !== 'string') return v;
+  try {
+    return JSON.parse(v);
+  } catch {
+    throw new BadRequestException(`Invalid JSON in '${field}'`);
+  }
+};
 
 @Controller('services')
 export class ServicesController {
@@ -63,13 +83,16 @@ export class ServicesController {
   }
 
   @Get('user/:userId')
-  async getUserServices(@Param('userId') userId: string) {
+  @UseGuards(OptionalJwtAuthGuard)
+  async getUserServices(@Param('userId') userId: string, @Request() req) {
     console.log('🚚 Fetching services for user:', userId);
-    return this.servicesService.getServicesByUser(userId);
+    return this.servicesService.getPublicServicesByUser(userId, req.user?.sub || null);
   }
 
   @Get()
+  @UseGuards(OptionalJwtAuthGuard)
   async getServices(
+    @Request() req,
     @Query('category_id') categoryId?: string,
     @Query('search') search?: string,
     @Query('limit') limit?: string,
@@ -80,19 +103,22 @@ export class ServicesController {
       search,
       limit: limit ? parseInt(limit, 10) : undefined,
       offset: offset ? parseInt(offset, 10) : undefined,
+      viewerId: req.user?.sub || null,
     };
     return this.servicesService.getServices(queryOptions);
   }
 
   @Get(':id')
-  async getService(@Param('id') id: string) {
-    return this.servicesService.getService(id);
+  @UseGuards(OptionalJwtAuthGuard)
+  async getService(@Param('id') id: string, @Request() req) {
+    return this.servicesService.getService(id, req.user?.sub || null);
   }
 
   // Public endpoint: Get service preview for deep linking (no auth required)
   @Get('public/:id')
-  async getPublicService(@Param('id') id: string) {
-    return this.servicesService.getService(id);
+  @UseGuards(OptionalJwtAuthGuard)
+  async getPublicService(@Param('id') id: string, @Request() req) {
+    return this.servicesService.getService(id, req.user?.sub || null);
   }
 
   @Put(':id')
@@ -186,9 +212,11 @@ export class ServicesController {
       category_id: body.category_id,
       duration: body.duration,
       location: body.location,
+      location_latitude: parseOptionalFinite(body.location_latitude),
+      location_longitude: parseOptionalFinite(body.location_longitude),
       service_area: body.service_area,
-      availability: body.availability ? JSON.parse(body.availability) : { weekdays: false, weekends: false, evenings: false, emergency: false },
-      tags: body.tags ? JSON.parse(body.tags) : [],
+      availability: parseJsonField(body.availability, 'availability', { weekdays: false, weekends: false, evenings: false, emergency: false })!,
+      tags: parseJsonField(body.tags, 'tags', []),
       booking_type: body.booking_type,
       images: [], // Will be populated by the service
       videos: [], // Will be populated by the service

@@ -7,6 +7,7 @@ import { VideoProcessingHelper } from '../shared/video-processing.helper';
 import { TagsService } from '../tags/tags.service';
 import { MentionsService } from '../mentions/mentions.service';
 import { EmbeddingService } from '../ai/core/embedding.service';
+import { isAdultViewer } from '../shared/viewer-age';
 import ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -81,6 +82,25 @@ export class ProductsService {
       throw new BadRequestException(`Invalid category: ${createProductDto.category_id}`);
     }
 
+    // Weight required when courier delivery/shipping is enabled —
+    // multi-item products can satisfy it per-variant instead.
+    const shipsByCourier = !!createProductDto.shipping_options?.delivery
+      || !!createProductDto.shipping_options?.shipping;
+    if (shipsByCourier) {
+      const hasProductWeight = createProductDto.weight_kg != null && createProductDto.weight_kg > 0;
+      if (!hasProductWeight) {
+        const variants = createProductDto.variants ?? [];
+        const allVariantsWeighted = createProductDto.is_multi_item
+          && variants.length > 0
+          && variants.every((v: any) => (v.weight_kg ?? v.weightKg) != null && (v.weight_kg ?? v.weightKg) > 0);
+        if (!allVariantsWeighted) {
+          throw new BadRequestException(
+            'Product weight (kg) is required when delivery or shipping is enabled — logistics partners charge per kilogram.',
+          );
+        }
+      }
+    }
+
     // Prepare product data
     const productData = {
       user_id: userId,
@@ -89,6 +109,10 @@ export class ProductsService {
       description: createProductDto.description,
       price: createProductDto.price,
       quantity: createProductDto.quantity,
+      weight_kg: createProductDto.weight_kg ?? null,
+      length_cm: createProductDto.length_cm ?? null,
+      width_cm: createProductDto.width_cm ?? null,
+      height_cm: createProductDto.height_cm ?? null,
       condition: createProductDto.condition,
       images: createProductDto.images || [],
       primary_image_url: createProductDto.primary_image_url || createProductDto.images?.[0] || null,
@@ -96,6 +120,8 @@ export class ProductsService {
       primary_video_url: createProductDto.primary_video_url || null,
       media_type: createProductDto.media_type || 'image',
       location: createProductDto.location,
+      location_latitude: createProductDto.location_latitude ?? null,
+      location_longitude: createProductDto.location_longitude ?? null,
       shipping_options: createProductDto.shipping_options || { pickup: false, delivery: false, shipping: false },
       tags: createProductDto.tags || [],
       status: 'active',
@@ -137,12 +163,14 @@ export class ProductsService {
     return this.mapToProductResponse(data);
   }
 
-  async getProducts(query: ProductQueryDto): Promise<ProductResponseDto[]> {
+  async getProducts(query: ProductQueryDto, viewerId?: string | null): Promise<ProductResponseDto[]> {
+    const viewerIsAdult = await isAdultViewer(this.serviceSupabase, viewerId);
+
     let queryBuilder = this.supabase
       .from('products')
       .select(`
         *,
-        user_profiles!products_user_id_fkey (
+        user_profiles!products_user_id_fkey!inner (
           username,
           avatar_url,
           is_verified,
@@ -150,18 +178,41 @@ export class ProductsService {
         )
       `)
       .eq('status', 'active')
-      .is('deleted_at', null);
+      .is('deleted_at', null)
+      .eq('user_profiles.catalog_hidden', false);
+
+    if (!viewerIsAdult) {
+      queryBuilder = queryBuilder.eq('user_profiles.is_adult_content', false);
+    }
 
     if (query.category_id) {
       queryBuilder = queryBuilder.eq('category_id', query.category_id);
     }
 
     if (query.search) {
-      queryBuilder = queryBuilder.textSearch('search_vector', query.search);
+      queryBuilder = queryBuilder.textSearch('search_vector', query.search, { type: 'websearch' });
+    }
+    if (query.price_min !== undefined) {
+      queryBuilder = queryBuilder.gte('price', query.price_min);
+    }
+    if (query.price_max !== undefined) {
+      queryBuilder = queryBuilder.lte('price', query.price_max);
+    }
+    if (query.min_rating !== undefined) {
+      queryBuilder = queryBuilder.gte('average_rating', query.min_rating);
     }
 
+    const sortMap: Record<string, { column: string; ascending: boolean }> = {
+      price_asc: { column: 'price', ascending: true },
+      price_desc: { column: 'price', ascending: false },
+      rating: { column: 'average_rating', ascending: false },
+      popular: { column: 'view_count', ascending: false },
+      newest: { column: 'created_at', ascending: false },
+    };
+    const sort = sortMap[query.sort || 'newest'] || sortMap.newest;
+
     const { data, error } = await queryBuilder
-      .order('created_at', { ascending: false })
+      .order(sort.column, { ascending: sort.ascending })
       .range(query.offset || 0, (query.offset || 0) + (query.limit || 20) - 1);
 
     if (error) {
@@ -199,7 +250,43 @@ export class ProductsService {
     return (data || []).map(this.mapToProductResponse);
   }
 
-  async getTrendingProducts(limit: number = 10): Promise<ProductResponseDto[]> {
+  /**
+   * Public catalog for a vendor — used by GET /products/user/:userId.
+   * Unlike getMyProducts (owner view, all statuses), this returns only
+   * active listings and honors the vendor's catalog visibility flags.
+   */
+  async getPublicProductsByUser(userId: string, viewerId?: string | null, limit = 50, offset = 0): Promise<ProductResponseDto[]> {
+    const { data: vendor } = await this.serviceSupabase
+      .from('user_profiles')
+      .select('catalog_hidden, is_adult_content')
+      .eq('id', userId)
+      .single();
+
+    if (vendor?.catalog_hidden) return [];
+    if (vendor?.is_adult_content && !(await isAdultViewer(this.serviceSupabase, viewerId))) return [];
+
+    const safeLimit = Math.min(Math.max(limit || 50, 1), 100);
+    const safeOffset = Math.max(offset || 0, 0);
+
+    const { data, error } = await this.serviceSupabase
+      .from('products')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .is('deleted_at', null)
+      .order('created_at', { ascending: false })
+      .range(safeOffset, safeOffset + safeLimit - 1);
+
+    if (error) {
+      throw new Error(`Database error: ${error.message}`);
+    }
+
+    return (data || []).map(this.mapToProductResponse);
+  }
+
+  async getTrendingProducts(limit: number = 10, viewerId?: string | null): Promise<ProductResponseDto[]> {
+    const viewerIsAdult = await isAdultViewer(this.serviceSupabase, viewerId);
+
     // Use serviceSupabase to bypass RLS limitations for analytics view
     const { data: trendingData, error: trendingError } = await this.serviceSupabase
       .from('trending_products')
@@ -210,26 +297,26 @@ export class ProductsService {
     if (trendingError) {
       console.error('Error fetching trending products:', trendingError);
       // Fallback: return newest products if trending view fails
-      return this.getProducts({ limit, offset: 0 } as any);
+      return this.getProducts({ limit, offset: 0 } as any, viewerId);
     }
 
     if (!trendingData || trendingData.length === 0) {
       // No trending data yet – fallback to newest products
-      return this.getProducts({ limit, offset: 0 } as any);
+      return this.getProducts({ limit, offset: 0 } as any, viewerId);
     }
 
     const productIds: string[] = trendingData.map((row: any) => row.product_id).filter(Boolean);
 
     if (productIds.length === 0) {
-      return this.getProducts({ limit, offset: 0 } as any);
+      return this.getProducts({ limit, offset: 0 } as any, viewerId);
     }
 
     // Fetch full product records with vendor profile info
-    const { data, error } = await this.serviceSupabase
+    let productsQuery = this.serviceSupabase
       .from('products')
       .select(`
         *,
-        user_profiles!products_user_id_fkey (
+        user_profiles!products_user_id_fkey!inner (
           username,
           avatar_url,
           is_verified,
@@ -238,7 +325,14 @@ export class ProductsService {
       `)
       .in('id', productIds)
       .eq('status', 'active')
-      .is('deleted_at', null);
+      .is('deleted_at', null)
+      .eq('user_profiles.catalog_hidden', false);
+
+    if (!viewerIsAdult) {
+      productsQuery = productsQuery.eq('user_profiles.is_adult_content', false);
+    }
+
+    const { data, error } = await productsQuery;
 
     if (error) {
       console.error('Error fetching products for trending list:', error);
@@ -277,12 +371,13 @@ export class ProductsService {
     const candidatePoolSize = Math.max(200, (offset + limit) * 3);
 
     const userLocation = await this.getUserLocationForRanking(userId);
+    const viewerIsAdult = await isAdultViewer(this.serviceSupabase, userId);
 
     let queryBuilder = this.serviceSupabase
       .from('products')
       .select(`
         *,
-        user_profiles!products_user_id_fkey (
+        user_profiles!products_user_id_fkey!inner (
           id,
           username,
           avatar_url,
@@ -296,18 +391,24 @@ export class ProductsService {
           price,
           media_url,
           media_type,
-          sort_order
+          sort_order,
+          weight_kg
         )
       `)
       .eq('status', 'active')
       .gt('quantity', 0)
-      .is('deleted_at', null);
+      .is('deleted_at', null)
+      .eq('user_profiles.catalog_hidden', false);
+
+    if (!viewerIsAdult) {
+      queryBuilder = queryBuilder.eq('user_profiles.is_adult_content', false);
+    }
 
     if (query.category_id) {
       queryBuilder = queryBuilder.eq('category_id', query.category_id);
     }
     if (query.search) {
-      queryBuilder = queryBuilder.textSearch('search_vector', query.search);
+      queryBuilder = queryBuilder.textSearch('search_vector', query.search, { type: 'websearch' });
     }
     if (query.price_min !== undefined) {
       queryBuilder = queryBuilder.gte('price', query.price_min);
@@ -658,7 +759,7 @@ export class ProductsService {
     await this.serviceSupabase.from('product_events').insert(rows);
   }
 
-  async getProduct(id: string): Promise<ProductResponseDto> {
+  async getProduct(id: string, viewerId?: string | null): Promise<ProductResponseDto> {
     try {
       const { data, error } = await this.serviceSupabase
         .from('products')
@@ -667,7 +768,9 @@ export class ProductsService {
           user_profiles!products_user_id_fkey (
             username,
             avatar_url,
-            display_name
+            display_name,
+            catalog_hidden,
+            is_adult_content
           ),
           product_variants (
             id,
@@ -675,7 +778,8 @@ export class ProductsService {
             price,
             media_url,
             media_type,
-            sort_order
+            sort_order,
+            weight_kg
           )
         `)
         .eq('id', id)
@@ -695,12 +799,26 @@ export class ProductsService {
         throw new NotFoundException('Product not found');
       }
 
-      // Increment view count with null safety
-      const currentViewCount = data.view_count || 0;
-      await this.serviceSupabase
-        .from('products')
-        .update({ view_count: currentViewCount + 1 })
-        .eq('id', id);
+      // Unlisted catalogs still resolve via direct link (purchasable);
+      // adult-flagged catalogs require a verified 18+ viewer (owner exempt).
+      if (data.user_profiles?.is_adult_content && data.user_id !== viewerId) {
+        const viewerIsAdult = await isAdultViewer(this.serviceSupabase, viewerId);
+        if (!viewerIsAdult) {
+          throw new ForbiddenException({
+            code: 'ADULT_CONTENT_RESTRICTED',
+            message: 'This content is restricted to viewers 18 and older',
+          });
+        }
+      }
+
+      // Increment view count atomically in Postgres (migration 225) —
+      // read-modify-write lost increments under concurrent views.
+      const { error: viewCountError } = await this.serviceSupabase
+        .rpc('increment_view_count', { p_product_id: id });
+      if (viewCountError) {
+        // Counter failure must not fail the product fetch.
+        this.logger.warn(`increment_view_count failed for ${id}: ${viewCountError.message}`);
+      }
 
       return this.mapToProductResponse(data);
     } catch (error) {
@@ -708,7 +826,7 @@ export class ProductsService {
       if (error instanceof NotFoundException) {
         throw error;
       }
-      throw new Error(`Failed to fetch product: ${error.message}`);
+      throw new Error(`Failed to fetch product: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -716,7 +834,7 @@ export class ProductsService {
     // Verify product ownership using serviceSupabase
     const { data: product } = await this.serviceSupabase
       .from('products')
-      .select('user_id')
+      .select('user_id, status, weight_kg, is_multi_item, shipping_options, location')
       .eq('id', id)
       .single();
 
@@ -728,12 +846,46 @@ export class ProductsService {
       throw new ForbiddenException('You can only update your own products');
     }
 
+    // Moderation lock: 'removed' is set by staff rejection only — vendors may
+    // still edit fields but cannot change status (i.e. cannot undo moderation)
+    if (product.status === 'removed' && updateProductDto.status !== undefined) {
+      throw new ForbiddenException('This product was removed by moderation and cannot be reactivated');
+    }
+
+    // Weight enforcement: a product that offers courier delivery/shipping must
+    // have a weight — either on the product or on every variant. Check the
+    // *resulting* state (existing values + this update) so a vendor can't
+    // enable delivery on a weightless product or strip the weight afterwards.
+    const resultShipping = updateProductDto.shipping_options ?? product.shipping_options;
+    const resultWeight = updateProductDto.weight_kg ?? product.weight_kg;
+    const shipsByCourier = !!resultShipping?.delivery || !!resultShipping?.shipping;
+    if (shipsByCourier && !(resultWeight != null && resultWeight > 0)) {
+      let variantsCover = false;
+      if (product.is_multi_item) {
+        const { data: variantRows } = await this.serviceSupabase
+          .from('product_variants')
+          .select('weight_kg')
+          .eq('product_id', id);
+        variantsCover = !!variantRows?.length
+          && variantRows.every((v: any) => v.weight_kg != null && v.weight_kg > 0);
+      }
+      if (!variantsCover) {
+        throw new BadRequestException(
+          'Product weight (kg) is required when delivery or shipping is enabled — logistics partners charge per kilogram.',
+        );
+      }
+    }
+
     // Prepare update data
     const updateData: any = {};
     if (updateProductDto.name !== undefined) updateData.name = updateProductDto.name;
     if (updateProductDto.description !== undefined) updateData.description = updateProductDto.description;
     if (updateProductDto.price !== undefined) updateData.price = updateProductDto.price;
     if (updateProductDto.quantity !== undefined) updateData.quantity = updateProductDto.quantity;
+    if (updateProductDto.weight_kg !== undefined) updateData.weight_kg = updateProductDto.weight_kg;
+    if (updateProductDto.length_cm !== undefined) updateData.length_cm = updateProductDto.length_cm;
+    if (updateProductDto.width_cm !== undefined) updateData.width_cm = updateProductDto.width_cm;
+    if (updateProductDto.height_cm !== undefined) updateData.height_cm = updateProductDto.height_cm;
     if (updateProductDto.condition !== undefined) updateData.condition = updateProductDto.condition;
     if (updateProductDto.category_id !== undefined) updateData.category_id = updateProductDto.category_id;
     if (updateProductDto.images !== undefined) {
@@ -741,6 +893,18 @@ export class ProductsService {
       updateData.primary_image_url = updateProductDto.images[0] || null;
     }
     if (updateProductDto.location !== undefined) updateData.location = updateProductDto.location;
+    if (updateProductDto.location_latitude !== undefined) updateData.location_latitude = updateProductDto.location_latitude;
+    if (updateProductDto.location_longitude !== undefined) updateData.location_longitude = updateProductDto.location_longitude;
+    // Location text changed without new coords → stale coords are worse than none
+    if (
+      updateProductDto.location !== undefined
+      && updateProductDto.location !== product.location
+      && updateProductDto.location_latitude === undefined
+      && updateProductDto.location_longitude === undefined
+    ) {
+      updateData.location_latitude = null;
+      updateData.location_longitude = null;
+    }
     if (updateProductDto.shipping_options !== undefined) updateData.shipping_options = updateProductDto.shipping_options;
     if (updateProductDto.tags !== undefined) updateData.tags = updateProductDto.tags;
     if (updateProductDto.status !== undefined) updateData.status = updateProductDto.status;
@@ -810,7 +974,7 @@ export class ProductsService {
     }
   }
 
-  async getSeasonalProducts(limit: number = 12, region?: string): Promise<ProductResponseDto[]> {
+  async getSeasonalProducts(limit: number = 12, region?: string, viewerId?: string | null): Promise<ProductResponseDto[]> {
     // Basic seasonal implementation based on current date and product tags/categories.
     // This keeps logic in code while still auto-selecting appropriate products.
     const now = new Date();
@@ -843,12 +1007,14 @@ export class ProductsService {
       activeLabels.push('harmattan');
     }
 
+    const viewerIsAdult = await isAdultViewer(this.serviceSupabase, viewerId);
+
     // Fetch a wider pool of active products to score in memory
-    const { data, error } = await this.serviceSupabase
+    let seasonalQuery = this.serviceSupabase
       .from('products')
       .select(`
         *,
-        user_profiles!products_user_id_fkey (
+        user_profiles!products_user_id_fkey!inner (
           username,
           avatar_url,
           is_verified,
@@ -857,12 +1023,18 @@ export class ProductsService {
       `)
       .eq('status', 'active')
       .is('deleted_at', null)
-      .limit(200);
+      .eq('user_profiles.catalog_hidden', false);
+
+    if (!viewerIsAdult) {
+      seasonalQuery = seasonalQuery.eq('user_profiles.is_adult_content', false);
+    }
+
+    const { data, error } = await seasonalQuery.limit(200);
 
     if (error) {
       console.error('Error fetching products for seasonal list:', error);
       // Fallback to trending if seasonal fails
-      return this.getTrendingProducts(limit);
+      return this.getTrendingProducts(limit, viewerId);
     }
 
     const seasonalKeywords = activeLabels.map(l => l.toLowerCase());
@@ -908,7 +1080,7 @@ export class ProductsService {
 
     if (filtered.length === 0) {
       // If nothing matches seasonal context, fall back to trending
-      return this.getTrendingProducts(limit);
+      return this.getTrendingProducts(limit, viewerId);
     }
 
     const top = filtered
@@ -964,6 +1136,43 @@ export class ProductsService {
     }
   }
 
+  /**
+   * Whether the user may review this product: must have purchased and received
+   * it, and not already reviewed. Mirrors the gate in addProductReview so the
+   * client can hide/disable the review form upfront instead of failing on submit.
+   */
+  async getReviewEligibility(productId: string, userId: string) {
+    const { data: product } = await this.serviceSupabase
+      .from('products')
+      .select('id')
+      .eq('id', productId)
+      .single();
+
+    if (!product) {
+      throw new NotFoundException('Product not found');
+    }
+
+    const { data: purchased } = await this.serviceSupabase
+      .from('order_items')
+      .select('id, orders!inner(buyer_id, status)')
+      .eq('product_id', productId)
+      .eq('orders.buyer_id', userId)
+      .in('orders.status', ['delivered', 'completed'])
+      .limit(1);
+
+    const { data: existingReview } = await this.serviceSupabase
+      .from('product_ratings')
+      .select('id')
+      .eq('product_id', productId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    const hasPurchased = (purchased?.length ?? 0) > 0;
+    const hasReviewed = !!existingReview;
+
+    return { canReview: hasPurchased && !hasReviewed, hasPurchased, hasReviewed };
+  }
+
   async addProductReview(productId: string, userId: string, reviewData: { rating: number; comment: string }, userToken?: string) {
     // Use serviceSupabase - user tokens can't be used for DB operations
 
@@ -981,6 +1190,22 @@ export class ProductsService {
 
     if (!product) {
       throw new NotFoundException('Product not found');
+    }
+
+    // Purchase gate: only buyers who actually received the product may review
+    // it. order_items.product_id + orders.buyer_id is authoritative.
+    // Note: gift recipients aren't orders.buyer_id holders — they can't
+    // review gifts they received (documented limitation).
+    const { data: purchased } = await this.serviceSupabase
+      .from('order_items')
+      .select('id, orders!inner(buyer_id, status)')
+      .eq('product_id', productId)
+      .eq('orders.buyer_id', userId)
+      .in('orders.status', ['delivered', 'completed'])
+      .limit(1);
+
+    if (!purchased || purchased.length === 0) {
+      throw new ForbiddenException('You can only review products you have purchased and received');
     }
 
     // Check if user already reviewed this product
@@ -1087,6 +1312,31 @@ export class ProductsService {
 
       if (!userProfile?.is_seller) {
         throw new ForbiddenException('Only sellers can create products');
+      }
+
+      // Weight is required when courier delivery/shipping is enabled —
+      // logistics partners price per kilogram. For multi-item products every
+      // variant needs its own weight, or a product-level weight as fallback.
+      // (The multipart upload path bypasses ValidationPipe, so enforce here.)
+      const shipsByCourier = !!productData.shipping_options?.delivery
+        || !!productData.shipping_options?.shipping;
+      if (shipsByCourier) {
+        const hasProductWeight = productData.weight_kg != null && productData.weight_kg > 0;
+        if (productData.is_multi_item) {
+          const variants = productData.variants ?? [];
+          const missingWeight = variants.some(
+            (v: any) => !hasProductWeight && !(v.weight_kg ?? v.weightKg),
+          );
+          if (missingWeight || (!hasProductWeight && variants.length === 0)) {
+            throw new BadRequestException(
+              'Weight (kg) is required for items delivered by courier — it drives the delivery price shown to buyers.',
+            );
+          }
+        } else if (!hasProductWeight) {
+          throw new BadRequestException(
+            'Product weight (kg) is required when delivery or shipping is enabled — logistics partners charge per kilogram.',
+          );
+        }
       }
 
       let imageUrls: string[] = [];
@@ -1281,6 +1531,7 @@ export class ProductsService {
             product_id: product.id,
             name: variant.name,
             price: variant.price,
+            weight_kg: variant.weight_kg ?? variant.weightKg ?? null,
             media_url: mediaUrl,
             media_type: variant.mediaType,
             sort_order: index,
@@ -1323,7 +1574,8 @@ export class ProductsService {
               price,
               media_url,
               media_type,
-              sort_order
+              sort_order,
+              weight_kg
             )
           `)
           .eq('id', product.id)
@@ -1466,6 +1718,10 @@ export class ProductsService {
       description: data.description,
       price: parseFloat(data.price) || 0,
       quantity: data.quantity,
+      weight_kg: data.weight_kg != null ? parseFloat(data.weight_kg) : undefined,
+      length_cm: data.length_cm != null ? parseFloat(data.length_cm) : undefined,
+      width_cm: data.width_cm != null ? parseFloat(data.width_cm) : undefined,
+      height_cm: data.height_cm != null ? parseFloat(data.height_cm) : undefined,
       condition: data.condition,
       images: data.images || [],
       primary_image_url: data.primary_image_url,
@@ -1475,6 +1731,8 @@ export class ProductsService {
       primary_video_url: data.primary_video_url,
       media_type: data.media_type || 'image',
       location: data.location,
+      location_latitude: data.location_latitude ?? undefined,
+      location_longitude: data.location_longitude ?? undefined,
       shipping_options: data.shipping_options,
       tags: data.tags || [],
       status: data.status,
@@ -1489,6 +1747,7 @@ export class ProductsService {
               media_url: v.media_url,
               media_type: v.media_type,
               sort_order: v.sort_order || 0,
+              weight_kg: v.weight_kg != null ? parseFloat(v.weight_kg) : undefined,
             }))
         : undefined,
       is_featured: data.is_featured,

@@ -35,6 +35,13 @@ import {
   TransactionType,
 } from './dto/live-sales.dto';
 import { LiveSalesGamificationService } from './live-sales-gamification.service';
+import { isAdultViewer } from '../shared/viewer-age';
+import {
+  chargeableWeightKg,
+  recomputeInterstateDeliveryFee,
+  recomputeRiderDeliveryFee,
+} from '../shared/delivery-pricing';
+import { hasCoords, roadDistanceKm } from '../shared/geo';
 
 /**
  * Live Sales Service
@@ -149,11 +156,34 @@ export class LiveSalesService {
   // =====================
 
   /**
+   * Throws 403 when the vendor is adult-flagged and the viewer is not
+   * verified 18+. Used on direct-link, join, and purchase paths.
+   * Unlisted (catalog_hidden) vendors are NOT gated here — link-only
+   * catalogs remain accessible and purchasable via direct links.
+   */
+  private async assertAdultAccess(
+    vendor: { is_adult_content?: boolean } | null | undefined,
+    userId?: string | null,
+    vendorId?: string,
+  ): Promise<void> {
+    // The vendor is never gated from their own stream
+    if (vendorId && vendorId === userId) return;
+    if (vendor?.is_adult_content && !(await isAdultViewer(this.supabase, userId))) {
+      throw new ForbiddenException({
+        code: 'ADULT_CONTENT_RESTRICTED',
+        message: 'This content is restricted to viewers 18 and older',
+      });
+    }
+  }
+
+  /**
    * Get live streams from users the current user is connected to (plugged)
    * Returns streams from connected vendors sorted by recency
    */
   async getPluggedVendorsStreams(userId: string, limit = 10): Promise<LiveStreamResponse[]> {
     try {
+      const viewerIsAdult = await isAdultViewer(this.supabase, userId);
+
       // First get the connected vendor IDs
       const { data: connections, error: connectionsError } = await this.supabase
         .from('user_connections')
@@ -170,7 +200,8 @@ export class LiveSalesService {
       const connectedVendorIds = connections.map(c => c.addressee_id);
 
       // Then get live streams from connected vendors
-      const { data, error } = await this.supabase
+      // (!inner vendor join + flag filters: unlisted/18+ catalogs stay off feed surfaces)
+      let query = this.supabase
         .from('live_stream_stats')
         .select(`
           id,
@@ -188,7 +219,7 @@ export class LiveSalesService {
           total_gifts,
           created_at,
           started_at,
-          vendor:user_profiles!vendor_id (
+          vendor:user_profiles!vendor_id!inner (
             id,
             username,
             avatar_url,
@@ -197,9 +228,16 @@ export class LiveSalesService {
           )
         `)
         .eq('status', 'live')
+        .eq('vendor.catalog_hidden', false)
         .in('vendor_id', connectedVendorIds)
         .order('started_at', { ascending: false })
         .limit(limit);
+
+      if (!viewerIsAdult) {
+        query = query.eq('vendor.is_adult_content', false);
+      }
+
+      const { data, error } = await query;
 
       if (error) throw error;
 
@@ -214,8 +252,10 @@ export class LiveSalesService {
    * Get all active live streams for discovery feed
    * Returns streams sorted by viewer count and recency, excluding plugged vendors if requested
    */
-  async getActiveStreams(limit = 20, offset = 0, excludePluggedVendors = false, userId?: string): Promise<LiveStreamResponse[]> {
+  async getActiveStreams(limit = 20, offset = 0, excludePluggedVendors = false, userId?: string, search?: string): Promise<LiveStreamResponse[]> {
     try {
+      const viewerIsAdult = await isAdultViewer(this.supabase, userId);
+
       let query = this.supabase
         .from('live_stream_stats')
         .select(`
@@ -237,7 +277,7 @@ export class LiveSalesService {
           stream_url,
           created_at,
           started_at,
-          vendor:user_profiles!vendor_id (
+          vendor:user_profiles!vendor_id!inner (
             id,
             username,
             avatar_url,
@@ -245,7 +285,24 @@ export class LiveSalesService {
             display_name
           )
         `)
-        .eq('status', StreamStatus.LIVE);
+        .eq('status', StreamStatus.LIVE)
+        .eq('vendor.catalog_hidden', false);
+
+      // Search live streams by title or vendor username/display name.
+      // The vendor embed is !inner so embedded-column filters apply to rows.
+      const searchTerm = search
+        ?.trim()
+        .slice(0, 80)
+        .replace(/[%(),."'\\]/g, '');
+      if (searchTerm) {
+        query = query.or(
+          `title.ilike.%${searchTerm}%,vendor.username.ilike.%${searchTerm}%,vendor.display_name.ilike.%${searchTerm}%`,
+        );
+      }
+
+      if (!viewerIsAdult) {
+        query = query.eq('vendor.is_adult_content', false);
+      }
 
       // Exclude plugged vendors if requested
       if (excludePluggedVendors && userId) {
@@ -305,7 +362,8 @@ export class LiveSalesService {
             avatar_url,
             is_verified,
             display_name,
-            location
+            location,
+            is_adult_content
           )
         `)
         .eq('id', streamId)
@@ -314,6 +372,9 @@ export class LiveSalesService {
       if (streamError || !stream) {
         throw new NotFoundException('Live stream not found');
       }
+
+      // Direct links to unlisted catalogs still resolve; adult catalogs are 18+ only
+      await this.assertAdultAccess(stream.vendor as any, userId, stream.vendor_id);
 
       // Get stream products if it's a product stream
       let products = [];
@@ -346,6 +407,25 @@ export class LiveSalesService {
         }
       }
 
+      // Get stream services if it's a services stream
+      let services = [];
+      if (stream.stream_type === StreamType.SERVICES) {
+        const { data: serviceData, error: serviceError } = await this.supabase
+          .from('live_stream_services')
+          .select(`
+            id,
+            service_id,
+            live_price,
+            available_slots,
+            service:services!service_id (*)
+          `)
+          .eq('stream_id', streamId);
+
+        if (!serviceError) {
+          services = serviceData || [];
+        }
+      }
+
       // Track viewer join if userId provided
       if (userId && stream.status === StreamStatus.LIVE) {
         await this.joinStream(streamId, userId, undefined); // No accessToken available in this context
@@ -354,6 +434,7 @@ export class LiveSalesService {
       return {
         ...stream,
         products,
+        services,
       };
     } catch (error) {
       this.logEvent('error', 'fetch_stream_failed', {
@@ -457,6 +538,61 @@ export class LiveSalesService {
             vendorId,
             productCount: productsToInsert.length,
           });
+        }
+      }
+
+      // Add services if provided (services-type streams)
+      if (createStreamDto.services && createStreamDto.services.length > 0) {
+        // NOTE: only stream_id/service_id/live_price are set — the
+        // available_slots JSONB / booking_window columns belong to the
+        // dormant slot-booking machinery (p_skip_slot_booking is always true).
+        const servicesToInsert = createStreamDto.services.map((service) => ({
+          stream_id: stream.id,
+          service_id: service.service_id,
+          live_price: service.live_price,
+        }));
+
+        const { error: serviceError } = await this.supabase
+          .from('live_stream_services')
+          .insert(servicesToInsert);
+
+        if (serviceError) {
+          this.logEvent('error', 'error_adding_services_to_stream', {
+            streamId: stream.id,
+            vendorId,
+            error: serviceError.message,
+          });
+          // Don't throw here, just log the error
+        } else {
+          this.logEvent('log', 'services_added_successfully', {
+            streamId: stream.id,
+            vendorId,
+            serviceCount: servicesToInsert.length,
+          });
+        }
+      }
+
+      // Add availability time slots if provided (services-type streams)
+      if (createStreamDto.time_slots && createStreamDto.time_slots.length > 0) {
+        const slotsToInsert = createStreamDto.time_slots.map((slot) => ({
+          stream_id: stream.id,
+          date: slot.date,
+          start_time: slot.start_time,
+          end_time: slot.end_time,
+          duration_minutes: slot.duration_minutes,
+        }));
+
+        const { error: slotsError } = await this.supabase
+          .from('live_time_slots')
+          .insert(slotsToInsert);
+
+        if (slotsError) {
+          this.logEvent('error', 'error_adding_time_slots_to_stream', {
+            streamId: stream.id,
+            vendorId,
+            error: slotsError.message,
+          });
+          // Don't throw here, just log the error
         }
       }
 
@@ -698,7 +834,7 @@ export class LiveSalesService {
 
       const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
-        .select('status, vendor_id')
+        .select('status, vendor_id, vendor:user_profiles!vendor_id (is_adult_content)')
         .eq('id', streamId)
         .single();
 
@@ -713,6 +849,9 @@ export class LiveSalesService {
         this.logger.log(`Host ${userId} joining their own stream; not tracking as viewer`);
         return;
       }
+
+      // Adult-content vendors: joining requires verified 18+
+      await this.assertAdultAccess(stream.vendor as any, userId, stream.vendor_id);
 
       // ✅ RETRY LOGIC: Handle race condition between updateStreamStatus and joinStream
       if (stream.status !== StreamStatus.LIVE && retryCount < 3) {
@@ -1010,13 +1149,15 @@ export class LiveSalesService {
       // 1. Get stream details and verify it's live
       const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
-        .select('vendor_id, status, title')
+        .select('vendor_id, status, title, vendor:user_profiles!vendor_id (is_adult_content)')
         .eq('id', sendGiftDto.stream_id)
         .single();
 
       if (streamError || !stream) {
         throw new NotFoundException('Live stream not found');
       }
+
+      await this.assertAdultAccess(stream.vendor as any, userId, stream.vendor_id);
 
       if (stream.status !== 'live') {
         throw new BadRequestException('Cannot send gifts to inactive streams');
@@ -1027,11 +1168,14 @@ export class LiveSalesService {
       }
 
       // 2. Get gift type details
+      // Only include id.eq when the value is actually a UUID — PostgREST
+      // 400s on `id.eq.<non-uuid>`, which would break name-based lookups.
       let giftType: any = null;
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sendGiftDto.gift_type);
       const { data: giftTypeRow } = await this.supabase
         .from('gift_types')
         .select('id, name, base_value, is_active')
-        .or(`name.eq.${sendGiftDto.gift_type},id.eq.${sendGiftDto.gift_type}`)
+        .or(isUuid ? `name.eq.${sendGiftDto.gift_type},id.eq.${sendGiftDto.gift_type}` : `name.eq.${sendGiftDto.gift_type}`)
         .eq('is_active', true)
         .single();
 
@@ -1123,12 +1267,17 @@ export class LiveSalesService {
 
       const giftTransaction = giftResult.gift;
 
-      // 9. Log analytics
-      await this.logAnalytics(sendGiftDto.stream_id, 'gift_sent', totalCost, {
+      // 9. Log analytics — 'gift' rows carry the quantity, 'gift_value' rows
+      // carry the monetary amount (reader treats them separately).
+      await this.logAnalytics(sendGiftDto.stream_id, 'gift', sendGiftDto.quantity || 1, {
         sender_id: userId,
         gift_type: sendGiftDto.gift_type,
         quantity: sendGiftDto.quantity,
         value: totalCost,
+      });
+      await this.logAnalytics(sendGiftDto.stream_id, 'gift_value', totalCost, {
+        sender_id: userId,
+        gift_type: sendGiftDto.gift_type,
       });
 
       this.logEvent('log', 'gift_sent_successfully', {
@@ -1228,13 +1377,15 @@ export class LiveSalesService {
       // 1. Get stream details and verify it's live
       const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
-        .select('vendor_id, status, title')
+        .select('vendor_id, status, title, vendor:user_profiles!vendor_id (is_adult_content)')
         .eq('id', purchaseDto.stream_id)
         .single();
 
       if (streamError || !stream) {
         throw new NotFoundException('Live stream not found');
       }
+
+      await this.assertAdultAccess(stream.vendor as any, userId, stream.vendor_id);
 
       if (stream.status !== 'live') {
         throw new BadRequestException('Cannot purchase from inactive streams');
@@ -1259,7 +1410,16 @@ export class LiveSalesService {
             id,
             name,
             description,
-            user_id
+            user_id,
+            weight_kg,
+            length_cm,
+            width_cm,
+            height_cm,
+            location_latitude,
+            location_longitude,
+            product_categories!category_id (
+              default_weight_kg
+            )
           )
         `)
         .eq('stream_id', purchaseDto.stream_id)
@@ -1434,15 +1594,51 @@ export class LiveSalesService {
       const platformFee = subtotal * platformFeeRate;
       const vendorAmount = subtotal - platformFee;
 
-      // Calculate delivery fee if rider or interstate logistics company selected
+      // Server-computed chargeable weight: product weight (or category
+      // default / volumetric) × quantity. Never taken from the payload.
+      const totalWeightKg = chargeableWeightKg({
+        weight_kg: liveProduct.product?.weight_kg
+          ?? liveProduct.product?.product_categories?.default_weight_kg,
+        length_cm: liveProduct.product?.length_cm,
+        width_cm: liveProduct.product?.width_cm,
+        height_cm: liveProduct.product?.height_cm,
+      }) * purchaseDto.quantity;
+
+      // Calculate delivery fee — recomputed server-side from the provider's
+      // own pricing config; client-supplied prices are only a legacy fallback
+      // when the provider has no pricing configured at all.
       let deliveryFee = 0;
       if (purchaseDto.interstateCompany) {
-        deliveryFee = purchaseDto.interstateCompany.deliveryPrice;
+        const recomputed = await recomputeInterstateDeliveryFee(
+          this.supabase,
+          purchaseDto.interstateCompany.companyId,
+          purchaseDto.interstateCompany.isInternational,
+          totalWeightKg,
+        );
+        deliveryFee = recomputed ?? purchaseDto.interstateCompany.deliveryPrice;
       } else if (purchaseDto.rider_id) {
+        // Authoritative route distance: product location coords ↔ delivery
+        // address coords; client-sent distanceKm is only a fallback.
+        const pickupCoords = {
+          latitude: liveProduct.product?.location_latitude,
+          longitude: liveProduct.product?.location_longitude,
+        };
+        const serverRouteKm = hasCoords(pickupCoords) && hasCoords(purchaseDto.delivery_address)
+          ? roadDistanceKm(pickupCoords, purchaseDto.delivery_address)
+          : undefined;
+        const recomputed = await recomputeRiderDeliveryFee(
+          this.supabase,
+          purchaseDto.rider_id,
+          undefined,
+          serverRouteKm ?? purchaseDto.distanceKm,
+          totalWeightKg,
+        );
         const providedDeliveryPrice = purchaseDto.deliveryPrice;
-        deliveryFee = providedDeliveryPrice !== undefined && providedDeliveryPrice !== null
-          ? Number(providedDeliveryPrice)
-          : 10.00;
+        deliveryFee = recomputed ?? (
+          providedDeliveryPrice !== undefined && providedDeliveryPrice !== null
+            ? Number(providedDeliveryPrice)
+            : 10.00
+        );
       }
 
       const totalAmount = subtotal + deliveryFee;
@@ -1499,6 +1695,7 @@ export class LiveSalesService {
         source: 'live_stream',
         total_amount: totalAmount,
         delivery_fee: deliveryFee,
+        total_weight_kg: totalWeightKg,
         platform_fee: platformFee,
         status: 'pending',
         escrow_enabled: true,
@@ -1996,19 +2193,22 @@ export class LiveSalesService {
       serviceDate: bookingDto.service_date,
       serviceTime: bookingDto.service_time,
       continueWatching: bookingDto.continue_watching,
+      serviceId: bookingDto.service_id,
     });
 
     try {
       // 1. Get stream details and verify it's live
       const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
-        .select('vendor_id, status, title')
+        .select('vendor_id, status, title, vendor:user_profiles!vendor_id (is_adult_content)')
         .eq('id', bookingDto.stream_id)
         .single();
 
       if (streamError || !stream) {
         throw new NotFoundException('Live stream not found');
       }
+
+      await this.assertAdultAccess(stream.vendor as any, userId, stream.vendor_id);
 
       if (stream.status !== 'live') {
         throw new BadRequestException('Cannot book services from inactive streams');
@@ -2079,8 +2279,15 @@ export class LiveSalesService {
         }
       }
 
-      // 3. Get live stream service details
-      const { data: liveService, error: serviceError } = await this.supabase
+      // 3. Get live stream service details. Scope to the specific service the
+      // viewer picked — a stream can list multiple services, so filtering only
+      // by stream_id makes .single() fail. The client sends services.id;
+      // live_stream_services.id is also accepted for legacy callers.
+      // Embed the full service row: the services schema is not uniform across
+      // environments (duration_minutes/location_* may not exist), so naming
+      // specific columns makes PostgREST 42703 and the booking fails. `(*)`
+      // matches the getStreamById query which works on every schema.
+      let serviceQuery = this.supabase
         .from('live_stream_services')
         .select(`
           id,
@@ -2089,19 +2296,40 @@ export class LiveSalesService {
           available_slots,
           booking_window_days,
           max_advance_days,
-          service:services!service_id (
-            id,
-            name,
-            description,
-            duration_minutes,
-            location_type,
-            vendor_id
-          )
+          service:services!service_id (*)
         `)
-        .eq('stream_id', bookingDto.stream_id)
-        .single();
+        .eq('stream_id', bookingDto.stream_id);
+
+      if (bookingDto.service_id) {
+        serviceQuery = serviceQuery.or(
+          `service_id.eq.${bookingDto.service_id},id.eq.${bookingDto.service_id}`,
+        );
+      }
+
+      const { data: liveService, error: serviceError } = await serviceQuery.single();
 
       if (serviceError || !liveService) {
+        this.logger.error('❌ Error querying live_stream_services:', {
+          error: serviceError,
+          code: serviceError?.code,
+          message: serviceError?.message,
+          details: serviceError?.details,
+          stream_id: bookingDto.stream_id,
+          service_id: bookingDto.service_id,
+        });
+
+        // Surface what's actually attached to this stream to make id
+        // mismatches (stale cart ids, portfolio ids, wrong service) obvious.
+        const { data: streamServices } = await this.supabase
+          .from('live_stream_services')
+          .select('id, service_id')
+          .eq('stream_id', bookingDto.stream_id);
+        this.logger.error('🔍 live_stream_services rows for stream:', {
+          stream_id: bookingDto.stream_id,
+          rows: streamServices,
+          sent_service_id: bookingDto.service_id,
+        });
+
         throw new NotFoundException('Service not found in this stream');
       }
 
@@ -2123,14 +2351,40 @@ export class LiveSalesService {
       // Calculate delivery fee if rider or interstate logistics company selected.
       // Services can be location_type = 'in_person', in which case the buyer may
       // want the provider (or their materials) delivered rather than picking up.
+      // Services have no product weight → recompute with 0kg (base pricing);
+      // this still prevents the client-supplied deliveryPrice being trusted.
       let deliveryFee = 0;
       if (bookingDto.interstateCompany) {
-        deliveryFee = bookingDto.interstateCompany.deliveryPrice;
+        const recomputed = await recomputeInterstateDeliveryFee(
+          this.supabase,
+          bookingDto.interstateCompany.companyId,
+          bookingDto.interstateCompany.isInternational,
+          0,
+        );
+        deliveryFee = recomputed ?? bookingDto.interstateCompany.deliveryPrice;
       } else if (bookingDto.rider_id) {
+        // Authoritative route distance: service location coords ↔ delivery
+        // address coords; client-sent distanceKm is only a fallback.
+        const pickupCoords = {
+          latitude: liveService.service?.location_latitude,
+          longitude: liveService.service?.location_longitude,
+        };
+        const serverRouteKm = hasCoords(pickupCoords) && hasCoords(bookingDto.delivery_address)
+          ? roadDistanceKm(pickupCoords, bookingDto.delivery_address)
+          : undefined;
+        const recomputed = await recomputeRiderDeliveryFee(
+          this.supabase,
+          bookingDto.rider_id,
+          undefined,
+          serverRouteKm ?? bookingDto.distanceKm,
+          0,
+        );
         const providedDeliveryPrice = bookingDto.deliveryPrice;
-        deliveryFee = providedDeliveryPrice !== undefined && providedDeliveryPrice !== null
-          ? Number(providedDeliveryPrice)
-          : 10.00;
+        deliveryFee = recomputed ?? (
+          providedDeliveryPrice !== undefined && providedDeliveryPrice !== null
+            ? Number(providedDeliveryPrice)
+            : 10.00
+        );
       }
 
       const totalAmount = servicePrice + deliveryFee;
@@ -2186,8 +2440,10 @@ export class LiveSalesService {
           service_name: liveService.service.name,
           booking_date: bookingDto.service_date,
           booking_time: bookingDto.service_time,
-          duration_minutes: liveService.service.duration_minutes,
-          location_type: liveService.service.location_type,
+          // services.duration is a display string (e.g. "2 hours") in the
+          // deployed schema — duration_minutes only exists in some envs.
+          duration_minutes: liveService.service.duration_minutes ?? liveService.service.duration ?? null,
+          location_type: liveService.service.location_type ?? null,
           transaction_id: transactionId,
           special_notes: bookingDto.service_notes,
           ...(bookingDto.interstateCompany ? {
@@ -2209,8 +2465,8 @@ export class LiveSalesService {
           product_metadata: {
             is_service: true,
             description: liveService.service.description,
-            duration_minutes: liveService.service.duration_minutes,
-            location_type: liveService.service.location_type,
+            duration_minutes: liveService.service.duration_minutes ?? liveService.service.duration ?? null,
+            location_type: liveService.service.location_type ?? null,
             special_notes: bookingDto.service_notes,
           },
         },
@@ -2940,20 +3196,24 @@ export class LiveSalesService {
       }
 
       // 12. Create service booking record (for service-specific data)
+      // service_bookings schema (migration 011): user_id, service_id,
+      // requested_date, special_requests, quoted_price, final_price, status,
+      // order_id, location, confirmed_at, created_at, updated_at
+      const requestedDateTime = new Date(`${bookingDto.service_date}T${bookingDto.service_time}`);
       const bookingData = {
         id: transactionId,
         order_id: order.id, // Link to order
-        stream_id: bookingDto.stream_id,
-        customer_id: userId,
+        user_id: userId,
         service_id: liveService.service_id,
-        vendor_id: stream.vendor_id,
-        booking_date: bookingDto.service_date,
-        booking_time: bookingDto.service_time,
-        service_price: servicePrice,
-        platform_fee: platformFee,
-        total_amount: servicePrice,
+        requested_date: isNaN(requestedDateTime.getTime()) ? null : requestedDateTime.toISOString(),
+        special_requests: bookingDto.service_notes || null,
+        location: typeof bookingDto.delivery_address === 'string'
+          ? bookingDto.delivery_address
+          : bookingDto.delivery_address?.address || null,
+        quoted_price: servicePrice,
+        final_price: servicePrice,
         status: 'confirmed',
-        special_notes: bookingDto.service_notes || null,
+        confirmed_at: new Date().toISOString(),
         created_at: new Date().toISOString(),
       };
 
@@ -4473,26 +4733,27 @@ export class LiveSalesService {
             break;
           case 'gift':
             analytics.total_gifts += metric.metric_value;
+            break;
+          case 'gift_value':
+          case 'gift_sent': // legacy rows stored the monetary amount here
             analytics.total_gift_value += metric.metric_value;
             break;
         }
       });
 
-      // Get purchase and booking data from orders table
-      const { data: orders, error: ordersError } = await this.supabase
-        .from('orders')
-        .select('total_amount, source, created_at')
-        .eq('source', 'live_stream')
-        .eq('status', 'paid')
-        .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()); // Last 30 days
+      // Get purchase data scoped to THIS stream via live_stream_transactions
+      // (the previous global orders query attributed every live_stream order in
+      // the last 30 days to whichever stream was queried).
+      const { data: transactions, error: txError } = await this.supabase
+        .from('live_stream_transactions')
+        .select('total_amount, status')
+        .eq('stream_id', streamId)
+        .in('status', ['paid', 'completed']);
 
-      if (!ordersError && orders) {
-        orders.forEach(order => {
-          if (order.source === 'live_stream') {
-            // This is a simplified check - in reality we'd need to link orders to streams
-            analytics.total_purchases += 1;
-            analytics.total_purchase_value += parseFloat(order.total_amount);
-          }
+      if (!txError && transactions) {
+        transactions.forEach(tx => {
+          analytics.total_purchases += 1;
+          analytics.total_purchase_value += parseFloat(tx.total_amount) || 0;
         });
       }
 
@@ -4803,13 +5064,15 @@ export class LiveSalesService {
       // 1. Get stream details and verify it's live
       const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
-        .select('vendor_id, status, title')
+        .select('vendor_id, status, title, vendor:user_profiles!vendor_id (is_adult_content)')
         .eq('id', bookingDto.stream_id)
         .single();
 
       if (streamError || !stream) {
         throw new NotFoundException('Live stream not found');
       }
+
+      await this.assertAdultAccess(stream.vendor as any, userId, stream.vendor_id);
 
       if (stream.status !== 'live') {
         throw new BadRequestException('Cannot book portfolio services from inactive streams');
@@ -4907,14 +5170,31 @@ export class LiveSalesService {
       const vendorAmount = servicePrice - platformFee;
 
       // Calculate delivery fee if rider or interstate logistics company selected.
+      // No product weight for services → 0kg; recompute still prevents the
+      // client-supplied deliveryPrice from being trusted verbatim.
       let deliveryFee = 0;
       if (bookingDto.interstateCompany) {
-        deliveryFee = bookingDto.interstateCompany.deliveryPrice;
+        const recomputed = await recomputeInterstateDeliveryFee(
+          this.supabase,
+          bookingDto.interstateCompany.companyId,
+          bookingDto.interstateCompany.isInternational,
+          0,
+        );
+        deliveryFee = recomputed ?? bookingDto.interstateCompany.deliveryPrice;
       } else if (bookingDto.rider_id) {
+        const recomputed = await recomputeRiderDeliveryFee(
+          this.supabase,
+          bookingDto.rider_id,
+          undefined,
+          bookingDto.distanceKm,
+          0,
+        );
         const providedDeliveryPrice = bookingDto.deliveryPrice;
-        deliveryFee = providedDeliveryPrice !== undefined && providedDeliveryPrice !== null
-          ? Number(providedDeliveryPrice)
-          : 10.00;
+        deliveryFee = recomputed ?? (
+          providedDeliveryPrice !== undefined && providedDeliveryPrice !== null
+            ? Number(providedDeliveryPrice)
+            : 10.00
+        );
       }
 
       const totalAmount = servicePrice + deliveryFee;
@@ -5275,13 +5555,15 @@ export class LiveSalesService {
       // 1. Get stream details and verify it's live
       const { data: stream, error: streamError } = await this.supabase
         .from('live_streams')
-        .select('vendor_id, status, title')
+        .select('vendor_id, status, title, vendor:user_profiles!vendor_id (is_adult_content)')
         .eq('id', bookingDto.stream_id)
         .single();
 
       if (streamError || !stream) {
         throw new NotFoundException('Live stream not found');
       }
+
+      await this.assertAdultAccess(stream.vendor as any, userId, stream.vendor_id);
 
       if (stream.status !== 'live') {
         throw new BadRequestException('Cannot book portfolio services from inactive streams');

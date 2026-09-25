@@ -7,12 +7,18 @@ import { Transform } from 'class-transformer';
 export class PlaceBidDto {
   @IsNotEmpty()
   @IsString()
-  auction_id: string;
+  auction_id!: string;
+
+  // Optional explicit item_id for multi-item live auctions.
+  // If not provided, the backend will use auction.current_item_id.
+  @IsOptional()
+  @IsString()
+  item_id?: string;
 
   @IsNumber({ maxDecimalPlaces: 6 })
   @Min(0.01)
   @Transform(({ value }) => parseFloat(value))
-  amount: number;
+  amount!: number;
 
   @IsOptional()
   @IsEnum(['manual', 'proxy'])
@@ -32,10 +38,10 @@ export class PlaceBidDto {
 export class UpdateProxyBidDto {
   @IsNotEmpty()
   @IsString()
-  auction_id: string;
+  auction_id!: string;
 
   @IsNumber({ maxDecimalPlaces: 6 })
   @Min(0.01)
   @Transform(({ value }) => parseFloat(value))
-  max_bid_amount: number;
+  max_bid_amount!: number;
 }

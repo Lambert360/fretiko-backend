@@ -8,34 +8,34 @@ export enum ServiceBookingType {
 
 class AvailabilityDto {
   @IsBoolean()
-  weekdays: boolean;
+  weekdays!: boolean;
 
   @IsBoolean()
-  weekends: boolean;
+  weekends!: boolean;
 
   @IsBoolean()
-  evenings: boolean;
+  evenings!: boolean;
 
   @IsBoolean()
-  emergency: boolean;
+  emergency!: boolean;
 }
 
 export class CreateServiceDto {
   @IsString()
-  name: string;
+  name!: string;
 
   @IsString()
-  description: string;
+  description!: string;
 
   @IsNumber()
-  base_price: number;
+  base_price!: number;
 
   @IsOptional()
   @IsString()
   duration?: string;
 
   @IsUUID()
-  category_id: string;
+  category_id!: string;
 
   @IsOptional()
   @IsArray()
@@ -55,13 +55,22 @@ export class CreateServiceDto {
   @IsString()
   location?: string;
 
+  // GPS/state-centroid coords of the SERVICE location (set at upload)
+  @IsOptional()
+  @IsNumber()
+  location_latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  location_longitude?: number;
+
   @IsOptional()
   @IsString()
   service_area?: string;
 
   @ValidateNested()
   @Type(() => AvailabilityDto)
-  availability: AvailabilityDto;
+  availability!: AvailabilityDto;
 
   @IsOptional()
   @IsArray()
@@ -74,6 +83,10 @@ export class CreateServiceDto {
 }
 
 export class UpdateServiceDto {
+  @IsOptional()
+  @IsEnum(['draft', 'active', 'busy', 'inactive'])
+  status?: string;
+
   @IsOptional()
   @IsString()
   name?: string;
@@ -107,6 +120,14 @@ export class UpdateServiceDto {
   @IsOptional()
   @IsString()
   location?: string;
+
+  @IsOptional()
+  @IsNumber()
+  location_latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  location_longitude?: number;
 
   @IsOptional()
   @IsString()

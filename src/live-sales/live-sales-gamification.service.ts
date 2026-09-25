@@ -436,7 +436,14 @@ export class LiveSalesGamificationService {
       const { data, error } = await query;
       if (error) throw error;
 
-      const vendorIds = (data || []).map((entry: any) => entry.vendor_id);
+      // Defensive: keep the best-ranked row per vendor in case duplicate
+      // cache rows were ever written (rows arrive ordered by rank asc).
+      const data2 = (data || []).filter(
+        (entry: any, i: number, arr: any[]) =>
+          arr.findIndex(x => x.vendor_id === entry.vendor_id) === i,
+      );
+
+      const vendorIds = data2.map((entry: any) => entry.vendor_id);
       const liveStreamMap = new Map<string, string>();
 
       if (vendorIds.length > 0) {
@@ -457,7 +464,7 @@ export class LiveSalesGamificationService {
         }
       }
 
-      return (data || []).map((entry: any) => ({
+      return data2.map((entry: any) => ({
         vendor_id: entry.vendor_id,
         vendor_name: entry.vendor_name,
         avatar_url: entry.avatar_url,
@@ -573,13 +580,48 @@ export class LiveSalesGamificationService {
         total_viewers,
         total_sales,
         products:live_stream_products!stream_id(sold_count),
-        transactions:live_stream_transactions!stream_id(id, total_amount, status)
+        transactions:live_stream_transactions!stream_id(id, total_amount, status, order_id)
       `)
       .gte('started_at', start.toISOString())
       .lte('started_at', end.toISOString())
       .eq('status', 'ended');
 
     if (error) throw error;
+
+    const streamIds = (streams || []).map(s => s.id);
+    const streamVendor = new Map((streams || []).map(s => [s.id, s.vendor_id]));
+
+    // live_stream_transactions rows are frozen at 'pending'/'escrow' — nothing
+    // ever flips them to 'paid'/'completed' — and portfolio bookings don't
+    // create one at all. Orders (source='live_stream', metadata.stream_id) are
+    // the source of truth for every live sale type: products, services AND
+    // portfolio bookings.
+    const orderTxIds = new Set<string>();
+    const ordersByStream = new Map<string, { orders: number; revenue: number }>();
+    if (streamIds.length > 0) {
+      const { data: liveOrders, error: ordersError } = await this.supabase
+        .from('orders')
+        .select('id, total_amount, status, metadata')
+        .eq('source', 'live_stream')
+        .neq('status', 'cancelled')
+        .gte('created_at', start.toISOString())
+        .lte('created_at', end.toISOString())
+        .in('metadata->>stream_id', streamIds);
+
+      if (ordersError) {
+        this.logger.error('Error fetching live-stream orders for leaderboard:', ordersError);
+      }
+
+      (liveOrders || []).forEach(o => {
+        const streamId = o.metadata?.stream_id;
+        if (!streamId) return;
+        if (o.metadata?.transaction_id) orderTxIds.add(o.metadata.transaction_id);
+        const bucket = ordersByStream.get(streamId) || { orders: 0, revenue: 0 };
+        bucket.orders += 1;
+        bucket.revenue += o.total_amount || 0;
+        ordersByStream.set(streamId, bucket);
+      });
+    }
 
     const vendorMap = new Map<string, any>();
 
@@ -598,16 +640,19 @@ export class LiveSalesGamificationService {
       const v = vendorMap.get(vendorId);
       v.total_streams += 1;
       v.total_viewers += stream.total_viewers || 0;
-      v.total_revenue += stream.total_sales || 0;
 
-      for (const product of stream.products || []) {
-        v.total_orders += product.sold_count || 0;
-      }
+      const streamOrders = ordersByStream.get(stream.id) || { orders: 0, revenue: 0 };
+      v.total_orders += streamOrders.orders;
+      v.total_revenue += streamOrders.revenue;
 
+      // Transactions with no linked order (order_id null and not referenced
+      // by an order's metadata.transaction_id) represent sales that never
+      // produced an orders row — count them so nothing is missed.
       for (const tx of stream.transactions || []) {
-        if (tx.status === 'paid' || tx.status === 'completed') {
-          v.total_revenue += tx.total_amount || 0;
-        }
+        if (tx.order_id || orderTxIds.has(tx.id)) continue;
+        if (tx.status === 'cancelled') continue;
+        v.total_orders += 1;
+        v.total_revenue += tx.total_amount || 0;
       }
     }
 
@@ -655,6 +700,9 @@ export class LiveSalesGamificationService {
     eventName?: string,
   ): Promise<void> {
     const now = new Date().toISOString();
+    const periodStart = start.toISOString().split('T')[0];
+    const periodEnd = end.toISOString().split('T')[0];
+
     // Fetch vendor profiles
     const vendorIds = scored.map(s => s.vendor_id);
     const { data: profiles, error } = await this.supabase
@@ -669,8 +717,8 @@ export class LiveSalesGamificationService {
     const rows = scored.map(s => ({
       vendor_id: s.vendor_id,
       period,
-      period_start: start.toISOString().split('T')[0],
-      period_end: end.toISOString().split('T')[0],
+      period_start: periodStart,
+      period_end: periodEnd,
       event_name: eventName || null,
       rank: s.rank,
       score: s.score,
@@ -686,10 +734,29 @@ export class LiveSalesGamificationService {
       updated_at: now,
     }));
 
-    const { error: upsertError } = await this.supabase
+    // The cache holds exactly one snapshot per period — the leaderboard UI
+    // shows current standings only, there is no historical view. period_end
+    // is "now" so it drifts every recalc day; keying the delete on the slice
+    // dates would let yesterday's snapshot linger and duplicate vendors in
+    // the list. Wipe the whole period bucket instead (event recalcs are
+    // scoped to their event_name so concurrent/named events are preserved).
+    let deleteQuery = this.supabase
       .from('vendor_leaderboard_cache')
-      .upsert(rows, { onConflict: 'vendor_id,period,period_start,period_end,event_name' });
+      .delete()
+      .eq('period', period);
+    deleteQuery = eventName
+      ? deleteQuery.eq('event_name', eventName)
+      : deleteQuery.is('event_name', null);
 
-    if (upsertError) throw upsertError;
+    const { error: deleteError } = await deleteQuery;
+    if (deleteError) throw deleteError;
+
+    if (rows.length === 0) return;
+
+    const { error: insertError } = await this.supabase
+      .from('vendor_leaderboard_cache')
+      .insert(rows);
+
+    if (insertError) throw insertError;
   }
 }

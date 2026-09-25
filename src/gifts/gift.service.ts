@@ -993,12 +993,23 @@ export class GiftService {
   // SOUND ASSET MANAGEMENT
   // =====================
 
-  async getSounds(): Promise<Sound[]> {
-    const { data, error } = await this.supabase
+  /**
+   * List platform sounds for admins. Optionally scoped by context
+   * ('gift' | 'live_stream'). Vendor-owned uploads (owner_id set) are
+   * private to the vendor's soundboard and never surface here.
+   */
+  async getSounds(context?: 'gift' | 'live_stream'): Promise<Sound[]> {
+    let query = this.supabase
       .from('sounds')
       .select('*')
       .eq('is_active', true)
-      .order('sort_order', { ascending: true });
+      .is('owner_id', null);
+
+    if (context) {
+      query = query.eq('context', context);
+    }
+
+    const { data, error } = await query.order('sort_order', { ascending: true });
 
     if (error) {
       this.logger.error(`Failed to fetch sounds: ${error.message}`);
@@ -1016,6 +1027,7 @@ export class GiftService {
         sound_url: dto.sound_url,
         sort_order: dto.sort_order || 0,
         is_active: dto.is_active !== undefined ? dto.is_active : true,
+        context: dto.context || 'gift',
       })
       .select()
       .single();
@@ -1034,6 +1046,7 @@ export class GiftService {
     if (dto.sound_url !== undefined) updates.sound_url = dto.sound_url;
     if (dto.sort_order !== undefined) updates.sort_order = dto.sort_order;
     if (dto.is_active !== undefined) updates.is_active = dto.is_active;
+    if (dto.context !== undefined) updates.context = dto.context;
     updates.updated_at = new Date().toISOString();
 
     const { data, error } = await this.supabase

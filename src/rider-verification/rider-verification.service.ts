@@ -187,6 +187,36 @@ export class RiderVerificationService {
   }
 
   /**
+   * Get the current user's rider status.
+   * Covers BOTH flows:
+   * - verified_riders: claimed partner accounts AND admin-approved self-applications
+   * - rider_verification_requests: pending/rejected self-application status
+   */
+  async getMyRiderStatus(userId: string): Promise<{
+    rider_status: 'active' | 'suspended' | 'terminated' | 'dormant' | null;
+    request_status: 'in_progress' | 'under_review' | 'verified' | 'rejected' | null;
+  }> {
+    const { data: rider } = await this.supabase
+      .from('verified_riders')
+      .select('verification_status')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    const { data: request } = await this.supabase
+      .from('rider_verification_requests')
+      .select('status')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    return {
+      rider_status: rider?.verification_status || null,
+      request_status: request?.status || null,
+    };
+  }
+
+  /**
    * Get all verification requests with filters (admin endpoint)
    */
   async getAllVerifications(filters: VerificationFiltersDto): Promise<RiderVerificationList> {

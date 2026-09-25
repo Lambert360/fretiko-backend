@@ -31,7 +31,7 @@ export class CheckoutController {
       // Parse selectedItemIds if provided (comma-separated string)
       const itemIds = selectedItemIds ? selectedItemIds.split(',') : undefined;
       return await this.checkoutService.getCheckoutSummary(req.user.sub, req.supabaseToken, itemIds);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error getting checkout summary:', error);
       throw new HttpException(
         'Failed to get checkout summary',
@@ -62,7 +62,7 @@ export class CheckoutController {
         qty,
         req.supabaseToken,
       );
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error getting direct checkout summary:', error);
       throw new HttpException(
         error.message || 'Failed to get direct checkout summary',
@@ -76,7 +76,7 @@ export class CheckoutController {
   async getPaymentMethods(@Request() req) {
     try {
       return await this.checkoutService.getPaymentMethods(req.user.sub, req.supabaseToken);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error getting payment methods:', error);
       throw new HttpException(
         'Failed to get payment methods',
@@ -90,7 +90,7 @@ export class CheckoutController {
   async getDefaultAddress(@Request() req) {
     try {
       return await this.checkoutService.getDefaultAddress(req.user.sub, req.supabaseToken);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error getting default address:', error);
       return null; // Return null instead of throwing error - allows frontend to handle gracefully
     }
@@ -101,7 +101,7 @@ export class CheckoutController {
   async getAllAddresses(@Request() req) {
     try {
       return await this.checkoutService.getAllAddresses(req.user.sub, req.supabaseToken);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error getting addresses:', error);
       throw new HttpException(
         'Failed to get addresses',
@@ -115,7 +115,7 @@ export class CheckoutController {
   async saveAddress(@Body() addressData: any, @Request() req) {
     try {
       return await this.checkoutService.saveAddress(req.user.sub, addressData, req.supabaseToken);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error saving address:', error);
       throw new HttpException(
         'Failed to save address',
@@ -138,7 +138,7 @@ export class CheckoutController {
         addressData,
         req.supabaseToken,
       );
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error updating address:', error);
       throw new HttpException(
         'Failed to update address',
@@ -156,7 +156,7 @@ export class CheckoutController {
         addressId,
         req.supabaseToken,
       );
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error deleting address:', error);
       throw new HttpException(
         'Failed to delete address',
@@ -174,7 +174,7 @@ export class CheckoutController {
         addressId,
         req.supabaseToken,
       );
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error setting default address:', error);
       throw new HttpException(
         'Failed to set default address',
@@ -188,7 +188,7 @@ export class CheckoutController {
   async createOrder(@Body() orderData: any, @Request() req) {
     try {
       return await this.checkoutService.createOrder(req.user.sub, orderData, req.supabaseToken);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error creating order:', error);
       throw new HttpException(
         error.message || 'Failed to create order',
@@ -202,7 +202,7 @@ export class CheckoutController {
   async validateCheckout(@Request() req) {
     try {
       return await this.checkoutService.validateCheckout(req.user.sub, req.supabaseToken);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error validating checkout:', error);
       throw new HttpException(
         'Failed to validate checkout',
@@ -225,7 +225,7 @@ export class CheckoutController {
 
       const fee = await this.checkoutService.calculateEscrowFee(orderAmount);
       return { fee };
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error calculating escrow fee:', error);
       throw new HttpException(
         'Failed to calculate escrow fee',
@@ -239,7 +239,7 @@ export class CheckoutController {
   async getDeliveryOptions(@Body('address') address: any, @Request() req) {
     try {
       return await this.checkoutService.getDeliveryOptions(address, req.user.sub);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error getting delivery options:', error);
       throw new HttpException(
         'Failed to get delivery options',
@@ -252,6 +252,7 @@ export class CheckoutController {
   @Get('summary/auction')
   async getAuctionCheckoutSummary(
     @Query('auctionId') auctionId: string,
+    @Query('itemId') itemId: string,
     @Request() req,
   ) {
     try {
@@ -265,9 +266,10 @@ export class CheckoutController {
       return await this.checkoutService.getAuctionCheckoutSummary(
         req.user.sub,
         auctionId,
+        itemId,
         req.supabaseToken,
       );
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error getting auction checkout summary:', error);
       throw new HttpException(
         error.message || 'Failed to get auction checkout summary',
@@ -303,7 +305,7 @@ export class CheckoutController {
         wishlistItemIds,
         req.supabaseToken,
       );
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error getting wishlist checkout summary:', error);
       throw new HttpException(
         error.message || 'Failed to get wishlist checkout summary',
@@ -340,7 +342,7 @@ export class CheckoutController {
           route: a.route,
         })),
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error previewing rider assignments:', error);
       throw new HttpException('Failed to preview riders', HttpStatus.INTERNAL_SERVER_ERROR);
     }
@@ -356,7 +358,7 @@ export class CheckoutController {
         req.supabaseToken
       );
       return result;
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error creating grouped order:', error);
       throw new HttpException(
         error.message || 'Failed to create grouped order',

@@ -68,11 +68,6 @@ export class AuctionFilterDto {
   @IsOptional()
   @IsBoolean()
   @Transform(({ value }) => value === 'true' || value === true)
-  featured_only?: boolean;
-
-  @IsOptional()
-  @IsBoolean()
-  @Transform(({ value }) => value === 'true' || value === true)
   no_reserve?: boolean;
 
   @IsOptional()

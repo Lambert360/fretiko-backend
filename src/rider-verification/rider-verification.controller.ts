@@ -62,7 +62,7 @@ export class RiderVerificationController {
         success: true,
         message: 'Verification request submitted successfully. You will be notified once reviewed.',
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: error.message || 'Failed to submit verification request',
@@ -86,12 +86,26 @@ export class RiderVerificationController {
         success: true,
         verification,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: 'No verification request found',
       };
     }
+  }
+
+  /**
+   * Get current user's rider status (covers claimed + self-applied accounts)
+   * GET /rider-verification/my-status
+   */
+  @Get('my-status')
+  async getMyRiderStatus(@Req() req: any): Promise<{
+    success: boolean;
+    rider_status: 'active' | 'suspended' | 'terminated' | 'dormant' | null;
+    request_status: 'in_progress' | 'under_review' | 'verified' | 'rejected' | null;
+  }> {
+    const status = await this.riderVerificationService.getMyRiderStatus(req.user.sub);
+    return { success: true, ...status };
   }
 
   /**
@@ -112,7 +126,7 @@ export class RiderVerificationController {
         success: true,
         companies,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: 'Failed to fetch verified companies',
@@ -142,7 +156,7 @@ export class RiderVerificationController {
         success: true,
         data: result,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: error.message || 'Failed to fetch verification requests',
@@ -172,7 +186,7 @@ export class RiderVerificationController {
         success: true,
         verification,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: 'Verification request not found',
@@ -201,7 +215,7 @@ export class RiderVerificationController {
         success: true,
         message: 'Verification status updated to under review',
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: error.message || 'Failed to update verification status',
@@ -231,7 +245,7 @@ export class RiderVerificationController {
         success: true,
         message: 'Rider verified successfully',
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: error.message || 'Failed to verify rider',
@@ -261,7 +275,7 @@ export class RiderVerificationController {
         success: true,
         message: 'Rider verification rejected successfully',
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: error.message || 'Failed to reject rider verification',
@@ -291,7 +305,7 @@ export class RiderVerificationController {
         success: true,
         data: result,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: error.message || 'Failed to fetch verified riders',
@@ -321,7 +335,7 @@ export class RiderVerificationController {
         success: true,
         rider,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: 'Verified rider not found',
@@ -353,7 +367,7 @@ export class RiderVerificationController {
           totalVerifiedRiders,
         },
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         message: error.message || 'Failed to fetch statistics',

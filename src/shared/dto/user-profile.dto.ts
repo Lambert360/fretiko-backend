@@ -37,6 +37,14 @@ export class UpdateProfileDto {
   isRider?: boolean;
 
   @IsOptional()
+  @IsBoolean()
+  catalogHidden?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  isAdultContent?: boolean;
+
+  @IsOptional()
   @IsString()
   avatarUrl?: string;
 
@@ -66,8 +74,8 @@ export class UpdateProfileDto {
 }
 
 export class UserProfileResponse {
-  id: string;
-  username: string;
+  id!: string;
+  username!: string;
   bio?: string;
   avatarUrl?: string;
   bgPicUrl?: string;
@@ -75,20 +83,27 @@ export class UserProfileResponse {
   phone?: string;
   dateOfBirth?: string;
   preferences?: any;
-  isSeller: boolean;
-  isRider: boolean;
-  createdAt: string;
-  updatedAt: string;
+  isSeller!: boolean;
+  isRider!: boolean;
+  catalogHidden?: boolean;
+  isAdultContent?: boolean;
+  citizenNumber?: number;
+  citizenNumberSeenAt?: string | null;
+  createdAt!: string;
+  updatedAt!: string;
 }
 
 export class PublicProfileResponse {
-  id: string;
-  username: string;
+  id!: string;
+  username!: string;
   bio?: string;
   avatarUrl?: string;
   bgPicUrl?: string;
   location?: string;
-  isSeller: boolean;
-  isRider: boolean;
-  createdAt: string;
+  isSeller!: boolean;
+  isRider!: boolean;
+  catalogHidden?: boolean;
+  isAdultContent?: boolean;
+  citizenNumber?: number;
+  createdAt!: string;
 }

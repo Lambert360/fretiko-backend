@@ -1,4 +1,4 @@
-import { IsString, IsEnum, IsOptional, IsNumber, IsUUID, IsArray, ValidateNested, IsPositive, IsDateString, MinLength, MaxLength, IsBoolean, Min } from 'class-validator';
+import { IsString, IsEnum, IsOptional, IsNumber, IsUUID, IsArray, ValidateNested, IsPositive, IsDateString, MinLength, MaxLength, IsBoolean, IsInt, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 
 export enum StreamType {
@@ -62,6 +62,44 @@ export class CreateLiveStreamDto {
   @ValidateNested({ each: true })
   @Type(() => LiveStreamProductDto)
   products?: LiveStreamProductDto[];
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => LiveStreamServiceDto)
+  services?: LiveStreamServiceDto[];
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => LiveTimeSlotDto)
+  time_slots?: LiveTimeSlotDto[];
+}
+
+// DTO for a service attached to a services-type live stream
+export class LiveStreamServiceDto {
+  @IsUUID()
+  service_id!: string;
+
+  @IsNumber()
+  @Min(0)
+  live_price!: number;
+}
+
+// DTO for an availability slot on a services-type live stream
+export class LiveTimeSlotDto {
+  @IsString()
+  date!: string; // YYYY-MM-DD
+
+  @IsString()
+  start_time!: string; // HH:MM
+
+  @IsString()
+  end_time!: string; // HH:MM
+
+  @IsInt()
+  @Min(1)
+  duration_minutes!: number;
 }
 
 // DTO for adding products to a live stream
@@ -196,6 +234,14 @@ export class LiveProductPurchaseDto {
   @Min(0)
   deliveryPrice?: number;
 
+  // Distance (km) from the rider quote — lets the server reproduce the
+  // per-km component when recomputing the fee. Client-claimed by nature
+  // until real routing lands, but rates themselves stay server-side.
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  distanceKm?: number;
+
   @IsOptional()
   delivery_address?: any; // JSON object for delivery details
 
@@ -218,6 +264,13 @@ export class LiveProductPurchaseDto {
 export class LiveServiceBookingDto {
   @IsUUID()
   stream_id!: string;
+
+  // The service the viewer picked — services.id (live_stream_services.id is
+  // also accepted for legacy callers). A stream can list multiple services,
+  // so the lookup must scope to this id, not just stream_id.
+  @IsOptional()
+  @IsUUID()
+  service_id?: string;
 
   @IsDateString()
   service_date!: string;
@@ -242,6 +295,11 @@ export class LiveServiceBookingDto {
   @IsNumber()
   @Min(0)
   deliveryPrice?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  distanceKm?: number;
 
   @IsOptional()
   delivery_address?: any; // JSON object for delivery details
@@ -284,6 +342,11 @@ export class LivePortfolioBookingDto {
   @IsNumber()
   @Min(0)
   deliveryPrice?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  distanceKm?: number;
 
   @IsOptional()
   delivery_address?: any; // JSON object for delivery details
@@ -337,9 +400,33 @@ export interface LiveStreamResponse {
   preview_video_url?: string;
   stream_url?: string;
   products?: LiveStreamProductResponse[];
+  services?: LiveStreamServiceResponse[];
   started_at?: string;
   ended_at?: string;
   created_at: string;
+}
+
+export interface LiveStreamServiceResponse {
+  id: string;
+  service_id: string;
+  service: {
+    id: string;
+    name: string;
+    description?: string;
+    category_name?: string;
+    duration_minutes?: number;
+    location_type?: 'online' | 'in_person' | 'hybrid';
+  };
+  live_price: number;
+  available_slots?: Array<{
+    date: string;
+    time: string;
+    available: boolean;
+  }>;
+  booking_window_days?: number;
+  max_advance_days?: number;
+  display_order?: number;
+  is_featured?: boolean;
 }
 
 export interface LiveStreamProductResponse {

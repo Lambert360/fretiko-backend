@@ -1,9 +1,12 @@
-import { Injectable, Logger, UnauthorizedException, ConflictException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException, ConflictException, Inject, Optional, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { createClient } from '@supabase/supabase-js';
 import { SocialAuthDto, SocialAuthResponse } from './dto/social-auth.dto';
 import { TokenService } from './token.service';
+import { EmailNotificationService } from '../notifications/email-notification.service';
+import { welcomeEmail } from '../notifications/email-templates';
+import { resolveReferrer } from '../shared/referral';
 
 @Injectable()
 export class SocialAuthService {
@@ -13,6 +16,8 @@ export class SocialAuthService {
   constructor(
     private configService: ConfigService,
     private tokenService: TokenService,
+    @Optional() @Inject(forwardRef(() => EmailNotificationService))
+    private emailNotificationService?: EmailNotificationService,
   ) {
     const supabaseUrl = this.configService.get<string>('SUPABASE_URL');
     const supabaseServiceKey = this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY');
@@ -141,6 +146,13 @@ export class SocialAuthService {
         const [derivedFirstName, ...rest] = (dtoFullName || providerName || '').split(' ');
         const derivedLastName = rest.join(' ');
 
+        // Referral input may be a code OR the referrer's username —
+        // normalize to the canonical referral_code (referred_by_code is
+        // VARCHAR(10); a long username would fail the upsert).
+        const resolvedReferralCode = referralCode
+          ? (await resolveReferrer(this.supabase, referralCode))?.referral_code ?? null
+          : null;
+
         const upsertPayload: any = {
           id: userId,
           email_confirmed: true,
@@ -157,7 +169,7 @@ export class SocialAuthService {
           terms_accepted_at: new Date().toISOString(),
           terms_accepted_ip: ipAddress || null,
           terms_accepted_user_agent: userAgent || null,
-          ...(referralCode && { referred_by_code: referralCode }),
+          ...(resolvedReferralCode && { referred_by_code: resolvedReferralCode }),
           preferences: {
             ...(profileData?.preferences || {}),
             auth_provider: provider,
@@ -176,6 +188,19 @@ export class SocialAuthService {
         if (upsertError) {
           this.logger.error('Failed to create social user profile:', upsertError);
           throw new UnauthorizedException('Failed to create user profile');
+        }
+
+        // Record the completed referral (best-effort — never block signup on it).
+        // The RPC resolves code-or-username itself and stores the canonical code.
+        if (referralCode) {
+          try {
+            await this.supabase.rpc('complete_referral', {
+              p_referred_user_id: userId,
+              p_referral_code: referralCode,
+            });
+          } catch (referralError) {
+            this.logger.warn('complete_referral failed (non-fatal):', referralError);
+          }
         }
       }
 
@@ -197,7 +222,7 @@ export class SocialAuthService {
 
       const { data: finalProfile } = await this.supabase
         .from('user_profiles')
-        .select('id, username, avatar_url, user_role, is_seller, is_rider, is_verified, display_name')
+        .select('id, username, avatar_url, user_role, is_seller, is_rider, is_verified, display_name, citizen_number')
         .eq('id', userId)
         .single();
 
@@ -221,7 +246,22 @@ export class SocialAuthService {
         is_seller: finalProfile?.is_seller || false,
         is_rider: finalProfile?.is_rider || false,
         is_verified: finalProfile?.is_verified || false,
+        citizen_number: finalProfile?.citizen_number,
       };
+
+      // Best-effort welcome email for brand-new social accounts — deduped
+      // once per user, gated by email prefs
+      const emailService = this.emailNotificationService;
+      if (isNewUser && emailService) {
+        void emailService
+          .sendUserEmail(userId, {
+            subject: 'Welcome to Fretiko',
+            category: 'system',
+            reminder: { type: 'welcome', entityType: 'user', entityId: userId },
+            buildHtml: (ctx) => welcomeEmail({ name: ctx.name, appUrl: emailService.appUrl() }),
+          })
+          .catch(() => {});
+      }
 
       return {
         success: true,

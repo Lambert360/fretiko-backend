@@ -144,6 +144,22 @@ export class ContentModerationController {
   }
 
   /**
+   * Set/clear a vendor's adult-content flag
+   * POST /admin/content/users/:userId/adult-flag
+   * Requires: suspend_users permission
+   */
+  @Post('users/:userId/adult-flag')
+  @UseGuards(PermissionsGuard)
+  @Permissions('suspend_users')
+  async setAdultContentFlag(
+    @Req() req,
+    @Param('userId') userId: string,
+    @Body() body: { isAdult: boolean; reason?: string },
+  ) {
+    return this.adminService.setUserAdultContentFlag(req.user.sub, userId, body.isAdult === true, body.reason);
+  }
+
+  /**
    * Get stories for moderation
    * GET /admin/content/stories
    * Requires: view_stories permission

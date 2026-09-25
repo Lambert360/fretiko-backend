@@ -180,14 +180,14 @@ export class GiftController {
   }
 
   /**
-   * Admin: List sounds
-   * GET /gifts/admin/sounds
+   * Admin: List platform sounds
+   * GET /gifts/admin/sounds?context=gift|live_stream
    */
   @Get('admin/sounds')
   @UseGuards(StaffJwtAuthGuard, PermissionsGuard)
   @Permissions('view_revenue')
-  async getSounds(@Req() req) {
-    return await this.giftService.getSounds();
+  async getSounds(@Req() req, @Query('context') context?: 'gift' | 'live_stream') {
+    return await this.giftService.getSounds(context);
   }
 
   /**

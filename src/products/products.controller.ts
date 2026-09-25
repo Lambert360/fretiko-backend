@@ -11,6 +11,7 @@ import {
   Request,
   UseInterceptors,
   UploadedFiles,
+  BadRequestException,
 } from '@nestjs/common';
 import { FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 // import { Public } from '../auth/public.decorator';
@@ -18,6 +19,26 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../auth/optional-jwt-auth.guard';
 import { ProductsService } from './products.service';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto, RankedProductsQueryDto, RecordProductEventDto } from './dto/product.dto';
+
+// Postgres NUMERIC accepts NaN (and NaN >= 0 passes CHECK constraints), so
+// reject non-finite parses at the boundary instead of storing NaN.
+const parseOptionalFinite = (v: any): number | undefined => {
+  if (v === undefined || v === null || v === '') return undefined;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : undefined;
+};
+
+// FormData fields arrive as JSON strings; malformed input becomes a clean
+// 400 instead of an unhandled SyntaxError 500.
+const parseJsonField = <T = any>(v: any, field: string, fallback?: T): T | undefined => {
+  if (v === undefined || v === null || v === '') return fallback;
+  if (typeof v !== 'string') return v; // already an object (JSON-body clients)
+  try {
+    return JSON.parse(v);
+  } catch {
+    throw new BadRequestException(`Invalid JSON in '${field}'`);
+  }
+};
 
 @Controller('products')
 export class ProductsController {
@@ -30,23 +51,26 @@ export class ProductsController {
   }
 
   @Get()
-  async getProducts(@Query() query: ProductQueryDto) {
+  @UseGuards(OptionalJwtAuthGuard)
+  async getProducts(@Query() query: ProductQueryDto, @Request() req) {
     console.log('📦 Fetching products with query:', query);
-    return this.productsService.getProducts(query);
+    return this.productsService.getProducts(query, req.user?.sub || null);
   }
 
   @Get('trending')
-  async getTrendingProducts(@Query('limit') limit?: string) {
+  @UseGuards(OptionalJwtAuthGuard)
+  async getTrendingProducts(@Query('limit') limit?: string, @Request() req?) {
     const parsedLimit = limit ? parseInt(limit, 10) : 10;
     console.log('📦 Fetching trending products, limit:', parsedLimit);
-    return this.productsService.getTrendingProducts(Number.isNaN(parsedLimit) ? 10 : parsedLimit);
+    return this.productsService.getTrendingProducts(Number.isNaN(parsedLimit) ? 10 : parsedLimit, req?.user?.sub || null);
   }
 
   @Get('seasonal')
-  async getSeasonalProducts(@Query('limit') limit?: string, @Query('region') region?: string) {
+  @UseGuards(OptionalJwtAuthGuard)
+  async getSeasonalProducts(@Query('limit') limit?: string, @Query('region') region?: string, @Request() req?) {
     const parsedLimit = limit ? parseInt(limit, 10) : 12;
     console.log('📦 Fetching seasonal products, limit:', parsedLimit, 'region:', region);
-    return this.productsService.getSeasonalProducts(Number.isNaN(parsedLimit) ? 12 : parsedLimit, region);
+    return this.productsService.getSeasonalProducts(Number.isNaN(parsedLimit) ? 12 : parsedLimit, region, req?.user?.sub || null);
   }
 
   // Location-aware, engagement/trust-ranked product feed for the HomeScreen product tab.
@@ -76,22 +100,35 @@ export class ProductsController {
 
   // @Public()
   @Get('user/:userId')
-  async getUserProducts(@Param('userId') userId: string) {
+  @UseGuards(OptionalJwtAuthGuard)
+  async getUserProducts(
+    @Param('userId') userId: string,
+    @Request() req,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
     console.log('📦 Fetching public products for user:', userId);
-    return this.productsService.getMyProducts(userId);
+    return this.productsService.getPublicProductsByUser(
+      userId,
+      req.user?.sub || null,
+      limit ? parseInt(limit, 10) : 50,
+      offset ? parseInt(offset, 10) : 0,
+    );
   }
 
   @Get(':id')
-  async getProduct(@Param('id') id: string) {
+  @UseGuards(OptionalJwtAuthGuard)
+  async getProduct(@Param('id') id: string, @Request() req) {
     console.log('📦 Fetching product:', id);
-    return this.productsService.getProduct(id);
+    return this.productsService.getProduct(id, req.user?.sub || null);
   }
 
   // Public endpoint: Get product preview for deep linking (no auth required)
   @Get('public/:id')
-  async getPublicProduct(@Param('id') id: string) {
+  @UseGuards(OptionalJwtAuthGuard)
+  async getPublicProduct(@Param('id') id: string, @Request() req) {
     console.log('📦 Fetching public product:', id);
-    return this.productsService.getProduct(id);
+    return this.productsService.getProduct(id, req.user?.sub || null);
   }
 
   @Post()
@@ -145,6 +182,12 @@ export class ProductsController {
     return this.productsService.getProductReviews(id);
   }
 
+  @Get(':id/review-eligibility')
+  @UseGuards(JwtAuthGuard)
+  async getReviewEligibility(@Param('id') productId: string, @Request() req) {
+    return this.productsService.getReviewEligibility(productId, req.user.sub);
+  }
+
   @Post(':id/reviews')
   @UseGuards(JwtAuthGuard)
   async addProductReview(
@@ -184,13 +227,19 @@ export class ProductsController {
       category_id: body.category_id,
       condition: body.condition,
       quantity: parseInt(body.quantity),
+      weight_kg: parseOptionalFinite(body.weight_kg),
+      length_cm: parseOptionalFinite(body.length_cm),
+      width_cm: parseOptionalFinite(body.width_cm),
+      height_cm: parseOptionalFinite(body.height_cm),
       location: body.location,
+      location_latitude: parseOptionalFinite(body.location_latitude),
+      location_longitude: parseOptionalFinite(body.location_longitude),
       images: [], // Will be populated by the service
       videos: [], // Will be populated by the service
-      tags: body.tags ? JSON.parse(body.tags) : [],
-      shipping_options: body.shipping_options ? JSON.parse(body.shipping_options) : undefined,
+      tags: parseJsonField(body.tags, 'tags', []),
+      shipping_options: parseJsonField(body.shipping_options, 'shipping_options'),
       is_multi_item: body.is_multi_item === 'true' || body.is_multi_item === true,
-      variants: body.variants ? JSON.parse(body.variants) : undefined,
+      variants: parseJsonField(body.variants, 'variants'),
     };
 
     console.log('📦 Parsed product data:', productData);

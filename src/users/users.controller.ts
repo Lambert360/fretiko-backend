@@ -57,6 +57,15 @@ export class UsersController {
     return this.usersService.updateTimezone(req.user.sub, body.timezone);
   }
 
+  /**
+   * Stamp the citizen number reveal as seen (one-time, idempotent).
+   */
+  @Put('citizen-number-seen')
+  @UseGuards(JwtAuthGuard)
+  async markCitizenNumberSeen(@Request() req) {
+    return this.usersService.markCitizenNumberSeen(req.user.sub);
+  }
+
   @Post('avatar')
   @UseGuards(JwtAuthGuard)
   @UseInterceptors(FileInterceptor('avatar', {

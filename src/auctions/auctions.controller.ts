@@ -48,6 +48,7 @@ export class AuctionsController {
    * Public endpoint with optional user-specific data
    */
   @Get()
+  @UseGuards(OptionalJwtAuthGuard)
   async getAuctions(
     @Query(new ValidationPipe({ transform: true, whitelist: true })) filters: AuctionFilterDto,
     @Request() req?: any,
@@ -60,10 +61,10 @@ export class AuctionsController {
    * Get featured auctions for discovery screen
    */
   @Get('featured')
+  @UseGuards(OptionalJwtAuthGuard)
   async getFeaturedAuctions(@Request() req?: any) {
     const userId = req?.user?.sub;
     const filters: AuctionFilterDto = {
-      featured_only: true,
       status: 'active',
       limit: 10,
       sort: 'bids_desc',
@@ -75,6 +76,7 @@ export class AuctionsController {
    * Get auctions ending soon
    */
   @Get('ending-soon')
+  @UseGuards(OptionalJwtAuthGuard)
   async getAuctionsEndingSoon(@Request() req?: any) {
     const userId = req?.user?.sub;
     const filters: AuctionFilterDto = {
@@ -90,6 +92,7 @@ export class AuctionsController {
    * Get auctions by category
    */
   @Get('category/:categorySlug')
+  @UseGuards(OptionalJwtAuthGuard)
   async getAuctionsByCategory(
     @Param('categorySlug') categorySlug: string,
     @Query(new ValidationPipe({ transform: true, whitelist: true })) filters: AuctionFilterDto,
@@ -111,7 +114,7 @@ export class AuctionsController {
   @UseGuards(OptionalJwtAuthGuard)
   async getAuction(@Param('id') id: string, @Request() req?: any) {
     const userId = req?.user?.sub;
-    return this.auctionsService.findById(id, userId);
+    return this.auctionsService.findById(id, userId, true);
   }
 
   /**
@@ -119,7 +122,7 @@ export class AuctionsController {
    */
   @Get('public/:id')
   async getPublicAuction(@Param('id') id: string) {
-    return this.auctionsService.findById(id, undefined);
+    return this.auctionsService.findById(id, undefined, true);
   }
 
   /**
@@ -228,6 +231,7 @@ export class AuctionsController {
       req.user.sub,
       placeBidDto,
       req.headers.authorization?.replace('Bearer ', ''),
+      { ipAddress: req.ip, userAgent: req.headers['user-agent'] },
     );
   }
 
@@ -354,6 +358,36 @@ export class AuctionsController {
     @Request() req: any,
   ) {
     return this.auctionsService.stopBroadcast(auctionId, req.user.sub);
+  }
+
+  /**
+   * End a live auction and stop its broadcast.
+   * Marks the auction as ended, closes any active item, and clears the stream URL.
+   * Called when the auctioneer explicitly ends the live stream.
+   */
+  @Post(':id/end-live')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async endLiveAuction(
+    @Param('id') auctionId: string,
+    @Request() req: any,
+  ) {
+    return this.auctionsService.endLiveAuction(auctionId, req.user.sub);
+  }
+
+  /**
+   * Pause or resume the live broadcast for an auction.
+   * Body: { status: 'paused' | 'live' }
+   */
+  @Post(':id/broadcast-status')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async setBroadcastStatus(
+    @Param('id') auctionId: string,
+    @Body('status') status: 'paused' | 'live',
+    @Request() req: any,
+  ) {
+    return this.auctionsService.setBroadcastStatus(auctionId, req.user.sub, status);
   }
 
   /**
@@ -550,8 +584,8 @@ export class AuctionsController {
     @Param('itemId') itemId: string,
     @Request() req: any,
   ) {
-    await this.auctionsService.endItemBidding(auctionId, itemId, req.user.sub);
-    return { message: 'Bidding ended', item_id: itemId };
+    const outcome = await this.auctionsService.endItemBidding(auctionId, itemId, req.user.sub);
+    return { message: 'Bidding ended', ...outcome };
   }
 
   /**
@@ -584,6 +618,38 @@ export class AuctionsController {
   ) {
     await this.auctionsService.skipItem(auctionId, itemId, req.user.sub);
     return { message: 'Item skipped', item_id: itemId };
+  }
+
+  /**
+   * Defer a waiting item to the back of the queue, then load the next one
+   * Only auction seller can control
+   */
+  @Post(':auctionId/items/:itemId/defer')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async deferItem(
+    @Param('auctionId') auctionId: string,
+    @Param('itemId') itemId: string,
+    @Request() req: any,
+  ) {
+    await this.auctionsService.deferItem(auctionId, itemId, req.user.sub);
+    return { message: 'Item deferred', item_id: itemId };
+  }
+
+  /**
+   * Load a specific waiting item as the current item
+   * Only auction seller can control
+   */
+  @Post(':auctionId/items/:itemId/select')
+  @UseGuards(JwtAuthGuard, AuctionOwnerGuard)
+  @HttpCode(HttpStatus.OK)
+  async selectItem(
+    @Param('auctionId') auctionId: string,
+    @Param('itemId') itemId: string,
+    @Request() req: any,
+  ) {
+    await this.auctionsService.selectItem(auctionId, itemId, req.user.sub);
+    return { message: 'Item selected', item_id: itemId };
   }
 
   /**

@@ -6,6 +6,7 @@ import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
 import { TagsService } from '../tags/tags.service';
 import { MentionsService } from '../mentions/mentions.service';
+import { isAdultViewer } from '../shared/viewer-age';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
@@ -89,6 +90,8 @@ export class ServicesService {
       primary_media_url: createServiceDto.images?.[0] || createServiceDto.videos?.[0] || null,
       media_type: (createServiceDto.images && createServiceDto.images.length > 0) ? 'image' : 'video',
       location: createServiceDto.location,
+      location_latitude: createServiceDto.location_latitude ?? null,
+      location_longitude: createServiceDto.location_longitude ?? null,
       service_area: createServiceDto.service_area,
       availability: createServiceDto.availability,
       tags: createServiceDto.tags || [],
@@ -138,6 +141,42 @@ export class ServicesService {
     return data;
   }
 
+  /**
+   * Public catalog for a provider — used by GET /services/user/:userId.
+   * Unlike getServicesByUser (owner view, all statuses), this returns only
+   * active listings and honors the vendor's catalog visibility flags.
+   */
+  async getPublicServicesByUser(userId: string, viewerId?: string | null) {
+    const { data: vendor } = await this.serviceSupabase
+      .from('user_profiles')
+      .select('catalog_hidden, is_adult_content')
+      .eq('id', userId)
+      .single();
+
+    if (vendor?.catalog_hidden) return [];
+    if (vendor?.is_adult_content && !(await isAdultViewer(this.serviceSupabase, viewerId))) return [];
+
+    const { data, error } = await this.serviceSupabase
+      .from('services')
+      .select(`
+        *,
+        service_categories (
+          name,
+          icon_name,
+          color_hex
+        )
+      `)
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      throw new Error(`Failed to fetch user services: ${error.message}`);
+    }
+
+    return data;
+  }
+
   async getServicesByUser(userId: string, userToken?: string) {
     // Use serviceSupabase - user tokens can't be used for DB operations
     const supabaseClient = this.serviceSupabase;
@@ -167,7 +206,14 @@ export class ServicesService {
     search?: string;
     limit?: number;
     offset?: number;
+    viewerId?: string | null;
+    price_min?: number;
+    price_max?: number;
+    min_rating?: number;
+    sort?: 'newest' | 'popular' | 'rating' | 'price_asc' | 'price_desc';
   }) {
+    const viewerIsAdult = await isAdultViewer(this.serviceSupabase, options.viewerId);
+
     let query = this.serviceSupabase
       .from('services')
       .select(`
@@ -177,23 +223,41 @@ export class ServicesService {
           icon_name,
           color_hex
         ),
-        user_profiles!services_user_id_fkey (
+        user_profiles!services_user_id_fkey!inner (
           username,
           avatar_url,
           is_verified,
           display_name
         )
       `)
-      .eq('status', 'active');
+      .eq('status', 'active')
+      .eq('user_profiles.catalog_hidden', false);
+
+    if (!viewerIsAdult) {
+      query = query.eq('user_profiles.is_adult_content', false);
+    }
 
     if (options.category_id) {
       query = query.eq('category_id', options.category_id);
     }
 
     if (options.search) {
-      query = query.or(
-        `name.ilike.%${options.search}%,description.ilike.%${options.search}%,tags.cs.{${options.search}}`
-      );
+      // Weighted tsvector search (migration 226): name=A, description=B,
+      // tags=C, location=D. websearch_to_tsquery tolerates raw user input
+      // (spaces, punctuation) without tsquery syntax errors.
+      query = query.textSearch('search_vector', options.search, { type: 'websearch' });
+    }
+
+    if (options.price_min !== undefined) {
+      query = query.gte('base_price', options.price_min);
+    }
+
+    if (options.price_max !== undefined) {
+      query = query.lte('base_price', options.price_max);
+    }
+
+    if (options.min_rating !== undefined) {
+      query = query.gte('average_rating', options.min_rating);
     }
 
     if (options.limit) {
@@ -204,7 +268,16 @@ export class ServicesService {
       query = query.range(options.offset, (options.offset || 0) + (options.limit || 10) - 1);
     }
 
-    query = query.order('created_at', { ascending: false });
+    const serviceSortMap: Record<string, { column: string; ascending: boolean }> = {
+      price_asc: { column: 'base_price', ascending: true },
+      price_desc: { column: 'base_price', ascending: false },
+      rating: { column: 'average_rating', ascending: false },
+      popular: { column: 'rating_count', ascending: false },
+      newest: { column: 'created_at', ascending: false },
+    };
+    const sort = serviceSortMap[options.sort || 'newest'] || serviceSortMap.newest;
+
+    query = query.order(sort.column, { ascending: sort.ascending });
 
     const { data, error } = await query;
 
@@ -254,8 +327,10 @@ export class ServicesService {
   async getVideoFeed(userId: string | null, options: { limit?: number; offset?: number }) {
     console.log('🎥 getVideoFeed called with userId:', userId, 'options:', options);
 
+    const viewerIsAdult = await isAdultViewer(this.serviceSupabase, userId);
+
     // Get services that have videos for the TikTok-style video feed
-    const query = this.serviceSupabase
+    let query = this.serviceSupabase
       .from('services')
       .select(`
         *,
@@ -264,16 +339,21 @@ export class ServicesService {
           icon_name,
           color_hex
         ),
-        user_profiles!services_user_id_fkey (
+        user_profiles!services_user_id_fkey!inner (
           username,
           avatar_url,
           display_name
         )
       `)
       .eq('status', 'active')
+      .eq('user_profiles.catalog_hidden', false)
       .or('videos.not.eq.{},images.not.eq.{}')  // Services with videos or images
       .order('created_at', { ascending: false })  // Most recent first
       .limit(options.limit || 10);
+
+    if (!viewerIsAdult) {
+      query = query.eq('user_profiles.is_adult_content', false);
+    }
 
     if (options.offset) {
       query.range(options.offset, (options.offset || 0) + (options.limit || 10) - 1);
@@ -395,7 +475,7 @@ export class ServicesService {
     return videoFeed;
   }
 
-  async getService(id: string) {
+  async getService(id: string, viewerId?: string | null) {
     const { data, error } = await this.serviceSupabase
       .from('services')
       .select(`
@@ -408,7 +488,9 @@ export class ServicesService {
         user_profiles!services_user_id_fkey (
           username,
           avatar_url,
-          display_name
+          display_name,
+          catalog_hidden,
+          is_adult_content
         )
       `)
       .eq('id', id)
@@ -416,6 +498,18 @@ export class ServicesService {
 
     if (error) {
       throw new NotFoundException(`Service not found: ${error.message}`);
+    }
+
+    // Unlisted catalogs still resolve via direct link (bookable);
+    // adult-flagged catalogs require a verified 18+ viewer (owner exempt).
+    if (data.user_profiles?.is_adult_content && data.user_id !== viewerId) {
+      const viewerIsAdult = await isAdultViewer(this.serviceSupabase, viewerId);
+      if (!viewerIsAdult) {
+        throw new ForbiddenException({
+          code: 'ADULT_CONTENT_RESTRICTED',
+          message: 'This content is restricted to viewers 18 and older',
+        });
+      }
     }
 
     // Increment view count
@@ -434,7 +528,7 @@ export class ServicesService {
     // First verify the service belongs to the user
     const { data: existingService } = await supabaseClient
       .from('services')
-      .select('user_id')
+      .select('user_id, status, location')
       .eq('id', serviceId)
       .single();
 
@@ -444,6 +538,12 @@ export class ServicesService {
 
     if (existingService.user_id !== userId) {
       throw new ForbiddenException('You can only update your own services');
+    }
+
+    // Moderation lock: 'removed' is set by staff rejection only — vendors may
+    // still edit fields but cannot change status (i.e. cannot undo moderation)
+    if (existingService.status === 'removed' && updateServiceDto.status !== undefined) {
+      throw new ForbiddenException('This service was removed by moderation and cannot be reactivated');
     }
 
     // Verify category exists if provided
@@ -461,7 +561,18 @@ export class ServicesService {
     }
 
     const updateData: any = { ...updateServiceDto };
-    
+
+    // Location text changed without new coords → stale coords are worse than none
+    if (
+      updateServiceDto.location !== undefined
+      && updateServiceDto.location !== existingService.location
+      && updateServiceDto.location_latitude === undefined
+      && updateServiceDto.location_longitude === undefined
+    ) {
+      updateData.location_latitude = null;
+      updateData.location_longitude = null;
+    }
+
     // Update media info if images or videos changed
     if (updateServiceDto.images || updateServiceDto.videos) {
       const images = updateServiceDto.images || [];

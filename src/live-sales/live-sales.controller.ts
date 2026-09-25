@@ -67,6 +67,7 @@ export class LiveSalesController {
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
     @Query('exclude_plugged') excludePlugged?: string,
+    @Query('search') search?: string,
     @Request() req?: any,
   ) {
     const limitNum = limit ? parseInt(limit, 10) : 20;
@@ -81,7 +82,8 @@ export class LiveSalesController {
       limitNum, 
       offsetNum, 
       excludePluggedVendors, 
-      req?.user?.sub
+      req?.user?.sub,
+      search
     );
   }
 
@@ -140,7 +142,8 @@ export class LiveSalesController {
       throw new BadRequestException('User not authenticated');
     }
 
-    // Verify user is a vendor (seller or rider)
+    // Verify user is a vendor (seller or rider) — fail closed: if the
+    // profile cannot be loaded we cannot confirm vendor status.
     try {
       const userProfile = await this.usersService.getProfile(userId);
       if (!userProfile.isSeller && !userProfile.isRider) {
@@ -150,8 +153,8 @@ export class LiveSalesController {
       if (error instanceof ForbiddenException) {
         throw error;
       }
-      // If profile not found or other error, log but allow (profile might be incomplete)
       this.liveSalesService['logger']?.warn(`Could not verify vendor role: ${error instanceof Error ? error.message : String(error)}`);
+      throw new ForbiddenException('Unable to verify vendor status');
     }
 
     const token = req.headers.authorization?.replace('Bearer ', '');

@@ -5,6 +5,7 @@ import { TagsService } from '../tags/tags.service';
 import { MentionsService } from '../mentions/mentions.service';
 import { ServicesService } from '../services/services.service';
 import { VideoProcessingHelper } from '../shared/video-processing.helper';
+import { isAdultViewer } from '../shared/viewer-age';
 import { Post, PostInteraction, PostMedia, UnifiedFeedItem, LiveStreamData, UserInfo, InteractionType, MediaType, PrivacyLevel, FeedItemType } from './interfaces/post.interface';
 import { CreatePostDto } from './dto/create-post.dto';
 import { UpdatePostDto } from './dto/update-post.dto';
@@ -340,9 +341,11 @@ export class PostsService {
     }
 
     // Get active live streams to mix into the unified feed
+    // (unlisted/18+ vendor catalogs stay off feed surfaces; direct links still work)
+    const viewerIsAdult = await isAdultViewer(this.supabase, userId);
     let liveStreamFeedItems: UnifiedFeedItem[] = [];
     try {
-      const { data: liveStreams, error: liveError } = await this.supabase
+      let liveStreamQuery = this.supabase
         .from('live_stream_stats')
         .select(`
           id,
@@ -364,7 +367,7 @@ export class PostsService {
           stream_url,
           created_at,
           started_at,
-          vendor:user_profiles!vendor_id (
+          vendor:user_profiles!vendor_id!inner (
             id,
             username,
             avatar_url,
@@ -373,9 +376,16 @@ export class PostsService {
           )
         `)
         .eq('status', 'live')
+        .eq('vendor.catalog_hidden', false)
         .order('viewer_count', { ascending: false })
         .order('started_at', { ascending: false })
         .range(0, Math.min(candidatePoolSize, 20));
+
+      if (!viewerIsAdult) {
+        liveStreamQuery = liveStreamQuery.eq('vendor.is_adult_content', false);
+      }
+
+      const { data: liveStreams, error: liveError } = await liveStreamQuery;
 
       if (!liveError && liveStreams) {
         // Bulk-fetch the lowest live price for product streams

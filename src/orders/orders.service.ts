@@ -29,82 +29,234 @@ export class OrdersService {
     private realtimeGateway: RealtimeGateway,
   ) {}
 
+  private readonly ordersListSelect = `
+    id,
+    order_number,
+    status,
+    total_amount,
+    delivery_fee,
+    platform_fee,
+    estimated_delivery,
+    delivery_address,
+    delivery_instructions,
+    metadata,
+    created_at,
+    buyer_id,
+    vendor_id,
+    rider_id,
+    escrow_enabled,
+    delivery_type,
+    rider_info,
+    source,
+    order_items (
+      id,
+      product_id,
+      service_id,
+      product_name,
+      unit_price,
+      quantity,
+      total_price,
+      scheduled_date,
+      scheduled_time,
+      product_metadata
+    )
+  `;
+
+  // Resolve item images in a second query — avoids depending on the
+  // order_items→products/services FK embed, which may not exist on the
+  // live schema.
+  private async attachItemImages(supabase: any, orders: any[]): Promise<void> {
+    const productIds = new Set<string>();
+    const serviceIds = new Set<string>();
+    for (const order of orders) {
+      for (const item of order.order_items || []) {
+        if (item.product_id) productIds.add(item.product_id);
+        if (item.service_id) serviceIds.add(item.service_id);
+      }
+    }
+
+    const [productsResult, servicesResult] = await Promise.all([
+      productIds.size
+        ? supabase
+            .from('products')
+            .select('id, primary_image_url, images, primary_video_url, processed_videos')
+            .in('id', [...productIds])
+        : Promise.resolve({ data: [] }),
+      serviceIds.size
+        ? supabase
+            .from('services')
+            .select('id, primary_media_url, images, videos, processed_videos')
+            .in('id', [...serviceIds])
+        : Promise.resolve({ data: [] }),
+    ]);
+
+    type ItemMedia = { image: string | null; images: string[]; videos: string[] };
+
+    const productMedia = new Map<string, ItemMedia>(
+      (productsResult.data || []).map((p: any): [string, ItemMedia] => [
+        p.id,
+        {
+          image: p.primary_image_url,
+          images: Array.isArray(p.images) && p.images.length ? p.images : (p.primary_image_url ? [p.primary_image_url] : []),
+          videos: [
+            ...new Set<string>(
+              ((Array.isArray(p.processed_videos) ? p.processed_videos : []) as string[])
+                .concat(p.primary_video_url ? [p.primary_video_url] : []),
+            ),
+          ],
+        },
+      ]),
+    );
+    const serviceMedia = new Map<string, ItemMedia>(
+      (servicesResult.data || []).map((s: any): [string, ItemMedia] => {
+        const images = Array.isArray(s.images) && s.images.length ? s.images : [];
+        const videos = [
+          ...new Set<string>(
+            ((Array.isArray(s.processed_videos) ? s.processed_videos : []) as string[])
+              .concat(Array.isArray(s.videos) ? s.videos : []),
+          ),
+        ];
+        return [
+          s.id,
+          {
+            // primary_media_url can point at a video — prefer a real image
+            // (a video thumbnail is generated into images[] at upload time)
+            image: images[0] ?? s.primary_media_url ?? null,
+            images,
+            videos,
+          },
+        ];
+      }),
+    );
+
+    for (const order of orders) {
+      for (const item of order.order_items || []) {
+        const media = item.product_id
+          ? productMedia.get(item.product_id)
+          : serviceMedia.get(item.service_id);
+        item.image = media?.image ?? null;
+        item.images = media?.images ?? [];
+        item.videos = media?.videos ?? [];
+      }
+    }
+  }
+
+  private mapOrderListItem(order: any) {
+    return {
+      id: order.id,
+      orderNumber: order.order_number,
+      status: order.status,
+      total: order.total_amount,
+      subtotal: order.metadata?.subtotal || order.total_amount - order.delivery_fee,
+      deliveryFee: order.delivery_fee,
+      tax: order.metadata?.tax_amount || 0,
+      platformFee: order.platform_fee,
+      escrowFee: order.metadata?.escrow_fee || 0,
+      itemCount: order.order_items?.length || 0,
+      orderDate: order.created_at,
+      estimatedDelivery: order.estimated_delivery,
+      deliveryAddress: order.delivery_address,
+      deliveryInstructions: order.delivery_instructions,
+      escrowEnabled: order.escrow_enabled,
+      deliveryType: order.delivery_type,
+      riderInfo: order.rider_info,
+      source: order.source,
+      buyerId: order.buyer_id,
+      vendorId: order.vendor_id,
+      riderId: order.rider_id,
+      metadata: order.metadata,
+      items: (order.order_items || []).map((item: any) => ({
+        id: item.id,
+        productId: item.product_id,
+        serviceId: item.service_id,
+        name: item.product_name,
+        image: item.image ?? null,
+        images: item.images ?? [],
+        videos: item.videos ?? [],
+        price: item.unit_price,
+        quantity: item.quantity,
+        totalPrice: item.total_price,
+        serviceDate: item.scheduled_date,
+        serviceTime: item.scheduled_time,
+        metadata: item.product_metadata,
+      })),
+    };
+  }
+
   async getMyOrders(userId: string, filters?: any) {
     const supabase = createServiceSupabaseClient(this.configService);
-    
+
+    // Pagination params: when limit/offset are supplied the response is an
+    // envelope { orders, pagination }. Legacy callers (no params) keep the
+    // original unbounded-array contract so old app builds don't break.
+    const paginated = filters?.limit !== undefined || filters?.offset !== undefined;
+    const limit = Math.min(Math.max(parseInt(filters?.limit) || 20, 1), 100);
+    const offset = Math.max(parseInt(filters?.offset) || 0, 0);
+
+    const statusList = filters?.status ? String(filters.status).split(',') : null;
+    const startDate = filters?.startDate;
+    const endDate = filters?.endDate;
+    const minAmount = filters?.minAmount ? parseFloat(filters.minAmount) : null;
+    const maxAmount = filters?.maxAmount ? parseFloat(filters.maxAmount) : null;
+
+    const applyFilters = (q: any) => {
+      if (statusList?.length) q = q.in('status', statusList);
+      if (startDate) q = q.gte('created_at', startDate);
+      if (endDate) q = q.lte('created_at', endDate);
+      if (minAmount !== null) q = q.gte('total_amount', minAmount);
+      if (maxAmount !== null) q = q.lte('total_amount', maxAmount);
+      return q;
+    };
+
+    if (paginated) {
+      // Single query: buyer orders (excluding the user's own vendor orders)
+      // OR orders where the user is the gift recipient.
+      const { data, error, count } = await applyFilters(
+        supabase
+          .from('orders')
+          .select(this.ordersListSelect, { count: 'exact' })
+          .or(
+            `and(buyer_id.eq.${userId},or(vendor_id.neq.${userId},vendor_id.is.null)),` +
+            `and(source.eq.wishlist,metadata->>gift_recipient_id.eq.${userId})`
+          )
+          .order('created_at', { ascending: false })
+          .range(offset, offset + limit - 1),
+      );
+
+      if (error) {
+        throw new Error(`Failed to fetch orders: ${error.message}`);
+      }
+
+      const orders = data || [];
+      await this.attachItemImages(supabase, orders);
+
+      return {
+        orders: orders.map(order => this.mapOrderListItem(order)),
+        pagination: { limit, offset, total: count ?? 0 },
+      };
+    }
+
     // ✅ Query orders where user is buyer OR gift recipient
     // Use two queries and combine for reliability with JSONB filtering
     const [buyerOrdersResult, giftOrdersResult] = await Promise.all([
       // Orders where user is the buyer
-      supabase
-        .from('orders')
-        .select(`
-          id,
-          order_number,
-          status,
-          total_amount,
-          delivery_fee,
-          platform_fee,
-          estimated_delivery,
-          delivery_address,
-          delivery_instructions,
-          metadata,
-          created_at,
-          buyer_id,
-          vendor_id,
-          rider_id,
-          escrow_enabled,
-          delivery_type,
-          rider_info,
-          source,
-          order_items (
-            id,
-            product_id,
-            product_name,
-            unit_price,
-            quantity,
-            total_price,
-            product_metadata
-          )
-        `)
-        .eq('buyer_id', userId)
-        .order('created_at', { ascending: false }),
-      
+      applyFilters(
+        supabase
+          .from('orders')
+          .select(this.ordersListSelect)
+          .eq('buyer_id', userId)
+          .order('created_at', { ascending: false }),
+      ),
+
       // Orders where user is gift recipient (wishlist gift orders)
-      supabase
-        .from('orders')
-        .select(`
-          id,
-          order_number,
-          status,
-          total_amount,
-          delivery_fee,
-          platform_fee,
-          estimated_delivery,
-          delivery_address,
-          delivery_instructions,
-          metadata,
-          created_at,
-          buyer_id,
-          vendor_id,
-          rider_id,
-          escrow_enabled,
-          delivery_type,
-          rider_info,
-          source,
-          order_items (
-            id,
-            product_id,
-            product_name,
-            unit_price,
-            quantity,
-            total_price,
-            product_metadata
-          )
-        `)
-        .eq('source', 'wishlist')
-        .eq('metadata->>gift_recipient_id', userId)
-        .order('created_at', { ascending: false })
+      applyFilters(
+        supabase
+          .from('orders')
+          .select(this.ordersListSelect)
+          .eq('source', 'wishlist')
+          .eq('metadata->>gift_recipient_id', userId)
+          .order('created_at', { ascending: false }),
+      )
     ]);
 
     if (buyerOrdersResult.error) {
@@ -117,11 +269,11 @@ export class OrdersService {
 
     // Combine results and deduplicate by order ID
     const allOrdersMap = new Map();
-    
+
     buyerOrdersResult.data?.forEach(order => {
       allOrdersMap.set(order.id, order);
     });
-    
+
     giftOrdersResult.data?.forEach(order => {
       allOrdersMap.set(order.id, order);
     });
@@ -138,63 +290,13 @@ export class OrdersService {
       return true;
     });
 
-    // Apply filters
-    if (filters?.status?.length) {
-      const statusList = filters.status.split(',');
-      orders = orders.filter(order => statusList.includes(order.status));
-    }
-    if (filters?.startDate) {
-      orders = orders.filter(order => order.created_at >= filters.startDate);
-    }
-    if (filters?.endDate) {
-      orders = orders.filter(order => order.created_at <= filters.endDate);
-    }
-    if (filters?.minAmount) {
-      const minAmount = parseInt(filters.minAmount);
-      orders = orders.filter(order => order.total_amount >= minAmount);
-    }
-    if (filters?.maxAmount) {
-      const maxAmount = parseInt(filters.maxAmount);
-      orders = orders.filter(order => order.total_amount <= maxAmount);
-    }
-
     // Sort by created_at descending
     orders.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
+    await this.attachItemImages(supabase, orders);
+
     // Transform data to match frontend interface
-    return orders.map(order => ({
-      id: order.id,
-      orderNumber: order.order_number,
-      status: order.status,
-      total: order.total_amount,
-      subtotal: order.metadata?.subtotal || order.total_amount - order.delivery_fee,
-      deliveryFee: order.delivery_fee,
-      tax: order.metadata?.tax_amount || 0,
-      platformFee: order.platform_fee,
-      escrowFee: order.metadata?.escrow_fee || 0,
-      itemCount: order.order_items?.length || 0,
-      orderDate: order.created_at,
-      estimatedDelivery: order.estimated_delivery,
-      deliveryAddress: order.delivery_address,
-      deliveryInstructions: order.delivery_instructions, // ✅ Include delivery instructions
-      escrowEnabled: order.escrow_enabled,
-      deliveryType: order.delivery_type,
-      riderInfo: order.rider_info,
-      source: order.source,
-      buyerId: order.buyer_id,
-      vendorId: order.vendor_id,
-      riderId: order.rider_id,
-      metadata: order.metadata,
-      items: order.order_items.map(item => ({
-        id: item.id,
-        productId: item.product_id,
-        name: item.product_name,
-        price: item.unit_price,
-        quantity: item.quantity,
-        totalPrice: item.total_price,
-        metadata: item.product_metadata,
-      }))
-    }));
+    return orders.map(order => this.mapOrderListItem(order));
   }
 
   async getOrderDetails(userId: string, orderId: string) {
@@ -235,6 +337,7 @@ export class OrdersService {
         order_items (
           id,
           product_id,
+          service_id,
           product_name,
           unit_price,
           quantity,
@@ -248,6 +351,8 @@ export class OrdersService {
     if (error) {
       throw new Error(`Failed to fetch order details: ${error.message}`);
     }
+
+    await this.attachItemImages(supabase, [data]);
 
     // Fetch vendor profile if vendor_id exists
     let vendorInfo: { name: string; phone?: string; avatar?: string } | null = null;
@@ -325,7 +430,11 @@ export class OrdersService {
       items: data.order_items.map(item => ({
         id: item.id,
         productId: item.product_id,
+        serviceId: item.service_id,
         name: item.product_name,
+        image: item.image ?? null,
+        images: item.images ?? [],
+        videos: item.videos ?? [],
         price: item.unit_price,
         quantity: item.quantity,
         totalPrice: item.total_price,
@@ -394,75 +503,54 @@ export class OrdersService {
 
   async searchOrders(userId: string, query: string) {
     const supabase = createServiceSupabaseClient(this.configService);
-    
-    const { data, error } = await supabase
-      .from('orders')
-      .select(`
-        id,
-        order_number,
-        status,
-        total,
-        subtotal,
-        delivery_fee,
-        tax,
-        item_count,
-        order_date,
-        estimated_delivery,
-        delivery_address,
-        order_items (
-          id,
-          product_id,
-          service_id,
-          name,
-          image,
-          price,
-          original_price,
-          quantity,
-          seller_id,
-          seller_name,
-          category,
-          is_service,
-          service_date,
-          service_time
-        )
-      `)
-      .eq('user_id', userId)
-      .or(`order_number.ilike.%${query}%,order_items.name.ilike.%${query}%`)
-      .order('order_date', { ascending: false });
 
-    if (error) {
-      throw new Error(`Failed to search orders: ${error.message}`);
+    // Strip PostgREST/ilike metacharacters so user input can't corrupt the
+    // or() filter or act as a wildcard.
+    const q = String(query || '').trim().replace(/[(),."%_*\\]/g, '');
+    if (q.length < 2) return [];
+
+    const searchSelect = this.ordersListSelect.replace(
+      'order_items (',
+      'order_items!inner (',
+    );
+    const searchOr = `order_number.ilike.*${q}*,order_items.product_name.ilike.*${q}*`;
+
+    const [buyerResult, giftResult] = await Promise.all([
+      supabase
+        .from('orders')
+        .select(searchSelect)
+        .eq('buyer_id', userId)
+        .neq('vendor_id', userId)
+        .or(searchOr)
+        .order('created_at', { ascending: false })
+        .limit(50),
+      supabase
+        .from('orders')
+        .select(searchSelect)
+        .eq('source', 'wishlist')
+        .eq('metadata->>gift_recipient_id', userId)
+        .or(searchOr)
+        .order('created_at', { ascending: false })
+        .limit(50),
+    ]);
+
+    if (buyerResult.error) {
+      throw new Error(`Failed to search orders: ${buyerResult.error.message}`);
+    }
+    if (giftResult.error) {
+      throw new Error(`Failed to search gift orders: ${giftResult.error.message}`);
     }
 
-    return data.map(order => ({
-      id: order.id,
-      orderNumber: order.order_number,
-      status: order.status,
-      total: order.total,
-      subtotal: order.subtotal,
-      deliveryFee: order.delivery_fee,
-      tax: order.tax,
-      itemCount: order.item_count,
-      orderDate: order.order_date,
-      estimatedDelivery: order.estimated_delivery,
-      deliveryAddress: order.delivery_address,
-      items: order.order_items.map(item => ({
-        id: item.id,
-        productId: item.product_id,
-        serviceId: item.service_id,
-        name: item.name,
-        image: item.image,
-        price: item.price,
-        originalPrice: item.original_price,
-        quantity: item.quantity,
-        sellerId: item.seller_id,
-        sellerName: item.seller_name,
-        category: item.category,
-        isService: item.is_service,
-        serviceDate: item.service_date,
-        serviceTime: item.service_time
-      }))
-    }));
+    const ordersMap = new Map<string, any>();
+    ((buyerResult.data || []) as any[]).forEach(o => ordersMap.set(o.id, o));
+    ((giftResult.data || []) as any[]).forEach(o => ordersMap.set(o.id, o));
+
+    const orders = Array.from(ordersMap.values())
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+      .slice(0, 50);
+
+    await this.attachItemImages(supabase, orders);
+    return orders.map(order => this.mapOrderListItem(order));
   }
 
   async cancelOrder(userId: string, orderId: string, reason?: string) {
@@ -567,21 +655,106 @@ export class OrdersService {
 
   async rateOrderItem(userId: string, orderId: string, itemId: string, rating: number, review?: string) {
     const supabase = createServiceSupabaseClient(this.configService);
-    
-    const { error } = await supabase
-      .from('order_item_ratings')
-      .insert({
-        order_id: orderId,
-        order_item_id: itemId,
-        user_id: userId,
-        rating,
-        review: review || null,
-        created_at: new Date().toISOString()
-      });
+
+    if (!rating || rating < 1 || rating > 5) {
+      throw new Error('Rating must be between 1 and 5');
+    }
+
+    // Verify the caller owns the order and it's in a rateable state
+    const { data: order } = await supabase
+      .from('orders')
+      .select('id, status')
+      .eq('id', orderId)
+      .eq('buyer_id', userId)
+      .single();
+
+    if (!order) {
+      throw new Error('Order not found or access denied');
+    }
+    if (!['delivered', 'completed'].includes(order.status)) {
+      throw new Error('You can only rate items from delivered orders');
+    }
+
+    // Verify the item belongs to this order
+    const { data: item } = await supabase
+      .from('order_items')
+      .select('id, product_id, service_id')
+      .eq('id', itemId)
+      .eq('order_id', orderId)
+      .single();
+
+    if (!item) {
+      throw new Error('Order item not found');
+    }
+
+    // Write to the real ratings tables — product_ratings/service_ratings feed
+    // product/service pages AND the seller_stats triggers. The old
+    // order_item_ratings table does not exist in the live schema.
+    const table = item.product_id ? 'product_ratings' : 'service_ratings';
+    const fkColumn = item.product_id ? 'product_id' : 'service_id';
+    const targetId = item.product_id || item.service_id;
+
+    if (!targetId) {
+      throw new Error('Order item has no product or service to rate');
+    }
+
+    // Re-rating (repeat purchase) updates the existing rating instead of
+    // erroring on the (product_id, user_id) duplicate.
+    const { data: existing } = await supabase
+      .from(table)
+      .select('id')
+      .eq(fkColumn, targetId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    const { error } = existing
+      ? await supabase
+          .from(table)
+          .update({ rating, review: review || null })
+          .eq('id', existing.id)
+      : await supabase
+          .from(table)
+          .insert({
+            [fkColumn]: targetId,
+            user_id: userId,
+            rating,
+            review: review || null,
+            // product_ratings.helpful_count has no reliable default
+            ...(item.product_id ? { helpful_count: 0 } : {}),
+          });
 
     if (error) {
-      throw new Error(`Failed to rate order item: ${error.message}`);
+      throw new Error(`Failed to save rating: ${error.message}`);
     }
+
+    // Refresh the listing's aggregate rating
+    await this.refreshListingRating(supabase, item.product_id ? 'products' : 'services', table, fkColumn, targetId);
+  }
+
+  // products use (average_rating, review_count); services use
+  // (average_rating, rating_count) — column names differ per table.
+  private async refreshListingRating(
+    supabase: any,
+    targetTable: 'products' | 'services',
+    ratingsTable: 'product_ratings' | 'service_ratings',
+    fkColumn: string,
+    targetId: string,
+  ) {
+    const { data: ratings } = await supabase
+      .from(ratingsTable)
+      .select('rating')
+      .eq(fkColumn, targetId);
+
+    const count = ratings?.length || 0;
+    const average = count
+      ? ratings.reduce((sum: number, r: any) => sum + (r.rating || 0), 0) / count
+      : 0;
+
+    const countColumn = targetTable === 'products' ? 'review_count' : 'rating_count';
+    await supabase
+      .from(targetTable)
+      .update({ average_rating: average, [countColumn]: count })
+      .eq('id', targetId);
   }
 
   async reportOrderIssue(userId: string, orderId: string, issue: any) {
@@ -1076,8 +1249,14 @@ export class OrdersService {
 
     console.log(`✅ Order ${orderId} marked as completed with immediate escrow release`);
 
-    // Update service_bookings status if this is a service booking
-    if (order.source === 'service_booking') {
+    // Update service_bookings status if this is a service booking.
+    // Live-stream service/portfolio bookings arrive with source='live_stream'
+    // and metadata.booking_type='service'|'portfolio' — their booking rows are
+    // linked by order_id (portfolio bookings have no service_bookings row; the
+    // update is then a harmless no-op).
+    if (order.source === 'service_booking' ||
+        (order.source === 'live_stream' &&
+          ['service', 'portfolio'].includes(order.metadata?.booking_type))) {
       try {
         await supabase
           .from('service_bookings')
@@ -1378,6 +1557,8 @@ export class OrdersService {
             order_id: orderId,
             order_number: order.order_number,
             reason: reason,
+            recipient_role: 'vendor',
+            target_screen: 'VendorOrderDetails',
           },
         };
 

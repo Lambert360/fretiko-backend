@@ -55,6 +55,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
   private connectedUsers = new Map<string, { userId: string; streamId?: string; role: string; accessToken?: string }>();
   private streamViewerCounts = new Map<string, Set<string>>(); // Fallback viewer tracking: streamId -> Set of userIds
   private streamVendorCache = new Map<string, string>();
+  private soundCooldowns = new Map<string, number>(); // client.id -> last play_sound timestamp
   private supabase;
 
   constructor(
@@ -235,6 +236,7 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
       }
 
       this.connectedUsers.delete(client.id);
+      this.soundCooldowns.delete(client.id);
       this.logger.log(`Client disconnected: ${client.id}`);
     } catch (error: any) {
       this.logger.error(`Disconnect error: ${error.message}`);
@@ -896,6 +898,152 @@ export class LiveStreamGateway implements OnGatewayInit, OnGatewayConnection, On
     } catch (error: any) {
       this.logger.error(`Error highlighting item: ${error.message}`);
       client.emit('error', { message: error.message });
+    }
+  }
+
+  // =====================
+  // SOUNDBOARD
+  // =====================
+
+  /**
+   * Host plays a soundboard sound — broadcast to all viewers so every
+   * device plays the actual audio file natively (rather than relying on
+   * speaker→mic acoustic pickup through Agora).
+   *
+   * Emits 'sound_played' with a server-verified payload:
+   *   { streamId, soundId, name, soundUrl? }
+   * soundId is either a 'builtin:*' key (bundled asset on all devices) or a
+   * sounds-table UUID that must be an active live_stream sound owned by the
+   * platform or by this host — the URL is always taken from the DB, never
+   * trusted from the client.
+   */
+  @SubscribeMessage('play_sound')
+  async handlePlaySound(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { streamId: string; soundId: string; name?: string },
+  ) {
+    try {
+      const userInfo = this.connectedUsers.get(client.id);
+      if (!userInfo || userInfo.userId === 'anonymous') {
+        client.emit('error', { message: 'User not authenticated' });
+        return;
+      }
+
+      if (!data?.streamId || !data?.soundId) {
+        client.emit('error', { message: 'streamId and soundId are required' });
+        return;
+      }
+
+      // Simple per-socket cooldown to prevent sound spam
+      const now = Date.now();
+      const last = this.soundCooldowns.get(client.id) || 0;
+      if (now - last < 800) {
+        return; // silently drop — soundboard spam is not an error worth surfacing
+      }
+      this.soundCooldowns.set(client.id, now);
+
+      // Verify user is the stream owner and stream is live
+      try {
+        const stream = await this.liveSalesService.getStreamById(data.streamId);
+
+        if (stream.vendor_id !== userInfo.userId) {
+          client.emit('error', { message: 'Only the stream host can play sounds' });
+          return;
+        }
+
+        if (stream.status !== 'live') {
+          client.emit('error', { message: 'Can only play sounds during a live stream' });
+          return;
+        }
+      } catch (error: any) {
+        client.emit('error', {
+          message: error instanceof NotFoundException ? 'Stream not found' : 'Failed to verify stream',
+        });
+        return;
+      }
+
+      let payload: { streamId: string; soundId: string; name: string; soundUrl?: string };
+
+      if (data.soundId.startsWith('builtin:')) {
+        // Built-in bundled sound — viewers map the key to a local asset
+        payload = {
+          streamId: data.streamId,
+          soundId: data.soundId,
+          name: data.name || data.soundId.replace('builtin:', ''),
+        };
+      } else {
+        // Custom sound — must be an active live_stream sound owned by the
+        // platform (owner_id NULL) or by this host
+        const { data: sound, error: soundError } = await this.supabase
+          .from('sounds')
+          .select('id, name, sound_url, owner_id')
+          .eq('id', data.soundId)
+          .eq('context', 'live_stream')
+          .eq('is_active', true)
+          .single();
+
+        if (soundError || !sound) {
+          client.emit('error', { message: 'Sound not found' });
+          return;
+        }
+
+        if (sound.owner_id && sound.owner_id !== userInfo.userId) {
+          client.emit('error', { message: 'You cannot play this sound' });
+          return;
+        }
+
+        payload = {
+          streamId: data.streamId,
+          soundId: sound.id,
+          name: sound.name,
+          soundUrl: sound.sound_url,
+        };
+      }
+
+      // Broadcast to all OTHER clients in the stream — the host already
+      // plays the sound locally on their own device.
+      client.broadcast.to(`stream:${data.streamId}`).emit('sound_played', {
+        ...payload,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      this.logger.error(`Error playing sound: ${error.message}`);
+      client.emit('error', { message: error.message });
+    }
+  }
+
+  /**
+   * Host stops a playing soundboard sound — broadcast so viewers stop
+   * playback mid-play too. Emits 'sound_stopped' { streamId, soundId }.
+   * No sound lookup needed: stopping is harmless regardless of the id.
+   */
+  @SubscribeMessage('stop_sound')
+  async handleStopSound(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { streamId: string; soundId: string },
+  ) {
+    try {
+      const userInfo = this.connectedUsers.get(client.id);
+      if (!userInfo || userInfo.userId === 'anonymous' || !data?.streamId || !data?.soundId) {
+        return;
+      }
+
+      try {
+        const stream = await this.liveSalesService.getStreamById(data.streamId);
+        if (stream.vendor_id !== userInfo.userId || stream.status !== 'live') {
+          return;
+        }
+      } catch {
+        return;
+      }
+
+      client.broadcast.to(`stream:${data.streamId}`).emit('sound_stopped', {
+        streamId: data.streamId,
+        soundId: data.soundId,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      this.logger.error(`Error stopping sound: ${error.message}`);
     }
   }
 

@@ -530,22 +530,10 @@ export class RiderNotificationService {
   private async sendPushNotification(userId: string, template: NotificationTemplate): Promise<void> {
     // This would integrate with a push notification service like Firebase FCM
     console.log(`📱 Sending push notification to ${userId}:`, template.title);
-    
-    // Mock implementation - would integrate with actual push service
-    const { error } = await this.supabase
-      .from('notifications')
-      .insert({
-        user_id: userId,
-        type: 'push',
-        title: template.title,
-        body: template.body,
-        data: template.data,
-        created_at: new Date().toISOString(),
-      });
 
-    if (error) {
-      throw new Error(`Failed to send push notification: ${error.message}`);
-    }
+    // Stub: channel not implemented — no insert (a channel send is not a
+    // notification row; 'push'/'email'/'sms' are not valid notification types)
+    throw new Error('Push notification channel not implemented');
   }
 
   private async sendWebSocketNotification(userId: string, template: NotificationTemplate): Promise<void> {
@@ -559,43 +547,15 @@ export class RiderNotificationService {
   private async sendEmailNotification(userId: string, template: NotificationTemplate): Promise<void> {
     // This would integrate with an email service like SendGrid
     console.log(`📧 Sending email notification to ${userId}:`, template.title);
-    
-    // Mock implementation - would integrate with actual email service
-    const { error } = await this.supabase
-      .from('notifications')
-      .insert({
-        user_id: userId,
-        type: 'email',
-        title: template.title,
-        body: template.body,
-        data: template.data,
-        created_at: new Date().toISOString(),
-      });
 
-    if (error) {
-      throw new Error(`Failed to send email notification: ${error.message}`);
-    }
+    throw new Error('Email notification channel not implemented');
   }
 
   private async sendSMSNotification(userId: string, template: NotificationTemplate): Promise<void> {
     // This would integrate with an SMS service like Twilio
     console.log(`📱 Sending SMS notification to ${userId}:`, template.title);
-    
-    // Mock implementation - would integrate with actual SMS service
-    const { error } = await this.supabase
-      .from('notifications')
-      .insert({
-        user_id: userId,
-        type: 'sms',
-        title: template.title,
-        body: template.body,
-        data: template.data,
-        created_at: new Date().toISOString(),
-      });
 
-    if (error) {
-      throw new Error(`Failed to send SMS notification: ${error.message}`);
-    }
+    throw new Error('SMS notification channel not implemented');
   }
 
   // ===== HELPER METHODS =====

@@ -5,17 +5,42 @@
 
 import { Injectable, Logger } from '@nestjs/common';
 import { NotificationsService } from './notifications.service';
+import { EmailNotificationService, EmailCategory } from './email-notification.service';
+import { genericNotificationEmail } from './email-templates';
 import { CreateNotificationDto, NotificationType, NotificationPriority, ActionButtonType } from './dto/notification.dto';
 
 // Forward declare to avoid circular dependency
 let NotificationsGateway: any;
 let PushNotificationService: any;
 
+/**
+ * Which notification types also go out over email, and under which
+ * email preference category. chat/ai_* are deliberately excluded —
+ * per-message email would flood inboxes.
+ */
+const EMAIL_CATEGORY_BY_TYPE: Record<string, EmailCategory> = {
+  [NotificationType.ORDER]: 'order',
+  [NotificationType.DELIVERY]: 'delivery',
+  [NotificationType.PAYMENT]: 'payment',
+  [NotificationType.PROMOTION]: 'promotion',
+  [NotificationType.SYSTEM]: 'system',
+  [NotificationType.LIVE]: 'live',
+  [NotificationType.SOCIAL]: 'social',
+  [NotificationType.CONNECTION_REQUEST]: 'social',
+  [NotificationType.CONNECTION_ACCEPTED]: 'social',
+  [NotificationType.USER_WARNING]: 'system',
+  [NotificationType.SCHEDULE]: 'order',
+  [NotificationType.DISPUTE]: 'order',
+  // NOTE: auction_* types are deliberately unmapped — auction flows send
+  // their own dedicated emails and would double-send if mirrored here.
+};
+
 @Injectable()
 export class NotificationHelperService {
   private readonly logger = new Logger(NotificationHelperService.name);
   private gateway: any; // Will be injected later to avoid circular dependency
   private pushNotificationService: any; // Will be injected later
+  private emailNotificationService: EmailNotificationService | null = null;
 
   constructor(private readonly notificationsService: NotificationsService) {}
 
@@ -27,6 +52,11 @@ export class NotificationHelperService {
   // Method to set the push notification service reference (called from the module)
   setPushNotificationService(pushNotificationService: any) {
     this.pushNotificationService = pushNotificationService;
+  }
+
+  // Method to set the email notification service reference (called from the module)
+  setEmailNotificationService(emailNotificationService: EmailNotificationService) {
+    this.emailNotificationService = emailNotificationService;
   }
 
   // ============================================
@@ -138,7 +168,7 @@ export class NotificationHelperService {
           order_id: orderData.id,
           order_number: orderData.orderNumber,
           recipient_role: 'rider',
-          target_screen: 'Workspace'
+          target_screen: 'VendorOrderDetails'
         }
       };
 
@@ -340,7 +370,9 @@ export class NotificationHelperService {
           rider_id: riderData.id,
           rider_name: riderData.name,
           rider_phone: riderData.phone,
-          order_id: orderData.id
+          order_id: orderData.id,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         },
         avatar_url: riderData.avatar_url
       };
@@ -623,7 +655,9 @@ export class NotificationHelperService {
           order_number: orderData.orderNumber,
           total_amount: orderData.totalAmount,
           item_count: orderData.itemCount,
-          buyer_name: orderData.buyerName
+          buyer_name: orderData.buyerName,
+          recipient_role: 'vendor',
+          target_screen: 'VendorOrderDetails'
         }
       };
 
@@ -746,7 +780,9 @@ export class NotificationHelperService {
           delivery_fee: orderData.deliveryFee,
           pickup_address: orderData.pickupAddress,
           delivery_address: orderData.deliveryAddress,
-          estimated_earnings: orderData.estimatedEarnings
+          estimated_earnings: orderData.estimatedEarnings,
+          recipient_role: 'rider',
+          target_screen: 'VendorOrderDetails'
         }
       };
 
@@ -830,7 +866,9 @@ export class NotificationHelperService {
         data: {
           order_id: orderData.orderId,
           order_number: orderData.orderNumber,
-          vendor_id: orderData.vendorId
+          vendor_id: orderData.vendorId,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         }
       };
 
@@ -957,7 +995,9 @@ export class NotificationHelperService {
           order_id: orderData.id,
           order_number: orderData.orderNumber,
           pickup_pin: orderData.pickupPin,
-          vendor_name: orderData.vendorName
+          vendor_name: orderData.vendorName,
+          recipient_role: 'rider',
+          target_screen: 'VendorOrderDetails'
         }
       };
 
@@ -987,7 +1027,9 @@ export class NotificationHelperService {
         data: {
           order_id: orderData.id,
           order_number: orderData.orderNumber,
-          delivery_pin: orderData.deliveryPin
+          delivery_pin: orderData.deliveryPin,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         }
       };
 
@@ -1022,7 +1064,9 @@ export class NotificationHelperService {
           order_id: orderData.id,
           order_number: orderData.orderNumber,
           buyer_name: orderData.buyerName,
-          delivery_type: 'pickup'
+          delivery_type: 'pickup',
+          recipient_role: 'vendor',
+          target_screen: 'VendorOrderDetails'
           // ⚠️ Never include delivery_pin here - vendor must never learn the PIN in advance
         }
       };
@@ -1056,7 +1100,9 @@ export class NotificationHelperService {
           order_number: orderData.orderNumber,
           delivery_pin: orderData.deliveryPin,
           vendor_name: orderData.vendorName,
-          delivery_type: 'pickup'
+          delivery_type: 'pickup',
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         }
       };
 
@@ -1089,7 +1135,9 @@ export class NotificationHelperService {
           order_number: orderData.orderNumber,
           vendor_name: orderData.vendorName,
           delivery_pin: orderData.deliveryPin,
-          delivery_type: 'pickup'
+          delivery_type: 'pickup',
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         }
       };
 
@@ -1121,7 +1169,9 @@ export class NotificationHelperService {
           ],
           data: {
             order_id: orderData.id,
-            order_number: orderData.orderNumber
+            order_number: orderData.orderNumber,
+            recipient_role: 'rider',
+            target_screen: 'VendorOrderDetails'
           }
         };
 
@@ -1142,7 +1192,9 @@ export class NotificationHelperService {
         ],
         data: {
           order_id: orderData.id,
-          order_number: orderData.orderNumber
+          order_number: orderData.orderNumber,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         }
       };
 
@@ -1232,7 +1284,9 @@ export class NotificationHelperService {
         ],
         data: {
           order_id: orderData.id,
-          order_number: orderData.orderNumber
+          order_number: orderData.orderNumber,
+          recipient_role: 'buyer',
+          target_screen: 'OrderTracking'
         }
       };
 
@@ -1248,7 +1302,9 @@ export class NotificationHelperService {
         badge: 'OUT_FOR_DELIVERY',
         data: {
           order_id: orderData.id,
-          order_number: orderData.orderNumber
+          order_number: orderData.orderNumber,
+          recipient_role: 'vendor',
+          target_screen: 'VendorOrderDetails'
         }
       };
 
@@ -1409,13 +1465,64 @@ export class NotificationHelperService {
   }
 
   // ============================================
+  // ADMIN BROADCASTS
+  // ============================================
+
+  /**
+   * Deliver an admin broadcast to a single user through the standard
+   * funnel: in-app row + websocket + push + (optionally) the generic
+   * email mirror. Broadcasts use type 'promotion' so every channel is
+   * gated by the user's existing promotion preferences.
+   *
+   * Channels can be narrowed per broadcast (e.g. email handled by the
+   * broadcast service itself with a dedicated subject/dedup key).
+   */
+  async sendBroadcastNotification(
+    userId: string,
+    opts: {
+      title: string;
+      message: string;
+      data?: Record<string, any>;
+      ctaLabel?: string;
+      sendPush?: boolean;
+      sendEmail?: boolean;
+    },
+  ): Promise<boolean> {
+    try {
+      await this.createAndSendNotification(
+        {
+          user_id: userId,
+          type: NotificationType.PROMOTION,
+          title: opts.title,
+          message: opts.message,
+          priority: NotificationPriority.MEDIUM,
+          badge: 'PROMO',
+          has_actions: !!opts.ctaLabel,
+          action_buttons: opts.ctaLabel
+            ? [{ label: opts.ctaLabel, type: ActionButtonType.PRIMARY }]
+            : undefined,
+          data: opts.data || {},
+        },
+        { push: opts.sendPush, email: opts.sendEmail },
+      );
+      return true;
+    } catch (error) {
+      this.logger.error(`Broadcast notification failed for ${userId}:`, error);
+      return false;
+    }
+  }
+
+  // ============================================
   // PRIVATE HELPER METHOD
   // ============================================
 
   /**
    * Create notification in database, send real-time via WebSocket, and send push notification
    */
-  private async createAndSendNotification(notification: CreateNotificationDto): Promise<void> {
+  private async createAndSendNotification(
+    notification: CreateNotificationDto,
+    channels?: { push?: boolean; email?: boolean },
+  ): Promise<void> {
     // Create notification in database
     const createdNotification = await this.notificationsService.createNotification(notification);
     
@@ -1426,8 +1533,34 @@ export class NotificationHelperService {
       }
 
       // Send push notification if service is available
-      if (this.pushNotificationService) {
+      if (this.pushNotificationService && channels?.push !== false) {
         await this.pushNotificationService.sendNotificationPush(notification.user_id, createdNotification);
+      }
+
+      // Mirror to email when this notification type is emailable
+      const emailService = this.emailNotificationService;
+      const emailCategory = EMAIL_CATEGORY_BY_TYPE[notification.type];
+      if (emailCategory && emailService && channels?.email !== false) {
+        try {
+          await emailService.sendUserEmail(notification.user_id, {
+            subject: notification.title,
+            category: emailCategory,
+            reminder: {
+              type: 'notification',
+              entityType: 'notification',
+              entityId: createdNotification.id,
+            },
+            buildHtml: ({ name }) => genericNotificationEmail({
+              name,
+              title: notification.title,
+              message: notification.message,
+              ctaLabel: notification.action_buttons?.[0]?.label,
+              appUrl: emailService.appUrl(),
+            }),
+          });
+        } catch (error) {
+          this.logger.warn(`Email mirror failed for notification ${createdNotification.id}: ${error}`);
+        }
       }
     }
   }

@@ -37,6 +37,9 @@ export interface RiderProfile {
   vehicleType: 'wheelbarrow' | 'bike' | 'car';
   price: number;
   distanceFromPickup: number;
+  /** Pickup→delivery route distance (km) the per-km price was computed on;
+   *  clients echo this back so checkout can recompute the same fee. */
+  routeDistanceKm?: number;
   estimatedArrival: number;
   isAvailable: boolean;
   unavailableReason?: string;
@@ -46,6 +49,7 @@ export interface RiderProfile {
   completionRate?: number;
   deliveryPromise?: string;
   isCurrentlyDelivering?: boolean; // NEW: Indicates if rider is currently on an active delivery
+  is_verified?: boolean; // from user_profiles — used by search results verified badge
 }
 
 @Controller('riders')
@@ -72,11 +76,13 @@ export class RidersController {
     @Body() request: {
       pickupLocation: { state?: string; country?: string };
       deliveryLocation: { state?: string; country?: string };
+      weightKg?: number;
     },
   ) {
     console.log('🚛 Finding interstate delivery companies:', {
       pickup: request.pickupLocation,
       delivery: request.deliveryLocation,
+      weightKg: request.weightKg,
     });
 
     return this.ridersService.findInterstateCompanies(
@@ -84,6 +90,7 @@ export class RidersController {
       request.pickupLocation?.country,
       request.deliveryLocation?.state,
       request.deliveryLocation?.country,
+      request.weightKg,
     );
   }
 

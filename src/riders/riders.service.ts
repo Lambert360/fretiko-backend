@@ -3,11 +3,17 @@ import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient, createUserSupabaseClient } from '../shared/supabase.client';
 import { NotificationHelperService } from '../notifications/notification-helper.service';
 import { RiderAvailabilityRequest, OrderDetails, RiderProfile } from './riders.controller';
+import { computeDeliveryFee, exceedsCapacity, DeliveryRate } from '../shared/delivery-pricing';
+import { haversineKm, roadDistanceKm, hasCoords, isLegacyMockCoord } from '../shared/geo';
+import { escapePostgrestTerm } from '../shared/postgrest';
 
 interface RiderLocationData {
   user_id: string;
   current_order_id?: string;
   is_available?: boolean;
+  latitude?: number;
+  longitude?: number;
+  last_ping?: string;
 }
 
 interface OrderData {
@@ -167,7 +173,7 @@ export class RidersService {
       // Get rider_locations for active order detection (new feature)
       const { data: riderLocationsData } = await this.supabase
         .from('rider_locations')
-        .select('user_id, current_order_id, is_available')
+        .select('user_id, current_order_id, is_available, latitude, longitude, last_ping')
         .in('user_id', riderIds) as { data: RiderLocationData[] | null };
 
       // Get active order details for riders with current_order_id
@@ -207,8 +213,27 @@ export class RidersService {
           const riderProfileData = riderProfilesData?.find(rp => rp.user_id === vr.user_id);
           const riderLocation = riderLocationMap.get(vr.user_id);
 
-          // Mock distance calculation (in real app, use geolocation)
-          const distance = Math.random() * 5; // 0-5km
+          // Real rider→pickup distance when the rider has a fresh GPS ping
+          // and the request carries real pickup coords; deterministic
+          // fallbacks below keep old clients working (never random — a
+          // random distance made consecutive quotes drift).
+          const pickupIsReal = hasCoords(request.pickupLocation) && !isLegacyMockCoord(request.pickupLocation);
+          const deliveryIsReal = hasCoords(request.deliveryLocation) && !isLegacyMockCoord(request.deliveryLocation);
+
+          const riderLoc = riderLocationMap.get(vr.user_id);
+          const pingFresh = !!riderLoc?.last_ping
+            && (Date.now() - new Date(riderLoc.last_ping).getTime()) < 15 * 60 * 1000;
+          const riderDistanceKm = pingFresh && hasCoords(riderLoc) && pickupIsReal
+            ? haversineKm(riderLoc, request.pickupLocation)
+            : null;
+
+          // Route distance (pickup→delivery) drives the per-km price —
+          // Bolt/Uber price the trip, not the rider's distance to pickup.
+          const routeKm = pickupIsReal && deliveryIsReal
+            ? roadDistanceKm(request.pickupLocation, request.deliveryLocation)
+            : (request.orderDetails?.distance ?? null);
+
+          const distance = riderDistanceKm ?? routeKm ?? 2.5; // display/sort/ETA value
 
           // verified_riders.vehicle_type is authoritative (set during official verification)
           const vehicleType = vr.vehicle_type || riderProfileData?.vehicle_type || profile?.preferences?.vehicleType || 'bike';
@@ -221,15 +246,22 @@ export class RidersService {
             request.itemTypes
           );
 
-          // Price = company's live pricing_config if set, otherwise flat 2 Freti
+          // Price = company's live pricing_config if set, otherwise flat 2 Freti.
+          // Weight-aware: base + per_km*km + per_kg*(weight - included_weight_kg).
+          // Services carry no weight — clamp to 0 so a per-kg rate never
+          // surcharges a Bolt/Uber-style service delivery.
+          const isServiceOnly = request.itemTypes?.length
+            ? request.itemTypes.every(t => t === 'service')
+            : false;
+          const orderWeight = isServiceOnly ? 0 : (request.orderDetails?.weight ?? 0);
           let price: number;
           let deliveryPromise: string | undefined;
 
-          const companyRates = companyPricing[vr.company_id]?.[this.normalizeVehicleType(vehicleType)];
+          const companyRates = companyPricing[vr.company_id]?.[this.normalizeVehicleType(vehicleType)] as DeliveryRate | undefined;
+          const overweight = exceedsCapacity(companyRates, orderWeight);
 
-          if (companyRates?.base_price && companyRates?.per_km_rate) {
-            // Use company's live pricing: base + distance × per_km_rate
-            price = companyRates.base_price + (distance * companyRates.per_km_rate);
+          if (companyRates && (companyRates.base_price || companyRates.fixed_price != null)) {
+            price = computeDeliveryFee(companyRates, routeKm ?? distance, orderWeight);
           } else {
             // No company pricing set — fixed 2 Freti regardless of distance
             price = 2;
@@ -248,9 +280,12 @@ export class RidersService {
             vehicleType: ['wheelbarrow', 'bike', 'car', 'van', 'truck'].includes(vehicleType) ? vehicleType as any : 'bike',
             price: Math.round(price * 100) / 100,
             distanceFromPickup: Math.round(distance * 10) / 10,
+            routeDistanceKm: routeKm != null ? Math.round(routeKm * 100) / 100 : undefined,
             estimatedArrival: Math.max(3, Math.round(distance * 3)),
-            isAvailable: this.checkAvailability(vehicleType, request.orderDetails),
-            unavailableReason: this.getUnavailableReason(vehicleType, request.orderDetails),
+            isAvailable: !overweight && this.checkAvailability(vehicleType, request.orderDetails),
+            unavailableReason: overweight
+              ? `Order exceeds ${vehicleType} weight capacity`
+              : this.getUnavailableReason(vehicleType, request.orderDetails),
             specialties: this.getSpecialtiesByVehicle(vehicleType),
             isOnline,
             trustScore: trustData?.rider_trust_score || 750,
@@ -285,16 +320,17 @@ export class RidersService {
    * Get a list of users whose role is rider for the Search screen.
    * Includes any user marked as a rider — whether verified by a logistics partner or not.
    */
-  async getRidersForSearch(limit: number = 20, query?: string): Promise<RiderProfile[]> {
+  async getRidersForSearch(limit: number = 20, query?: string, offset: number = 0): Promise<RiderProfile[]> {
     try {
       let builder: any = this.supabase
         .from('user_profiles')
-        .select('id, username, avatar_url, location, preferences, is_rider, role')
-        .or('role.eq.rider,preferences->>isRider.eq.true,is_rider.eq.true')
-        .limit(limit);
+        .select('id, username, avatar_url, location, preferences, is_rider, user_role, is_verified')
+        .or('user_role.eq.rider,preferences->>isRider.eq.true,is_rider.eq.true')
+        .range(offset, offset + limit - 1);
 
-      if (query?.trim()) {
-        builder = builder.ilike('username', `%${query.trim()}%`);
+      const q = escapePostgrestTerm(query);
+      if (q) {
+        builder = builder.ilike('username', `%${q}%`);
       }
 
       const { data: riderUsers, error } = await builder;
@@ -344,6 +380,7 @@ export class RidersService {
           isOnline: riderProfileData?.is_online ?? false,
           trustScore,
           completionRate: Math.min(99, 85 + completed / 10),
+          is_verified: profile.is_verified === true,
         };
       });
 
@@ -366,12 +403,17 @@ export class RidersService {
     pickupCountry?: string,
     deliveryState?: string,
     deliveryCountry?: string,
+    weightKg?: number,
   ): Promise<Array<{
     companyId: string;
     companyName: string;
     logoUrl?: string;
     basePrice: number;
     perKmRate: number;
+    perKgRate: number;
+    includedWeightKg: number;
+    maxWeightKg: number | null;
+    quotedPrice: number;
     estimatedDeliveryDaysMin: number;
     estimatedDeliveryDaysMax: number;
     isInternational: boolean;
@@ -425,20 +467,44 @@ export class RidersService {
           covers(deliveryCountryIso, deliveryStateIso || undefined)
         );
       })
-      .map((p: any) => ({
-        companyId: p.id,
-        companyName: p.company_name,
-        logoUrl: p.company_logo_url,
-        basePrice: isInternational
-          ? p.interstate_config?.international_base_price || p.interstate_config?.base_price || 0
-          : p.interstate_config?.base_price || 0,
-        perKmRate: isInternational
-          ? p.interstate_config?.international_per_km_rate || p.interstate_config?.per_km_rate || 0
-          : p.interstate_config?.per_km_rate || 0,
-        estimatedDeliveryDaysMin: p.interstate_config?.estimated_delivery_days_min ?? 2,
-        estimatedDeliveryDaysMax: p.interstate_config?.estimated_delivery_days_max ?? 5,
-        isInternational,
-      }));
+      .map((p: any) => {
+        const cfg = p.interstate_config || {};
+        const basePrice = isInternational
+          ? cfg.international_base_price || cfg.base_price || 0
+          : cfg.base_price || 0;
+        const perKmRate = isInternational
+          ? cfg.international_per_km_rate || cfg.per_km_rate || 0
+          : cfg.per_km_rate || 0;
+        const perKgRate = isInternational
+          ? cfg.international_per_kg_rate ?? cfg.per_kg_rate ?? 0
+          : cfg.per_kg_rate ?? 0;
+        const includedWeightKg = cfg.included_weight_kg;
+        const maxWeightKg = cfg.max_weight_kg ?? null;
+
+        // Interstate pricing is weight-driven: base + per_kg * (kg - included).
+        // distance=0 → per_km contributes nothing unless the company also sets per_km_rate.
+        const rate: DeliveryRate = { base_price: basePrice, per_km_rate: perKmRate, per_kg_rate: perKgRate, included_weight_kg: includedWeightKg };
+        const quotedPrice = Math.round(computeDeliveryFee(rate, 0, weightKg ?? 0) * 100) / 100;
+
+        return {
+          companyId: p.id,
+          companyName: p.company_name,
+          logoUrl: p.company_logo_url,
+          basePrice,
+          perKmRate,
+          perKgRate,
+          includedWeightKg: includedWeightKg ?? 0,
+          maxWeightKg,
+          quotedPrice,
+          estimatedDeliveryDaysMin: cfg.estimated_delivery_days_min ?? 2,
+          estimatedDeliveryDaysMax: cfg.estimated_delivery_days_max ?? 5,
+          isInternational,
+        };
+      })
+      // Companies that declare a max capacity are filtered out for overweight orders
+      .filter((c: { maxWeightKg: number | null }) =>
+        weightKg == null || c.maxWeightKg == null || c.maxWeightKg >= weightKg,
+      );
   }
 
   async getRiderRecommendations(

@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { ConfigService } from '@nestjs/config';
 import { createServiceSupabaseClient, createUserSupabaseClient, createSupabaseClient } from '../shared/supabase.client';
 import { SupabaseClientManager } from '../auth/supabase-client-manager.service';
+import { isAdultViewer } from '../shared/viewer-age';
 
 @Injectable()
 export class CartService {
@@ -26,11 +27,13 @@ export class CartService {
           price,
           images,
           quantity,
+          status,
           location,
           user_id,
           user_profiles (
             username,
-            location
+            location,
+            is_adult_content
           ),
           product_categories (
             name
@@ -40,11 +43,13 @@ export class CartService {
           name,
           base_price,
           images,
+          status,
           location,
           user_id,
           user_profiles (
             username,
-            location
+            location,
+            is_adult_content
           ),
           service_categories (
             name
@@ -110,6 +115,8 @@ export class CartService {
     const buyerState = buyerDefaultAddress?.state || undefined;
     const buyerCountry = buyerDefaultAddress?.country || undefined;
 
+    const viewerIsAdult = await isAdultViewer(this.serviceSupabase, userId);
+
     // Transform data to match frontend expectations
     return (data || []).map(item => {
       const isService = !!item.service_id;
@@ -133,6 +140,9 @@ export class CartService {
           sellerId: item.services?.user_id,
           sellerName: item.services?.user_profiles?.username || 'Unknown Provider',
           category: item.services?.service_categories?.name || 'Services',
+          isAvailable: !!item.services
+            && (item.services.status === 'active' || item.services.status === 'busy')
+            && (viewerIsAdult || !item.services.user_profiles?.is_adult_content),
           sellerLocation: productLoc,
           isOutOfState,
           isOutOfCountry,
@@ -157,6 +167,10 @@ export class CartService {
           sellerId: item.products?.user_id,
           sellerName: item.products?.user_profiles?.username || 'Unknown Seller',
           category: item.products?.product_categories?.name || 'Uncategorized',
+          isAvailable: !!item.products
+            && item.products.status === 'active'
+            && (item.products.quantity || 0) > 0
+            && (viewerIsAdult || !item.products.user_profiles?.is_adult_content),
           sellerLocation: productLoc,
           isOutOfState,
           isOutOfCountry,
